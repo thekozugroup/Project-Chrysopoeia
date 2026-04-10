@@ -24,6 +24,7 @@ anyhow = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+tokio-util = "0.7"
 chrysopeia-core = { workspace = true }
 chrysopeia-hwdetect = { workspace = true }
 oximedia-transcode = { workspace = true, optional = true }

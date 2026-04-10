@@ -42,14 +42,14 @@ async fn main() -> anyhow::Result<()> {
     let capabilities = chrysopeia_hwdetect::detect_hardware().await?;
     tracing::info!("Detected {} hardware capabilities", capabilities.len());
 
-    // Create progress channel for worker <-> server communication
-    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(256);
+    // Create broadcast channel for progress events (worker -> server -> WebSocket clients)
+    let (event_tx, _event_rx) = tokio::sync::broadcast::channel(256);
 
     // Initialize transcode engine
     let engine = chrysopeia_worker::TranscodeEngine::new(
         capabilities.clone(),
         2, // max concurrent jobs
-        progress_tx,
+        event_tx,
     );
 
     // Build application state
