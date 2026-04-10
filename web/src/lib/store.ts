@@ -354,6 +354,14 @@ interface AppStore {
   settingsOpen: boolean;
   setSettingsOpen: (v: boolean) => void;
 
+  // Main area tab
+  activeTab: "overview" | "queue" | "settings";
+  setActiveTab: (tab: "overview" | "queue" | "settings") => void;
+
+  // Adding new library (inline in sidebar)
+  isAddingLibrary: boolean;
+  setIsAddingLibrary: (v: boolean) => void;
+
   // Theme
   theme: "dark" | "light";
   toggleTheme: () => void;
@@ -452,6 +460,14 @@ export const useAppStore = create<AppStore>((set) => ({
   // Settings
   settingsOpen: false,
   setSettingsOpen: (v) => set({ settingsOpen: v }),
+
+  // Tab
+  activeTab: "overview",
+  setActiveTab: (tab) => set({ activeTab: tab }),
+
+  // Adding library
+  isAddingLibrary: false,
+  setIsAddingLibrary: (v) => set({ isAddingLibrary: v }),
 
   // Theme
   theme: "dark",

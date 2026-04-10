@@ -1,7 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Play, Pause, RotateCw, Settings2, FolderOpen, Activity, ChevronUp } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Play, Pause, RotateCw, FolderOpen, Activity } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 
@@ -12,17 +12,12 @@ import {
   startProcessing as apiStart,
   stopProcessing as apiStop,
 } from "@/lib/api";
-import { FileList } from "./file-list";
 import { FileListSkeleton } from "./file-list-skeleton";
 import { ActivityLog } from "./activity-log";
-import { SettingsPanel } from "./settings-panel";
 import { ThemeToggle } from "./theme-toggle";
-
-function formatBytes(bytes: number): string {
-  if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
-  return `${(bytes / 1e6).toFixed(0)} MB`;
-}
+import { OverviewTab } from "./tabs/overview-tab";
+import { QueueTab } from "./tabs/queue-tab";
+import { LibrarySettingsTab } from "./tabs/library-settings-tab";
 
 const ONBOARDING_STEPS = [
   {
@@ -42,56 +37,22 @@ const ONBOARDING_STEPS = [
   },
 ];
 
+const TABS = [
+  { key: "overview" as const, label: "Overview" },
+  { key: "queue" as const, label: "Queue" },
+  { key: "settings" as const, label: "Settings" },
+];
+
 export function Dashboard() {
-  const stats = useAppStore((s) => s.stats);
   const isProcessing = useAppStore((s) => s.isProcessing);
   const isScanning = useAppStore((s) => s.isScanning);
   const wsConnected = useAppStore((s) => s.wsConnected);
-  const globalSettings = useAppStore((s) => s.globalSettings);
   const libraryPaths = useAppStore((s) => s.library_paths);
   const isLoading = useAppStore((s) => s.isLoading);
   const setIsLoading = useAppStore((s) => s.setIsLoading);
   const files = useAppStore((s) => s.files);
-  const settingsOpen = useAppStore((s) => s.settingsOpen);
-  const setSettingsOpen = useAppStore((s) => s.setSettingsOpen);
-  const selectedLibraryId = useAppStore((s) => s.selectedLibraryId);
-
-  // Find selected library name
-  const selectedLibrary = libraryPaths.find((lp) => lp.id === selectedLibraryId);
-  const headerTitle = selectedLibrary
-    ? selectedLibrary.path.split("/").pop() ?? selectedLibrary.path
-    : "Library";
-
-  // Filter files by selected library
-  const filteredFiles = useMemo(() => {
-    if (!selectedLibraryId) return files;
-    const lib = libraryPaths.find((lp) => lp.id === selectedLibraryId);
-    if (!lib) return files;
-    return files.filter((f) => f.library_path === lib.path);
-  }, [files, selectedLibraryId, libraryPaths]);
-
-  // Compute filtered stats
-  const filteredStats = useMemo(() => {
-    if (!selectedLibraryId) return stats;
-    return {
-      total_files: filteredFiles.length,
-      pending: filteredFiles.filter((f) => f.status === "pending").length,
-      queued: filteredFiles.filter((f) => f.status === "queued").length,
-      transcoding: filteredFiles.filter((f) => f.status === "transcoding").length,
-      complete: filteredFiles.filter((f) => f.status === "complete").length,
-      skipped: filteredFiles.filter((f) => f.status === "skipped").length,
-      errored: filteredFiles.filter((f) => f.status === "error").length,
-      total_size_bytes: filteredFiles.reduce((a, f) => a + f.size_bytes, 0),
-      saved_bytes: filteredFiles.reduce(
-        (a, f) =>
-          a +
-          (f.status === "complete" && f.output_size_bytes != null
-            ? f.size_bytes - f.output_size_bytes
-            : 0),
-        0,
-      ),
-    };
-  }, [selectedLibraryId, filteredFiles, stats]);
+  const activeTab = useAppStore((s) => s.activeTab);
+  const setActiveTab = useAppStore((s) => s.setActiveTab);
 
   // Simulate initial data load
   useEffect(() => {
@@ -110,7 +71,6 @@ export function Dashboard() {
     useAppStore.getState().startScan();
     try {
       const result = await scanLibrary();
-      // scanComplete fires its own toast
       setTimeout(() => useAppStore.getState().scanComplete(result.queued), 500);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Scan failed");
@@ -140,19 +100,11 @@ export function Dashboard() {
     }
   }, []);
 
-  const displayStats = filteredStats;
-  const completionPct =
-    displayStats.total_files > 0
-      ? Math.round(
-          ((displayStats.complete + displayStats.skipped) / displayStats.total_files) * 100
-        )
-      : 0;
-
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
+      {/* Single header: tabs on left, actions on right */}
       <header
-        className={`relative flex shrink-0 flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-border px-4 md:px-6 py-4 overflow-hidden transition-colors ${
+        className={`relative flex shrink-0 items-center border-b border-border px-4 md:px-6 py-2 transition-colors ${
           !wsConnected ? "bg-destructive/5" : ""
         }`}
       >
@@ -161,78 +113,42 @@ export function Dashboard() {
             <div className="h-full w-1/4 bg-gold/50 rounded-full animate-[scan-sweep_2s_ease-in-out_infinite]" />
           </div>
         )}
-        <div>
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2">
-              <h2 className="font-heading text-xl tracking-tight">{headerTitle}</h2>
-              <span
-                className={`inline-block h-2 w-2 rounded-full ${
-                  wsConnected
-                    ? "status-pulse bg-emerald-400"
-                    : "bg-destructive animate-pulse"
-                }`}
-                title={wsConnected ? "Connected" : "Disconnected"}
-              />
-              {!wsConnected && (
-                <span className="text-[10px] text-destructive">
-                  Reconnecting...
-                </span>
-              )}
-            </div>
-            <span className="text-xs tabular-nums text-muted-foreground">
-              {displayStats.total_files.toLocaleString()} files &middot;{" "}
-              {formatBytes(displayStats.total_size_bytes)}
-            </span>
-          </div>
 
-          {/* Size overlay bar: total original size as full, compressed as gold overlay */}
-          <div className="mt-2">
-            <div className="relative h-2 w-40 md:w-64 rounded-full bg-muted-foreground/15 overflow-hidden">
-              <div
-                className="absolute inset-y-0 left-0 rounded-full bg-gold/60 transition-all duration-700"
-                style={{ width: `${completionPct}%` }}
-              />
-            </div>
-            <div className="flex items-center gap-3 mt-1">
-              <span className="text-[10px] tabular-nums text-muted-foreground">
-                {completionPct}% complete
-              </span>
-              {displayStats.saved_bytes > 0 && (
-                <span className="text-[10px] text-gold tabular-nums">
-                  {formatBytes(displayStats.saved_bytes)} saved
-                </span>
-              )}
-            </div>
-          </div>
+        {/* Centered tabs */}
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <nav className="flex items-center gap-1 rounded-lg bg-muted/50 p-0.5 pointer-events-auto" role="tablist">
+            {TABS.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === tab.key}
+                onClick={() => setActiveTab(tab.key)}
+                className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-all ${
+                  activeTab === tab.key
+                    ? "bg-background text-foreground shadow-sm"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </nav>
         </div>
 
-        {/* Controls */}
-        <div className="flex items-center gap-2 self-start sm:self-auto">
+        {/* Spacer to push actions right */}
+        <div className="flex-1" />
+
+        {/* Actions */}
+        <div className="relative z-10 flex items-center gap-2">
           <ThemeToggle />
           <Button
-            size="sm"
-            variant={settingsOpen ? "default" : "secondary"}
-            onClick={() => setSettingsOpen(!settingsOpen)}
-            className={`gap-1.5 text-xs transition-transform hover:scale-[1.02] ${
-              settingsOpen
-                ? "bg-gold/15 text-gold border border-gold/20"
-                : ""
-            }`}
-            aria-label="Toggle settings"
-            aria-expanded={settingsOpen}
-          >
-            {settingsOpen ? (
-              <ChevronUp className="h-3 w-3" />
-            ) : (
-              <Settings2 className="h-3 w-3" />
-            )}
-          </Button>
-          <Button
+            type="button"
             size="sm"
             variant="secondary"
             onClick={handleScan}
             disabled={isScanning}
-            className="gap-1.5 text-xs transition-transform hover:scale-[1.02]"
+            className="gap-1.5 text-xs"
           >
             <RotateCw
               className={`h-3 w-3 ${isScanning ? "animate-spin" : ""}`}
@@ -242,19 +158,21 @@ export function Dashboard() {
 
           {isProcessing ? (
             <Button
+              type="button"
               size="sm"
               variant="secondary"
               onClick={handleStop}
-              className="gap-1.5 text-xs bg-gold/15 text-gold border border-gold/20 hover:bg-gold/25 animate-pulse transition-transform hover:scale-[1.02]"
+              className="gap-1.5 text-xs bg-gold/15 text-gold border border-gold/20 hover:bg-gold/25 animate-pulse"
             >
               <Pause className="h-3 w-3" />
               Pause
             </Button>
           ) : (
             <Button
+              type="button"
               size="sm"
               onClick={handleStart}
-              className="gap-1.5 bg-gold text-gold-foreground hover:bg-gold/90 text-xs shadow-[0_0_12px_var(--gold-muted)] hover:shadow-[0_0_16px_var(--gold-muted)] transition-transform hover:scale-[1.02]"
+              className="gap-1.5 bg-gold text-gold-foreground hover:bg-gold/90 text-xs"
             >
               <Play className="h-3 w-3" />
               Start
@@ -263,49 +181,7 @@ export function Dashboard() {
         </div>
       </header>
 
-      {/* Settings panel */}
-      <SettingsPanel />
-
-      {/* Stats row */}
-      <div aria-live="polite" className="flex shrink-0 items-center border-b border-border px-4 md:px-6 py-1.5">
-        <p className="text-xs text-muted-foreground tabular-nums">
-          <span className="text-emerald-400 font-medium">{displayStats.transcoding}</span>
-          <span className="text-muted-foreground/70"> transcoding</span>
-          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
-          <span className="text-foreground font-medium">{displayStats.queued}</span>
-          <span className="text-muted-foreground/70"> queued</span>
-          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
-          <span className="text-foreground font-medium">{displayStats.pending.toLocaleString()}</span>
-          <span className="text-muted-foreground/70"> pending</span>
-          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
-          <span className="text-gold font-medium">{displayStats.complete.toLocaleString()}</span>
-          <span className="text-muted-foreground/70"> complete</span>
-          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
-          <span className="text-foreground font-medium">{displayStats.skipped}</span>
-          <span className="text-muted-foreground/70"> skipped</span>
-          {displayStats.errored > 0 && (
-            <>
-              <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
-              <span className="text-destructive font-medium">{displayStats.errored}</span>
-              <span className="text-muted-foreground/70"> errors</span>
-            </>
-          )}
-        </p>
-        <div className="ml-auto flex items-center gap-1.5">
-          <span className="inline-flex items-center gap-1 rounded-full bg-gold/10 px-2.5 py-0.5 text-[10px] font-mono uppercase text-gold ring-1 ring-inset ring-gold/20">
-            {globalSettings.default_video}
-            <span className="text-gold/40">/</span>
-            {globalSettings.default_audio}
-            <span className="text-gold/40">/</span>
-            .{globalSettings.default_container}
-          </span>
-        </div>
-      </div>
-
-      {/* Separator */}
-      <div className="h-px bg-border/40" />
-
-      {/* File list, skeleton, onboarding, or empty state */}
+      {/* Tab content / skeleton / onboarding / empty states */}
       <ScrollArea className="min-h-0 flex-1">
         {isLoading ? (
           <FileListSkeleton />
@@ -370,20 +246,12 @@ export function Dashboard() {
               </p>
             </div>
           </div>
-        ) : !globalSettings.default_video ? (
-          <div className="flex flex-col items-center justify-center py-24 text-center gap-4">
-            <div className="rounded-full bg-secondary/60 p-4">
-              <Settings2 className="h-8 w-8 text-muted-foreground/40" />
-            </div>
-            <div>
-              <p className="text-sm font-medium text-muted-foreground">Select an output format</p>
-              <p className="text-xs text-muted-foreground/60 mt-1.5 max-w-xs mx-auto">
-                Choose a video codec in the sidebar to configure your transcoding pipeline
-              </p>
-            </div>
-          </div>
         ) : (
-          <FileList />
+          <>
+            {activeTab === "overview" && <OverviewTab />}
+            {activeTab === "queue" && <QueueTab />}
+            {activeTab === "settings" && <LibrarySettingsTab />}
+          </>
         )}
       </ScrollArea>
 
@@ -427,4 +295,3 @@ export function Dashboard() {
     </div>
   );
 }
-

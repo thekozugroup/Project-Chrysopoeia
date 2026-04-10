@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState } from "react";
 import {
   Folder,
   Plus,
@@ -8,6 +8,7 @@ import {
   Cpu,
   Zap,
   ZapOff,
+  Check,
 } from "lucide-react";
 import {
   Sidebar,
@@ -15,7 +16,6 @@ import {
   SidebarFooter,
   SidebarGroup,
   SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
@@ -41,40 +41,36 @@ export function AppSidebar() {
   const setSelectedLibrary = useAppStore((s) => s.setSelectedLibrary);
   const hardware = useAppStore((s) => s.hardware);
   const files = useAppStore((s) => s.files);
+  const isAddingLibrary = useAppStore((s) => s.isAddingLibrary);
+  const setIsAddingLibrary = useAppStore((s) => s.setIsAddingLibrary);
   const [newPath, setNewPath] = useState("");
-
-  // Compute per-library stats
-  const libStats = useMemo(() => {
-    const out: Record<string, { pct: number; origBytes: number; newBytes: number }> = {};
-    for (const lp of libraryPaths) {
-      const pathFiles = files.filter((f) => f.library_path === lp.path);
-      if (pathFiles.length === 0) {
-        out[lp.id] = { pct: 0, origBytes: lp.total_size_bytes, newBytes: lp.total_size_bytes };
-      } else {
-        const done = pathFiles.filter(
-          (f) => f.status === "complete" || f.status === "skipped",
-        ).length;
-        const origBytes = pathFiles.reduce((a, f) => a + f.size_bytes, 0);
-        const newBytes = pathFiles.reduce((a, f) => {
-          if (f.status === "complete" && f.output_size_bytes != null) return a + f.output_size_bytes;
-          return a + f.size_bytes;
-        }, 0);
-        out[lp.id] = {
-          pct: pathFiles.length > 0 ? Math.round((done / pathFiles.length) * 100) : 0,
-          origBytes,
-          newBytes,
-        };
-      }
-    }
-    return out;
-  }, [files, libraryPaths]);
 
   function handleAddPath() {
     const p = newPath.trim();
     if (p && !libraryPaths.some((lp) => lp.path === p)) {
       addLibraryPath(p);
       setNewPath("");
+      setIsAddingLibrary(false);
     }
+  }
+
+  function handleCancelAdd() {
+    setNewPath("");
+    setIsAddingLibrary(false);
+  }
+
+  // Compute per-library compression stats
+  function getLibStats(lp: (typeof libraryPaths)[0]) {
+    const pathFiles = files.filter((f) => f.library_path === lp.path);
+    if (pathFiles.length === 0) {
+      return { origBytes: lp.total_size_bytes, newBytes: lp.total_size_bytes };
+    }
+    const origBytes = pathFiles.reduce((a, f) => a + f.size_bytes, 0);
+    const newBytes = pathFiles.reduce((a, f) => {
+      if (f.status === "complete" && f.output_size_bytes != null) return a + f.output_size_bytes;
+      return a + f.size_bytes;
+    }, 0);
+    return { origBytes, newBytes };
   }
 
   return (
@@ -97,27 +93,75 @@ export function AppSidebar() {
               <line x1="16" y1="12" x2="21" y2="12" />
             </svg>
           </div>
-          <div>
-            <h1 className="font-heading text-lg font-normal tracking-tight">
-              Chrysopeia
-            </h1>
-            <p className="text-[10px] text-muted-foreground">
-              Media Transmuter
-            </p>
-          </div>
+          <h1 className="font-heading text-xl font-normal tracking-tight">
+            Chrysopeia
+          </h1>
         </div>
       </SidebarHeader>
 
       <SidebarContent>
         <SidebarGroup>
-          <SidebarGroupLabel className="text-[10px] uppercase tracking-widest text-muted-foreground/60">
-            Libraries
-          </SidebarGroupLabel>
+          {/* Libraries header with + button */}
+          <div className="flex items-center justify-between px-4 py-1">
+            <span className="text-[10px] uppercase tracking-widest text-muted-foreground/60 font-medium">
+              Libraries
+            </span>
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              onClick={() => setIsAddingLibrary(true)}
+              className="h-5 w-5 p-0 text-muted-foreground/50 hover:text-foreground"
+              aria-label="Add library"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+
           <SidebarGroupContent>
             <div className="px-2">
+              {/* Inline add-library card */}
+              {isAddingLibrary && (
+                <div className="rounded-lg border border-gold/30 bg-secondary/50 px-3 py-2.5 mb-1 animate-fade-up">
+                  <Input
+                    autoFocus
+                    value={newPath}
+                    onChange={(e) => setNewPath(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") handleAddPath();
+                      if (e.key === "Escape") handleCancelAdd();
+                    }}
+                    placeholder="/path/to/media"
+                    className="h-7 font-mono text-sm border-0 bg-transparent px-0 focus-visible:ring-0 placeholder:text-muted-foreground/40"
+                  />
+                  <div className="flex items-center justify-end gap-1.5 mt-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="ghost"
+                      onClick={handleCancelAdd}
+                      className="h-6 px-2 text-[10px] text-muted-foreground"
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handleAddPath}
+                      disabled={!newPath.trim()}
+                      className="h-6 px-2 text-[10px] bg-gold text-gold-foreground hover:bg-gold/90 disabled:opacity-30"
+                    >
+                      <Check className="h-3 w-3 mr-1" />
+                      Add
+                    </Button>
+                  </div>
+                </div>
+              )}
+
+              {/* Library cards */}
               {libraryPaths.map((lp) => {
                 const isSelected = selectedLibraryId === lp.id;
-                const st = libStats[lp.id] ?? { pct: 0, origBytes: 0, newBytes: 0 };
+                const st = getLibStats(lp);
                 const compressionPct = st.origBytes > 0 ? Math.round((st.newBytes / st.origBytes) * 100) : 100;
 
                 return (
@@ -127,16 +171,16 @@ export function AppSidebar() {
                     aria-label={`Library: ${lp.path.split("/").pop() || lp.path}`}
                     aria-pressed={isSelected}
                     onClick={() => setSelectedLibrary(isSelected ? null : lp.id)}
-                    className={`group flex w-full flex-col rounded-lg px-3 py-1.5 text-left transition-colors mb-0.5 ${
+                    className={`group flex w-full flex-col rounded-lg px-3 py-2 text-left transition-colors mb-0.5 ${
                       isSelected
                         ? "bg-secondary/70"
                         : "hover:bg-secondary/30"
                     } ${!lp.enabled ? "opacity-40" : ""}`}
                   >
-                    {/* Path name */}
+                    {/* Name + remove */}
                     <div className="flex items-center justify-between w-full">
                       <span
-                        className={`text-sm truncate ${
+                        className={`text-sm ${
                           isSelected ? "text-foreground font-medium" : "text-foreground/80"
                         } ${!lp.enabled ? "line-through" : ""}`}
                       >
@@ -155,16 +199,15 @@ export function AppSidebar() {
                       </button>
                     </div>
 
-                    {/* Size bar: original size as full bar, compressed overlay on top */}
+                    {/* Size bar */}
                     <div className="mt-1.5 w-full">
                       <div className="relative h-1.5 w-full rounded-full bg-muted-foreground/10 overflow-hidden">
-                        {/* Compressed size overlay */}
                         <div
                           className="absolute inset-y-0 left-0 rounded-full bg-gold/50 transition-all duration-500"
                           style={{ width: `${compressionPct}%` }}
                         />
                       </div>
-                      <div className="flex items-center justify-between mt-1">
+                      <div className="flex items-center justify-between mt-0.5">
                         <span className="text-[9px] text-muted-foreground/50 tabular-nums">
                           {formatBytes(st.origBytes)}
                         </span>
@@ -183,29 +226,6 @@ export function AppSidebar() {
                   </button>
                 );
               })}
-
-              {/* Add library input */}
-              <div className="flex gap-1.5 pt-2">
-                <div className="relative flex-1">
-                  <Folder className="absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground/50" />
-                  <Input
-                    value={newPath}
-                    onChange={(e) => setNewPath(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && handleAddPath()}
-                    placeholder="/path/to/media"
-                    className="h-7 pl-7 font-mono text-[11px]"
-                  />
-                </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={handleAddPath}
-                  aria-label="Add library path"
-                  className="h-7 w-7 shrink-0 p-0"
-                >
-                  <Plus className="h-3 w-3" />
-                </Button>
-              </div>
             </div>
           </SidebarGroupContent>
         </SidebarGroup>
