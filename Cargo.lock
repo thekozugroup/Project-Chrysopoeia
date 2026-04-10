@@ -383,7 +383,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopeia-core"
+name = "chrysopoeia-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -399,10 +399,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopeia-hwdetect"
+name = "chrysopoeia-hwdetect"
 version = "0.1.0"
 dependencies = [
- "chrysopeia-core",
+ "chrysopoeia-core",
  "oximedia-accel",
  "serde",
  "serde_json",
@@ -412,12 +412,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopeia-scanner"
+name = "chrysopoeia-scanner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "chrysopeia-core",
+ "chrysopoeia-core",
  "globset",
  "notify",
  "oximedia-container",
@@ -432,16 +432,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopeia-server"
+name = "chrysopoeia-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "chrono",
- "chrysopeia-core",
- "chrysopeia-hwdetect",
- "chrysopeia-scanner",
- "chrysopeia-worker",
+ "chrysopoeia-core",
+ "chrysopoeia-hwdetect",
+ "chrysopoeia-scanner",
+ "chrysopoeia-worker",
  "clap",
  "serde",
  "serde_json",
@@ -456,13 +456,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopeia-worker"
+name = "chrysopoeia-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "chrysopeia-core",
- "chrysopeia-hwdetect",
+ "chrysopoeia-core",
+ "chrysopoeia-hwdetect",
  "oximedia-accel",
  "oximedia-compat-ffmpeg",
  "oximedia-jobs",

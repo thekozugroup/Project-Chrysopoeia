@@ -1,64 +1,26 @@
-# Chrysopeia
+Chrysopoeia is a self-hosted media transcoder that automatically converts entire libraries to patent-free formats like AV1 and Opus. It detects available hardware encoders at startup and selects the fastest encoding path — NVENC, VAAPI, QSV, or software fallback — without manual configuration.
 
-Self-hosted media transcoding and management server. Converts your media library to modern formats (AV1, HEVC) with hardware acceleration support.
+## Screenshots
 
-## Quick Start
+![Chrysopoeia overview dashboard showing codec distribution, compression progress, and library status](./docs/screenshot.png)
 
-```bash
-cp .env.example .env
-# Edit .env to set your MEDIA_PATH
-docker compose up -d
-```
+## How it works
 
-The web UI is available at `http://localhost:3000` and the API at `http://localhost:8080`.
+Point Chrysopoeia at your media directories and choose an output format. It scans every file with ffprobe to identify codecs, resolution, and bitrate, then queues anything that isn't already in the target format. Files already encoded in AV1, VP9, or Opus are skipped automatically.
 
-## Architecture
+Each library can have its own encoding profile. A movies folder might target AV1 at CRF 28 while a TV folder uses HEVC at CRF 24. The transcoding engine spawns ffmpeg with the correct encoder and hardware acceleration flags, parses real-time progress from the process, and streams updates to the browser over WebSocket.
 
-- **Backend** -- Rust server handling transcoding jobs, media scanning, and the REST API
-- **Frontend** -- Next.js web interface for library browsing, job management, and configuration
-- **Storage** -- SQLite database for metadata and job state; media files served from a mounted volume
+The dashboard provides a Tdarr-style overview with codec distribution charts, a processing queue with per-file circular progress indicators, and per-library settings. Everything runs in a single Docker container with an embedded SQLite database.
 
-## Features
+## Stack
 
-- Batch transcode to AV1, HEVC, or H.264
-- Hardware-accelerated encoding (NVIDIA NVENC, VA-API, Vulkan)
-- FFmpeg fallback for software encoding
-- Concurrent job queue with configurable parallelism
-- Media library scanning and metadata extraction
-- Real-time job progress via WebSocket
-- Web UI for browsing, filtering, and managing your library
+- Rust (Axum, SQLx, Tokio) for the backend server and transcoding orchestration
+- FFmpeg for encoding with hardware acceleration (NVENC, VAAPI, QSV, VideoToolbox)
+- OxiMedia integration path for pure-Rust patent-free encoding
+- Next.js 15 with shadcn/ui for the web dashboard
+- SQLite with WAL mode for metadata and job persistence
+- Docker with optional NVIDIA GPU passthrough
 
-## Development
+## Status
 
-### Prerequisites
-
-- Rust 1.85+
-- Node.js 22+ with pnpm
-- FFmpeg
-
-### Running locally
-
-```bash
-# Backend
-cargo run --release -p chrysopeia-server
-
-# Frontend (separate terminal)
-cd web
-pnpm install
-pnpm dev
-```
-
-### Docker build
-
-```bash
-docker compose build
-docker compose up
-```
-
-## GPU Support
-
-The `docker-compose.yml` includes NVIDIA GPU reservations. If you don't have an NVIDIA GPU, remove or comment out the `deploy.resources.reservations.devices` section, or set `HW_ACCEL=none` in your `.env`.
-
-## License
-
-MIT
+In progress

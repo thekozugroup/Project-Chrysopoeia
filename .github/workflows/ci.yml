@@ -91,6 +91,6 @@ jobs:
         with:
           context: .
           push: false
-          tags: chrysopeia:ci-${{ github.sha }}
+          tags: chrysopoeia:ci-${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

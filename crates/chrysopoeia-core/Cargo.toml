@@ -1,0 +1,22 @@
+[package]
+name = "chrysopoeia-core"
+description = "Core types, configuration, and shared logic for Chrysopeia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+oximedia = ["dep:oximedia-core", "dep:oximedia-codec", "dep:oximedia-container"]
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+oximedia-core = { workspace = true, optional = true }
+oximedia-codec = { workspace = true, optional = true }
+oximedia-container = { workspace = true, optional = true }

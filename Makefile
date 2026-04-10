@@ -12,7 +12,7 @@ build: ## Build web frontend and Rust backend
 	cargo build --release
 
 docker: ## Build Docker image
-	docker build -t chrysopeia:latest .
+	docker build -t chrysopoeia:latest .
 
 docker-up: ## Start services with docker compose
 	docker compose up -d

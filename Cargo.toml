@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/chrysopeia-core",
-    "crates/chrysopeia-server",
-    "crates/chrysopeia-worker",
-    "crates/chrysopeia-scanner",
-    "crates/chrysopeia-hwdetect",
+    "crates/chrysopoeia-core",
+    "crates/chrysopoeia-server",
+    "crates/chrysopoeia-worker",
+    "crates/chrysopoeia-scanner",
+    "crates/chrysopoeia-hwdetect",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/michaelwong/chrysopeia"
+repository = "https://github.com/michaelwong/chrysopoeia"
 
 [workspace.dependencies]
 # OxiMedia crates (optional - enable with "oximedia" feature on each crate)
@@ -56,7 +56,7 @@ walkdir = "2"
 globset = "0.4"
 
 # Internal crates
-chrysopeia-core = { path = "crates/chrysopeia-core" }
-chrysopeia-hwdetect = { path = "crates/chrysopeia-hwdetect" }
-chrysopeia-scanner = { path = "crates/chrysopeia-scanner" }
-chrysopeia-worker = { path = "crates/chrysopeia-worker" }
+chrysopoeia-core = { path = "crates/chrysopoeia-core" }
+chrysopoeia-hwdetect = { path = "crates/chrysopoeia-hwdetect" }
+chrysopoeia-scanner = { path = "crates/chrysopoeia-scanner" }
+chrysopoeia-worker = { path = "crates/chrysopoeia-worker" }

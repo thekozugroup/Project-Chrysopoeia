@@ -1,0 +1,26 @@
+[package]
+name = "chrysopoeia-server"
+description = "Axum-based HTTP API and WebSocket server for Chrysopeia"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+sqlx = { workspace = true }
+chrysopoeia-core = { workspace = true }
+chrysopoeia-hwdetect = { workspace = true }
+chrysopoeia-scanner = { workspace = true }
+chrysopoeia-worker = { workspace = true }
