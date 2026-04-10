@@ -1,6 +1,7 @@
 services:
   chrysopeia:
     build: .
+    image: chrysopeia:latest
     container_name: chrysopeia
     ports:
       - "${PORT:-8080}:8080"
@@ -22,14 +23,55 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        tag: "chrysopeia|{{.Name}}"
     deploy:
       resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+        limits:
+          cpus: "${CPU_LIMIT:-0}"
+          memory: "${MEMORY_LIMIT:-0}"
+        # Uncomment the reservations block below for NVIDIA GPU passthrough.
+        # For non-NVIDIA systems, leave commented out and set HW_ACCEL=auto
+        # to use CPU-based encoding.
+        #
+        # reservations:
+        #   devices:
+        #     - driver: nvidia
+        #       count: all
+        #       capabilities: [gpu]
+    networks:
+      - chrysopeia-net
+
+  # --------------------------------------------------------------------------
+  # Watchtower: auto-update running containers (optional)
+  # Uncomment to enable automatic image updates from a registry.
+  # --------------------------------------------------------------------------
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     - WATCHTOWER_CLEANUP=true
+  #     - WATCHTOWER_POLL_INTERVAL=3600
+  #     - WATCHTOWER_LABEL_ENABLE=true
+  #   restart: unless-stopped
+  #   logging:
+  #     driver: json-file
+  #     options:
+  #       max-size: "5m"
+  #       max-file: "2"
+  #   networks:
+  #     - chrysopeia-net
 
 volumes:
   chrysopeia-data:
+
+networks:
+  chrysopeia-net:
+    driver: bridge

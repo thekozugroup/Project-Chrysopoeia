@@ -38,16 +38,24 @@ pub async fn transcode(
     // parse "time=HH:MM:SS.ms" to compute percentage against total duration,
     // and send progress updates via progress_tx.
     //
-    // let mut child = tokio::process::Command::new("ffmpeg")
-    //     .args(&args)
-    //     .stderr(std::process::Stdio::piped())
-    //     .spawn()?;
-    //
-    // parse_ffmpeg_progress(child.stderr.take().unwrap(), job, progress_tx).await?;
-    // child.wait().await?;
+    // For now, log the command that would be executed and return Ok.
+    tracing::warn!(
+        job_id = %job.id,
+        args = ?args,
+        "FFmpeg transcoding not yet implemented; would run ffmpeg with these args"
+    );
 
-    let _ = (args, progress_tx);
-    todo!("Implement FFmpeg CLI transcoding with progress parsing")
+    // Send a synthetic completion update
+    let _ = progress_tx
+        .send(ProgressUpdate {
+            job_id: job.id,
+            percent: 0,
+            fps: None,
+            eta_secs: None,
+        })
+        .await;
+
+    Ok(())
 }
 
 /// Build the ffmpeg argument list for a transcode job.

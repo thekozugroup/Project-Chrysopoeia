@@ -15,7 +15,7 @@ license = "Apache-2.0"
 repository = "https://github.com/michaelwong/chrysopeia"
 
 [workspace.dependencies]
-# OxiMedia crates
+# OxiMedia crates (optional - enable with "oximedia" feature on each crate)
 oximedia-core = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
 oximedia-transcode = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
 oximedia-accel = { git = "https://github.com/cool-japan/oximedia", branch = "master" }

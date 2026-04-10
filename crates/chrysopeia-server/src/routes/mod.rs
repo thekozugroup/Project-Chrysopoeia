@@ -1,7 +1,6 @@
 //! Route definitions for the Chrysopeia HTTP API.
 
 pub mod api;
-pub mod chat;
 pub mod ws;
 
 use axum::Router;
@@ -14,7 +13,6 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/api", api::api_routes())
-        .nest("/api/chat", chat::chat_routes())
         .nest("/ws", ws::ws_routes())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())

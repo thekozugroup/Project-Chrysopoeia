@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+oximedia = ["dep:oximedia-accel"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -12,4 +16,4 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 chrysopeia-core = { workspace = true }
-oximedia-accel = { workspace = true }
+oximedia-accel = { workspace = true, optional = true }

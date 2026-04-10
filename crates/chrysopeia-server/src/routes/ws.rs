@@ -2,7 +2,7 @@
 
 use axum::{
     Router,
-    extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
+    extract::{State, WebSocketUpgrade, ws::WebSocket},
     response::IntoResponse,
     routing::get,
 };

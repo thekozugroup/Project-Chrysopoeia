@@ -100,7 +100,6 @@ async fn create_job(
     Json(req): Json<CreateJobRequest>,
 ) -> Json<TranscodeJob> {
     let _ = state;
-    let now = chrono::Utc::now();
     Json(TranscodeJob {
         id: Uuid::new_v4(),
         media_file_id: req.media_file_id,

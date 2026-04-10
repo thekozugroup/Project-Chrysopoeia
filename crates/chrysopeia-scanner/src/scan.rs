@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrono::Utc;
-use chrysopeia_core::models::{MediaFile, MediaFileStatus, MediaFormat};
+use chrysopeia_core::models::{MediaFile, MediaFileStatus};
 use uuid::Uuid;
 use walkdir::WalkDir;
 

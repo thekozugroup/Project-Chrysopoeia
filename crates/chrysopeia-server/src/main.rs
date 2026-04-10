@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Detected {} hardware capabilities", capabilities.len());
 
     // Create progress channel for worker <-> server communication
-    let (progress_tx, progress_rx) = tokio::sync::mpsc::channel(256);
+    let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(256);
 
     // Initialize transcode engine
     let engine = chrysopeia_worker::TranscodeEngine::new(

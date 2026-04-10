@@ -5,6 +5,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+oximedia = [
+    "dep:oximedia-transcode",
+    "dep:oximedia-accel",
+    "dep:oximedia-jobs",
+    "dep:oximedia-presets",
+    "dep:oximedia-compat-ffmpeg",
+]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,8 +26,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 chrysopeia-core = { workspace = true }
 chrysopeia-hwdetect = { workspace = true }
-oximedia-transcode = { workspace = true }
-oximedia-accel = { workspace = true }
-oximedia-jobs = { workspace = true }
-oximedia-presets = { workspace = true }
-oximedia-compat-ffmpeg = { workspace = true }
+oximedia-transcode = { workspace = true, optional = true }
+oximedia-accel = { workspace = true, optional = true }
+oximedia-jobs = { workspace = true, optional = true }
+oximedia-presets = { workspace = true, optional = true }
+oximedia-compat-ffmpeg = { workspace = true, optional = true }

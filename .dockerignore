@@ -1,0 +1,13 @@
+target/
+web/node_modules/
+web/.next/
+.git/
+*.db
+.env
+.env.*
+!.env.example
+*.log
+.claude/
+.github/
+README.md
+Makefile

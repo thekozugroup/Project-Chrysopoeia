@@ -1,6 +1,7 @@
 //! Pure oximedia transcoding backend.
 //!
 //! Uses the oximedia-transcode Transcoder API for native AV1, VP9, and Opus encoding.
+//! Only available when the `oximedia` feature is enabled.
 
 use chrysopeia_core::models::{MediaFile, TranscodeJob};
 use tokio::sync::mpsc;
@@ -22,24 +23,32 @@ pub async fn transcode(
         "Starting oximedia native transcode"
     );
 
-    // TODO: Implement using oximedia-transcode:
-    //
-    // let mut transcoder = oximedia_transcode::Transcoder::builder()
-    //     .input(&media_file.path)
-    //     .output(&output_path)
-    //     .video_codec(target_codec)
-    //     .audio_codec("opus")
-    //     .on_progress(|progress| {
-    //         let _ = progress_tx.try_send(ProgressUpdate {
-    //             job_id: job.id,
-    //             percent: progress.percent,
-    //             fps: progress.fps,
-    //             eta_secs: progress.eta_secs,
-    //         });
-    //     })
-    //     .build()?;
-    //
-    // transcoder.run().await?;
+    #[cfg(feature = "oximedia")]
+    {
+        // TODO: Implement using oximedia-transcode when available:
+        //
+        // let mut transcoder = oximedia_transcode::Transcoder::builder()
+        //     .input(&media_file.path)
+        //     .output(&output_path)
+        //     .video_codec(target_codec)
+        //     .audio_codec("opus")
+        //     .on_progress(|progress| { ... })
+        //     .build()?;
+        //
+        // transcoder.run().await?;
+        let _ = (media_file, target_codec, &progress_tx);
+        anyhow::bail!("oximedia native transcoding not yet implemented")
+    }
 
-    todo!("Implement oximedia native transcoding pipeline")
+    #[cfg(not(feature = "oximedia"))]
+    {
+        tracing::warn!(
+            job_id = %job.id,
+            "oximedia feature not enabled; cannot use native transcoding pipeline"
+        );
+        let _ = (media_file, target_codec, &progress_tx);
+        anyhow::bail!(
+            "oximedia native transcoding requires the 'oximedia' feature to be enabled"
+        )
+    }
 }
