@@ -251,9 +251,6 @@ export function AppSidebar() {
             </p>
           </TooltipContent>
         </Tooltip>
-        <p className="mt-1.5 text-center text-[10px] text-muted-foreground/40">
-          v0.1.0 &middot; oximedia
-        </p>
       </SidebarFooter>
     </Sidebar>
   );

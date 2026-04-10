@@ -124,7 +124,7 @@ export function Dashboard() {
                 role="tab"
                 aria-selected={activeTab === tab.key}
                 onClick={() => setActiveTab(tab.key)}
-                className={`rounded-md px-3.5 py-1.5 text-sm font-medium transition-all ${
+                className={`rounded-md px-3 py-1 text-xs font-medium transition-all ${
                   activeTab === tab.key
                     ? "bg-background text-foreground shadow-sm"
                     : "text-muted-foreground hover:text-foreground"
@@ -181,8 +181,8 @@ export function Dashboard() {
         </div>
       </header>
 
-      {/* Tab content / skeleton / onboarding / empty states */}
-      <ScrollArea className="min-h-0 flex-1">
+      {/* Tab content — fixed area, no expanding */}
+      <ScrollArea className="min-h-0 flex-1 overflow-hidden">
         {isLoading ? (
           <FileListSkeleton />
         ) : showOnboarding ? (
@@ -247,11 +247,11 @@ export function Dashboard() {
             </div>
           </div>
         ) : (
-          <>
+          <div key={activeTab} className="animate-fade-in">
             {activeTab === "overview" && <OverviewTab />}
             {activeTab === "queue" && <QueueTab />}
             {activeTab === "settings" && <LibrarySettingsTab />}
-          </>
+          </div>
         )}
       </ScrollArea>
 
