@@ -5,10 +5,12 @@ import { useState, useCallback } from "react";
 import { Toaster } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useWebSocket } from "@/lib/use-websocket";
+import { useDataInit } from "@/lib/use-data-init";
 import { useKeyboardShortcuts } from "@/lib/use-keyboard-shortcuts";
 import { ShortcutsDialog } from "@/components/shortcuts-dialog";
 
-function WebSocketProvider({ children }: { children: React.ReactNode }) {
+function DataInitProvider({ children }: { children: React.ReactNode }) {
+  useDataInit();
   useWebSocket();
   return <>{children}</>;
 }
@@ -35,7 +37,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delay={300}>
-        <WebSocketProvider>{children}</WebSocketProvider>
+        <DataInitProvider>{children}</DataInitProvider>
         <KeyboardShortcutsManager />
         <Toaster
           position="bottom-right"

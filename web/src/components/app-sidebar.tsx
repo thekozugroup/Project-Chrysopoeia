@@ -20,7 +20,9 @@ import {
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { toast } from "sonner";
 import { useAppStore } from "@/lib/store";
+import * as api from "@/lib/api";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
@@ -40,12 +42,30 @@ export function AppSidebar() {
   const setIsAddingLibrary = useAppStore((s) => s.setIsAddingLibrary);
   const [newPath, setNewPath] = useState("");
 
-  function handleAddPath() {
+  async function handleAddPath() {
     const p = newPath.trim();
     if (p && !libraryPaths.some((lp) => lp.path === p)) {
       addLibraryPath(p);
       setNewPath("");
       setIsAddingLibrary(false);
+      try {
+        await api.addLibrary(p);
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to add library to backend",
+        );
+      }
+    }
+  }
+
+  async function handleRemoveLibrary(id: string) {
+    removeLibraryPath(id);
+    try {
+      await api.deleteLibrary(id);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to remove library from backend",
+      );
     }
   }
 
@@ -186,12 +206,12 @@ export function AppSidebar() {
                         tabIndex={0}
                         onClick={(e) => {
                           e.stopPropagation();
-                          removeLibraryPath(lp.id);
+                          handleRemoveLibrary(lp.id);
                         }}
                         onKeyDown={(e) => {
                           if (e.key === "Enter" || e.key === " ") {
                             e.stopPropagation();
-                            removeLibraryPath(lp.id);
+                            handleRemoveLibrary(lp.id);
                           }
                         }}
                         className="shrink-0 text-muted-foreground/30 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100 ml-2 cursor-pointer"

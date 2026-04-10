@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { Play, Pause, RotateCw, FolderOpen, Activity } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -49,16 +49,9 @@ export function Dashboard() {
   const wsConnected = useAppStore((s) => s.wsConnected);
   const libraryPaths = useAppStore((s) => s.library_paths);
   const isLoading = useAppStore((s) => s.isLoading);
-  const setIsLoading = useAppStore((s) => s.setIsLoading);
   const files = useAppStore((s) => s.files);
   const activeTab = useAppStore((s) => s.activeTab);
   const setActiveTab = useAppStore((s) => s.setActiveTab);
-
-  // Simulate initial data load
-  useEffect(() => {
-    const timer = setTimeout(() => setIsLoading(false), 1500);
-    return () => clearTimeout(timer);
-  }, [setIsLoading]);
 
   const logEntries = useAppStore((s) => s.logEntries);
   const [logOpen, setLogOpen] = useState(false);

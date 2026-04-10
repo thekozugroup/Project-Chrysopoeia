@@ -2,6 +2,8 @@ import type {
   MediaFile,
   LibraryStats,
   HardwareInfo,
+  LibraryPath,
+  LibraryTranscodeConfig,
   GlobalSettings,
 } from "./types";
 
@@ -92,6 +94,31 @@ export async function getConfig(): Promise<GlobalSettings> {
 export async function updateConfig(config: Partial<GlobalSettings>): Promise<GlobalSettings> {
   return request("/config", {
     method: "PATCH",
+    body: JSON.stringify(config),
+  });
+}
+
+export async function getLibraries(): Promise<LibraryPath[]> {
+  return request("/libraries");
+}
+
+export async function addLibrary(path: string): Promise<LibraryPath> {
+  return request("/libraries", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+}
+
+export async function deleteLibrary(id: string): Promise<void> {
+  await request(`/libraries/${id}`, { method: "DELETE" });
+}
+
+export async function updateLibrary(
+  id: string,
+  config: Partial<LibraryTranscodeConfig>,
+): Promise<LibraryPath> {
+  return request(`/libraries/${id}`, {
+    method: "PUT",
     body: JSON.stringify(config),
   });
 }

@@ -21,7 +21,9 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { toast } from "sonner";
 import { useAppStore } from "@/lib/store";
+import * as api from "@/lib/api";
 import type {
   OutputFormat,
   OutputAudioFormat,
@@ -392,66 +394,96 @@ export function LibrarySettingsTab() {
         skip_open_formats: globalSettings.default_skip_open,
       };
 
+  const persistLibrary = useCallback(
+    async (libraryId: string, patch: Record<string, unknown>) => {
+      try {
+        await api.updateLibrary(libraryId, patch);
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to save library settings");
+      }
+    },
+    [],
+  );
+
+  const persistGlobal = useCallback(
+    async (patch: Record<string, unknown>) => {
+      try {
+        await api.updateConfig(patch);
+      } catch (err) {
+        toast.error(err instanceof Error ? err.message : "Failed to save global settings");
+      }
+    },
+    [],
+  );
+
   const handleVideoChange = useCallback(
     (v: OutputFormat) => {
       if (selectedLibrary) {
         updateLibraryConfig(selectedLibrary.id, { output_video: v });
+        persistLibrary(selectedLibrary.id, { output_video: v });
       } else {
         updateGlobalSettings({ default_video: v });
+        persistGlobal({ default_video: v });
       }
     },
-    [selectedLibrary, updateLibraryConfig, updateGlobalSettings],
+    [selectedLibrary, updateLibraryConfig, updateGlobalSettings, persistLibrary, persistGlobal],
   );
 
   const handleAudioChange = useCallback(
     (v: OutputAudioFormat) => {
       if (selectedLibrary) {
         updateLibraryConfig(selectedLibrary.id, { output_audio: v });
+        persistLibrary(selectedLibrary.id, { output_audio: v });
       } else {
         updateGlobalSettings({ default_audio: v });
+        persistGlobal({ default_audio: v });
       }
     },
-    [selectedLibrary, updateLibraryConfig, updateGlobalSettings],
+    [selectedLibrary, updateLibraryConfig, updateGlobalSettings, persistLibrary, persistGlobal],
   );
 
   const handleContainerChange = useCallback(
     (v: OutputContainer) => {
       if (selectedLibrary) {
         updateLibraryConfig(selectedLibrary.id, { output_container: v });
+        persistLibrary(selectedLibrary.id, { output_container: v });
       } else {
         updateGlobalSettings({ default_container: v });
+        persistGlobal({ default_container: v });
       }
     },
-    [selectedLibrary, updateLibraryConfig, updateGlobalSettings],
+    [selectedLibrary, updateLibraryConfig, updateGlobalSettings, persistLibrary, persistGlobal],
   );
 
   const handleCrfChange = useCallback(
     (v: number) => {
       if (selectedLibrary) {
         updateLibraryConfig(selectedLibrary.id, { crf: v });
+        persistLibrary(selectedLibrary.id, { crf: v });
       } else {
         updateGlobalSettings({ default_crf: v });
+        persistGlobal({ default_crf: v });
       }
     },
-    [selectedLibrary, updateLibraryConfig, updateGlobalSettings],
+    [selectedLibrary, updateLibraryConfig, updateGlobalSettings, persistLibrary, persistGlobal],
   );
 
   const handleSkipOpenChange = useCallback(() => {
+    const newVal = !effectiveConfig.skip_open_formats;
     if (selectedLibrary) {
-      updateLibraryConfig(selectedLibrary.id, {
-        skip_open_formats: !effectiveConfig.skip_open_formats,
-      });
+      updateLibraryConfig(selectedLibrary.id, { skip_open_formats: newVal });
+      persistLibrary(selectedLibrary.id, { skip_open_formats: newVal });
     } else {
-      updateGlobalSettings({
-        default_skip_open: !globalSettings.default_skip_open,
-      });
+      updateGlobalSettings({ default_skip_open: newVal });
+      persistGlobal({ default_skip_open: newVal });
     }
   }, [
     selectedLibrary,
     effectiveConfig,
-    globalSettings,
     updateLibraryConfig,
     updateGlobalSettings,
+    persistLibrary,
+    persistGlobal,
   ]);
 
   const resetToDefaults = useCallback(() => {
@@ -565,9 +597,10 @@ export function LibrarySettingsTab() {
             label="Auto-scan"
             sublabel="Automatically watch library folders for new files"
             checked={globalSettings.auto_scan}
-            onChange={() =>
-              updateGlobalSettings({ auto_scan: !globalSettings.auto_scan })
-            }
+            onChange={() => {
+              updateGlobalSettings({ auto_scan: !globalSettings.auto_scan });
+              persistGlobal({ auto_scan: !globalSettings.auto_scan });
+            }}
           />
 
           {globalSettings.auto_scan && (
@@ -674,7 +707,10 @@ export function LibrarySettingsTab() {
           {/* Concurrent jobs */}
           <JobsSlider
             value={globalSettings.concurrent_jobs}
-            onChange={(v) => updateGlobalSettings({ concurrent_jobs: v })}
+            onChange={(v) => {
+              updateGlobalSettings({ concurrent_jobs: v });
+              persistGlobal({ concurrent_jobs: v });
+            }}
             recommended={recommendedJobs}
           />
 
@@ -682,11 +718,10 @@ export function LibrarySettingsTab() {
             label="Auto-transcode"
             sublabel="Automatically start processing newly scanned files"
             checked={globalSettings.auto_transcode}
-            onChange={() =>
-              updateGlobalSettings({
-                auto_transcode: !globalSettings.auto_transcode,
-              })
-            }
+            onChange={() => {
+              updateGlobalSettings({ auto_transcode: !globalSettings.auto_transcode });
+              persistGlobal({ auto_transcode: !globalSettings.auto_transcode });
+            }}
           />
 
           <Toggle
@@ -742,7 +777,14 @@ export function LibrarySettingsTab() {
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => removeLibraryPath(selectedLibrary.id)}
+                        onClick={async () => {
+                          removeLibraryPath(selectedLibrary.id);
+                          try {
+                            await api.deleteLibrary(selectedLibrary.id);
+                          } catch (err) {
+                            toast.error(err instanceof Error ? err.message : "Failed to remove library");
+                          }
+                        }}
                         className="gap-1.5 text-xs border-destructive/30 text-destructive hover:bg-destructive/10 hover:border-destructive/50"
                       >
                         <Trash2 className="h-3 w-3" />
