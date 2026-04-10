@@ -1,77 +1,69 @@
-//! WebSocket handler for real-time progress updates.
+//! WebSocket handler forwarding progress events to clients.
 
 use axum::{
-    Router,
-    extract::{State, WebSocketUpgrade, ws::WebSocket},
+    extract::{State, WebSocketUpgrade, ws::{Message, WebSocket}},
     response::IntoResponse,
-    routing::get,
 };
-use serde::Serialize;
 
 use crate::state::AppState;
 
-/// Build WebSocket routes.
-pub fn ws_routes() -> Router<AppState> {
-    Router::new().route("/events", get(ws_handler))
-}
-
-/// Events sent over the WebSocket connection.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WsEvent {
-    /// A transcode job's progress has updated.
-    JobProgress {
-        job_id: String,
-        percent: u8,
-        fps: Option<f64>,
-        eta_secs: Option<f64>,
-    },
-    /// A transcode job's status has changed.
-    JobStatusChanged {
-        job_id: String,
-        status: String,
-    },
-    /// A library scan event (new file found, scan complete, etc.).
-    ScanEvent {
-        event_type: String,
-        path: Option<String>,
-        total_found: Option<u64>,
-    },
-}
-
-/// Handle WebSocket upgrade requests.
-async fn ws_handler(
+/// Handle WebSocket upgrade.
+pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-/// Handle an individual WebSocket connection.
 async fn handle_socket(mut socket: WebSocket, state: AppState) {
     tracing::info!("WebSocket client connected");
-    let _ = state;
 
-    // TODO: Subscribe to progress updates from the worker engine
-    // and scan events from the scanner, forwarding them as JSON
-    // messages over the WebSocket.
-    //
-    // loop {
-    //     tokio::select! {
-    //         Some(progress) = progress_rx.recv() => {
-    //             let event = WsEvent::JobProgress { ... };
-    //             let msg = serde_json::to_string(&event).unwrap();
-    //             socket.send(Message::Text(msg)).await.ok();
-    //         }
-    //         Some(msg) = socket.recv() => {
-    //             // Handle client messages (ping/pong, subscription filters)
-    //         }
-    //     }
-    // }
+    // Subscribe to engine progress events
+    let mut event_rx = state.engine.subscribe();
 
-    // Placeholder: keep connection alive
-    while let Some(Ok(_msg)) = socket.recv().await {
-        // Echo or handle client messages
+    // Keepalive interval
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    loop {
+        tokio::select! {
+            // Forward progress events from engine to client
+            event = event_rx.recv() => {
+                match event {
+                    Ok(ev) => {
+                        if let Ok(json) = serde_json::to_string(&ev) {
+                            if socket.send(Message::Text(json.into())).await.is_err() {
+                                break; // Client disconnected
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!("WebSocket client lagged, missed {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        break; // Channel closed
+                    }
+                }
+            }
+            // Handle messages from client (ping/pong, close)
+            msg = socket.recv() => {
+                match msg {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(data))) => {
+                        if socket.send(Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {} // Ignore other messages
+                    Some(Err(_)) => break,
+                }
+            }
+            // Keepalive ping
+            _ = ping_interval.tick() => {
+                if socket.send(Message::Ping(vec![].into())).await.is_err() {
+                    break;
+                }
+            }
+        }
     }
 
     tracing::info!("WebSocket client disconnected");

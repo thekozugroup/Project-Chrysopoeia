@@ -13,7 +13,7 @@ use crate::state::AppState;
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .nest("/api", api::api_routes())
-        .nest("/ws", ws::ws_routes())
+        .route("/ws", axum::routing::get(ws::ws_handler))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         .with_state(state)

@@ -1,16 +1,16 @@
-//! REST API route handlers.
+//! REST API route handlers backed by SQLite.
 
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    routing::{delete, get, post, put},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{delete, get, patch, post, put},
 };
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use serde::Deserialize;
 
+use crate::db;
 use crate::state::AppState;
-use chrysopeia_core::models::*;
-use chrysopeia_core::profile;
 
 /// Build the API route tree.
 pub fn api_routes() -> Router<AppState> {
@@ -18,165 +18,264 @@ pub fn api_routes() -> Router<AppState> {
         .route("/health", get(health))
         .route("/stats", get(stats))
         .route("/files", get(list_files))
-        .route("/files/{id}", get(get_file))
-        .route("/jobs", post(create_job))
-        .route("/jobs", get(list_jobs))
-        .route("/jobs/{id}", get(get_job))
-        .route("/jobs/{id}", delete(cancel_job))
-        .route("/hardware", get(hardware))
-        .route("/profiles", get(profiles))
         .route("/scan", post(trigger_scan))
+        .route("/process/start", post(start_processing))
+        .route("/process/stop", post(stop_processing))
+        .route("/hardware", get(hardware))
+        .route("/libraries", get(list_libraries))
+        .route("/libraries", post(add_library))
+        .route("/libraries/{id}", put(update_library))
+        .route("/libraries/{id}", delete(delete_library))
         .route("/config", get(get_config))
-        .route("/config", put(update_config))
+        .route("/config", patch(update_config))
 }
 
-/// Pagination query parameters.
+// --- Health ---
+
+async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+// --- Stats ---
+
+async fn stats(State(state): State<AppState>) -> impl IntoResponse {
+    match db::get_stats(&state.db).await {
+        Ok(s) => (StatusCode::OK, Json(s)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+// --- Files ---
+
 #[derive(Debug, Deserialize)]
-pub struct PaginationParams {
-    pub page: Option<u32>,
-    pub per_page: Option<u32>,
+struct FileQuery {
+    status: Option<String>,
+    library: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 }
 
-/// Health check response.
-#[derive(Serialize)]
-struct HealthResponse {
-    status: &'static str,
-    version: &'static str,
-}
-
-/// GET /api/health - Basic health check.
-async fn health() -> Json<HealthResponse> {
-    Json(HealthResponse {
-        status: "ok",
-        version: env!("CARGO_PKG_VERSION"),
-    })
-}
-
-/// GET /api/stats - Library statistics.
-async fn stats(State(state): State<AppState>) -> Json<LibraryStats> {
-    // TODO: Query database for real stats
-    let _ = state;
-    Json(LibraryStats {
-        total_files: 0,
-        transcoded: 0,
-        pending: 0,
-        total_size: 0,
-        saved_size: 0,
-    })
-}
-
-/// GET /api/files - List media files with pagination.
 async fn list_files(
     State(state): State<AppState>,
-    Query(params): Query<PaginationParams>,
-) -> Json<Vec<MediaFile>> {
-    let _ = (state, params);
-    // TODO: Query database with pagination
-    Json(vec![])
+    Query(q): Query<FileQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100);
+    let offset = q.offset.unwrap_or(0);
+    match db::get_files(&state.db, q.status.as_deref(), q.library.as_deref(), limit, offset).await
+    {
+        Ok(files) => (StatusCode::OK, Json(serde_json::json!(files))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
 }
 
-/// GET /api/files/:id - Get a single media file.
-async fn get_file(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Json<Option<MediaFile>> {
-    let _ = (state, id);
-    // TODO: Query database by ID
-    Json(None)
-}
+// --- Scan ---
 
-/// Request body for creating a transcode job.
-#[derive(Debug, Deserialize)]
-pub struct CreateJobRequest {
-    pub media_file_id: Uuid,
-    pub profile: Option<String>,
-    pub target_codec: Option<String>,
-    pub target_container: Option<String>,
-}
+async fn trigger_scan(State(state): State<AppState>) -> impl IntoResponse {
+    // Scan all enabled library paths in background
+    let db = state.db.clone();
+    tokio::spawn(async move {
+        let libs = match db::get_libraries(&db).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::error!("Failed to get libraries for scan: {e}");
+                return;
+            }
+        };
 
-/// POST /api/jobs - Create a new transcode job.
-async fn create_job(
-    State(state): State<AppState>,
-    Json(req): Json<CreateJobRequest>,
-) -> Json<TranscodeJob> {
-    let _ = state;
-    Json(TranscodeJob {
-        id: Uuid::new_v4(),
-        media_file_id: req.media_file_id,
-        status: TranscodeStatus::Pending,
-        progress: 0,
-        target_codec: req.target_codec.unwrap_or_else(|| "av1".to_string()),
-        target_container: req.target_container.unwrap_or_else(|| "mkv".to_string()),
-        hw_accel: false,
-        started_at: None,
-        completed_at: None,
-        error_msg: None,
-        output_path: None,
-        size_reduction_pct: None,
-    })
-}
+        let mut total_found = 0u64;
+        for lib in &libs {
+            let enabled = lib["enabled"].as_bool().unwrap_or(false);
+            let path = lib["path"].as_str().unwrap_or("");
+            if !enabled || path.is_empty() {
+                continue;
+            }
 
-/// GET /api/jobs - List transcode jobs.
-async fn list_jobs(
-    State(state): State<AppState>,
-    Query(params): Query<PaginationParams>,
-) -> Json<Vec<TranscodeJob>> {
-    let _ = (state, params);
-    // TODO: Query database
-    Json(vec![])
-}
+            tracing::info!("Scanning library: {path}");
+            match chrysopeia_scanner::scan_directory(std::path::Path::new(path)).await {
+                Ok(files) => {
+                    let count = files.len();
+                    let now = chrono::Utc::now().to_rfc3339();
+                    for f in &files {
+                        let filename = std::path::Path::new(&f.path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("");
+                        let res_str = f.format.resolution.as_ref().map(|r| format!("{}x{}", r.width, r.height));
 
-/// GET /api/jobs/:id - Get a single job.
-async fn get_job(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Json<Option<TranscodeJob>> {
-    let _ = (state, id);
-    // TODO: Query database
-    Json(None)
-}
+                        let status = if chrysopeia_core::codec::is_open_format(&f.format) {
+                            "skipped"
+                        } else {
+                            "pending"
+                        };
 
-/// DELETE /api/jobs/:id - Cancel a job.
-async fn cancel_job(
-    State(state): State<AppState>,
-    Path(id): Path<Uuid>,
-) -> Json<serde_json::Value> {
-    let _ = (state, id);
-    // TODO: Cancel via engine
-    Json(serde_json::json!({"cancelled": true}))
-}
+                        if let Err(e) = db::upsert_file(
+                            &db,
+                            &f.id.to_string(),
+                            &f.path,
+                            path,
+                            filename,
+                            &f.format.container,
+                            f.format.video_codec.as_deref(),
+                            f.format.audio_codec.as_deref(),
+                            res_str.as_deref(),
+                            f.format.duration_secs,
+                            f.size as i64,
+                            f.format.video_bitrate.map(|b| (b / 1000) as i64),
+                            status,
+                            &now,
+                        ).await {
+                            tracing::warn!("Failed to insert file {}: {e}", f.path);
+                        }
+                    }
+                    total_found += count as u64;
+                    tracing::info!("Scanned {path}: found {count} media files");
+                }
+                Err(e) => {
+                    tracing::error!("Scan failed for {path}: {e}");
+                }
+            }
+        }
+        tracing::info!("Scan complete: {total_found} total files found");
+    });
 
-/// GET /api/hardware - Detected hardware capabilities.
-async fn hardware(State(state): State<AppState>) -> Json<Vec<HardwareCapability>> {
-    Json((*state.capabilities).clone())
-}
-
-/// GET /api/profiles - Available transcode profiles.
-async fn profiles() -> Json<Vec<chrysopeia_core::profile::TranscodeProfile>> {
-    Json(profile::default_profiles())
-}
-
-/// POST /api/scan - Trigger a library scan.
-async fn trigger_scan(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let _ = state;
-    // TODO: Trigger scan via scanner handle
     Json(serde_json::json!({"status": "scan_started"}))
 }
 
-/// GET /api/config - Get current configuration.
-async fn get_config(
-    State(state): State<AppState>,
-) -> Json<chrysopeia_core::config::AppConfig> {
-    let config = state.config.read().await;
-    Json(config.clone())
+// --- Processing control ---
+
+async fn start_processing(State(state): State<AppState>) -> impl IntoResponse {
+    let mut processing = state.processing.write().await;
+    *processing = true;
+    Json(serde_json::json!({"processing": true}))
 }
 
-/// PUT /api/config - Update configuration.
+async fn stop_processing(State(state): State<AppState>) -> impl IntoResponse {
+    let mut processing = state.processing.write().await;
+    *processing = false;
+    // Cancel active jobs
+    state.engine.cancel_all().await;
+    Json(serde_json::json!({"processing": false}))
+}
+
+// --- Hardware ---
+
+async fn hardware(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "gpu_name": state.hardware_info.gpu_name,
+        "gpu_vendor": state.hardware_info.gpu_vendor,
+        "formats": state.hardware_info.formats,
+        "cpu_cores": state.hardware_info.cpu_cores,
+        "ram_gb": state.hardware_info.ram_gb,
+    }))
+}
+
+// --- Libraries ---
+
+async fn list_libraries(State(state): State<AppState>) -> impl IntoResponse {
+    match db::get_libraries(&state.db).await {
+        Ok(libs) => (StatusCode::OK, Json(serde_json::json!(libs))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddLibraryRequest {
+    path: String,
+}
+
+async fn add_library(
+    State(state): State<AppState>,
+    Json(req): Json<AddLibraryRequest>,
+) -> impl IntoResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    match db::insert_library(&state.db, &id, &req.path, &now).await {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({"id": id, "path": req.path})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateLibraryRequest {
+    output_video: Option<String>,
+    output_audio: Option<String>,
+    output_container: Option<String>,
+    crf: Option<i32>,
+    skip_open_formats: Option<bool>,
+}
+
+async fn update_library(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateLibraryRequest>,
+) -> impl IntoResponse {
+    match db::update_library(
+        &state.db,
+        &id,
+        &req.output_video.unwrap_or_else(|| "av1".into()),
+        &req.output_audio.unwrap_or_else(|| "opus".into()),
+        &req.output_container.unwrap_or_else(|| "mkv".into()),
+        req.crf.unwrap_or(28),
+        req.skip_open_formats.unwrap_or(true),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"updated": true}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+async fn delete_library(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match db::delete_library(&state.db, &id).await {
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"deleted": true}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+// --- Config ---
+
+async fn get_config(State(state): State<AppState>) -> impl IntoResponse {
+    let config = state.config.read().await;
+    Json(serde_json::json!(*config))
+}
+
 async fn update_config(
     State(state): State<AppState>,
-    Json(new_config): Json<chrysopeia_core::config::AppConfig>,
-) -> Json<chrysopeia_core::config::AppConfig> {
+    Json(patch): Json<serde_json::Value>,
+) -> impl IntoResponse {
     let mut config = state.config.write().await;
-    *config = new_config.clone();
-    Json(new_config)
+    // Merge patch into config
+    if let (Some(existing), Some(new)) = (config.as_object_mut(), patch.as_object()) {
+        for (k, v) in new {
+            existing.insert(k.clone(), v.clone());
+        }
+    }
+    Json(serde_json::json!(*config))
 }
