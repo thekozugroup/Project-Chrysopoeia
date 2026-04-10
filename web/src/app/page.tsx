@@ -10,7 +10,7 @@ export default function Home() {
     <ErrorBoundary>
       <SidebarProvider>
         <AppSidebar />
-        <SidebarInset className="flex h-screen flex-col">
+        <SidebarInset className="flex h-screen flex-col overflow-hidden min-w-0">
           <div className="flex-1 min-h-0">
             <Dashboard />
           </div>

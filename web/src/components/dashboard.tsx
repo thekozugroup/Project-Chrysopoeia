@@ -101,7 +101,7 @@ export function Dashboard() {
   }, []);
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col overflow-hidden">
       {/* Single header: tabs on left, actions on right */}
       <header
         className={`relative flex shrink-0 items-center border-b border-border px-4 md:px-6 py-2 transition-colors ${

@@ -371,7 +371,7 @@ export function OverviewTab() {
   const statusTotal = statusBreakdown.reduce((sum, s) => sum + s.count, 0);
 
   return (
-    <div className="space-y-6 px-6 py-6 animate-fade-up">
+    <div className="space-y-6 px-6 py-6 animate-fade-up overflow-hidden">
       {/* Header */}
       <div className="flex items-baseline gap-2">
         <h2 className="font-heading text-2xl tracking-tight text-foreground">

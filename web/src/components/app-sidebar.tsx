@@ -181,17 +181,24 @@ export function AppSidebar() {
                       >
                         {lp.path.split("/").pop() || lp.path}
                       </span>
-                      <button
-                        type="button"
+                      <span
+                        role="button"
+                        tabIndex={0}
                         onClick={(e) => {
                           e.stopPropagation();
                           removeLibraryPath(lp.id);
                         }}
-                        className="shrink-0 text-muted-foreground/30 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100 ml-2"
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.stopPropagation();
+                            removeLibraryPath(lp.id);
+                          }
+                        }}
+                        className="shrink-0 text-muted-foreground/30 opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100 ml-2 cursor-pointer"
                         aria-label={`Remove ${lp.path}`}
                       >
                         <X className="h-3 w-3" />
-                      </button>
+                      </span>
                     </div>
 
                     {/* Size bar */}
