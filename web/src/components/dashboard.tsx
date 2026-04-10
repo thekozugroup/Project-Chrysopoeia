@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { Play, Pause, RotateCw, Settings2, FolderOpen, Activity, ChevronUp } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
+
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { useAppStore } from "@/lib/store";
 import {
@@ -16,6 +16,7 @@ import { FileList } from "./file-list";
 import { FileListSkeleton } from "./file-list-skeleton";
 import { ActivityLog } from "./activity-log";
 import { SettingsPanel } from "./settings-panel";
+import { ThemeToggle } from "./theme-toggle";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
@@ -207,6 +208,7 @@ export function Dashboard() {
 
         {/* Controls */}
         <div className="flex items-center gap-2 self-start sm:self-auto">
+          <ThemeToggle />
           <Button
             size="sm"
             variant={settingsOpen ? "default" : "secondary"}
@@ -252,7 +254,7 @@ export function Dashboard() {
             <Button
               size="sm"
               onClick={handleStart}
-              className="gap-1.5 bg-gold text-gold-foreground hover:bg-gold/90 text-xs shadow-[0_0_12px_oklch(0.78_0.12_75_/_0.3)] hover:shadow-[0_0_16px_oklch(0.78_0.12_75_/_0.4)] transition-transform hover:scale-[1.02]"
+              className="gap-1.5 bg-gold text-gold-foreground hover:bg-gold/90 text-xs shadow-[0_0_12px_var(--gold-muted)] hover:shadow-[0_0_16px_var(--gold-muted)] transition-transform hover:scale-[1.02]"
             >
               <Play className="h-3 w-3" />
               Start
@@ -265,29 +267,30 @@ export function Dashboard() {
       <SettingsPanel />
 
       {/* Stats row */}
-      <div aria-live="polite" className="flex shrink-0 flex-wrap items-center gap-y-2 border-b border-border px-4 md:px-6 py-3">
-        <div className="flex flex-wrap items-center divide-x divide-border">
-          <div className="pr-4">
-            <Stat label="Transcoding" value={displayStats.transcoding} active />
-          </div>
-          <div className="px-4">
-            <Stat label="Queued" value={displayStats.queued} />
-          </div>
-          <div className="px-4">
-            <Stat label="Pending" value={displayStats.pending} />
-          </div>
-          <div className="px-4">
-            <Stat label="Complete" value={displayStats.complete} accent />
-          </div>
-          <div className="px-4">
-            <Stat label="Skipped" value={displayStats.skipped} />
-          </div>
+      <div aria-live="polite" className="flex shrink-0 items-center border-b border-border px-4 md:px-6 py-1.5">
+        <p className="text-xs text-muted-foreground tabular-nums">
+          <span className="text-emerald-400 font-medium">{displayStats.transcoding}</span>
+          <span className="text-muted-foreground/70"> transcoding</span>
+          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
+          <span className="text-foreground font-medium">{displayStats.queued}</span>
+          <span className="text-muted-foreground/70"> queued</span>
+          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
+          <span className="text-foreground font-medium">{displayStats.pending.toLocaleString()}</span>
+          <span className="text-muted-foreground/70"> pending</span>
+          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
+          <span className="text-gold font-medium">{displayStats.complete.toLocaleString()}</span>
+          <span className="text-muted-foreground/70"> complete</span>
+          <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
+          <span className="text-foreground font-medium">{displayStats.skipped}</span>
+          <span className="text-muted-foreground/70"> skipped</span>
           {displayStats.errored > 0 && (
-            <div className="pl-4">
-              <Stat label="Errors" value={displayStats.errored} error />
-            </div>
+            <>
+              <span className="mx-1.5 text-muted-foreground/30">&middot;</span>
+              <span className="text-destructive font-medium">{displayStats.errored}</span>
+              <span className="text-muted-foreground/70"> errors</span>
+            </>
           )}
-        </div>
+        </p>
         <div className="ml-auto flex items-center gap-1.5">
           <span className="inline-flex items-center gap-1 rounded-full bg-gold/10 px-2.5 py-0.5 text-[10px] font-mono uppercase text-gold ring-1 ring-inset ring-gold/20">
             {globalSettings.default_video}
@@ -394,13 +397,14 @@ export function Dashboard() {
           <button
             type="button"
             onClick={() => setLogOpen(true)}
+            aria-label="Show activity log"
             className="relative flex h-6 items-center gap-1 rounded-full border border-border/40 bg-card/80 px-2 text-[10px] font-medium text-muted-foreground/60 transition-all hover:text-muted-foreground hover:border-border focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-gold/40"
             title="Show activity log"
           >
             <Activity className="h-3 w-3" />
             Activity
             {hasErrors && (
-              <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-red-400 ring-1 ring-card" />
+              <span className="absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full bg-destructive ring-1 ring-card" />
             )}
           </button>
         )}
@@ -413,6 +417,7 @@ export function Dashboard() {
               new KeyboardEvent("keydown", { key: "?" }),
             );
           }}
+          aria-label="Keyboard shortcuts help"
           className="flex h-6 w-6 items-center justify-center rounded-full border border-border/40 bg-card/80 text-[10px] font-medium text-muted-foreground/40 opacity-0 transition-all hover:opacity-100 hover:text-muted-foreground hover:border-border focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-gold/40"
           title="Press ? for shortcuts"
         >
@@ -423,30 +428,3 @@ export function Dashboard() {
   );
 }
 
-function Stat({
-  label,
-  value,
-  accent,
-  active,
-  error,
-}: {
-  label: string;
-  value: number;
-  accent?: boolean;
-  active?: boolean;
-  error?: boolean;
-}) {
-  let valueClass = "text-foreground";
-  if (accent) valueClass = "text-gold";
-  if (active) valueClass = "text-emerald-400";
-  if (error) valueClass = "text-destructive";
-
-  return (
-    <div className={`flex flex-col items-center gap-0.5 ${error ? "animate-error-pulse rounded-md px-1.5 py-0.5 -mx-1.5 -my-0.5" : ""}`}>
-      <span className={`text-base font-semibold tabular-nums leading-none ${valueClass}`}>
-        {value.toLocaleString()}
-      </span>
-      <span className="text-[9px] text-muted-foreground/70 uppercase tracking-wider">{label}</span>
-    </div>
-  );
-}

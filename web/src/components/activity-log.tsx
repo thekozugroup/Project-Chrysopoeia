@@ -94,6 +94,8 @@ export function ActivityLog({
       <div className="flex h-9 shrink-0 items-center gap-2 border-b border-border/50 px-3">
         <button
           onClick={onToggle}
+          aria-label={isOpen ? "Collapse activity log" : "Expand activity log"}
+          aria-expanded={isOpen}
           className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
         >
           {isOpen ? (
@@ -116,6 +118,8 @@ export function ActivityLog({
                 <button
                   key={p.key}
                   onClick={() => setFilter(p.key)}
+                  aria-label={`Filter: ${p.label}`}
+                  aria-pressed={filter === p.key}
                   className={`rounded-full px-2 py-0.5 text-[10px] font-medium transition-colors ${
                     filter === p.key
                       ? "bg-gold/15 text-gold ring-1 ring-inset ring-gold/25"
@@ -135,7 +139,8 @@ export function ActivityLog({
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
                 placeholder="Filter logs..."
-                className="h-5 w-32 rounded-sm border border-border/50 bg-secondary/40 pl-5 pr-5 text-[10px] text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-gold/30"
+                aria-label="Filter activity log entries"
+                className="h-5 w-32 rounded-sm border border-border/50 bg-card pl-5 pr-5 text-[10px] text-foreground placeholder:text-muted-foreground/40 focus:outline-none focus:ring-1 focus:ring-gold/30"
               />
               {search && (
                 <button
@@ -152,6 +157,7 @@ export function ActivityLog({
               size="icon"
               className="h-5 w-5 text-muted-foreground/60 hover:text-muted-foreground"
               onClick={clearLog}
+              aria-label="Clear activity log"
               title="Clear log"
             >
               <Trash2 className="h-3 w-3" />

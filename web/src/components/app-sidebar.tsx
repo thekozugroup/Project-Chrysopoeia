@@ -3,7 +3,6 @@
 import { useState, useMemo } from "react";
 import {
   Folder,
-  FolderOpen,
   Plus,
   X,
   Cpu,
@@ -125,8 +124,10 @@ export function AppSidebar() {
                   <button
                     key={lp.id}
                     type="button"
+                    aria-label={`Library: ${lp.path.split("/").pop() || lp.path}`}
+                    aria-pressed={isSelected}
                     onClick={() => setSelectedLibrary(isSelected ? null : lp.id)}
-                    className={`group flex w-full flex-col rounded-lg px-3 py-2.5 text-left transition-colors mb-1 ${
+                    className={`group flex w-full flex-col rounded-lg px-3 py-1.5 text-left transition-colors mb-0.5 ${
                       isSelected
                         ? "bg-secondary/70"
                         : "hover:bg-secondary/30"
@@ -154,13 +155,8 @@ export function AppSidebar() {
                       </button>
                     </div>
 
-                    {/* Full path */}
-                    <span className="text-[10px] text-muted-foreground/50 font-mono truncate mt-0.5">
-                      {lp.path}
-                    </span>
-
                     {/* Size bar: original size as full bar, compressed overlay on top */}
-                    <div className="mt-2 w-full">
+                    <div className="mt-1.5 w-full">
                       <div className="relative h-1.5 w-full rounded-full bg-muted-foreground/10 overflow-hidden">
                         {/* Compressed size overlay */}
                         <div
@@ -180,14 +176,10 @@ export function AppSidebar() {
                       </div>
                     </div>
 
-                    {/* Format badges */}
-                    <div className="mt-1.5 flex items-center gap-1 text-[9px] text-muted-foreground/50">
-                      <span className="uppercase">{lp.transcode.output_video}</span>
-                      <span>/</span>
-                      <span className="uppercase">{lp.transcode.output_audio}</span>
-                      <span>/</span>
-                      <span>.{lp.transcode.output_container}</span>
-                    </div>
+                    {/* Format line */}
+                    <span className="mt-0.5 text-[8px] uppercase tracking-wide text-muted-foreground/35 font-mono">
+                      {lp.transcode.output_video} / {lp.transcode.output_audio} / .{lp.transcode.output_container}
+                    </span>
                   </button>
                 );
               })}
@@ -208,6 +200,7 @@ export function AppSidebar() {
                   size="sm"
                   variant="secondary"
                   onClick={handleAddPath}
+                  aria-label="Add library path"
                   className="h-7 w-7 shrink-0 p-0"
                 >
                   <Plus className="h-3 w-3" />

@@ -43,7 +43,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
             className: "!bg-card !text-foreground !border-border/60 !shadow-lg",
             descriptionClassName: "!text-muted-foreground",
           }}
-          theme="dark"
+          theme="system"
           richColors
         />
       </TooltipProvider>

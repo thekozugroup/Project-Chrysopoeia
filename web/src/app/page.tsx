@@ -5,8 +5,6 @@ import { AppSidebar } from "@/components/app-sidebar";
 import { Dashboard } from "@/components/dashboard";
 import { ErrorBoundary } from "@/components/error-boundary";
 import { StatusBar } from "@/components/status-bar";
-import { ThemeToggle } from "@/components/theme-toggle";
-
 export default function Home() {
   return (
     <ErrorBoundary>
@@ -18,7 +16,6 @@ export default function Home() {
           </div>
           <StatusBar />
         </SidebarInset>
-        <ThemeToggle />
       </SidebarProvider>
     </ErrorBoundary>
   );

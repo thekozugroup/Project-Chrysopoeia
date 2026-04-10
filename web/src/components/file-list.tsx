@@ -362,7 +362,7 @@ export function FileList() {
   return (
     <div className="relative min-w-0" role="table" aria-label="Media files">
       {/* Column headers */}
-      <div role="row" className="sticky top-0 z-10 flex items-center gap-2 md:gap-4 border-b border-border bg-card/85 backdrop-blur-md px-3 md:px-6 py-2 will-change-transform">
+      <div role="row" className="sticky top-0 z-10 flex items-center gap-2 md:gap-4 border-b border-border bg-background/95 backdrop-blur-md px-3 md:px-6 py-2 shadow-[0_1px_2px_0_rgb(0_0_0/0.03)] will-change-transform">
         <div className="w-4" />
         <div role="columnheader" aria-label="Status" className="w-5" />
         <div role="columnheader" className="flex-1 text-[10px] text-muted-foreground/60 uppercase tracking-wider">

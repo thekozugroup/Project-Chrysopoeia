@@ -55,43 +55,43 @@
 
 /* Light theme */
 :root {
-  --background: oklch(0.98 0.002 80);
+  --background: oklch(0.97 0.004 75);
   --foreground: oklch(0.15 0.01 80);
-  --card: oklch(0.96 0.003 75);
+  --card: oklch(0.995 0.001 80);
   --card-foreground: oklch(0.15 0.01 80);
-  --popover: oklch(0.96 0.003 75);
+  --popover: oklch(0.995 0.001 80);
   --popover-foreground: oklch(0.15 0.01 80);
-  --primary: oklch(0.78 0.12 75);
-  --primary-foreground: oklch(0.13 0.01 80);
-  --secondary: oklch(0.92 0.004 80);
+  --primary: oklch(0.68 0.14 75);
+  --primary-foreground: oklch(0.99 0.002 80);
+  --secondary: oklch(0.93 0.004 80);
   --secondary-foreground: oklch(0.25 0.01 80);
-  --muted: oklch(0.93 0.003 80);
+  --muted: oklch(0.94 0.003 80);
   --muted-foreground: oklch(0.45 0.01 80);
-  --accent: oklch(0.94 0.005 80);
+  --accent: oklch(0.95 0.005 80);
   --accent-foreground: oklch(0.15 0.01 80);
   --destructive: oklch(0.55 0.22 25);
-  --border: oklch(0.88 0.005 75);
-  --input: oklch(0.90 0.003 80);
-  --ring: oklch(0.78 0.12 75);
-  --chart-1: oklch(0.78 0.12 75);
-  --chart-2: oklch(0.65 0.10 75);
-  --chart-3: oklch(0.52 0.08 75);
-  --chart-4: oklch(0.40 0.06 75);
-  --chart-5: oklch(0.30 0.04 75);
+  --border: oklch(0.90 0.003 75);
+  --input: oklch(0.92 0.003 80);
+  --ring: oklch(0.68 0.14 75);
+  --chart-1: oklch(0.68 0.14 75);
+  --chart-2: oklch(0.58 0.12 75);
+  --chart-3: oklch(0.48 0.10 75);
+  --chart-4: oklch(0.38 0.08 75);
+  --chart-5: oklch(0.28 0.06 75);
   --radius: 0.5rem;
-  --sidebar: oklch(0.95 0.003 80);
+  --sidebar: oklch(0.96 0.005 75);
   --sidebar-foreground: oklch(0.25 0.01 80);
-  --sidebar-primary: oklch(0.78 0.12 75);
-  --sidebar-primary-foreground: oklch(0.13 0.01 80);
-  --sidebar-accent: oklch(0.92 0.005 80);
+  --sidebar-primary: oklch(0.68 0.14 75);
+  --sidebar-primary-foreground: oklch(0.99 0.002 80);
+  --sidebar-accent: oklch(0.93 0.005 80);
   --sidebar-accent-foreground: oklch(0.15 0.01 80);
-  --sidebar-border: oklch(0.88 0.005 80);
-  --sidebar-ring: oklch(0.78 0.12 75);
-  --gold: oklch(0.78 0.12 75);
-  --gold-foreground: oklch(0.13 0.01 80);
-  --gold-muted: oklch(0.55 0.08 75);
-  --warm-muted: oklch(0.65 0.03 60);
-  --ember: oklch(0.55 0.15 40);
+  --sidebar-border: oklch(0.90 0.003 80);
+  --sidebar-ring: oklch(0.68 0.14 75);
+  --gold: oklch(0.68 0.14 75);
+  --gold-foreground: oklch(0.99 0.002 80);
+  --gold-muted: oklch(0.50 0.10 75);
+  --warm-muted: oklch(0.60 0.04 60);
+  --ember: oklch(0.50 0.16 40);
 }
 
 /* Dark theme */
@@ -151,7 +151,7 @@
   }
   /* Focus-visible ring for all interactive elements */
   button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible, [role="button"]:focus-visible {
-    outline: 2px solid oklch(0.78 0.12 75 / 0.6);
+    outline: 2px solid var(--ring);
     outline-offset: 2px;
     border-radius: 4px;
   }
@@ -168,16 +168,16 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: oklch(0.25 0.005 80);
+    background: var(--border);
     border-radius: 3px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: oklch(0.35 0.005 80);
+    background: var(--muted-foreground);
   }
   /* Firefox scrollbar styling */
   * {
     scrollbar-width: thin;
-    scrollbar-color: oklch(0.25 0.005 80) transparent;
+    scrollbar-color: var(--border) transparent;
   }
 }
 
@@ -228,9 +228,9 @@
 .progress-shimmer {
   background: linear-gradient(
     90deg,
-    oklch(0.78 0.12 75) 0%,
-    oklch(0.88 0.10 75) 40%,
-    oklch(0.78 0.12 75) 80%
+    var(--gold) 0%,
+    var(--gold-muted) 40%,
+    var(--gold) 80%
   );
   background-size: 200% 100%;
   animation: shimmer 2s ease-in-out infinite;
@@ -268,8 +268,8 @@
 
 /* Error pulse glow */
 @keyframes error-pulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 oklch(0.60 0.20 25 / 0); }
-  50% { opacity: 0.85; box-shadow: 0 0 8px 2px oklch(0.60 0.20 25 / 0.3); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 transparent; }
+  50% { opacity: 0.85; box-shadow: 0 0 8px 2px var(--destructive); }
 }
 .animate-error-pulse {
   animation: error-pulse 2s ease-in-out infinite;

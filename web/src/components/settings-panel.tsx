@@ -278,7 +278,7 @@ function CrfSlider({
         aria-label={`Quality CRF value: ${value}`}
         onChange={(e) => onChange(Number(e.target.value))}
         style={{
-          background: `linear-gradient(to right, oklch(0.78 0.12 75) 0%, oklch(0.78 0.12 75) ${pct}%, oklch(0.18 0.005 80) ${pct}%, oklch(0.18 0.005 80) 100%)`,
+          background: `linear-gradient(to right, var(--gold) 0%, var(--gold) ${pct}%, var(--input) ${pct}%, var(--input) 100%)`,
         }}
         className="w-full h-1.5 rounded-full appearance-none cursor-pointer
           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gold [&::-webkit-slider-thumb]:shadow-sm
@@ -319,7 +319,7 @@ function JobsSlider({
         aria-label={`Concurrent jobs: ${value}`}
         onChange={(e) => onChange(Number(e.target.value))}
         style={{
-          background: `linear-gradient(to right, oklch(0.78 0.12 75) 0%, oklch(0.78 0.12 75) ${pct}%, oklch(0.18 0.005 80) ${pct}%, oklch(0.18 0.005 80) 100%)`,
+          background: `linear-gradient(to right, var(--gold) 0%, var(--gold) ${pct}%, var(--input) ${pct}%, var(--input) 100%)`,
         }}
         className="w-full h-1.5 rounded-full appearance-none cursor-pointer
           [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-gold [&::-webkit-slider-thumb]:shadow-sm
@@ -339,22 +339,6 @@ function JobsSlider({
     </div>
   );
 }
-
-// ---- Library Override Row ----
-
-const VIDEO_LABELS: Record<string, string> = {
-  av1: "AV1",
-  vp9: "VP9",
-  hevc: "HEVC",
-  h264: "H.264",
-};
-
-const AUDIO_LABELS: Record<string, string> = {
-  opus: "Opus",
-  flac: "FLAC",
-  aac: "AAC",
-  copy: "Copy",
-};
 
 // ---- Main Settings Panel ----
 
@@ -501,14 +485,14 @@ export function SettingsPanel() {
                       {libraryPaths.map((lp) => (
                         <tr
                           key={lp.id}
-                          className="border-b border-border/20 last:border-b-0"
+                          className="border-b border-border/20 last:border-b-0 transition-colors hover:bg-secondary/30"
                         >
-                          <td className="py-2 pr-3">
+                          <td className="py-1.5 pr-3">
                             <span className="font-mono text-[11px] text-foreground truncate block max-w-48">
                               {lp.path}
                             </span>
                           </td>
-                          <td className="py-2 pr-2">
+                          <td className="py-1.5 pr-2">
                             <select
                               value={lp.transcode.output_video}
                               onChange={(e) =>
@@ -517,7 +501,7 @@ export function SettingsPanel() {
                                     .value as OutputFormat,
                                 })
                               }
-                              className="h-6 rounded border border-border/50 bg-secondary/40 px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
+                              className="h-6 rounded border border-border/50 bg-card px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
                             >
                               <option value="av1">AV1</option>
                               <option value="vp9">VP9</option>
@@ -525,7 +509,7 @@ export function SettingsPanel() {
                               <option value="h264">H.264</option>
                             </select>
                           </td>
-                          <td className="py-2 pr-2">
+                          <td className="py-1.5 pr-2">
                             <select
                               value={lp.transcode.output_audio}
                               onChange={(e) =>
@@ -534,7 +518,7 @@ export function SettingsPanel() {
                                     .value as OutputAudioFormat,
                                 })
                               }
-                              className="h-6 rounded border border-border/50 bg-secondary/40 px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
+                              className="h-6 rounded border border-border/50 bg-card px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
                             >
                               <option value="opus">Opus</option>
                               <option value="flac">FLAC</option>
@@ -542,7 +526,7 @@ export function SettingsPanel() {
                               <option value="copy">Copy</option>
                             </select>
                           </td>
-                          <td className="py-2 pr-2">
+                          <td className="py-1.5 pr-2">
                             <select
                               value={lp.transcode.output_container}
                               onChange={(e) =>
@@ -551,14 +535,14 @@ export function SettingsPanel() {
                                     .value as OutputContainer,
                                 })
                               }
-                              className="h-6 rounded border border-border/50 bg-secondary/40 px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
+                              className="h-6 rounded border border-border/50 bg-card px-1 text-[10px] text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
                             >
                               <option value="mkv">.mkv</option>
                               <option value="webm">.webm</option>
                               <option value="mp4">.mp4</option>
                             </select>
                           </td>
-                          <td className="py-2 pr-2">
+                          <td className="py-1.5 pr-2">
                             <input
                               type="number"
                               min={18}
@@ -569,15 +553,15 @@ export function SettingsPanel() {
                                   crf: Number(e.target.value),
                                 })
                               }
-                              className="h-6 w-12 rounded border border-border/50 bg-secondary/40 px-1 text-center text-[10px] tabular-nums text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
+                              className="h-6 w-12 rounded border border-border/50 bg-card px-1 text-center text-[10px] tabular-nums text-foreground focus:outline-none focus:ring-1 focus:ring-gold/40"
                             />
                           </td>
-                          <td className="py-2 text-right">
+                          <td className="py-1.5 text-right">
                             <Button
                               size="sm"
-                              variant="ghost"
+                              variant="outline"
                               onClick={() => resetLibraryToDefaults(lp.id)}
-                              className="h-6 gap-1 px-2 text-[10px] text-muted-foreground hover:text-foreground"
+                              className="h-6 gap-1 px-2 text-[10px] text-muted-foreground hover:text-foreground hover:border-gold/30"
                             >
                               <RotateCcw className="h-2.5 w-2.5" />
                               Reset
@@ -591,9 +575,9 @@ export function SettingsPanel() {
                 <div className="flex justify-end">
                   <Button
                     size="sm"
-                    variant="secondary"
+                    variant="outline"
                     onClick={applyDefaultsToAll}
-                    className="gap-1.5 text-[10px]"
+                    className="gap-1.5 text-[10px] border-gold/20 text-gold hover:bg-gold/10 hover:border-gold/30"
                   >
                     <RotateCcw className="h-3 w-3" />
                     Apply defaults to all

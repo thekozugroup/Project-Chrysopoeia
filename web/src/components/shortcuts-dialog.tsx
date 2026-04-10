@@ -17,7 +17,7 @@ const SHORTCUTS = [
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return (
-    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-[5px] border border-border/60 bg-secondary/80 px-1.5 font-mono text-[11px] font-medium text-foreground/80 shadow-[0_1px_0_1px_oklch(0_0_0_/_0.15)]">
+    <kbd className="inline-flex h-6 min-w-6 items-center justify-center rounded-[5px] border border-border/60 bg-muted px-1.5 font-mono text-[11px] font-medium text-foreground/80 shadow-[0_1px_0_1px_var(--border)]">
       {children}
     </kbd>
   );

@@ -52,7 +52,7 @@ export class ErrorBoundary extends Component<Props, State> {
             <Button
               type="button"
               onClick={this.handleRetry}
-              className="gap-2 bg-gold text-gold-foreground hover:bg-gold/90 shadow-[0_0_12px_oklch(0.78_0.12_75_/_0.2)]"
+              className="gap-2 bg-gold text-gold-foreground hover:bg-gold/90 shadow-[0_0_12px_var(--gold-muted)]"
             >
               <RotateCw className="h-4 w-4" />
               Reload page
