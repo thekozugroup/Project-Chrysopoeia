@@ -94,7 +94,7 @@ export function AppSidebar() {
             </svg>
           </div>
           <h1 className="font-heading text-xl font-normal tracking-tight">
-            Chrysopeia
+            Chrysopoeia
           </h1>
         </div>
       </SidebarHeader>

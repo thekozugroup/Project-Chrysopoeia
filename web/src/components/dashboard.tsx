@@ -23,7 +23,7 @@ const ONBOARDING_STEPS = [
   {
     num: 1,
     title: "Add media library paths in the sidebar",
-    desc: "Point Chrysopeia at your movie, TV, or anime folders.",
+    desc: "Point Chrysopoeia at your movie, TV, or anime folders.",
   },
   {
     num: 2,
@@ -206,7 +206,7 @@ export function Dashboard() {
             </div>
 
             <h2 className="animate-fade-up stagger-1 font-heading text-2xl tracking-tight text-foreground">
-              Welcome to Chrysopeia
+              Welcome to Chrysopoeia
             </h2>
             <p className="animate-fade-up stagger-2 mt-2 max-w-sm text-sm text-muted-foreground">
               Transmute your media library into modern, open formats.

@@ -36,7 +36,7 @@ export function ShortcutsDialog({
         <DialogHeader>
           <DialogTitle>Keyboard Shortcuts</DialogTitle>
           <DialogDescription>
-            Navigate Chrysopeia faster with these shortcuts.
+            Navigate Chrysopoeia faster with these shortcuts.
           </DialogDescription>
         </DialogHeader>
 

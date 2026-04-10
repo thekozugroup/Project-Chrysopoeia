@@ -15,6 +15,13 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from "@/components/ui/card";
 import { useAppStore } from "@/lib/store";
 import type {
   OutputFormat,
@@ -137,33 +144,36 @@ function PillSelector<T extends string>({
   );
 }
 
-// ---- Collapsible section ----
+// ---- Collapsible section (used for danger zone) ----
 
-function Section({
+function CollapsibleSection({
   title,
+  icon,
   defaultOpen = true,
   children,
 }: {
   title: string;
+  icon?: React.ReactNode;
   defaultOpen?: boolean;
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <div className="border-b border-border/40 last:border-b-0">
+    <div>
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="flex w-full items-center justify-between px-5 md:px-6 py-4 text-xs font-semibold uppercase tracking-wider text-muted-foreground hover:text-foreground transition-colors"
+        className="flex w-full items-center justify-between py-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
       >
-        {title}
+        <span className="flex items-center gap-2">
+          {icon}
+          {title}
+        </span>
         <ChevronDown
           className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`}
         />
       </button>
-      {open && (
-        <div className="px-5 md:px-6 pb-5 space-y-5">{children}</div>
-      )}
+      {open && <div className="pt-2">{children}</div>}
     </div>
   );
 }
@@ -180,7 +190,7 @@ function VideoCodecSelector({
   const hardware = useAppStore((s) => s.hardware);
 
   return (
-    <div className="space-y-1.5" role="radiogroup" aria-label="Video codec">
+    <div className="space-y-2" role="radiogroup" aria-label="Video codec">
       {hardware.formats.map((fmt) => {
         const selected = value === fmt.codec;
         return (
@@ -190,14 +200,14 @@ function VideoCodecSelector({
             role="radio"
             aria-checked={selected}
             onClick={() => onChange(fmt.codec as OutputFormat)}
-            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all focus-visible:outline-2 focus-visible:outline-ring ${
+            className={`flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left transition-all focus-visible:outline-2 focus-visible:outline-ring ${
               selected
-                ? "bg-gold/15 ring-2 ring-gold/40"
-                : "hover:bg-secondary/50"
+                ? "border-gold/40 bg-gold/10 ring-1 ring-gold/30"
+                : "border-border/60 bg-card hover:border-border hover:bg-secondary/30"
             }`}
           >
             <div
-              className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors ${
+              className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${
                 selected ? "border-gold bg-gold" : "border-muted-foreground/30"
               }`}
             >
@@ -269,11 +279,11 @@ function CrfSlider({
   const pct = ((value - 18) / (40 - 18)) * 100;
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       <div className="flex items-center justify-between">
         <span className="text-sm text-muted-foreground">Quality (CRF)</span>
-        <div className="flex items-center gap-2">
-          <span className={`text-xs font-medium ${crfDesc.color}`}>
+        <div className="flex items-baseline gap-2">
+          <span className={`font-heading text-lg font-medium ${crfDesc.color}`}>
             {crfDesc.label}
           </span>
           <span className="text-sm tabular-nums font-mono text-foreground">
@@ -485,26 +495,30 @@ export function LibrarySettingsTab() {
   );
 
   return (
-    <div className="max-w-3xl mx-auto">
+    <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
       {/* Header */}
-      <div className="px-5 md:px-6 py-4 border-b border-border/40">
-        <h2 className="text-sm font-semibold">
+      <div>
+        <h2 className="font-heading text-xl tracking-tight text-foreground">
           {selectedLibrary
             ? `Settings for ${selectedLibrary.path}`
             : "Global Default Settings"}
         </h2>
-        <p className="text-xs text-muted-foreground/60 mt-0.5">
+        <p className="text-sm text-muted-foreground mt-1">
           {selectedLibrary
             ? "These settings override the defaults for this library."
             : "These settings apply to all libraries without custom overrides."}
         </p>
       </div>
 
-      {/* Output Format */}
-      <Section title="Output Format">
-        <div className="space-y-5">
+      {/* Output Format Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Output Format</CardTitle>
+          <CardDescription>Video, audio, and container settings</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-6">
           <div>
-            <p className="mb-2 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
+            <p className="mb-2.5 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
               Video Codec
             </p>
             <VideoCodecSelector
@@ -514,7 +528,7 @@ export function LibrarySettingsTab() {
           </div>
 
           <div>
-            <p className="mb-2 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
+            <p className="mb-2.5 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
               Audio Codec
             </p>
             <PillSelector
@@ -530,7 +544,7 @@ export function LibrarySettingsTab() {
           </div>
 
           <div>
-            <p className="mb-2 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
+            <p className="mb-2.5 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
               Container
             </p>
             <PillSelector
@@ -545,12 +559,16 @@ export function LibrarySettingsTab() {
             value={effectiveConfig.crf}
             onChange={handleCrfChange}
           />
-        </div>
-      </Section>
+        </CardContent>
+      </Card>
 
-      {/* Scan Settings */}
-      <Section title="Scan Settings">
-        <div className="space-y-4">
+      {/* Scan Settings Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Scan Settings</CardTitle>
+          <CardDescription>Library watching and file discovery</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
           <Toggle
             label="Auto-scan"
             sublabel="Automatically watch library folders for new files"
@@ -562,7 +580,7 @@ export function LibrarySettingsTab() {
 
           {globalSettings.auto_scan && (
             <div>
-              <p className="mb-2 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
+              <p className="mb-2.5 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
                 Scan Interval
               </p>
               <div className="flex flex-wrap gap-1.5" role="radiogroup" aria-label="Scan interval">
@@ -588,18 +606,22 @@ export function LibrarySettingsTab() {
               </div>
             </div>
           )}
-        </div>
-      </Section>
+        </CardContent>
+      </Card>
 
-      {/* Processing Settings */}
-      <Section title="Processing Settings">
-        <div className="space-y-5">
+      {/* Processing Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Processing</CardTitle>
+          <CardDescription>Encoding device and job configuration</CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-5">
           {/* Device selector */}
           <div>
-            <p className="mb-2 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
+            <p className="mb-2.5 text-xs text-muted-foreground/80 uppercase tracking-wider font-medium">
               Encoding Device
             </p>
-            <div className="space-y-1.5" role="radiogroup" aria-label="Encoding device">
+            <div className="space-y-2" role="radiogroup" aria-label="Encoding device">
               {deviceOptions.map((dev) => {
                 const selected = selectedDevice === dev.id;
                 const DevIcon = dev.icon;
@@ -610,14 +632,14 @@ export function LibrarySettingsTab() {
                     role="radio"
                     aria-checked={selected}
                     onClick={() => setSelectedDevice(dev.id)}
-                    className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all focus-visible:outline-2 focus-visible:outline-ring ${
+                    className={`flex w-full items-center gap-3 rounded-lg border px-4 py-3 text-left transition-all focus-visible:outline-2 focus-visible:outline-ring ${
                       selected
-                        ? "bg-gold/15 ring-2 ring-gold/40"
-                        : "hover:bg-secondary/50"
+                        ? "border-gold/40 bg-gold/10 ring-1 ring-gold/30"
+                        : "border-border/60 bg-card hover:border-border hover:bg-secondary/30"
                     }`}
                   >
                     <div
-                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                      className={`flex h-4 w-4 shrink-0 items-center justify-center rounded-full border-2 transition-colors ${
                         selected
                           ? "border-gold bg-gold"
                           : "border-muted-foreground/30"
@@ -682,66 +704,74 @@ export function LibrarySettingsTab() {
             checked={effectiveConfig.skip_open_formats}
             onChange={handleSkipOpenChange}
           />
-        </div>
-      </Section>
+        </CardContent>
+      </Card>
 
-      {/* Danger Zone */}
-      <Section title="Danger Zone" defaultOpen={false}>
-        <div className="space-y-3">
-          <div className="rounded-lg border border-border/40 p-4 space-y-3">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm text-foreground">Reset to defaults</p>
-                <p className="text-xs text-muted-foreground/60">
-                  {selectedLibrary
-                    ? "Reset this library's settings to the global defaults."
-                    : "Reset all global settings to their factory values."}
-                </p>
-              </div>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={resetToDefaults}
-                className="gap-1.5 text-xs border-muted-foreground/20 hover:border-amber-400/30 hover:text-amber-400"
-              >
-                <RotateCcw className="h-3 w-3" />
-                Reset
-              </Button>
-            </div>
-
-            {selectedLibrary && (
-              <>
-                <div className="h-px bg-border/40" />
+      {/* Danger Zone Card */}
+      <Card className="ring-destructive/20">
+        <CardContent>
+          <CollapsibleSection
+            title="Danger Zone"
+            icon={<AlertTriangle className="h-4 w-4 text-destructive/70" />}
+            defaultOpen={false}
+          >
+            <div className="space-y-3">
+              <div className="rounded-lg border border-destructive/20 bg-destructive/5 p-4 space-y-3">
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="text-sm text-destructive">Remove library</p>
+                    <p className="text-sm text-foreground">Reset to defaults</p>
                     <p className="text-xs text-muted-foreground/60">
-                      Remove this library from Chrysopeia. Files on disk are not
-                      affected.
+                      {selectedLibrary
+                        ? "Reset this library's settings to the global defaults."
+                        : "Reset all global settings to their factory values."}
                     </p>
                   </div>
                   <Button
                     size="sm"
                     variant="outline"
-                    onClick={() => removeLibraryPath(selectedLibrary.id)}
-                    className="gap-1.5 text-xs border-destructive/30 text-destructive hover:bg-destructive/10 hover:border-destructive/50"
+                    onClick={resetToDefaults}
+                    className="gap-1.5 text-xs border-muted-foreground/20 hover:border-amber-400/30 hover:text-amber-400"
                   >
-                    <Trash2 className="h-3 w-3" />
-                    Remove
+                    <RotateCcw className="h-3 w-3" />
+                    Reset
                   </Button>
                 </div>
-              </>
-            )}
-          </div>
 
-          <div className="flex items-start gap-2 px-1">
-            <AlertTriangle className="h-3.5 w-3.5 text-amber-400/60 shrink-0 mt-0.5" />
-            <p className="text-[10px] text-muted-foreground/50">
-              These actions cannot be undone. Proceed with caution.
-            </p>
-          </div>
-        </div>
-      </Section>
+                {selectedLibrary && (
+                  <>
+                    <div className="h-px bg-destructive/20" />
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="text-sm text-destructive">Remove library</p>
+                        <p className="text-xs text-muted-foreground/60">
+                          Remove this library from Chrysopoeia. Files on disk are not
+                          affected.
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => removeLibraryPath(selectedLibrary.id)}
+                        className="gap-1.5 text-xs border-destructive/30 text-destructive hover:bg-destructive/10 hover:border-destructive/50"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                        Remove
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="flex items-start gap-2 px-1">
+                <AlertTriangle className="h-3.5 w-3.5 text-amber-400/60 shrink-0 mt-0.5" />
+                <p className="text-[10px] text-muted-foreground/50">
+                  These actions cannot be undone. Proceed with caution.
+                </p>
+              </div>
+            </div>
+          </CollapsibleSection>
+        </CardContent>
+      </Card>
     </div>
   );
 }

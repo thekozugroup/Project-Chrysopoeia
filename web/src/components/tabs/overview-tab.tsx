@@ -2,6 +2,12 @@
 
 import { useMemo } from "react";
 import { useAppStore } from "@/lib/store";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,9 +102,74 @@ const STATUS_COLORS: Record<string, string> = {
   error: "bg-destructive",
 };
 
+const STATUS_TEXT_COLORS: Record<string, string> = {
+  pending: "text-muted-foreground",
+  queued: "text-amber-500",
+  transcoding: "text-blue-500",
+  complete: "text-emerald-500",
+  skipped: "text-muted-foreground/60",
+  error: "text-destructive",
+};
+
 // ---------------------------------------------------------------------------
 // Sub-components
 // ---------------------------------------------------------------------------
+
+function CircularProgress({ value, size = 140 }: { value: number; size?: number }) {
+  const clampedValue = Math.min(Math.max(value, 0), 100);
+  const displayValue = clampedValue.toFixed(1);
+
+  return (
+    <div
+      className="relative flex items-center justify-center rounded-full"
+      style={{
+        width: size,
+        height: size,
+        background: `conic-gradient(
+          var(--color-emerald-500) ${clampedValue * 3.6}deg,
+          var(--color-muted) ${clampedValue * 3.6}deg 360deg
+        )`,
+      }}
+    >
+      {/* Inner circle cutout */}
+      <div
+        className="absolute flex flex-col items-center justify-center rounded-full bg-card"
+        style={{ width: size - 20, height: size - 20 }}
+      >
+        <span className="font-heading text-3xl tabular-nums text-foreground">
+          {displayValue}
+          <span className="text-lg text-muted-foreground">%</span>
+        </span>
+        <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+          Complete
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function StatItem({
+  label,
+  value,
+  valueClass,
+}: {
+  label: string;
+  value: string;
+  valueClass?: string;
+}) {
+  return (
+    <div className="flex flex-col items-center gap-0.5">
+      <span
+        className={`font-heading text-2xl tabular-nums ${valueClass ?? "text-foreground"}`}
+      >
+        {value}
+      </span>
+      <span className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        {label}
+      </span>
+    </div>
+  );
+}
 
 function DistributionBar({
   data,
@@ -117,21 +188,23 @@ function DistributionBar({
   }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-3">
       {/* Bar */}
-      <div className="flex h-7 w-full overflow-hidden rounded-md bg-muted/50">
-        {data.map((d) => {
+      <div className="flex h-8 w-full overflow-hidden rounded-lg bg-muted/40">
+        {data.map((d, i) => {
           const width = pct(d.count, total);
           if (width === 0) return null;
+          const isFirst = i === 0 || data.slice(0, i).every((prev) => pct(prev.count, total) === 0);
+          const isLast = i === data.length - 1 || data.slice(i + 1).every((next) => pct(next.count, total) === 0);
           return (
             <div
               key={d.label}
-              className={`${colorMap[d.label] ?? "bg-muted-foreground"} relative flex items-center justify-center transition-all duration-500`}
-              style={{ width: `${width}%`, minWidth: width > 0 ? "2px" : 0 }}
+              className={`${colorMap[d.label] ?? "bg-muted-foreground"} relative flex items-center justify-center transition-all duration-500 ${isFirst ? "rounded-l-lg" : ""} ${isLast ? "rounded-r-lg" : ""}`}
+              style={{ width: `${width}%`, minWidth: width > 0 ? "3px" : 0 }}
               title={`${d.label}: ${d.count} (${width.toFixed(1)}%)`}
             >
-              {width > 8 && (
-                <span className="truncate px-1.5 text-[11px] font-semibold text-white drop-shadow-sm">
+              {width > 10 && (
+                <span className="truncate px-2 text-[11px] font-semibold text-white drop-shadow-sm">
                   {d.label}
                 </span>
               )}
@@ -141,19 +214,21 @@ function DistributionBar({
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap gap-x-4 gap-y-1">
+      <div className="flex flex-wrap gap-x-5 gap-y-1.5">
         {data.map((d) => (
-          <div key={d.label} className="flex items-center gap-1.5 text-xs">
+          <div key={d.label} className="flex items-center gap-2 text-xs">
             <span
-              className={`inline-block h-2.5 w-2.5 rounded-sm ${colorMap[d.label] ?? "bg-muted-foreground"}`}
+              className={`inline-block h-2.5 w-2.5 shrink-0 rounded-full ${colorMap[d.label] ?? "bg-muted-foreground"}`}
             />
-            <span className={`font-medium ${textColorMap[d.label] ?? "text-muted-foreground"}`}>
+            <span
+              className={`font-medium ${textColorMap[d.label] ?? "text-muted-foreground"}`}
+            >
               {d.label}
             </span>
-            <span className="text-muted-foreground tabular-nums">
+            <span className="tabular-nums text-muted-foreground">
               {d.count}
             </span>
-            <span className="text-muted-foreground/60 tabular-nums">
+            <span className="tabular-nums text-muted-foreground/60">
               ({pct(d.count, total).toFixed(1)}%)
             </span>
           </div>
@@ -293,11 +368,15 @@ export function OverviewTab() {
     ? selectedLibraryPath.split("/").pop()
     : null;
 
+  const statusTotal = statusBreakdown.reduce((sum, s) => sum + s.count, 0);
+
   return (
-    <div className="space-y-6 animate-fade-up">
+    <div className="space-y-6 px-6 py-6 animate-fade-up">
       {/* Header */}
       <div className="flex items-baseline gap-2">
-        <h2 className="text-lg font-semibold text-foreground">Overview</h2>
+        <h2 className="font-heading text-2xl tracking-tight text-foreground">
+          Overview
+        </h2>
         {selectedLibName && (
           <span className="text-sm text-muted-foreground">
             / {selectedLibName}
@@ -305,104 +384,103 @@ export function OverviewTab() {
         )}
       </div>
 
-      {/* Stats row */}
-      <div className="flex flex-wrap items-baseline gap-x-8 gap-y-2 text-sm">
-        <div>
-          <span className="text-muted-foreground">Files </span>
-          <span className="font-semibold tabular-nums text-foreground">
-            {displayStats.totalFiles.toLocaleString()}
-          </span>
-        </div>
-        <div>
-          <span className="text-muted-foreground">Total size </span>
-          <span className="font-semibold tabular-nums text-foreground">
-            {formatBytes(displayStats.totalSize)}
-          </span>
-        </div>
-        <div>
-          <span className="text-muted-foreground">Space saved </span>
-          <span className="font-semibold tabular-nums text-emerald-500">
-            {formatBytes(displayStats.savedBytes)}
-          </span>
-        </div>
-        <div>
-          <span className="text-muted-foreground">Complete </span>
-          <span className="font-semibold tabular-nums text-foreground">
-            {displayStats.completionPct.toFixed(1)}%
-          </span>
-        </div>
-      </div>
-
-      {/* Completion progress bar */}
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted/50">
-        <div
-          className="h-full rounded-full bg-emerald-500 transition-all duration-700"
-          style={{ width: `${Math.min(displayStats.completionPct, 100)}%` }}
-        />
-      </div>
+      {/* Top summary: Completion ring + stats */}
+      <Card>
+        <CardContent className="flex flex-col items-center gap-6 sm:flex-row sm:items-center sm:gap-10 pt-2">
+          <CircularProgress value={displayStats.completionPct} />
+          <div className="flex flex-1 flex-wrap items-center justify-center gap-8 sm:justify-start">
+            <StatItem
+              label="Files"
+              value={displayStats.totalFiles.toLocaleString()}
+            />
+            <StatItem
+              label="Total Size"
+              value={formatBytes(displayStats.totalSize)}
+            />
+            <StatItem
+              label="Space Saved"
+              value={formatBytes(displayStats.savedBytes)}
+              valueClass="text-emerald-500"
+            />
+          </div>
+        </CardContent>
+      </Card>
 
       {/* Distribution sections */}
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Video codecs */}
-        <section className="space-y-2">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Video Codecs
-          </h3>
-          <DistributionBar
-            data={videoCodecs}
-            colorMap={VIDEO_COLORS}
-            textColorMap={VIDEO_TEXT_COLORS}
-          />
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Video Codecs</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <DistributionBar
+              data={videoCodecs}
+              colorMap={VIDEO_COLORS}
+              textColorMap={VIDEO_TEXT_COLORS}
+            />
+          </CardContent>
+        </Card>
 
         {/* Audio codecs */}
-        <section className="space-y-2">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Audio Codecs
-          </h3>
-          <DistributionBar
-            data={audioCodecs}
-            colorMap={AUDIO_COLORS}
-            textColorMap={AUDIO_TEXT_COLORS}
-          />
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Audio Codecs</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <DistributionBar
+              data={audioCodecs}
+              colorMap={AUDIO_COLORS}
+              textColorMap={AUDIO_TEXT_COLORS}
+            />
+          </CardContent>
+        </Card>
 
         {/* Resolution */}
-        <section className="space-y-2">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Resolution
-          </h3>
-          <DistributionBar
-            data={resolutions}
-            colorMap={RESOLUTION_COLORS}
-            textColorMap={RESOLUTION_TEXT_COLORS}
-          />
-        </section>
+        <Card>
+          <CardHeader>
+            <CardTitle>Resolution</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <DistributionBar
+              data={resolutions}
+              colorMap={RESOLUTION_COLORS}
+              textColorMap={RESOLUTION_TEXT_COLORS}
+            />
+          </CardContent>
+        </Card>
 
         {/* Status breakdown */}
-        <section className="space-y-2">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Status
-          </h3>
-          <div className="space-y-1.5">
-            {statusBreakdown.map((s) => (
-              <div
-                key={s.label}
-                className="flex items-center justify-between text-sm"
-              >
-                <div className="flex items-center gap-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Status</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-2.5">
+              {statusBreakdown.map((s) => (
+                <div
+                  key={s.label}
+                  className="flex items-center gap-3 text-sm"
+                >
                   <span
-                    className={`inline-block h-2 w-2 rounded-full ${STATUS_COLORS[s.label] ?? "bg-muted-foreground"}`}
+                    className={`inline-block h-2.5 w-2.5 shrink-0 rounded-full ${STATUS_COLORS[s.label] ?? "bg-muted-foreground"}`}
                   />
-                  <span className="capitalize text-foreground">{s.label}</span>
+                  <span className="capitalize text-foreground flex-1">
+                    {s.label}
+                  </span>
+                  <span
+                    className={`shrink-0 tabular-nums font-medium ${STATUS_TEXT_COLORS[s.label] ?? "text-muted-foreground"}`}
+                  >
+                    {s.count.toLocaleString()}
+                  </span>
+                  <span className="shrink-0 w-12 text-right tabular-nums text-muted-foreground/60 text-xs">
+                    {statusTotal > 0 ? `${pct(s.count, statusTotal).toFixed(0)}%` : "0%"}
+                  </span>
                 </div>
-                <span className="tabular-nums text-muted-foreground">
-                  {s.count.toLocaleString()}
-                </span>
-              </div>
-            ))}
-          </div>
-        </section>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

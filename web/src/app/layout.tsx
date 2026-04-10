@@ -21,16 +21,16 @@ const jetbrainsMono = JetBrains_Mono({
 
 export const metadata: Metadata = {
   title: {
-    default: "Chrysopeia",
-    template: "%s | Chrysopeia",
+    default: "Chrysopoeia",
+    template: "%s | Chrysopoeia",
   },
   description:
-    "Transmute your media library. Chrysopeia is a conversational interface for intelligent media transcoding with hardware-accelerated encoding.",
+    "Transmute your media library. Chrysopoeia is a conversational interface for intelligent media transcoding with hardware-accelerated encoding.",
   openGraph: {
-    title: "Chrysopeia",
+    title: "Chrysopoeia",
     description:
       "Transmute your media library with intelligent, conversational transcoding.",
-    siteName: "Chrysopeia",
+    siteName: "Chrysopoeia",
     type: "website",
   },
   other: {

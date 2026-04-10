@@ -4,6 +4,12 @@ import { useMemo } from "react";
 import { Activity, TrendingDown, Clock, HardDrive } from "lucide-react";
 import { useAppStore } from "@/lib/store";
 import { FileList } from "@/components/file-list";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1e12) return `${(bytes / 1e12).toFixed(1)} TB`;
@@ -75,102 +81,117 @@ export function QueueTab() {
   }, [activeFiles, stats]);
 
   return (
-    <div className="flex flex-col gap-0">
-      {/* Compression Summary Bar */}
-      <div className="border-b border-border bg-card/30 px-4 md:px-6 py-4">
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mb-3">
-          <div className="flex items-center gap-2">
-            <HardDrive className="h-3.5 w-3.5 text-muted-foreground" />
-            <span className="text-xs text-muted-foreground">Original</span>
-            <span className="text-sm font-medium tabular-nums">
-              {formatBytes(compressionSummary.totalOriginal)}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <TrendingDown className="h-3.5 w-3.5 text-gold" />
-            <span className="text-xs text-muted-foreground">Estimated</span>
-            <span className="text-sm font-medium tabular-nums text-gold">
-              {formatBytes(compressionSummary.totalNew)}
-            </span>
-          </div>
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-muted-foreground">Saved</span>
-            <span className="text-sm font-medium tabular-nums text-emerald-400">
-              {formatBytes(compressionSummary.savedBytes)}
-            </span>
-            <span className="text-[10px] text-emerald-400/70">
-              ({compressionSummary.reductionPct}% reduction)
-            </span>
-          </div>
-        </div>
-
-        {/* Visual compression bar */}
-        <div className="relative h-2.5 w-full rounded-full bg-secondary/60 overflow-hidden">
-          {/* Full bar = original size */}
-          <div
-            className="absolute inset-y-0 left-0 rounded-full bg-gold/80 transition-all duration-500"
-            style={{ width: `${compressionSummary.compressedPct}%` }}
-          />
-          {/* Shimmer overlay */}
-          <div
-            className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-transparent via-white/10 to-transparent animate-pulse"
-            style={{
-              width: `${compressionSummary.compressedPct}%`,
-              animationDuration: "3s",
-            }}
-          />
-        </div>
-        <p className="mt-1.5 text-[10px] text-muted-foreground/60 tabular-nums">
-          {formatBytes(compressionSummary.totalOriginal)} &rarr;{" "}
-          {formatBytes(compressionSummary.totalNew)} (
-          {formatBytes(compressionSummary.savedBytes)} saved,{" "}
-          {compressionSummary.reductionPct}% reduction)
-        </p>
-      </div>
-
-      {/* Active Processing Status */}
-      <div className="border-b border-border/40 bg-card/20 px-4 md:px-6 py-2.5">
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {processingStats.transcodingCount > 0 ? (
-            <>
-              <Activity className="h-3.5 w-3.5 text-emerald-400 animate-pulse" />
-              <span>
-                Processing{" "}
-                <span className="text-foreground font-medium tabular-nums">
-                  {processingStats.transcodingCount}
-                </span>{" "}
-                of{" "}
-                <span className="text-foreground font-medium tabular-nums">
-                  {processingStats.pendingCount + processingStats.transcodingCount}
-                </span>{" "}
-                files
+    <div className="flex flex-col gap-6 px-6 py-6">
+      {/* Compression Summary Card */}
+      <Card>
+        <CardHeader>
+          <CardTitle>Compression Summary</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="flex flex-wrap items-baseline gap-x-8 gap-y-3">
+            <div className="flex flex-col">
+              <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                <HardDrive className="h-3.5 w-3.5" />
+                Original
               </span>
-              {processingStats.avgSpeed && (
-                <>
-                  <span className="text-border">&middot;</span>
-                  <span className="tabular-nums">
-                    {processingStats.avgSpeed}x avg speed
-                  </span>
-                </>
-              )}
-              {processingStats.totalEta != null && (
-                <>
-                  <span className="text-border">&middot;</span>
-                  <Clock className="h-3 w-3" />
-                  <span className="tabular-nums">
-                    {formatEtaHours(processingStats.totalEta)}
-                  </span>
-                </>
-              )}
-            </>
-          ) : (
-            <>
-              <Activity className="h-3.5 w-3.5 text-muted-foreground/40" />
-              <span>No active transcoding jobs</span>
-            </>
-          )}
-        </div>
-      </div>
+              <span className="font-heading text-2xl tabular-nums tracking-tight text-foreground">
+                {formatBytes(compressionSummary.totalOriginal)}
+              </span>
+            </div>
+            <div className="text-muted-foreground/40 text-lg select-none">&rarr;</div>
+            <div className="flex flex-col">
+              <span className="text-xs text-muted-foreground flex items-center gap-1.5">
+                <TrendingDown className="h-3.5 w-3.5 text-gold" />
+                Estimated
+              </span>
+              <span className="font-heading text-2xl tabular-nums tracking-tight text-gold">
+                {formatBytes(compressionSummary.totalNew)}
+              </span>
+            </div>
+            <div className="text-muted-foreground/40 text-lg select-none">&rarr;</div>
+            <div className="flex flex-col">
+              <span className="text-xs text-muted-foreground">Saved</span>
+              <span className="font-heading text-2xl tabular-nums tracking-tight text-emerald-400">
+                {formatBytes(compressionSummary.savedBytes)}
+              </span>
+              <span className="text-[10px] text-emerald-400/70 tabular-nums">
+                {compressionSummary.reductionPct}% reduction
+              </span>
+            </div>
+          </div>
+
+          {/* Visual compression bar */}
+          <div className="space-y-1.5">
+            <div className="relative h-3 w-full rounded-full bg-secondary/60 overflow-hidden">
+              {/* Full bar = original size */}
+              <div
+                className="absolute inset-y-0 left-0 rounded-full bg-gold/80 transition-all duration-500"
+                style={{ width: `${compressionSummary.compressedPct}%` }}
+              />
+              {/* Shimmer overlay */}
+              <div
+                className="absolute inset-y-0 left-0 rounded-full bg-gradient-to-r from-transparent via-white/10 to-transparent animate-pulse"
+                style={{
+                  width: `${compressionSummary.compressedPct}%`,
+                  animationDuration: "3s",
+                }}
+              />
+            </div>
+            <p className="text-[10px] text-muted-foreground/60 tabular-nums">
+              {formatBytes(compressionSummary.totalOriginal)} &rarr;{" "}
+              {formatBytes(compressionSummary.totalNew)} (
+              {formatBytes(compressionSummary.savedBytes)} saved,{" "}
+              {compressionSummary.reductionPct}% reduction)
+            </p>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Active Processing Status Card */}
+      <Card size="sm">
+        <CardContent>
+          <div className="flex items-center gap-2.5 text-sm">
+            {processingStats.transcodingCount > 0 ? (
+              <>
+                <Activity className="h-4 w-4 text-emerald-400 animate-pulse" />
+                <span className="text-foreground font-medium">
+                  Processing{" "}
+                  <span className="font-heading text-base tabular-nums">
+                    {processingStats.transcodingCount}
+                  </span>{" "}
+                  of{" "}
+                  <span className="font-heading text-base tabular-nums">
+                    {processingStats.pendingCount + processingStats.transcodingCount}
+                  </span>{" "}
+                  files
+                </span>
+                {processingStats.avgSpeed && (
+                  <>
+                    <span className="text-border">&middot;</span>
+                    <span className="tabular-nums text-muted-foreground">
+                      {processingStats.avgSpeed}x avg speed
+                    </span>
+                  </>
+                )}
+                {processingStats.totalEta != null && (
+                  <>
+                    <span className="text-border">&middot;</span>
+                    <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                    <span className="tabular-nums text-muted-foreground">
+                      {formatEtaHours(processingStats.totalEta)}
+                    </span>
+                  </>
+                )}
+              </>
+            ) : (
+              <>
+                <Activity className="h-4 w-4 text-muted-foreground/40" />
+                <span className="text-muted-foreground">No active transcoding jobs</span>
+              </>
+            )}
+          </div>
+        </CardContent>
+      </Card>
 
       {/* File List */}
       <FileList />
