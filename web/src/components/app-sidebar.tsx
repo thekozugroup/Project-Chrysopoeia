@@ -6,8 +6,8 @@ import {
   Plus,
   X,
   Cpu,
-  Zap,
-  ZapOff,
+  MonitorSmartphone,
+  MemoryStick,
   Check,
 } from "lucide-react";
 import {
@@ -20,11 +20,6 @@ import {
 } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 import { useAppStore } from "@/lib/store";
 
 function formatBytes(bytes: number): string {
@@ -231,26 +226,21 @@ export function AppSidebar() {
         </SidebarGroup>
       </SidebarContent>
 
-      <SidebarFooter className="p-3">
-        <Tooltip>
-          <TooltipTrigger className="flex w-full items-center gap-2 rounded-md bg-secondary/30 px-3 py-2 text-left">
-            <Cpu className="h-3.5 w-3.5 text-gold-muted" />
-            <span className="flex-1 truncate text-xs text-muted-foreground">
-              {hardware.gpu_name ?? "CPU Only"}
-            </span>
-            {hardware.gpu_name ? (
-              <Zap className="h-3 w-3 text-emerald-400" />
-            ) : (
-              <ZapOff className="h-3 w-3 text-muted-foreground" />
-            )}
-          </TooltipTrigger>
-          <TooltipContent side="top" className="max-w-64">
-            <p className="text-xs font-medium">{hardware.gpu_name}</p>
-            <p className="text-[10px] text-muted-foreground">
-              {hardware.cpu_cores} cores &middot; {hardware.ram_gb} GB RAM
-            </p>
-          </TooltipContent>
-        </Tooltip>
+      <SidebarFooter className="px-4 py-3 space-y-1.5">
+        {hardware.gpu_name && (
+          <div className="flex items-center gap-2 text-[11px] text-muted-foreground/70">
+            <MonitorSmartphone className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+            <span className="truncate">{hardware.gpu_name}</span>
+          </div>
+        )}
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground/70">
+          <Cpu className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+          <span>{hardware.cpu_cores} cores</span>
+        </div>
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground/70">
+          <MemoryStick className="h-3 w-3 shrink-0 text-muted-foreground/40" />
+          <span>{hardware.ram_gb} GB</span>
+        </div>
       </SidebarFooter>
     </Sidebar>
   );
