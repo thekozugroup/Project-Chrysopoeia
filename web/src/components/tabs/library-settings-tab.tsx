@@ -20,7 +20,6 @@ import {
   CardContent,
   CardHeader,
   CardTitle,
-  CardDescription,
 } from "@/components/ui/card";
 import { useAppStore } from "@/lib/store";
 import type {
@@ -503,18 +502,12 @@ export function LibrarySettingsTab() {
             ? `Settings for ${selectedLibrary.path}`
             : "Global Default Settings"}
         </h2>
-        <p className="text-sm text-muted-foreground mt-1">
-          {selectedLibrary
-            ? "These settings override the defaults for this library."
-            : "These settings apply to all libraries without custom overrides."}
-        </p>
       </div>
 
       {/* Output Format Card */}
       <Card>
         <CardHeader>
           <CardTitle>Output Format</CardTitle>
-          <CardDescription>Video, audio, and container settings</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <div>
@@ -566,7 +559,6 @@ export function LibrarySettingsTab() {
       <Card>
         <CardHeader>
           <CardTitle>Scan Settings</CardTitle>
-          <CardDescription>Library watching and file discovery</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
           <Toggle
@@ -613,7 +605,6 @@ export function LibrarySettingsTab() {
       <Card>
         <CardHeader>
           <CardTitle>Processing</CardTitle>
-          <CardDescription>Encoding device and job configuration</CardDescription>
         </CardHeader>
         <CardContent className="space-y-5">
           {/* Device selector */}

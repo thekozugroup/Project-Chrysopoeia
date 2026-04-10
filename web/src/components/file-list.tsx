@@ -7,7 +7,6 @@ import {
   CheckCircle2,
   AlertTriangle,
   Loader2,
-  Gauge,
   SkipForward,
   FolderOpen,
   Play,
@@ -16,7 +15,6 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
 import {
   Tooltip,
   TooltipContent,
@@ -145,14 +143,25 @@ function FileRow({ file, index, selected, onToggle }: { file: MediaFile; index: 
           </button>
         </div>
 
-        {/* Status indicator */}
+        {/* Status indicator — circular progress for transcoding, icon for others */}
         <div role="cell" className="shrink-0 w-5">
-          <StatusIcon
-            aria-label={statusCfg.label}
-            className={`h-4 w-4 ${statusCfg.color} ${
-              file.status === "transcoding" ? "animate-spin" : ""
-            }`}
-          />
+          {file.status === "transcoding" ? (
+            <svg className="h-5 w-5 -rotate-90" viewBox="0 0 20 20" aria-label={`Transcoding ${file.progress}%`}>
+              <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="2" className="text-muted-foreground/15" />
+              <circle
+                cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="2"
+                className="text-emerald-400 transition-all duration-500"
+                strokeLinecap="round"
+                strokeDasharray={`${2 * Math.PI * 8}`}
+                strokeDashoffset={`${2 * Math.PI * 8 * (1 - file.progress / 100)}`}
+              />
+            </svg>
+          ) : (
+            <StatusIcon
+              aria-label={statusCfg.label}
+              className={`h-4 w-4 ${statusCfg.color}`}
+            />
+          )}
         </div>
 
         {/* File info */}
@@ -261,51 +270,28 @@ function FileRow({ file, index, selected, onToggle }: { file: MediaFile; index: 
           )}
         </div>
 
-        {/* Progress area (for active/queued items) */}
-        <div role="cell" className="shrink-0 w-16 md:w-32">
+        {/* Progress/status info */}
+        <div role="cell" className="shrink-0 w-24 md:w-32 text-right">
           {file.status === "transcoding" && (
-            <div className="space-y-1">
-              <div className="relative">
-                <Progress value={file.progress} className="h-1" />
-                <div
-                  className="progress-shimmer absolute inset-0 h-1 rounded-full opacity-30"
-                  style={{ width: `${file.progress}%` }}
-                />
-              </div>
-              <div className="flex justify-between text-[9px] tabular-nums text-muted-foreground">
-                <span className="text-emerald-400 font-medium">
-                  {file.progress}%
-                </span>
-                <div className="hidden md:flex items-center gap-2">
-                  {file.speed && (
-                    <span className="flex items-center gap-0.5">
-                      <Gauge className="h-2.5 w-2.5" />
-                      {file.speed}
-                    </span>
-                  )}
-                  {file.eta_secs != null && (
-                    <span>{formatEta(file.eta_secs)}</span>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
-          {file.status === "complete" && (
-            <div className="flex items-center justify-end gap-1.5 text-[10px] text-gold">
-              <Check className="h-3.5 w-3.5 text-gold" />
-              {sizeReduction != null && (
-                <span className="tabular-nums">
-                  {formatBytes(file.size_bytes - (file.output_size_bytes ?? 0))} saved
-                </span>
+            <div className="text-[10px] tabular-nums text-muted-foreground">
+              <span className="text-emerald-400 font-medium">{file.progress}%</span>
+              {file.speed && (
+                <span className="hidden md:inline ml-1.5">{file.speed}</span>
+              )}
+              {file.eta_secs != null && (
+                <span className="hidden md:inline ml-1.5 text-muted-foreground/60">{formatEta(file.eta_secs)}</span>
               )}
             </div>
+          )}
+          {file.status === "complete" && sizeReduction != null && (
+            <span className="text-[10px] tabular-nums text-gold">
+              {formatBytes(file.size_bytes - (file.output_size_bytes ?? 0))} saved
+            </span>
           )}
           {file.status === "error" && (
             <Tooltip>
               <TooltipTrigger>
-                <span className="text-[10px] text-destructive truncate block max-w-32">
-                  Error
-                </span>
+                <span className="text-[10px] text-destructive">Error</span>
               </TooltipTrigger>
               <TooltipContent className="max-w-64">
                 <p className="text-xs">{file.error_message}</p>
@@ -377,8 +363,8 @@ export function FileList() {
         <div role="columnheader" className="w-20 text-right text-[10px] text-muted-foreground/60 uppercase tracking-wider">
           Size
         </div>
-        <div role="columnheader" className="w-16 md:w-32 text-right text-[10px] text-muted-foreground/60 uppercase tracking-wider">
-          Progress
+        <div role="columnheader" className="w-24 md:w-32 text-right text-[10px] text-muted-foreground/60 uppercase tracking-wider">
+          Status
         </div>
       </div>
 

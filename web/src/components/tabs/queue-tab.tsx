@@ -81,8 +81,9 @@ export function QueueTab() {
   }, [activeFiles, stats]);
 
   return (
-    <div className="flex flex-col gap-6 px-6 py-6">
+    <div className="flex flex-col">
       {/* Compression Summary Card */}
+      <div className="px-6 pt-6 pb-3">
       <Card>
         <CardHeader>
           <CardTitle>Compression Summary</CardTitle>
@@ -147,8 +148,11 @@ export function QueueTab() {
         </CardContent>
       </Card>
 
-      {/* Active Processing Status Card */}
-      <Card size="sm">
+      </div>
+
+      {/* Active Processing Status */}
+      <div className="px-6 pb-3">
+      <Card>
         <CardContent>
           <div className="flex items-center gap-2.5 text-sm">
             {processingStats.transcodingCount > 0 ? (
@@ -192,8 +196,9 @@ export function QueueTab() {
           </div>
         </CardContent>
       </Card>
+      </div>
 
-      {/* File List */}
+      {/* File List — no extra padding, let it fill remaining space */}
       <FileList />
     </div>
   );
