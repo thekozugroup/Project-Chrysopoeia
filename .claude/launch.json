@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "chrysopeia-web",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "/Users/michaelwong/Developer/Project Chrysopeia/web", "dev", "--port", "3737"],
+      "port": 3737
+    }
+  ]
+}
