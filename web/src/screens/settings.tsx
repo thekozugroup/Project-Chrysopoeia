@@ -19,6 +19,7 @@ import { ChoiceCard, Field, Input, Select, SwitchRow, Textarea } from "@/compone
 import { Badge, Callout, CopyButton, Skeleton } from "@/components/ui/display";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { formatHour } from "@/lib/format";
+import { bugReportText } from "@/lib/hardware";
 import { VALIDATION_HELP, VALIDATION_LABEL, VALIDATION_LEVELS } from "@/lib/labels";
 import { keys, useHardwareInfo, usePresets, useQueueState, useSettings, useSystem } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
@@ -646,12 +647,15 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   );
 }
 
-/** Version and build, for bug reports. */
+/** Version and build, and a copy of the facts a bug report needs. */
 function About() {
   const system = useSystem();
+  const { hw } = useHardwareInfo();
+  const queue = useQueueState();
+  const settings = useSettings();
   const info = system.data;
   if (!info) return null;
-  const text = `Chrysopoeia ${info.version}${info.build ? ` (${info.build})` : ""}${info.in_container ? ", in a container" : ""}`;
+  const text = bugReportText({ system: info, hw, queue: queue.data, settings: settings.data });
   return (
     <section
       aria-labelledby="about-heading"

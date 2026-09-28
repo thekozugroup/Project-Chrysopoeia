@@ -170,11 +170,19 @@ export function useFileActions() {
   });
 
   const bulk = useMutation({
-    // `note` says what the selection left out; it isn't sent.
-    mutationFn: ({ action, ids, library, status }: BulkRequest & { note?: string | null }) =>
+    // `note` says what the selection left out and `ignored` marks a skip of
+    // damaged originals ("Ignore"); neither is sent.
+    mutationFn: ({ action, ids, library, status }: BulkRequest & { note?: string | null; ignored?: boolean }) =>
       api.bulk({ action, ids, library, status }),
-    onSuccess: (res, { action, note }) => {
+    onSuccess: (res, { action, note, ignored }) => {
       const n = plural(res.affected, "file");
+      if (ignored && res.affected > 0) {
+        toast(`Ignored ${n}`, {
+          description: `${res.affected === 1 ? "It's" : "They're"} left as ${res.affected === 1 ? "it is" : "they are"}. A replaced copy is picked up automatically.`,
+        });
+        refresh();
+        return;
+      }
       const text =
         action === "skip" ? `Skipped ${n}` : action === "retry_failed" ? `Trying ${n} again` : `Added ${n} to the queue`;
       // What the selection left out, then what the server left out on top.

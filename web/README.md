@@ -39,6 +39,7 @@ MOCK_WS=off pnpm mock            # no WebSocket, like a proxy without it: the ap
 MOCK_MAX_JOBS=2 pnpm mock        # the job limit comes from the container's MAX_JOBS
 MOCK_FORCE=reject pnpm mock      # an older server refuses "Convert anyway" (=ignore: accepts it, still skips)
 MOCK_HOST=deny pnpm mock         # every request answers 403 host_not_allowed
+MOCK_SETTLE_MS=0 pnpm mock       # files still being copied never settle (default: after 60 s)
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 

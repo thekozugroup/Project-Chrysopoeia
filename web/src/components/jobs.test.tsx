@@ -125,4 +125,12 @@ describe("job summaries", () => {
     );
     expect(historyNote(job({ state: "cancelled", output_size: null }))).toMatch(/^Stopped/);
   });
+
+  it("says why a kept original was kept, naming the library's minimum", () => {
+    const kept = job({ state: "skipped", output_size: 9.4e9, skip_reason: "Only 6% smaller — kept the original" });
+    expect(historyNote(kept, 10)).toBe("6% smaller (needs at least 10%)");
+    expect(historyNote(kept)).toBe("6% smaller, not enough for this library");
+    expect(historyNote(job({ state: "skipped", output_size: null, skip_reason: "Already HEVC" }))).toBe("Already HEVC");
+    expect(historyNote(job({ state: "skipped", output_size: null, skip_reason: null }))).toBe("No conversion needed");
+  });
 });

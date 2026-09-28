@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { countFailures, hdrSummary, hdrTechnical, isUnreadableSource, skipSummary, unreadableDetail } from "./outcomes";
+import {
+  countFailures,
+  failedFilterLabel,
+  hdrSummary,
+  hdrTechnical,
+  isUnreadableSource,
+  skipNote,
+  skipSummary,
+  unreadableDetail,
+} from "./outcomes";
 import { serverLeftOutText, settlingCount } from "./convertible";
 import type { ActivityEntry, LibraryStats, MasteringDisplay } from "./types";
 
@@ -40,14 +49,40 @@ describe("isUnreadableSource", () => {
 });
 
 describe("skipSummary", () => {
-  it("turns the size rule into good news, said once", () => {
-    expect(skipSummary("Only 6% smaller — kept the original", true)).toEqual({
-      title: "Already efficient",
-      body: "Converting would only save 6%, so the original was kept.",
+  it("names the size rule, once, with the library's minimum when it explains the skip", () => {
+    expect(skipSummary("Only 6% smaller — kept the original", true, 10)).toEqual({
+      title: "Kept the original",
+      body: "The new file was 6% smaller, under this library's 10% minimum, so the original was kept.",
     });
-    expect(skipSummary("The new file was 7% larger — kept the original", true).body).toBe(
-      "The converted file came out 7% larger, so the original was kept.",
+    // A big saving under a high minimum is not "already efficient".
+    expect(skipSummary("Only 74% smaller — kept the original", true, 90).body).toBe(
+      "The new file was 74% smaller, under this library's 90% minimum, so the original was kept.",
     );
+    // The minimum changed since, or isn't known: don't name a number that doesn't explain it.
+    expect(skipSummary("Only 74% smaller — kept the original", true, 50).body).toBe(
+      "The new file was 74% smaller, under this library's minimum, so the original was kept.",
+    );
+    expect(skipSummary("Only 6% smaller — kept the original", true).title).toBe("Kept the original");
+    expect(skipSummary("The new file was 7% larger — kept the original", true)).toEqual({
+      title: "Kept the original",
+      body: "The converted file came out 7% larger, so the original was kept.",
+    });
+    expect(skipSummary("About the same size — kept the original", true).body).toBe(
+      "The converted file came out about the same size, so the original was kept.",
+    );
+  });
+
+  it("gives list rows a short reason beside their badge", () => {
+    expect(skipNote("Only 6% smaller — kept the original", 10)).toBe("6% smaller (needs at least 10%)");
+    expect(skipNote("Only 74% smaller — kept the original", 90)).toBe("74% smaller (needs at least 90%)");
+    expect(skipNote("Only 74% smaller — kept the original", null)).toBe("74% smaller, not enough for this library");
+    expect(skipNote("The new file was 7% larger — kept the original")).toBe("7% larger than the original");
+    expect(skipNote("About the same size — kept the original")).toBe("About the same size as the original");
+    expect(skipNote("Already HEVC")).toBe("Already HEVC");
+    expect(skipNote("HDR video would lose its colours as H.264 — left unchanged")).toBe(
+      "HDR video would lose its colours as H.264",
+    );
+    expect(skipNote(null)).toBeNull();
   });
 
   it("names the other kinds of skip plainly", () => {
@@ -113,7 +148,8 @@ describe("round-3 counts", () => {
 
   it("uses the server's settling count, and reads the scan summary only without it", () => {
     expect(settlingCount({ id: "lib", stats: stats(5) }, feed)).toBe(5);
-    expect(settlingCount({ id: "lib", stats: stats(0) }, feed)).toBe(3);
+    // 0 is the server's answer (the files settled), not "unknown".
+    expect(settlingCount({ id: "lib", stats: stats(0) }, feed)).toBe(0);
     expect(settlingCount({ id: "lib", stats: stats(undefined) }, feed)).toBe(3);
     expect(settlingCount({ id: "lib", stats: stats(0) }, [])).toBe(0);
   });
@@ -123,5 +159,14 @@ describe("round-3 counts", () => {
     expect(serverLeftOutText(1)).toBe("1 file was left out because this library's settings skip it.");
     expect(serverLeftOutText(0)).toBeNull();
     expect(serverLeftOutText(undefined)).toBeNull();
+  });
+});
+
+describe("failedFilterLabel", () => {
+  it("names the failed filter after what it lists", () => {
+    expect(failedFilterLabel({ unreadable: 2, conversion: 0 })).toBe("Can't be read");
+    expect(failedFilterLabel({ unreadable: 0, conversion: 3 })).toBe("Failed");
+    expect(failedFilterLabel({ unreadable: 1, conversion: 1 })).toBe("Needs review");
+    expect(failedFilterLabel(undefined)).toBe("Needs review");
   });
 });

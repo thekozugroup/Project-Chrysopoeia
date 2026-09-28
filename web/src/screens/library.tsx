@@ -13,6 +13,7 @@ import {
   CirclePlay,
   CircleMinus,
   Ellipsis,
+  FileWarning,
   FolderSearch,
   Hourglass,
   LoaderCircle,
@@ -22,11 +23,12 @@ import {
   Search,
   SlidersHorizontal,
   Trash2,
+  TriangleAlert,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { LibraryBar, LibraryLegend } from "@/components/library-bar";
+import { LibraryBar, LibraryLegend, countedFiles } from "@/components/library-bar";
 import { ProfileEditor } from "@/components/profile-editor";
 import { SaveBar } from "@/components/save-bar";
 import { PageHeader } from "@/components/shell";
@@ -40,6 +42,7 @@ import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { leftOutText, nothingToConvertText, planBulkConvert, settlingCount } from "@/lib/convertible";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
+import { cantBeReadText, failedFilterLabel, type FailureCounts } from "@/lib/outcomes";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
 import {
@@ -216,18 +219,21 @@ function Summary({ library }: { library: Library }) {
   const stats = library.stats;
   const failures = useFailures();
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
+  // Originals that can't be read are set aside, as in the bar below.
+  const counted = countedFiles(stats, unreadable);
   return (
     <section aria-label="Progress" className="rounded-lg border border-line bg-surface p-4 sm:p-5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
         <p className="text-sm text-fg">
           <span className="font-semibold tabular">{formatCount(stats.done + stats.skipped)}</span> of{" "}
-          <span className="tabular">{plural(stats.file_count, "file")}</span> finished
+          <span className="tabular">{plural(counted, "file")}</span> finished
           {stats.skipped > 0 ? (
             <span className="text-muted">
               {" "}
               ({formatCount(stats.done)} converted, {formatCount(stats.skipped)} skipped)
             </span>
           ) : null}
+          {unreadable > 0 ? <span className="text-muted"> · {cantBeReadText(unreadable)}</span> : null}
         </p>
         <p className="text-sm text-muted">
           {stats.saved_bytes > 0 ? (
@@ -286,11 +292,31 @@ function SearchBox({ initial }: { initial: string }) {
   );
 }
 
+/** The "failed" chip's words (see `failedFilterLabel`) with a matching icon. */
+function failedChip(counts: FailureCounts | undefined): { label: string; icon: ReactNode } {
+  const label = failedFilterLabel(counts);
+  const icon =
+    label === "Can't be read" ? (
+      <FileWarning aria-hidden />
+    ) : label === "Needs review" ? (
+      <TriangleAlert aria-hidden />
+    ) : (
+      fileStatusIcon("failed")
+    );
+  return { label, icon };
+}
+
 function StatusChips({ library, status }: { library: Library; status: FileStatus | null }) {
   const stats = library.stats;
-  const chips: { value: FileStatus | null; label: string; count: number }[] = [
+  const failures = useFailures();
+  const failed = failedChip(failures.ready ? failures.byLibrary[library.id] : undefined);
+  const chips: { value: FileStatus | null; label: string; count: number; icon?: ReactNode }[] = [
     { value: null, label: "All", count: stats.file_count },
-    ...FILE_STATUSES.map((s) => ({ value: s, label: FILE_STATUS_LABEL[s], count: stats[s] })),
+    ...FILE_STATUSES.map((s) =>
+      s === "failed"
+        ? { value: s, label: failed.label, count: stats[s], icon: failed.icon }
+        : { value: s, label: FILE_STATUS_LABEL[s], count: stats[s], icon: fileStatusIcon(s) },
+    ),
   ];
   // On phones the chips scroll sideways: keep the chosen one in view (a
   // "Review" link lands here with ?status=failed).
@@ -316,7 +342,7 @@ function StatusChips({ library, status }: { library: Library; status: FileStatus
         if (chip.value && chip.count === 0 && !active) return null;
         return (
           <button
-            key={chip.label}
+            key={chip.value ?? "all"}
             type="button"
             aria-pressed={active}
             title={chip.value ? FILE_STATUS_HELP[chip.value] : "Every file in this library"}
@@ -328,7 +354,7 @@ function StatusChips({ library, status }: { library: Library; status: FileStatus
                 : "border-line-strong/50 bg-surface text-muted hover:border-line-strong hover:text-fg",
             )}
           >
-            {chip.value ? <span className={cn(active ? "text-accent-ink" : "")}>{fileStatusIcon(chip.value)}</span> : null}
+            {chip.icon ? <span className={cn(active ? "text-accent-ink" : "")}>{chip.icon}</span> : null}
             {chip.label}
             <span className={cn("tabular text-xs", active ? "text-fg" : "text-muted")}>{formatCount(chip.count)}</span>
           </button>
@@ -440,8 +466,12 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const files = useFiles({ library: library.id, status: status ?? undefined, q: q || undefined, sort, limit: PAGE, offset });
   const { bulk } = useFileActions();
   const failures = useFailures();
-  // Damaged originals are left out: trying them again can't help.
+  // Damaged originals are left out: trying them again can't help. They get
+  // their own "Ignore" instead.
   const retryIds = failures.ready ? (failures.retryIds[library.id] ?? []) : [];
+  const unreadableIds = failures.ready
+    ? failures.unreadable.filter((f) => f.library_id === library.id).map((f) => f.id)
+    : [];
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmSkip, setConfirmSkip] = useState(false);
   const [confirmAgain, setConfirmAgain] = useState(false);
@@ -469,14 +499,13 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
       },
     );
 
-  const toggle = useCallback((id: string, on: boolean) => {
+  const toggle = (id: string, on: boolean) =>
     setSelected((prev) => {
       const next = new Set(prev);
       if (on) next.add(id);
       else next.delete(id);
       return next;
     });
-  }, []);
 
   const stats = library.stats;
   const filtered = Boolean(status || q);
@@ -682,6 +711,13 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
       <div
         className={cn(
           "mt-4 mb-3 flex min-h-9 flex-wrap items-center gap-2",
+          // Phones don't show the "Select files…" hint: with no buttons the
+          // row would be a blank gap, so it collapses to the spacing alone.
+          selection.length === 0 &&
+            stats.pending === 0 &&
+            retryIds.length === 0 &&
+            unreadableIds.length === 0 &&
+            "max-md:mb-0 max-md:min-h-0",
           // While files are selected the actions stay in view as the list scrolls.
           selection.length > 0 &&
             "sticky top-14 z-20 -mx-4 border-b border-line bg-bg px-4 py-2 sm:-mx-6 sm:px-6 md:top-0 md:mx-0 md:px-0",
@@ -743,6 +779,21 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
               >
                 <RotateCcw aria-hidden />
                 Try {plural(retryIds.length, "failed file")} again
+              </Button>
+            ) : null}
+            {unreadableIds.length > 0 ? (
+              <Button
+                variant="secondary"
+                size="sm"
+                loading={bulk.isPending && bulk.variables?.action === "skip"}
+                onClick={() => bulk.mutate({ action: "skip", ids: unreadableIds, ignored: true })}
+                title="Leave them as they are. A replaced copy is picked up automatically."
+                needsServer
+              >
+                <CircleMinus aria-hidden />
+                {unreadableIds.length === 1
+                  ? "Ignore the file that can't be read"
+                  : `Ignore ${formatCount(unreadableIds.length)} files that can't be read`}
               </Button>
             ) : null}
             {items.length > 0 ? (

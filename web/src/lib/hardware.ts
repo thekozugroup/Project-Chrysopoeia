@@ -3,8 +3,19 @@
  * work, whether a codec encodes quickly here, and which goal fits best.
  */
 
-import { GPU_VENDOR_LABEL, VIDEO_CODEC_LABEL } from "./labels";
-import type { EncoderStatus, Goal, GpuVendor, HardwareInfo, HwApi, HwPreference, VideoCodec } from "./types";
+import { GPU_VENDOR_LABEL, HW_PREFERENCE_LABEL, VIDEO_CODEC_LABEL } from "./labels";
+import type {
+  EncoderStatus,
+  Goal,
+  GpuVendor,
+  HardwareInfo,
+  HwApi,
+  HwPreference,
+  QueueState,
+  Settings,
+  SystemInfo,
+  VideoCodec,
+} from "./types";
 
 const API_VENDORS: Partial<Record<HwApi, GpuVendor[]>> = {
   nvenc: ["nvidia"],
@@ -287,4 +298,42 @@ export function preferenceChoices(
   }
   if (!choices.some((c) => c.value === current)) choices.push({ value: current, disabled: false });
   return choices;
+}
+
+/**
+ * The facts a bug report needs, as plain lines to paste: version and build,
+ * container, ffmpeg, GPUs, verified encoders, hardware preference and files
+ * at once with where that number comes from. Parts not loaded yet are left
+ * out rather than guessed.
+ */
+export function bugReportText({
+  system,
+  hw,
+  queue,
+  settings,
+}: {
+  system: Pick<SystemInfo, "version" | "build" | "in_container">;
+  hw?: Pick<HardwareInfo, "ffmpeg" | "gpus" | "encoders" | "cpu"> | undefined;
+  queue?: Pick<QueueState, "max_jobs" | "max_jobs_auto" | "max_jobs_source"> | undefined;
+  settings?: Pick<Settings, "hardware"> | undefined;
+}): string {
+  const lines = [
+    `Chrysopoeia ${system.version}${system.build ? ` (build ${system.build})` : ""}${system.in_container ? ", in a container" : ""}`,
+  ];
+  if (hw) {
+    lines.push(`ffmpeg: ${hw.ffmpeg.found ? (hw.ffmpeg.version ?? "found, version unknown") : "not found"}`);
+    lines.push(`CPU: ${hw.cpu.model || "unknown"} (${hw.cpu.logical_cores} threads)`);
+    lines.push(
+      `GPUs: ${hw.gpus.length ? hw.gpus.map((g) => `${g.name || GPU_VENDOR_LABEL[g.vendor]}${g.driver ? ` (${g.driver})` : ""}`).join(", ") : "none found"}`,
+    );
+    const verified = hw.encoders.filter((e) => e.verified).map((e) => e.name);
+    lines.push(`Verified encoders: ${verified.length ? verified.join(", ") : "none"}`);
+  }
+  if (settings) lines.push(`Hardware preference: ${HW_PREFERENCE_LABEL[settings.hardware] ?? settings.hardware}`);
+  if (queue) {
+    const source = queue.max_jobs_source ?? (queue.max_jobs_auto ? "auto" : "settings");
+    const from = source === "env" ? "from MAX_JOBS" : source === "auto" ? "automatic" : "set in Settings";
+    lines.push(`Files at once: ${queue.max_jobs} (${from})`);
+  }
+  return lines.join("\n");
 }

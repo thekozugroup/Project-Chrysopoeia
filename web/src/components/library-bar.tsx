@@ -1,11 +1,14 @@
 "use client";
 
 /**
- * The library bar: one horizontal bar per library showing how much of it is
- * converted (solid gold), on its way (gold stripes), still to convert (dark
- * neutral) and skipped (quiet neutral). Failed conversions are a thin amber
- * mark; originals that can't be read aren't drawn at all (they're listed
- * under "Needs your attention"). Every segment is also said in words.
+ * The library bar: one horizontal bar per library that fills from the left
+ * as files finish. Finished files are one gold family (converted is solid
+ * gold, skipped is a pale gold tint), so the filled length is the "%
+ * finished" next to it; files on their way are gold stripes; files still
+ * to convert are the plain track. Failed conversions are a thin amber mark
+ * at the end; originals that can't be read aren't drawn at all (they're
+ * listed under "Needs your attention") and aren't counted in "% finished"
+ * either. Every segment is also said in words.
  */
 
 import { formatCount, percentOf } from "@/lib/format";
@@ -22,14 +25,15 @@ interface Segment {
 function segments(stats: LibraryStats, unreadable: number): Segment[] {
   return [
     { key: "done", label: "Converted", count: stats.done, className: "bg-meter" },
+    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bg-bar-skipped" },
     {
       key: "active",
       label: "In queue or converting",
       count: stats.queued + stats.processing,
       className: "bar-active",
     },
-    { key: "pending", label: "To convert", count: stats.pending, className: "bg-bar-todo" },
-    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bg-bar-skipped" },
+    // The plain track: drawn empty, so the filled part is what's finished.
+    { key: "pending", label: "To convert", count: stats.pending, className: "bg-transparent" },
     {
       key: "failed",
       label: "Couldn't convert",
@@ -40,12 +44,20 @@ function segments(stats: LibraryStats, unreadable: number): Segment[] {
 }
 
 /**
- * Share of files that are finished: converted, or left as they are
- * (skipped). Shown as "% finished", never "% done", because "Converted"
- * counts only the first kind.
+ * Files the bar and "% finished" count: every file except originals that
+ * can't be read, which are set aside until they're replaced or ignored.
  */
-export function finishedPercent(stats: LibraryStats): number {
-  return percentOf(stats.done + stats.skipped, stats.file_count);
+export function countedFiles(stats: LibraryStats, unreadable = 0): number {
+  return Math.max(0, stats.file_count - unreadable);
+}
+
+/**
+ * Share of files that are finished: converted, or left as they are
+ * (skipped), out of the files the bar draws. Shown as "% finished", never
+ * "% done", because "Converted" counts only the first kind.
+ */
+export function finishedPercent(stats: LibraryStats, unreadable = 0): number {
+  return percentOf(stats.done + stats.skipped, countedFiles(stats, unreadable));
 }
 
 /** Files still waiting for work. */
@@ -80,7 +92,7 @@ export function LibraryBar({
   size?: "xs" | "md";
   className?: string;
 }) {
-  const total = Math.max(0, stats.file_count - unreadable);
+  const total = countedFiles(stats, unreadable);
   return (
     <div
       role="img"
@@ -122,7 +134,14 @@ export function LibraryLegend({
         .filter((s) => s.count > 0 || s.key === "done")
         .map((s) => (
           <li key={s.key} className="inline-flex items-center gap-1.5">
-            <span aria-hidden className={cn("size-2.5 rounded-[3px] ring-1 ring-line ring-inset", s.className)} />
+            <span
+              aria-hidden
+              className={cn(
+                "size-2.5 rounded-[3px] ring-1 ring-inset",
+                // "To convert" is the empty track: an outlined swatch.
+                s.key === "pending" ? "bg-raised ring-line-strong/60" : cn("ring-line", s.className),
+              )}
+            />
             <span>
               {s.label} <span className="tabular font-medium text-fg">{formatCount(s.count)}</span>
             </span>

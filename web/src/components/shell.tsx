@@ -28,7 +28,7 @@ import { Brand } from "@/components/brand";
 import { finishedPercent } from "@/components/library-bar";
 import { Tooltip } from "@/components/ui/overlays";
 import { formatHour, formatPercent, plural } from "@/lib/format";
-import { useLibraries, useQueueState, useSettings } from "@/lib/queries";
+import { useFailures, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import { useLive, useServerDown, type ConnectionState } from "@/lib/store";
 import { setTheme, useTheme, type ThemeChoice } from "@/lib/theme";
@@ -94,23 +94,30 @@ export function queueSummary(
 function QueuePill({ className }: { className?: string }) {
   const queue = useQueueState();
   const settings = useSettings();
+  const libraries = useLibraries();
   const scanning = useAnyScanning();
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
   const serverDown = useLive((s) => s.serverDown);
+  // The banner is up: the server can't be reached.
+  const away = useServerDown();
   const summary = queueSummary(queue.data, settings.data, scanning);
+  // No folder is watched yet: there's no queue state worth a pill.
+  if (libraries.data?.length === 0) return null;
   // Without live updates (and before polling catches up), or while the
   // server can't be reached, this is only the last known state.
   const stale = connection !== "open" && (serverDown || !polling);
+  const lastKnown = `Last known: ${summary.text.charAt(0).toLowerCase()}${summary.text.slice(1)}`;
   return (
     <a
       href={href("/queue")}
-      title={stale ? "Last known state" : undefined}
+      title={stale ? lastKnown : undefined}
       className={cn(
         "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-[color,background-color,opacity] pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
-        // Stale: neutral colours and a still icon, so it doesn't look live.
+        // Stale: an outline instead of a fill and a still icon, so it
+        // can't be mistaken for a live state.
         stale
-          ? "bg-raised text-muted hover:text-fg [&_.spin]:animate-none"
+          ? "border border-dashed border-line-strong/70 bg-transparent text-muted hover:text-fg [&_.spin]:animate-none"
           : summary.tone === "active"
             ? "bg-accent-soft text-accent-ink"
             : summary.tone === "paused"
@@ -119,9 +126,9 @@ function QueuePill({ className }: { className?: string }) {
         className,
       )}
     >
-      {summary.icon}
-      <span className="truncate">{summary.text}</span>
-      {stale ? <span className="sr-only"> (last known state)</span> : null}
+      {away ? <WifiOff aria-hidden /> : summary.icon}
+      <span className="truncate">{away ? "Not connected" : summary.text}</span>
+      {stale ? <span className="sr-only"> ({away ? lastKnown : "last known state"})</span> : null}
     </a>
   );
 }
@@ -262,6 +269,8 @@ function NavLink({
 
 function LibraryLink({ library, active }: { library: Library; active: boolean }) {
   const scan = useLive((s) => s.scans[library.id]);
+  const failures = useFailures();
+  const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   const scanning = library.scanning || Boolean(scan && scan.phase !== "done");
   let detail: ReactNode;
   if (library.path_error) {
@@ -283,7 +292,7 @@ function LibraryLink({ library, active }: { library: Library; active: boolean })
   } else if (library.stats.file_count === 0) {
     detail = "No files yet";
   } else {
-    detail = `${formatPercent(finishedPercent(library.stats))} finished`;
+    detail = `${formatPercent(finishedPercent(library.stats, unreadable))} finished`;
   }
   return (
     <a

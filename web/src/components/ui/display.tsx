@@ -277,8 +277,16 @@ export function SectionHeading({
    */
   quietAction?: boolean;
 }) {
+  // The action sits beside the heading at every width ("Libraries · Add
+  // library"); only a row of several controls that can't fit wraps below.
   return (
-    <div className={cn("mb-3 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4", className)}>
+    <div
+      className={cn(
+        "mb-3 flex flex-wrap justify-between gap-x-4 gap-y-2",
+        description ? "items-end" : "items-center",
+        className,
+      )}
+    >
       <div className="min-w-0">
         <h2 id={id} className="text-[1.0625rem] leading-snug font-semibold text-fg">
           {title}
@@ -286,6 +294,8 @@ export function SectionHeading({
         {description ? <p className="mt-0.5 text-[0.8125rem] text-muted">{description}</p> : null}
       </div>
       {action ? (
+        // Pulled left so a wrapped borderless button's text lines up with
+        // the heading; beside it, the margin only widens the gap.
         <div className={cn("flex shrink-0 flex-wrap items-center gap-2", quietAction && "-ml-2 sm:ml-0")}>{action}</div>
       ) : null}
     </div>

@@ -24,7 +24,6 @@
   --color-on-accent: var(--on-accent);
   --color-accent-soft: var(--accent-soft);
   --color-meter: var(--meter);
-  --color-bar-todo: var(--bar-todo);
   --color-bar-skipped: var(--bar-skipped);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
@@ -73,10 +72,11 @@
   --on-accent: oklch(0.2 0.03 70);
   --accent-soft: oklch(0.79 0.135 82 / 0.2);
   --meter: oklch(0.62 0.125 76);
-  /* "To convert" in the library bar: ≥3:1 against the track, darker than gold. */
-  --bar-todo: oklch(0.5 0.014 78);
-  /* "Skipped" in the library bar: finished without converting, a quieter neutral. */
-  --bar-skipped: oklch(0.66 0.012 80);
+  /*
+   * "Skipped" in the library bar: finished without converting, so it's part
+   * of the gold family (a pale tint), between solid gold and the track.
+   */
+  --bar-skipped: oklch(0.8 0.085 82);
   --success: oklch(0.48 0.11 152);
   --success-soft: oklch(0.6 0.12 152 / 0.12);
   --danger: oklch(0.52 0.18 28);
@@ -105,8 +105,7 @@
   --on-accent: oklch(0.19 0.02 70);
   --accent-soft: oklch(0.8 0.125 82 / 0.14);
   --meter: oklch(0.8 0.125 82);
-  --bar-todo: oklch(0.56 0.012 78);
-  --bar-skipped: oklch(0.43 0.01 78);
+  --bar-skipped: oklch(0.55 0.075 80);
   --success: oklch(0.78 0.13 152);
   --success-soft: oklch(0.78 0.13 152 / 0.12);
   --danger: oklch(0.74 0.15 28);

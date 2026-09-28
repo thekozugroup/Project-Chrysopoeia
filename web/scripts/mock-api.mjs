@@ -20,6 +20,9 @@
  *                           server: 400 for the unknown field)
  *   MOCK_HOST=allow         "deny" answers every request 403 host_not_allowed, like
  *                           the real server reached under an unknown name
+ *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
+ *                           start, one every few seconds ("Found … in <library>"),
+ *                           and LibraryStats.settling goes down to 0 (0 = never)
  *
  * Error codes, messages and the `field` of validation errors follow the
  * real server (crates/chrysopoeia-server), so the UI's error handling is
@@ -44,6 +47,7 @@ const WS_ON = (process.env.MOCK_WS ?? "on") !== "off";
 const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const FORCE = process.env.MOCK_FORCE ?? "on";
 const HOST_DENY = process.env.MOCK_HOST === "deny";
+const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
 /** Jobs queued with "Convert anyway" (force). */
 const forcedJobs = new Set();
 const STARTED = Date.now();
@@ -600,7 +604,7 @@ function populateMovies(library, count, doneShare) {
     if (roll < doneShare) markDone(file, between(0.38, 0.62), between(60, 86400 * 29));
     else if (roll < doneShare + 0.08) {
       file.status = "skipped";
-      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller, so the original was kept";
+      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller — kept the original";
     }
   }
 }
@@ -625,7 +629,7 @@ function populateTv(library, shows) {
         if (s === 1 && roll < 0.85) markDone(file, between(0.32, 0.55), between(60, 86400 * 25));
         else if (roll < 0.1) {
           file.status = "skipped";
-          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC), nothing to gain" : "Only 6% smaller, so the original was kept";
+          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC), nothing to gain" : "Only 6% smaller — kept the original";
         }
       }
     }
@@ -749,12 +753,28 @@ function seedDemo() {
     job.created_at = ago(4000 - i * 30);
   });
 
+  // A damaged episode in the TV library too: grouped problems span libraries.
+  const brokenEpisode = [...files.values()].find((f) => f.library_id === tv.id && f.status === "pending");
+  if (brokenEpisode) {
+    brokenEpisode.status = "failed";
+    brokenEpisode.error = "The original file appears damaged or incomplete (it stops after 2.4 s). It was left unchanged.";
+    makeJob(brokenEpisode, "failed", {
+      stage: "transcoding",
+      progress: 4,
+      error: brokenEpisode.error,
+      started_at: ago(7000),
+      finished_at: ago(6900),
+    });
+  }
+
   settling.set(tv.id, 3);
   addActivity("info", "Scanned Demo TV: 250 files, 3 still being copied (checked again when they're finished)", { library_id: tv.id });
   addActivity("info", "Scanned Demo Movies: 136 files, 2 new.", { library_id: movies.id });
   addActivity("success", "Converted Sintel (2010).mkv and saved 4.1 GB.", { library_id: movies.id });
   addActivity("warning", `Kept the original of ${skippedFile.file_name}: only 4% smaller.`, { library_id: movies.id });
   addActivity("error", `${failedA.file_name} failed its visual check. The original was kept.`, { library_id: movies.id });
+  // The real server's wording for a failed job ("Failed <name>: <error>"), here a damaged original.
+  addActivity("error", `Failed ${failedB.file_name}: ${failedB.error}`, { library_id: movies.id, file_id: failedB.id });
   addActivity("success", "Converted Demo Show - S01E04.mkv and saved 1.1 GB.", { library_id: tv.id });
   activity.forEach((e, i) => (e.at = ago(600 + i * 1900)));
 }
@@ -1033,6 +1053,37 @@ function tick() {
   startJobs();
 }
 setInterval(tick, TICK_MS);
+
+/**
+ * Files still being copied settle like on the real server: each arrives as
+ * "Found <name> in <library>" (never as a new scan summary) and the
+ * library's `settling` count goes down to 0.
+ */
+if (SETTLE_MS > 0) {
+  setTimeout(() => {
+    const timer = setInterval(() => {
+      const next = [...settling.entries()].find(([, n]) => n > 0);
+      if (!next) {
+        clearInterval(timer);
+        return;
+      }
+      const [libraryId, n] = next;
+      const library = libraries.get(libraryId);
+      settling.set(libraryId, n - 1);
+      if (!library) return;
+      const file = makeFile(library, `Arrivals/New Episode ${String(4 - n).padStart(2, "0")}.mkv`, {
+        size: between(0.8e9, 2.4e9),
+        codec: "h264",
+        resolution: "1080p",
+        duration: between(21, 45) * 60,
+        audio: "aac",
+      });
+      emitActivity(addActivity("info", `Found ${file.file_name} in ${library.name}`, { library_id: library.id, file_id: file.id }));
+      emitLibrary(library);
+      broadcast({ type: "files.changed", library_id: library.id });
+    }, 4000);
+  }, SETTLE_MS);
+}
 
 function simulateScan(library, generate) {
   if (scanning.has(library.id)) return false;

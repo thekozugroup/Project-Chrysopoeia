@@ -31,7 +31,7 @@ import { formatBytes, formatRelative, plural } from "@/lib/format";
 import { isUnreadableSource } from "@/lib/outcomes";
 import { useActivity, useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, openSheet, updateParams, type Route } from "@/lib/router";
-import type { ActivityLevel, Job } from "@/lib/types";
+import type { ActivityEntry, ActivityLevel, Job } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE = 50;
@@ -43,6 +43,12 @@ function openJob(job: Job) {
 function useLibraryName() {
   const libraries = useLibraries();
   return (id: string) => libraries.data?.find((l) => l.id === id)?.name ?? "";
+}
+
+/** A library's current minimum saving, to name it when a result fell short of it. */
+function useMinSavings() {
+  const libraries = useLibraries();
+  return (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
 }
 
 function ListSkeleton() {
@@ -243,6 +249,7 @@ function UpNextTab({ offset }: { offset: number }) {
 function HistoryTab({ offset }: { offset: number }) {
   const history = useJobs({ state: "history", limit: PAGE, offset });
   const libraryName = useLibraryName();
+  const minSavings = useMinSavings();
   const { retry, clearHistory } = useJobActions();
   const [confirmClear, setConfirmClear] = useState(false);
   useClampedOffset(offset, history.data?.total, PAGE);
@@ -280,12 +287,13 @@ function HistoryTab({ offset }: { offset: number }) {
                   </span>
                   <JobStateBadge job={job} />
                 </span>
-                <span className="mt-1 flex flex-wrap gap-x-1 text-[0.8125rem]">
-                  <span className={cn("min-w-0", job.state === "done" ? "text-fg/85" : "text-muted")}>
-                    {historyNote(job)}
+                {/* When the note wraps, the library and time start their own line, with no stray "·". */}
+                <span className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                  <span className={cn("min-w-0 text-[0.8125rem]", job.state === "done" ? "text-fg/85" : "text-muted")}>
+                    {historyNote(job, minSavings(job.library_id))}
                   </span>
-                  <span className="text-muted">
-                    · {libraryName(job.library_id)} · {formatRelative(job.finished_at)}
+                  <span className="text-xs text-muted">
+                    {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
                   </span>
                 </span>
               </button>
@@ -336,6 +344,14 @@ const LOG_ICON: Record<ActivityLevel, ReactNode> = {
   error: <CircleX className="text-danger" aria-hidden />,
 };
 
+/**
+ * An entry's tone. A damaged original is the file's problem, not a failed
+ * conversion: amber, as everywhere else ("Can't be read").
+ */
+export function logLevel(entry: Pick<ActivityEntry, "level" | "message">): ActivityLevel {
+  return entry.level === "error" && isUnreadableSource(entry.message) ? "warning" : entry.level;
+}
+
 /** Scans, warnings and problems as they happened, closed until wanted. */
 function Log() {
   const activity = useActivity();
@@ -346,8 +362,8 @@ function Log() {
       <ol className="flex flex-col gap-2.5">
         {items.map((entry) => (
           <li key={entry.id} className="flex gap-2.5 text-[0.8125rem] [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
-            {LOG_ICON[entry.level]}
-            <span className="sr-only">{entry.level}:</span>
+            {LOG_ICON[logLevel(entry)]}
+            <span className="sr-only">{logLevel(entry)}:</span>
             <span className="min-w-0 flex-1 text-fg/90">{entry.message}</span>
             <span className="shrink-0 text-xs text-muted">{formatRelative(entry.at)}</span>
           </li>

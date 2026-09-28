@@ -188,6 +188,7 @@ function FileTechnical({ file }: { file: MediaFile }) {
 
 function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   const live = useFileLive(file.id);
+  const { library } = useLibrary(file.library_id);
   const latest = jobs[0];
   const forcedIgnored = useLive((s) => Boolean(latest && latest.state === "skipped" && s.forced[latest.id]));
   if (file.status === "failed") {
@@ -203,7 +204,7 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
     // "Kept the original" when a new file was made and thrown away (the size
     // rule); everything else never needed work.
     const keptOriginal = latest?.state === "skipped" && latest.output_size !== null;
-    const summary = skipSummary(file.skip_reason, keptOriginal);
+    const summary = skipSummary(file.skip_reason, keptOriginal, library?.profile.min_savings_pct);
     return (
       <Callout tone="info" title={summary.title}>
         <p>{summary.body}</p>

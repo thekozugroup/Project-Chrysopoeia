@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  bugReportText,
   codecSpeedHint,
   encoderCell,
   isDetecting,
@@ -202,5 +203,41 @@ describe("goal advice on a CPU-only machine", () => {
     expect(speedWord(nvidia, "hevc")?.label).toBe("Fast");
     // This test ffmpeg has no AV1 encoder at all.
     expect(speedWord(nvidia, "av1")).toEqual({ tone: "blocked", label: "Not available here" });
+  });
+});
+
+describe("bugReportText", () => {
+  it("lists what a bug report needs, one fact per line", () => {
+    const hw = hardware({
+      gpus: [{ vendor: "nvidia", name: "NVIDIA GeForce RTX 3060", render_node: null, driver: "550.54" }],
+      encoders: [enc("hevc_nvenc", "hevc", "nvenc", true), enc("av1_nvenc", "av1", "nvenc", false), enc("libx265", "hevc", "software", true)],
+    });
+    const text = bugReportText({
+      system: { version: "0.2.0", build: "edge-1a2b3c4", in_container: true },
+      hw,
+      queue: { max_jobs: 3, max_jobs_auto: true, max_jobs_source: "env" },
+      settings: { hardware: "auto" },
+    });
+    expect(text.split("\n")).toEqual([
+      "Chrysopoeia 0.2.0 (build edge-1a2b3c4), in a container",
+      "ffmpeg: 6.1",
+      "CPU: Test CPU (8 threads)",
+      "GPUs: NVIDIA GeForce RTX 3060 (550.54)",
+      "Verified encoders: hevc_nvenc, libx265",
+      "Hardware preference: Automatic",
+      "Files at once: 3 (from MAX_JOBS)",
+    ]);
+  });
+
+  it("leaves out what hasn't loaded, and says when nothing was found", () => {
+    expect(bugReportText({ system: { version: "0.2.0", build: null, in_container: false } })).toBe("Chrysopoeia 0.2.0");
+    const bare = bugReportText({
+      system: { version: "0.2.0", in_container: false },
+      hw: hardware({ encoders: [] }),
+      queue: { max_jobs: 2, max_jobs_auto: true },
+    });
+    expect(bare).toContain("GPUs: none found");
+    expect(bare).toContain("Verified encoders: none");
+    expect(bare).toContain("Files at once: 2 (automatic)");
   });
 });

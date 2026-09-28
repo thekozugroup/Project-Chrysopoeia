@@ -3,7 +3,9 @@ import { videoCount } from "@/components/folder-picker";
 import { limitText, queueSentence } from "@/components/queue-controls";
 import type { Failures } from "@/lib/queries";
 import type { HardwareInfo, Library, QueueState } from "@/lib/types";
+import { finishedPercent } from "@/components/library-bar";
 import { overviewStatus, problemsFrom } from "./overview";
+import { logLevel } from "./queue";
 import { automaticJobs, splitPatterns } from "./settings";
 
 const queue = (partial: Partial<QueueState> = {}): QueueState => ({
@@ -103,6 +105,22 @@ describe("needs your attention", () => {
     expect(problems[0].action.href).toBe("#/library/lib-a?status=failed");
   });
 
+  it("gives each library its own row when a cause spans libraries, so Review shows every file it counted", () => {
+    const failures: Failures = {
+      ...noFailures,
+      total: { unreadable: 3, conversion: 1 },
+      byLibrary: { "lib-a": { unreadable: 2, conversion: 1 }, "lib-b": { unreadable: 1, conversion: 0 } },
+    };
+    const problems = problemsFrom([library(), library({ id: "lib-b", name: "Shows" })], failures, undefined);
+    expect(problems.map((p) => [p.title, p.action.href])).toEqual([
+      ["Movies: 2 files can't be read", "#/library/lib-a?status=failed"],
+      ["Shows: 1 file can't be read", "#/library/lib-b?status=failed"],
+      // One library only: no name needed.
+      ["1 file couldn't be converted", "#/library/lib-a?status=failed"],
+    ]);
+    expect(new Set(problems.map((p) => p.key)).size).toBe(problems.length);
+  });
+
   it("says hardware needs a fix once, and folders that can't be read", () => {
     const hw = {
       hints: [
@@ -155,5 +173,25 @@ describe("folder picker counts", () => {
     expect(videoCount(1000, true)).toBe("1,000+ videos");
     expect(videoCount(0)).toBeNull();
     expect(videoCount(null)).toBeNull();
+  });
+});
+
+describe("finished share", () => {
+  it("counts what the bar draws: originals that can't be read are set aside", () => {
+    const stats = { ...library().stats, file_count: 5, done: 2, skipped: 1, failed: 2 };
+    expect(finishedPercent(stats)).toBe(60);
+    expect(finishedPercent(stats, 2)).toBe(100);
+    expect(finishedPercent({ ...stats, file_count: 2, done: 0, skipped: 0 }, 2)).toBe(0);
+  });
+});
+
+describe("log tone", () => {
+  const entry = (level: "error" | "warning" | "info" | "success", message: string) => ({ level, message });
+  it("shows a damaged original as a warning, like its badge, and leaves other failures red", () => {
+    expect(
+      logLevel(entry("error", "Failed Truncated.mkv: The original file appears damaged or incomplete (it stops after 0.1 s).")),
+    ).toBe("warning");
+    expect(logLevel(entry("error", "Clip.mkv failed its visual check. The original was kept."))).toBe("error");
+    expect(logLevel(entry("info", "Scanned Movies: 3 files"))).toBe("info");
   });
 });

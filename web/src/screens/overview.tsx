@@ -40,10 +40,15 @@ import {
   type Failures,
 } from "@/lib/queries";
 import { href, openSheet } from "@/lib/router";
-import { useLive } from "@/lib/store";
-import type { HardwareInfo, Job, Library, Overview, QueueState, ScanProgress, Settings } from "@/lib/types";
+import { useLive, useServerDown } from "@/lib/store";
+import type { HardwareInfo, Job, JobQuery, Library, Overview, QueueState, ScanProgress, Settings } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareLine } from "./setup";
+
+/** "All caught up" → "all caught up", after "Last known:". */
+function lowerFirst(text: string): string {
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
 
 /** "Looking through Movies: 64 files found so far." for the scans in progress. */
 function scanSentence(libraries: Library[], scans: Record<string, ScanProgress>): string | null {
@@ -110,13 +115,22 @@ function StatusLine({ queue }: { queue: QueueState }) {
   const libraries = useLibraries();
   const scans = useLive((s) => s.scans);
   const { resume } = useQueueActions();
+  // While the server is away this is only what it last said: no live icon.
+  const down = useServerDown();
   const status = overviewStatus(queue, settings.data, scanSentence(libraries.data ?? [], scans));
   return (
     <div className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-2">
-      <p role="status" className="flex items-center gap-2 text-[1.0625rem] text-fg [&_svg]:size-[1.125rem] [&_svg]:shrink-0">
-        {status.icon}
+      <p
+        role="status"
+        className={cn(
+          "flex items-center gap-2 text-[1.0625rem] [&_svg]:size-[1.125rem] [&_svg]:shrink-0",
+          down ? "text-muted" : "text-fg",
+        )}
+      >
+        {down ? null : status.icon}
         <span>
-          <span className="font-medium">{status.text}</span>
+          {down ? <span>Last known: </span> : null}
+          <span className={down ? undefined : "font-medium"}>{down ? lowerFirst(status.text) : status.text}</span>
           {status.detail ? <span className="text-muted"> · {status.detail}</span> : null}
         </span>
       </p>
@@ -206,11 +220,27 @@ interface Problem {
   action: { label: string; href: string };
 }
 
-/** The library with the most of something, to link a grouped problem to. */
-function busiest(counts: Record<string, number>): string | undefined {
-  return Object.entries(counts)
-    .filter(([, n]) => n > 0)
-    .sort((a, b) => b[1] - a[1])[0]?.[0];
+/**
+ * One cause's rows: a single row when its files are all in one library,
+ * else one row per library named after it ("Movies: 2 files can't be
+ * read"), so every "Review" lands on a list that holds all it counted.
+ */
+function perLibrary(
+  key: string,
+  libraries: Library[],
+  counts: Record<string, number>,
+  row: (n: number) => Pick<Problem, "icon" | "tone" | "title" | "detail">,
+): Problem[] {
+  const hit = libraries.filter((l) => (counts[l.id] ?? 0) > 0);
+  const review = (library: Library) => ({
+    label: "Review",
+    href: href(`/library/${library.id}`, { status: "failed" }),
+  });
+  if (hit.length === 1) return [{ key, ...row(counts[hit[0].id]), action: review(hit[0]) }];
+  return hit.map((library) => {
+    const problem = row(counts[library.id]);
+    return { ...problem, key: `${key}-${library.id}`, title: `${library.name}: ${problem.title}`, action: review(library) };
+  });
 }
 
 /** Problems the user can fix, one per cause, each with one action. */
@@ -243,30 +273,22 @@ export function problemsFrom(
     });
   }
   if (failures.ready) {
-    const unreadable = failures.total.unreadable;
-    if (unreadable > 0) {
-      const target = busiest(Object.fromEntries(Object.entries(failures.byLibrary).map(([id, c]) => [id, c.unreadable])));
-      problems.push({
-        key: "unreadable",
+    const count = (kind: "unreadable" | "conversion") =>
+      Object.fromEntries(Object.entries(failures.byLibrary).map(([id, c]) => [id, c[kind]]));
+    problems.push(
+      ...perLibrary("unreadable", libraries, count("unreadable"), (n) => ({
         icon: <FileWarning aria-hidden />,
         tone: "warning",
-        title: `${plural(unreadable, "file")} can't be read`,
-        detail: `${unreadable === 1 ? "It looks" : "They look"} damaged or ${unreadable === 1 ? "isn't a video" : "aren't videos"}. Chrysopoeia left ${unreadable === 1 ? "it" : "them"} alone.`,
-        action: { label: "Review", href: href(`/library/${target ?? ""}`, { status: "failed" }) },
-      });
-    }
-    const failed = failures.total.conversion;
-    if (failed > 0) {
-      const target = busiest(Object.fromEntries(Object.entries(failures.byLibrary).map(([id, c]) => [id, c.conversion])));
-      problems.push({
-        key: "failed",
+        title: `${plural(n, "file")} can't be read`,
+        detail: `${n === 1 ? "It looks" : "They look"} damaged or ${n === 1 ? "isn't a video" : "aren't videos"}. Chrysopoeia left ${n === 1 ? "it" : "them"} alone.`,
+      })),
+      ...perLibrary("failed", libraries, count("conversion"), (n) => ({
         icon: <TriangleAlert aria-hidden />,
         tone: "danger",
-        title: `${plural(failed, "file")} couldn't be converted`,
-        detail: `The ${failed === 1 ? "original is" : "originals are"} untouched. See why, then try again.`,
-        action: { label: "Review", href: href(`/library/${target ?? ""}`, { status: "failed" }) },
-      });
-    }
+        title: `${plural(n, "file")} couldn't be converted`,
+        detail: `The ${n === 1 ? "original is" : "originals are"} untouched. See why, then try again.`,
+      })),
+    );
   }
   return problems;
 }
@@ -377,7 +399,8 @@ export function LibraryRow({ library }: { library: Library }) {
   } else if (copying > 0) {
     status = `Waiting for ${plural(copying, "file")} to finish copying`;
   } else {
-    status = "Everything is finished";
+    // Failed files aren't finished; "to review" follows.
+    status = stats.failed > 0 ? "Everything else is finished" : "Everything is finished";
   }
   return (
     <li className="group relative px-4 py-4 transition-colors hover:bg-raised/60 sm:px-5">
@@ -409,7 +432,7 @@ export function LibraryRow({ library }: { library: Library }) {
           ) : null}
         </span>
         {stats.file_count > 0 ? (
-          <span className="shrink-0 tabular">{formatPercent(finishedPercent(stats))} finished</span>
+          <span className="shrink-0 tabular">{formatPercent(finishedPercent(stats, unreadable))} finished</span>
         ) : null}
       </div>
       <LibraryBar stats={stats} unreadable={unreadable} className="mt-3" />
@@ -462,12 +485,16 @@ function Libraries() {
   );
 }
 
+/** The latest results (shared with the layout, which gives them a column only when there are some). */
+const RECENT_QUERY: JobQuery = { state: "history", limit: 6 };
+
 function RecentResults() {
-  const history = useJobs({ state: "history", limit: 6 });
+  const history = useJobs(RECENT_QUERY);
   const libraries = useLibraries();
   const items = history.data?.items ?? [];
   if (!history.isPending && items.length === 0) return null;
   const libraryName = (id: string) => libraries.data?.find((l) => l.id === id)?.name;
+  const minSavings = (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
   return (
     <section aria-labelledby="recent-heading">
       <SectionHeading
@@ -502,7 +529,7 @@ function RecentResults() {
                 </span>
                 <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">
                   <span className={cn("min-w-0 truncate", job.state === "done" ? "text-fg/85" : "text-muted")}>
-                    {historyNote(job)}
+                    {historyNote(job, minSavings(job.library_id))}
                   </span>
                   <span className="shrink-0 text-xs text-muted">
                     {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
@@ -567,6 +594,8 @@ function Welcome() {
 export function OverviewScreen() {
   const overview = useOverview();
   const libraries = useLibraries();
+  const recent = useJobs(RECENT_QUERY);
+  const hasRecent = recent.isPending || (recent.data?.items.length ?? 0) > 0;
   const data = overview.data;
   if (libraries.data !== undefined && libraries.data.length === 0) {
     return (
@@ -603,7 +632,13 @@ export function OverviewScreen() {
             <NowConverting queue={data.queue} />
           </div>
         ) : null}
-        <div className="grid grid-cols-1 gap-10 lg:col-span-2 xl:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]">
+        <div
+          className={cn(
+            "grid grid-cols-1 gap-10 lg:col-span-2",
+            // Before anything has finished, the libraries take the full width.
+            hasRecent && "xl:grid-cols-[minmax(0,1fr)_minmax(0,24rem)]",
+          )}
+        >
           <Libraries />
           <RecentResults />
         </div>

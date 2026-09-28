@@ -36,7 +36,7 @@ import {
   percentOf,
 } from "@/lib/format";
 import { HW_API_LABEL, HW_API_TECH, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
-import { isUnreadableSource, skipSummary, unreadableDetail } from "@/lib/outcomes";
+import { isUnreadableSource, skipNote, skipSummary, unreadableDetail } from "@/lib/outcomes";
 import { overallProgress } from "@/lib/progress";
 import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
@@ -248,15 +248,22 @@ export function savingsText(input: number, output: number | null): { text: strin
   return { text: `${formatBytes(-diff)} larger`, saved: false };
 }
 
-/** The second line of a finished job in a list: what came of it, briefly. */
-export function historyNote(job: Job): string {
+/**
+ * The second line of a finished job in a list: what came of it, briefly.
+ * Its badge already says "Kept original" or "Skipped", so a skip says why:
+ * "6% smaller (needs at least 10%)" (`minSavingsPct` is the
+ * library's current minimum, to name the rule).
+ */
+export function historyNote(job: Job, minSavingsPct?: number | null): string {
   switch (job.state) {
     case "done":
       return savingsText(job.input_size, job.output_size)?.text ?? "Converted";
     case "failed":
       return isUnreadableSource(job.error) ? "Looks damaged or isn't a video" : (job.error ?? "Failed");
     case "skipped":
-      return job.skip_reason ?? (job.output_size !== null ? "Kept the original" : "No conversion needed");
+      return (
+        skipNote(job.skip_reason, minSavingsPct) ?? (job.output_size !== null ? "Kept the original" : "No conversion needed")
+      );
     default:
       return "Stopped. The original was left as it is.";
   }
@@ -296,18 +303,12 @@ function BeforeAfter({ job, output }: { job: Job; output: number }) {
             label="New size compared with the original"
             tone={!kept ? "muted" : savings.saved ? "accent" : "danger"}
           />
-          <p
-            className={cn(
-              "mt-2 text-sm font-medium",
-              !kept ? "text-muted" : savings.saved ? "text-accent-ink" : "text-danger",
-            )}
-          >
-            {kept
-              ? savings.text
-              : `Would have been ${Math.round(Math.abs(percentOf(job.input_size - output, job.input_size)))}% ${
-                  savings.saved ? "smaller" : "larger"
-                }. The original was kept.`}
-          </p>
+          {/* A kept original's outcome above already says by how much and why. */}
+          {kept ? (
+            <p className={cn("mt-2 text-sm font-medium", savings.saved ? "text-accent-ink" : "text-danger")}>
+              {savings.text}
+            </p>
+          ) : null}
         </>
       ) : null}
     </div>
@@ -414,6 +415,7 @@ export function CantBeReadCallout({ error }: { error: string | null }) {
 
 function Outcome({ job }: { job: Job }) {
   const settings = useSettings();
+  const { library } = useLibrary(job.library_id);
   const forced = useLive((s) => Boolean(s.forced[job.id]));
   if (job.state === "failed") {
     if (isUnreadableSource(job.error)) return <CantBeReadCallout error={job.error} />;
@@ -427,7 +429,7 @@ function Outcome({ job }: { job: Job }) {
   if (job.state === "skipped") {
     // A new file was made and thrown away (the size rule), or the file never
     // needed work under the library's settings.
-    const summary = skipSummary(job.skip_reason, job.output_size !== null);
+    const summary = skipSummary(job.skip_reason, job.output_size !== null, library?.profile.min_savings_pct);
     return (
       <Callout tone="info" title={summary.title}>
         <p>{summary.body}</p>

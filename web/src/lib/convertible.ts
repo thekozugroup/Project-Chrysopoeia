@@ -9,6 +9,7 @@
 
 import { plural } from "./format";
 import { skippedByUser } from "./labels";
+import { isUnreadableSource } from "./outcomes";
 import type { ActivityEntry, Container, Library, MediaFile, TranscodeProfile, VideoCodec } from "./types";
 
 /**
@@ -148,12 +149,17 @@ export interface BulkConvertPlan {
   converted: number;
   /** Left out: audio-only, too short or unreadable; never converted. */
   unconvertible: number;
+  /**
+   * Left out: failed because the original is damaged or isn't a video.
+   * Converting it again can't succeed; the fix is replacing the file.
+   */
+  damaged: number;
   /** Left out: already queued or converting. */
   busy: number;
 }
 
 export function planBulkConvert(files: MediaFile[], profile: TranscodeProfile | undefined): BulkConvertPlan {
-  const plan: BulkConvertPlan = { ids: [], again: 0, settings: 0, converted: 0, unconvertible: 0, busy: 0 };
+  const plan: BulkConvertPlan = { ids: [], again: 0, settings: 0, converted: 0, unconvertible: 0, damaged: 0, busy: 0 };
   for (const file of files) {
     switch (file.status) {
       case "queued":
@@ -171,6 +177,10 @@ export function planBulkConvert(files: MediaFile[], profile: TranscodeProfile | 
           plan.again += 1;
         } else plan.converted += 1;
         break;
+      case "failed":
+        if (isUnreadableSource(file.error)) plan.damaged += 1;
+        else plan.ids.push(file.id);
+        break;
       default:
         plan.ids.push(file.id);
     }
@@ -178,7 +188,8 @@ export function planBulkConvert(files: MediaFile[], profile: TranscodeProfile | 
   return plan;
 }
 
-type LeftOut = Pick<BulkConvertPlan, "settings" | "converted" | "unconvertible" | "busy">;
+type LeftOut = Pick<BulkConvertPlan, "settings" | "converted" | "unconvertible" | "busy"> &
+  Partial<Pick<BulkConvertPlan, "damaged">>;
 
 /** What a bulk "Convert" left out, in a sentence or two, or `null` when nothing was. */
 export function leftOutText(plan: LeftOut): string | null {
@@ -194,6 +205,11 @@ export function leftOutText(plan: LeftOut): string | null {
   }
   if (plan.unconvertible) {
     parts.push(`${plural(plan.unconvertible, "file", "files")} can't be converted (each file says why).`);
+  }
+  if (plan.damaged) {
+    parts.push(
+      `${plural(plan.damaged, "file", "files")} can't be read (${plan.damaged === 1 ? "it looks damaged or isn't a video" : "they look damaged or aren't videos"}).`,
+    );
   }
   if (plan.busy) {
     parts.push(`${plural(plan.busy, "file is", "files are")} already in the queue.`);
@@ -219,6 +235,13 @@ export function nothingToConvertText(plan: LeftOut): string {
       ? { n: plan.converted, one: "is already converted to this library's format", many: "are already converted to this library's format" }
       : null,
     plan.unconvertible ? { n: plan.unconvertible, one: "can't be converted", many: "can't be converted" } : null,
+    plan.damaged
+      ? {
+          n: plan.damaged,
+          one: "can't be read (it looks damaged or isn't a video)",
+          many: "can't be read (they look damaged or aren't videos)",
+        }
+      : null,
     plan.busy ? { n: plan.busy, one: "is already in the queue", many: "are already in the queue" } : null,
   ].filter((g): g is { n: number; one: string; many: string } => g !== null);
   if (groups.length === 0) return "Nothing selected can be converted.";
@@ -241,21 +264,29 @@ const STILL_COPYING = /\b([\d,]+) still being copied\b/;
 /**
  * How many files the library's latest scan found still being copied (the
  * server waits until they stop changing), from the activity feed, which is
- * newest first. 0 when the latest scan found none, or no scan is listed.
+ * newest first. Files that settled since arrive as "Found <name> in
+ * <library>" entries, never as a new scan summary, so each of those after
+ * the summary takes one off. 0 when the latest scan found none, or no scan
+ * is listed.
  */
 export function stillCopyingCount(entries: ActivityEntry[] | undefined, libraryId: string): number {
-  const latest = entries?.find((e) => e.library_id === libraryId && e.message.startsWith("Scanned "));
-  const match = latest ? STILL_COPYING.exec(latest.message) : null;
-  return match ? Number(match[1].replace(/,/g, "")) || 0 : 0;
+  const own = entries?.filter((e) => e.library_id === libraryId) ?? [];
+  const at = own.findIndex((e) => e.message.startsWith("Scanned "));
+  if (at < 0) return 0;
+  const match = STILL_COPYING.exec(own[at].message);
+  const copying = match ? Number(match[1].replace(/,/g, "")) || 0 : 0;
+  const settledSince = own.slice(0, at).filter((e) => e.message.startsWith("Found ")).length;
+  return Math.max(0, copying - settledSince);
 }
 
 /**
  * How many of a library's files are still being copied: the server's
- * `stats.settling`, or, from servers without it, the latest scan summary in
- * the activity feed.
+ * `stats.settling` whenever it sends it (0 is an answer: nothing is being
+ * copied), or, from older servers that leave it out, the latest scan
+ * summary in the activity feed.
  */
 export function settlingCount(library: Pick<Library, "id" | "stats">, entries: ActivityEntry[] | undefined): number {
-  const settling = library.stats.settling ?? 0;
-  if (settling > 0) return settling;
+  const settling = library.stats.settling;
+  if (typeof settling === "number" && Number.isFinite(settling)) return Math.max(0, settling);
   return stillCopyingCount(entries, library.id);
 }
