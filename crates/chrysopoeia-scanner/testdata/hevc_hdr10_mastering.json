@@ -1,0 +1,198 @@
+{
+    "streams": [
+        {
+            "index": 0,
+            "codec_name": "hevc",
+            "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)",
+            "profile": "Main 10",
+            "codec_type": "video",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "width": 3840,
+            "height": 2160,
+            "coded_width": 3840,
+            "coded_height": 2160,
+            "closed_captions": 0,
+            "film_grain": 0,
+            "has_b_frames": 2,
+            "sample_aspect_ratio": "1:1",
+            "display_aspect_ratio": "16:9",
+            "pix_fmt": "yuv420p10le",
+            "level": 153,
+            "color_range": "tv",
+            "color_space": "bt2020nc",
+            "color_transfer": "smpte2084",
+            "color_primaries": "bt2020",
+            "chroma_location": "left",
+            "refs": 1,
+            "r_frame_rate": "24000/1001",
+            "avg_frame_rate": "24000/1001",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "extradata_size": 2491,
+            "disposition": {
+                "default": 1,
+                "dub": 0,
+                "original": 0,
+                "comment": 0,
+                "lyrics": 0,
+                "karaoke": 0,
+                "forced": 0,
+                "hearing_impaired": 0,
+                "visual_impaired": 0,
+                "clean_effects": 0,
+                "attached_pic": 0,
+                "timed_thumbnails": 0,
+                "non_diegetic": 0,
+                "captions": 0,
+                "descriptions": 0,
+                "metadata": 0,
+                "dependent": 0,
+                "still_image": 0
+            },
+            "tags": {
+                "title": "Main feature",
+                "BPS": "58234221",
+                "DURATION": "02:08:46.719000000",
+                "NUMBER_OF_FRAMES": "185216",
+                "NUMBER_OF_BYTES": "56227836012",
+                "_STATISTICS_WRITING_APP": "mkvmerge v81.0 ('Milliontown') 64-bit",
+                "_STATISTICS_TAGS": "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES"
+            },
+            "side_data_list": [
+                {
+                    "side_data_type": "Mastering display metadata",
+                    "red_x": "34000/50000",
+                    "red_y": "16000/50000",
+                    "green_x": "13250/50000",
+                    "green_y": "34500/50000",
+                    "blue_x": "7500/50000",
+                    "blue_y": "3000/50000",
+                    "white_point_x": "15635/50000",
+                    "white_point_y": "16450/50000",
+                    "min_luminance": "50/10000",
+                    "max_luminance": "40000000/10000"
+                },
+                {
+                    "side_data_type": "Content light level metadata",
+                    "max_content": 1000,
+                    "max_average": 400
+                }
+            ]
+        },
+        {
+            "index": 1,
+            "codec_name": "truehd",
+            "codec_long_name": "TrueHD",
+            "codec_type": "audio",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "sample_fmt": "s32",
+            "sample_rate": "48000",
+            "channels": 8,
+            "channel_layout": "7.1",
+            "bits_per_sample": 0,
+            "initial_padding": 0,
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "bits_per_raw_sample": "24",
+            "extradata_size": 0,
+            "disposition": {
+                "default": 1,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "language": "eng",
+                "title": "TrueHD Atmos 7.1",
+                "BPS": "4430892",
+                "DURATION": "02:08:46.720000000",
+                "NUMBER_OF_FRAMES": "9270336"
+            }
+        },
+        {
+            "index": 2,
+            "codec_name": "hdmv_pgs_subtitle",
+            "codec_long_name": "HDMV Presentation Graphic Stream subtitles",
+            "codec_type": "subtitle",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "width": 1920,
+            "height": 1080,
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 7726720,
+            "duration": "7726.720000",
+            "disposition": {
+                "default": 0,
+                "forced": 1,
+                "attached_pic": 0
+            },
+            "tags": {
+                "language": "eng",
+                "title": "Forced",
+                "BPS": "1051",
+                "DURATION": "01:59:02.345000000"
+            }
+        }
+    ],
+    "chapters": [
+        {
+            "id": 1,
+            "time_base": "1/1000000000",
+            "start": 0,
+            "start_time": "0.000000",
+            "end": 540000000000,
+            "end_time": "540.000000",
+            "tags": {
+                "title": "Chapter 01"
+            }
+        },
+        {
+            "id": 2,
+            "time_base": "1/1000000000",
+            "start": 540000000000,
+            "start_time": "540.000000",
+            "end": 1080000000000,
+            "end_time": "1080.000000",
+            "tags": {
+                "title": "Chapter 02"
+            }
+        },
+        {
+            "id": 3,
+            "time_base": "1/1000000000",
+            "start": 1080000000000,
+            "start_time": "1080.000000",
+            "end": 7726719000000,
+            "end_time": "7726.719000",
+            "tags": {
+                "title": "Chapter 03"
+            }
+        }
+    ],
+    "format": {
+        "filename": "/media/Movies/Example (2021)/Example (2021).mkv",
+        "nb_streams": 3,
+        "nb_programs": 0,
+        "format_name": "matroska,webm",
+        "format_long_name": "Matroska / WebM",
+        "start_time": "0.000000",
+        "duration": "7726.720000",
+        "size": "60549887123",
+        "bit_rate": "62691534",
+        "probe_score": 100,
+        "tags": {
+            "title": "Example",
+            "encoder": "libebml v1.4.4 + libmatroska v1.7.1",
+            "creation_time": "2023-10-01T12:00:00.000000Z"
+        }
+    }
+}

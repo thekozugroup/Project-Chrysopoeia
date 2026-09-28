@@ -1,0 +1,198 @@
+{
+    "streams": [
+        {
+            "index": 0,
+            "codec_name": "h264",
+            "codec_long_name": "H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10",
+            "profile": "High",
+            "codec_type": "video",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "width": 1920,
+            "height": 800,
+            "coded_width": 1920,
+            "coded_height": 800,
+            "has_b_frames": 2,
+            "sample_aspect_ratio": "1:1",
+            "display_aspect_ratio": "12:5",
+            "pix_fmt": "yuv420p",
+            "level": 41,
+            "color_range": "tv",
+            "color_space": "bt709",
+            "color_transfer": "bt709",
+            "color_primaries": "bt709",
+            "chroma_location": "left",
+            "field_order": "progressive",
+            "refs": 1,
+            "is_avc": "true",
+            "nal_length_size": "4",
+            "r_frame_rate": "24000/1001",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "bits_per_raw_sample": "8",
+            "extradata_size": 42,
+            "disposition": {
+                "default": 1,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "BPS-eng": "9512345",
+                "DURATION-eng": "01:52:03.625000000",
+                "NUMBER_OF_FRAMES-eng": "161207",
+                "NUMBER_OF_BYTES-eng": "7995432101",
+                "_STATISTICS_WRITING_APP-eng": "mkvmerge v9.8.0 ('Kuglblitz') 64bit",
+                "_STATISTICS_WRITING_DATE_UTC-eng": "2017-02-11 18:21:42",
+                "_STATISTICS_TAGS-eng": "BPS DURATION NUMBER_OF_FRAMES NUMBER_OF_BYTES"
+            }
+        },
+        {
+            "index": 1,
+            "codec_name": "dts",
+            "codec_long_name": "DCA (DTS Coherent Acoustics)",
+            "profile": "DTS-HD MA",
+            "codec_type": "audio",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "sample_fmt": "s32p",
+            "sample_rate": "48000",
+            "channels": 6,
+            "channel_layout": "5.1(side)",
+            "bits_per_sample": 0,
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "bits_per_raw_sample": "24",
+            "disposition": {
+                "default": 1,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "LANGUAGE": "eng",
+                "TITLE": "Surround 5.1",
+                "BPS-eng": "3456789",
+                "DURATION-eng": "01:52:03.648000000",
+                "NUMBER_OF_FRAMES-eng": "630342"
+            }
+        },
+        {
+            "index": 2,
+            "codec_name": "ac3",
+            "codec_long_name": "ATSC A/52A (AC-3)",
+            "codec_type": "audio",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "sample_fmt": "fltp",
+            "sample_rate": "48000",
+            "channels": 2,
+            "channel_layout": "stereo",
+            "bits_per_sample": 0,
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "disposition": {
+                "default": 0,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "language": "fre",
+                "title": "Commentary",
+                "BPS": "192000",
+                "DURATION": "01:52:03.680000000"
+            }
+        },
+        {
+            "index": 3,
+            "codec_name": "ass",
+            "codec_long_name": "ASS (Advanced SSA) subtitle",
+            "codec_type": "subtitle",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "disposition": {
+                "default": 0,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "language": "eng",
+                "BPS-eng": "95",
+                "DURATION-eng": "01:48:12.001000000"
+            }
+        },
+        {
+            "index": 4,
+            "codec_name": "ttf",
+            "codec_long_name": "TrueType font",
+            "codec_type": "attachment",
+            "codec_tag_string": "[0][0][0][0]",
+            "codec_tag": "0x0000",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/90000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 604961528,
+            "extradata_size": 145072,
+            "disposition": {
+                "default": 0,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "filename": "OpenSans-Semibold.ttf",
+                "mimetype": "application/x-truetype-font"
+            }
+        }
+    ],
+    "chapters": [
+        {
+            "id": 7255183542366846107,
+            "time_base": "1/1000000000",
+            "start": 0,
+            "start_time": "0.000000",
+            "end": 300000000000,
+            "end_time": "300.000000",
+            "tags": {
+                "title": "Opening"
+            }
+        },
+        {
+            "id": 2,
+            "time_base": "1/1000000000",
+            "start": 300000000000,
+            "start_time": "300.000000",
+            "end": 6723680000000,
+            "end_time": "6723.680000",
+            "tags": {
+                "title": "Main"
+            }
+        }
+    ],
+    "format": {
+        "filename": "/media/Movies/Old Rip (2009)/Old Rip (2009).mkv",
+        "nb_streams": 5,
+        "nb_programs": 0,
+        "format_name": "matroska,webm",
+        "format_long_name": "Matroska / WebM",
+        "start_time": "0.000000",
+        "size": "11234567890",
+        "probe_score": 100,
+        "tags": {
+            "title": "Old Rip",
+            "encoder": "libebml v1.3.4 + libmatroska v1.4.5"
+        }
+    }
+}

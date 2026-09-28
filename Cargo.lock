@@ -303,6 +303,7 @@ dependencies = [
  "chrono",
  "chrysopoeia-core",
  "globset",
+ "inotify",
  "notify",
  "serde",
  "serde_json",
@@ -310,6 +311,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
  "walkdir",
 ]
 

@@ -19,5 +19,11 @@ walkdir = { workspace = true }
 globset = { workspace = true }
 notify = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already used by notify; watches each root for the kernel dropping its
+# watches (unmounts), which notify does not report.
+inotify = { version = "0.10.2", default-features = false }
+
 [dev-dependencies]
 tempfile = { workspace = true }
+uuid = { workspace = true }
