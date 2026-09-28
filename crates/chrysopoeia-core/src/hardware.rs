@@ -158,6 +158,12 @@ pub struct HardwareInfo {
     pub memory: MemoryInfo,
     pub gpus: Vec<GpuDevice>,
     pub encoders: Vec<EncoderStatus>,
+    /// ffmpeg audio encoder names available (subset of
+    /// `AudioCodec::ffmpeg_encoder` values, e.g. `libopus`, `aac`).
+    pub audio_encoders: Vec<String>,
+    /// ffmpeg filters verification relies on that are available
+    /// (subset of `ssim`, `psnr`, `blackdetect`, `freezedetect`, `bwdif`).
+    pub filters: Vec<String>,
     pub ffmpeg: FfmpegInfo,
     pub recommended_jobs: JobRecommendation,
     pub hints: Vec<SetupHint>,
