@@ -193,46 +193,69 @@ impl std::fmt::Display for PlaceError {
 
 impl std::error::Error for PlaceError {}
 
+/// How messages name the folder a converted file goes to (`dir`): "the
+/// output folder /out/TV" or "the original's folder /media/Films", so a
+/// path never appears without saying what it is.
+pub(crate) fn destination_name(dir: &Path, mode: OutputMode) -> String {
+    match mode {
+        OutputMode::Folder => format!("the output folder {}", dir.display()),
+        OutputMode::Replace => format!("the original's folder {}", dir.display()),
+    }
+}
+
 /// The error for a file operation that failed while the new file was being
-/// put into `dir`. The original is where it was.
-fn placing_failed(e: &io::Error, dir: &Path) -> anyhow::Error {
+/// put into `dir` (in `mode`). The original is where it was.
+fn placing_failed(e: &io::Error, dir: &Path, mode: OutputMode) -> anyhow::Error {
     use io::ErrorKind as K;
-    let shown = dir.display();
+    let folder = destination_name(dir, mode);
+    let other_place = match mode {
+        OutputMode::Folder => "choose another output folder in Settings > Output",
+        OutputMode::Replace => "save converted files to a separate folder in Settings > Output",
+    };
     match e.kind() {
         K::StorageFull | K::QuotaExceeded => {
-            // A copy refused up front says how much room it needs.
-            let needs = e
+            // A copy refused up front says how big the new file is.
+            let size = e
                 .get_ref()
                 .map(|inner| format!(" ({inner})"))
                 .unwrap_or_default();
+            let fix = match mode {
+                OutputMode::Folder => {
+                    "Free up some space there, or choose another output folder in Settings > \
+                     Output."
+                }
+                OutputMode::Replace => "Free up some space on that disk, then try again.",
+            };
             PlaceError::error(
                 ProblemKind::DiskFull,
                 format!(
-                    "There isn't enough free space in {shown} for the new file{needs}, so the \
-                     original was kept. Free up some space there, then try again."
+                    "There isn't enough free space in {folder} for the new file{size}, so the \
+                     original was kept. {fix}"
                 ),
             )
         }
         K::PermissionDenied => PlaceError::error(
             ProblemKind::Destination,
             format!(
-                "Chrysopoeia doesn't have permission to write in {shown}, so the new file \
+                "Chrysopoeia doesn't have permission to write in {folder}, so the new file \
                  couldn't be put there and the original was kept. Check the folder's \
-                 permissions (in Docker, the PUID/PGID user needs write access)."
+                 permissions (in Docker, the PUID/PGID user needs write access), or \
+                 {other_place}."
             ),
         ),
         K::ReadOnlyFilesystem => PlaceError::error(
             ProblemKind::Destination,
             format!(
-                "The folder {shown} is on a read-only drive, so the new file couldn't be put \
-                 there and the original was kept. Make the drive writable, or save converted \
-                 files to a separate folder in Settings > Output."
+                "{} is on a read-only drive, so the new file couldn't be put there and the \
+                 original was kept. Make the drive writable, or {other_place}.",
+                crate::run::capitalize_first(&folder)
             ),
         ),
         _ => PlaceError::error(
             ProblemKind::Destination,
             format!(
-                "The new file couldn't be put in {shown} because {}, so the original was kept.",
+                "The new file couldn't be put in {folder} because {}, so the original was kept. \
+                 Check that folder, then try again.",
                 io_reason(e)
             ),
         ),
@@ -246,7 +269,8 @@ fn original_unavailable(e: &io::Error) -> anyhow::Error {
         PlaceError::error(
             ProblemKind::SourceChanged,
             "The original is no longer there, so the new file wasn't put in place. It may have \
-             been moved or deleted while it was being converted.",
+             been moved or deleted while it was being converted. If it was moved, scan the \
+             library again to find it.",
         )
     } else {
         PlaceError::error(
@@ -440,7 +464,7 @@ fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()>
     let dir = parent_dir(&req.final_path);
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .map_err(|e| placing_failed(&e, &dir))?;
+        .map_err(|e| placing_failed(&e, &dir, req.mode))?;
     let result = swap_in(req, mover, &staged, &dir, None, &mut Vec::new());
     if result.is_err() {
         mover.discard(&staged, &req.temp);
@@ -480,7 +504,7 @@ fn swap_in(
     }
     let backup = dir.join(backup_name);
 
-    fs::rename(&req.input, &backup).map_err(|e| placing_failed(&e, dir))?;
+    fs::rename(&req.input, &backup).map_err(|e| placing_failed(&e, dir, req.mode))?;
 
     // What was moved aside must be the file the job read. Checked on the
     // backup itself, so a replacement that raced the rename is caught too.
@@ -497,7 +521,7 @@ fn swap_in(
         Err(conflict) => Err(conflict),
         Ok(()) => mover
             .commit(staged, &req.final_path, &req.temp)
-            .map_err(|e| placing_failed(&e, dir)),
+            .map_err(|e| placing_failed(&e, dir, req.mode)),
     };
     if let Err(problem) = committed {
         restore_backup(&backup, &req.input).map_err(|e| restore_failed(&backup, &req.input, &e))?;
@@ -544,7 +568,7 @@ fn commit_without_backup(
 ) -> anyhow::Result<()> {
     mover
         .commit(staged, &req.final_path, &req.temp)
-        .map_err(|e| placing_failed(&e, dir))?;
+        .map_err(|e| placing_failed(&e, dir, req.mode))?;
     sync_dir(dir);
     if req.input == req.final_path || is_same_file(&req.input, &req.final_path) {
         return Ok(());
@@ -602,7 +626,7 @@ fn replace_with_new_name(
     let dir = parent_dir(&req.final_path);
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .map_err(|e| placing_failed(&e, &dir))?;
+        .map_err(|e| placing_failed(&e, &dir, req.mode))?;
     let result = swap_in(req, mover, &staged, &dir, Some(&conflict), notes);
     if result.is_err() {
         mover.discard(&staged, &req.temp);
@@ -613,7 +637,7 @@ fn replace_with_new_name(
 /// Folder mode: create folders, refuse to clobber, never touch the input.
 fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> {
     let dir = parent_dir(&req.final_path);
-    fs::create_dir_all(&dir).map_err(|e| placing_failed(&e, &dir))?;
+    fs::create_dir_all(&dir).map_err(|e| placing_failed(&e, &dir, req.mode))?;
     let conflict = || {
         PlaceError::error(
             ProblemKind::Destination,
@@ -630,7 +654,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
     }
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .map_err(|e| placing_failed(&e, &dir))?;
+        .map_err(|e| placing_failed(&e, &dir, req.mode))?;
     let placed = (|| {
         req.check_original()?;
         if exists(&req.final_path)? {
@@ -638,7 +662,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
         }
         mover
             .commit(&staged, &req.final_path, &req.temp)
-            .map_err(|e| placing_failed(&e, &dir))
+            .map_err(|e| placing_failed(&e, &dir, req.mode))
     })();
     if let Err(e) = placed {
         mover.discard(&staged, &req.temp);
@@ -733,9 +757,10 @@ impl Mover<'_> {
         if let Some((_, free)) = filesystem_of(&dir)
             && free < needed
         {
+            // The message gives the file's size; the margin is ours.
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
-                format!("it needs about {}", crate::validate::human_bytes(needed)),
+                crate::validate::human_bytes(size),
             ));
         }
         let result = (|| {
@@ -1266,8 +1291,10 @@ mod tests {
         assert!(
             placing
                 .message
-                .starts_with("The new file couldn't be put in ")
-                && placing.message.ends_with(", so the original was kept."),
+                .starts_with("The new file couldn't be put in the original's folder ")
+                && placing
+                    .message
+                    .ends_with(", so the original was kept. Check that folder, then try again."),
             "{err:#}"
         );
         assert!(!placing.message.contains("os error"), "{err:#}");
@@ -1383,7 +1410,9 @@ mod tests {
         let placing = err.downcast_ref::<PlaceError>().expect("a PlaceError");
         assert_eq!(placing.problem, ProblemKind::Destination);
         assert!(
-            placing.message.ends_with(", so the original was kept."),
+            placing
+                .message
+                .ends_with(", so the original was kept. Check that folder, then try again."),
             "{err:#}"
         );
         assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);

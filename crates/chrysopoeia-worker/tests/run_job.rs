@@ -674,7 +674,9 @@ async fn preparing_checks_fail_fast() {
     assert_eq!(
         outcome,
         JobOutcome::Failed {
-            error: "The file is no longer there. It may have been moved or deleted.".into(),
+            error: "The file is no longer there. It may have been moved or deleted. If it was \
+                    moved, scan the library again to find it."
+                .into(),
             problem: ProblemKind::SourceChanged,
             log_tail: None,
             command: None,
@@ -999,5 +1001,97 @@ async fn unreadable_audio_is_a_problem_with_the_original() {
             } if error == "None of this file's audio tracks can be read."
         ),
         "{outcome:?}"
+    );
+}
+
+/// A stand-in for ffmpeg: a shell script that prints `stderr` and fails.
+#[cfg(unix)]
+fn failing_ffmpeg(dir: &Path, stderr: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("fake-ffmpeg");
+    std::fs::write(&path, format!("#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A disk that fills up during an encode fails every encoder alike: the job
+/// stops after the first attempt instead of starting the next one, and says
+/// what happened without "None of the 2 ways …".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_full_disk_stops_the_job_instead_of_trying_the_next_encoder() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &library);
+    let before = std::fs::read(&input).unwrap();
+    let mut cfg = config(ValidationLevel::Quick);
+    cfg.ffmpeg = failing_ffmpeg(
+        dir.path(),
+        "[out#0/matroska @ 0x1] [error] Error writing trailer: No space left on device",
+    );
+    let mut spec = spec(&input, &library, profile());
+    spec.candidates = vec![candidate("h264_nvenc", HwApi::Nvenc, false), software()];
+    let (outcome, updates) = run(&cfg, &spec, &fake_plan).await;
+    let JobOutcome::Failed {
+        error,
+        problem,
+        attempt,
+        encoder,
+        ..
+    } = outcome
+    else {
+        panic!("expected Failed, got {outcome:?}");
+    };
+    assert_eq!(problem, ProblemKind::DiskFull);
+    assert_eq!(attempt, 1);
+    assert_eq!(encoder.as_deref(), Some("h264_nvenc"));
+    assert!(
+        error.starts_with(&format!(
+            "The disk ran out of space while the new file was being written in the original's \
+             folder {},",
+            library.display()
+        )),
+        "{error}"
+    );
+    let started = updates
+        .iter()
+        .filter(|p| p.stage == JobStage::Transcoding && p.progress == 0.0)
+        .count();
+    assert_eq!(started, 1, "only one encode was started");
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    assert!(support::artifacts_in(dir.path()).is_empty());
+}
+
+/// With low priority on (the default), ffmpeg runs under `nice`. A missing
+/// ffmpeg is still reported as not started (not as an encoder error quoting
+/// `nice`), once, however many encoders there are.
+#[tokio::test]
+async fn a_missing_ffmpeg_is_reported_plainly_under_low_priority() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, dir.path());
+    let mut cfg = config(ValidationLevel::Quick);
+    assert!(cfg.low_priority);
+    cfg.ffmpeg = PathBuf::from("/nonexistent/ffmpeg");
+    let mut spec = spec(&input, dir.path(), profile());
+    spec.candidates = vec![candidate("h264_nvenc", HwApi::Nvenc, false), software()];
+    let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
+    let JobOutcome::Failed {
+        error,
+        problem,
+        attempt,
+        ..
+    } = outcome
+    else {
+        panic!("expected Failed, got {outcome:?}");
+    };
+    assert_eq!(problem, ProblemKind::Other);
+    assert_eq!(attempt, 1);
+    assert_eq!(
+        error,
+        "The converter couldn't be started, so nothing was converted. ffmpeg wasn't found at \
+         \"/nonexistent/ffmpeg\". Install ffmpeg, or set FFMPEG_PATH to where it is."
     );
 }

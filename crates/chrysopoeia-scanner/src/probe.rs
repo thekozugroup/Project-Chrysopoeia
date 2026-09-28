@@ -328,12 +328,15 @@ fn input_argument(path: &Path) -> PathBuf {
     }
 }
 
+/// What to say when this process may not read a file, and what to do.
+const NO_READ_PERMISSION: &str = "Chrysopoeia doesn't have permission to read this file. Check \
+    its permissions (in Docker, the PUID/PGID user needs read access), then scan the library \
+    again.";
+
 fn describe_open_error(error: &io::Error) -> String {
     match error.kind() {
         io::ErrorKind::NotFound => "The file no longer exists.".to_string(),
-        io::ErrorKind::PermissionDenied => {
-            "Chrysopoeia doesn't have permission to read this file.".to_string()
-        }
+        io::ErrorKind::PermissionDenied => NO_READ_PERMISSION.to_string(),
         _ => format!(
             "The file couldn't be opened because {}.",
             chrysopoeia_core::plain::io_reason(error)
@@ -362,19 +365,18 @@ fn describe_spawn_error(ffprobe: &Path, error: &io::Error) -> String {
 fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> String {
     // Checked in order: the first match wins, so specific causes come first.
     const KNOWN: &[(&str, &str)] = &[
-        (
-            "permission denied",
-            "Chrysopoeia doesn't have permission to read this file.",
-        ),
+        ("permission denied", NO_READ_PERMISSION),
         (
             "operation not permitted",
-            "Chrysopoeia isn't allowed to read this file.",
+            "Chrysopoeia isn't allowed to read this file. Check its permissions (in Docker, the \
+             PUID/PGID user needs read access), then scan the library again.",
         ),
         ("no such file or directory", "The file no longer exists."),
         ("is a directory", "This is a folder, not a media file."),
         (
             "input/output error",
-            "The disk reported a read error for this file, so it may be damaged.",
+            "The disk reported a read error for this file, so it may be damaged. Check the \
+             drive, or replace the file with a good copy.",
         ),
         (
             "moov atom not found",
@@ -1374,7 +1376,7 @@ mod tests {
         let denied = b"/media/Broken/Fake.mp4: Permission denied\n";
         assert_eq!(
             describe_ffprobe_failure(denied, input, exit_status(1)),
-            "Chrysopoeia doesn't have permission to read this file."
+            NO_READ_PERMISSION
         );
         let missing = b"/media/Broken/Fake.mp4: No such file or directory\n";
         assert_eq!(
@@ -1819,10 +1821,8 @@ mod tests {
         );
         match probe_with(&denied, &media, timeout).await {
             Err(ProbeError::Unreadable(reason)) => {
-                assert_eq!(
-                    reason,
-                    "Chrysopoeia doesn't have permission to read this file."
-                );
+                assert_eq!(reason, NO_READ_PERMISSION);
+                assert!(reason.contains("PUID/PGID"), "{reason}");
             }
             other => panic!("{other:?}"),
         }

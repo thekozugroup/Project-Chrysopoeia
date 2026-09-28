@@ -150,39 +150,64 @@ const MIGRATION_V5: &[&str] = &[
     "ALTER TABLE savings_by_library RENAME TO savings",
 ];
 
+/// The kind of problem behind an `error` recorded before version 6, from
+/// its wording (the messages of that version are fixed and known). Order
+/// matters: a damaged original can be the last error of several attempts,
+/// and a failed move can quote a full disk. Anything else is `other`.
+macro_rules! problem_from_error {
+    () => {
+        "CASE \
+            WHEN error LIKE 'The file is no longer at %' \
+              OR error LIKE 'The file no longer exists%' \
+              OR error LIKE 'The original file is no longer there%' \
+              OR error LIKE 'This file is no longer in the library%' THEN 'source_changed' \
+            WHEN error LIKE '%The original file appears damaged or incomplete%' \
+              OR error LIKE 'This file can''t be read as a video%' \
+              OR error LIKE 'The file is empty%' \
+              OR error LIKE 'Could not read the file%' \
+              OR error LIKE 'Reading this file took longer%' \
+              OR error LIKE '%doesn''t have permission to read this file%' \
+              THEN 'unreadable_source' \
+            WHEN error LIKE 'The new file %' \
+              OR error LIKE 'All % attempts failed. Last error: The new file %' \
+              THEN 'verification' \
+            WHEN error LIKE 'Not enough free space%' \
+              OR error LIKE '%ran out of space%' \
+              OR error LIKE '%disk quota%' \
+              OR error LIKE '%No space left on device%' THEN 'disk_full' \
+            WHEN error LIKE 'Could not use the temp folder%' THEN 'work_folder' \
+            WHEN error LIKE '%converting on the CPU instead is turned off%' \
+              OR error LIKE 'No working encoder was found%' THEN 'hardware_unavailable' \
+            WHEN error LIKE '%doesn''t have permission to write in%' \
+              OR error LIKE '%already exists next to the original%' \
+              OR error LIKE '%already exists in the output folder%' \
+              OR error LIKE 'Output to a separate folder is on%' \
+              OR error LIKE 'Could not put the new file in place%' THEN 'destination' \
+            WHEN error LIKE '% stopped with exit code %' \
+              OR error LIKE '% was stopped by the system%' \
+              OR error LIKE '% stopped responding for %' \
+              OR error LIKE '% finished but wrote no output%' THEN 'encoder' \
+            ELSE 'other' END"
+    };
+}
+
 /// Version 6: `jobs.problem` and `files.problem`, the kind of problem behind
 /// an `error` (`ProblemKind` as snake_case text), so the UI can group
 /// problems and offer the right fix without reading sentences. Errors
-/// recorded before are sorted by the few causes whose wording is fixed and
-/// known; the rest are `other`.
+/// recorded before are sorted by their wording (see `problem_from_error`).
 const MIGRATION_V6: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN problem TEXT",
     "ALTER TABLE files ADD COLUMN problem TEXT",
-    "UPDATE jobs SET problem = CASE \
-        WHEN error LIKE 'The file is no longer at %' \
-          OR error LIKE 'The file no longer exists%' THEN 'source_changed' \
-        WHEN error LIKE 'The original file appears damaged or incomplete%' \
-          OR error LIKE 'This file can''t be read as a video%' THEN 'unreadable_source' \
-        WHEN error LIKE 'The new file %' THEN 'verification' \
-        WHEN error LIKE 'Not enough free space%' THEN 'disk_full' \
-        WHEN error LIKE 'Could not use the temp folder%' THEN 'work_folder' \
-        WHEN error LIKE '%converting on the CPU instead is turned off%' \
-          THEN 'hardware_unavailable' \
-        ELSE 'other' END \
-     WHERE error IS NOT NULL",
-    "UPDATE files SET problem = CASE \
-        WHEN error LIKE 'The file is no longer at %' \
-          OR error LIKE 'The file no longer exists%' THEN 'source_changed' \
-        WHEN error LIKE 'The original file appears damaged or incomplete%' \
-          OR error LIKE 'This file can''t be read as a video%' \
-          OR error LIKE 'The file is empty%' THEN 'unreadable_source' \
-        WHEN error LIKE 'The new file %' THEN 'verification' \
-        WHEN error LIKE 'Not enough free space%' THEN 'disk_full' \
-        WHEN error LIKE 'Could not use the temp folder%' THEN 'work_folder' \
-        WHEN error LIKE '%converting on the CPU instead is turned off%' \
-          THEN 'hardware_unavailable' \
-        ELSE 'other' END \
-     WHERE error IS NOT NULL",
+    concat!(
+        "UPDATE jobs SET problem = ",
+        problem_from_error!(),
+        " WHERE error IS NOT NULL"
+    ),
+    concat!(
+        "UPDATE files SET problem = ",
+        problem_from_error!(),
+        " WHERE error IS NOT NULL"
+    ),
 ];
 
 /// Steps applied on top of version 1, in order: (version reached, statements).
@@ -526,6 +551,160 @@ mod tests {
         assert_eq!(savings_rows(db.pool()).await.len(), 1);
     }
 
+    /// Errors as the version before 6 wrote them, and the kind each gets.
+    const ROWS: &[(&str, Option<&str>, Option<&str>)] = &[
+        (
+            "a01",
+            Some("The file is no longer at /m/a.mkv. It may have been moved."),
+            Some("source_changed"),
+        ),
+        (
+            "a02",
+            Some("The original file is no longer there"),
+            Some("source_changed"),
+        ),
+        (
+            "a03",
+            Some("The file no longer exists"),
+            Some("source_changed"),
+        ),
+        (
+            "b01",
+            Some("The original file appears damaged or incomplete (it stops after 0.1 s)."),
+            Some("unreadable_source"),
+        ),
+        (
+            "b02",
+            Some(
+                "All 2 attempts failed. Last error: The original file appears damaged or \
+                 incomplete (it stops after 0.1 s). It was left unchanged.",
+            ),
+            Some("unreadable_source"),
+        ),
+        (
+            "b03",
+            Some("Could not read the file: Permission denied (os error 13)"),
+            Some("unreadable_source"),
+        ),
+        (
+            "b04",
+            Some(
+                "Reading this file took longer than 60 seconds. It may be damaged, or the \
+                 drive may be very slow.",
+            ),
+            Some("unreadable_source"),
+        ),
+        (
+            "b05",
+            Some("Chrysopoeia doesn't have permission to read this file."),
+            Some("unreadable_source"),
+        ),
+        (
+            "b06",
+            Some("This file can't be read as a video: its MKV header is damaged."),
+            Some("unreadable_source"),
+        ),
+        (
+            "c01",
+            Some("The new file is shorter than the original (0.1 s instead of 8.0 s)"),
+            Some("verification"),
+        ),
+        (
+            "c02",
+            Some(
+                "All 2 attempts failed. Last error: The new file doesn't look like the \
+                 original",
+            ),
+            Some("verification"),
+        ),
+        (
+            "d01",
+            Some("libx264 stopped with exit code 1: Invalid argument"),
+            Some("encoder"),
+        ),
+        (
+            "d02",
+            Some("libsvtav1 finished but wrote no output"),
+            Some("encoder"),
+        ),
+        (
+            "e01",
+            Some(
+                "libx264 stopped with exit code 228: The disk ran out of space while writing \
+                 the new file (No space left on device)",
+            ),
+            Some("disk_full"),
+        ),
+        (
+            "e02",
+            Some("Not enough free space in /temp for this file (needs about 1.1 GB)"),
+            Some("disk_full"),
+        ),
+        (
+            "e03",
+            Some(
+                "Could not put the new file in place, so the original was kept: No space left \
+                 on device (os error 28)",
+            ),
+            Some("disk_full"),
+        ),
+        (
+            "f01",
+            Some("Could not use the temp folder /temp/work: File exists (os error 17)"),
+            Some("work_folder"),
+        ),
+        (
+            "g01",
+            Some(
+                "The NVIDIA GPU isn't available, and converting on the CPU instead is turned \
+                 off, so this file wasn't converted.",
+            ),
+            Some("hardware_unavailable"),
+        ),
+        (
+            "g02",
+            Some("No working encoder was found for H.264. Check the hardware settings"),
+            Some("hardware_unavailable"),
+        ),
+        (
+            "h01",
+            Some(
+                "Chrysopoeia doesn't have permission to write in /m/ro, so the converted file \
+                 can't be put there (in Docker, the PUID/PGID user needs write access).",
+            ),
+            Some("destination"),
+        ),
+        (
+            "h02",
+            Some("A file named \"Clip.mkv\" already exists next to the original"),
+            Some("destination"),
+        ),
+        (
+            "h03",
+            Some("A file named \"Clip.mkv\" already exists in the output folder"),
+            Some("destination"),
+        ),
+        (
+            "h04",
+            Some("Output to a separate folder is on, but no output folder is set"),
+            Some("destination"),
+        ),
+        (
+            "h05",
+            Some(
+                "Could not put the new file in place, so the original was kept: Invalid \
+                 cross-device link (os error 18)",
+            ),
+            Some("destination"),
+        ),
+        (
+            "i01",
+            Some("Could not start ffmpeg: No such file or directory (os error 2)"),
+            Some("other"),
+        ),
+        ("j01", None, None),
+    ];
+
     #[tokio::test]
     async fn version_6_sorts_recorded_errors_into_problem_kinds() {
         let dir = tempfile::tempdir().unwrap();
@@ -542,26 +721,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-            let rows = [
-                (
-                    "a",
-                    Some("The file is no longer at /m/a.mkv. It may have been moved."),
-                ),
-                (
-                    "b",
-                    Some("The original file appears damaged or incomplete (it stops after 0.1 s)."),
-                ),
-                (
-                    "c",
-                    Some("The new file is shorter than the original (0.1 s instead of 8.0 s)"),
-                ),
-                (
-                    "d",
-                    Some("libx264 stopped with exit code 1: Invalid argument"),
-                ),
-                ("e", None),
-            ];
-            for (i, (id, error)) in rows.iter().enumerate() {
+            for (i, (id, error, _)) in ROWS.iter().enumerate() {
                 sqlx::query(
                     "INSERT INTO files (id, library_id, path, relative_path, file_name, \
                      size_bytes, modified_at, status, error, scanned_at, updated_at) \
@@ -595,16 +755,9 @@ mod tests {
                 .fetch_all(db.pool())
                 .await
                 .unwrap();
-        let expected = [
-            ("a", Some("source_changed")),
-            ("b", Some("unreadable_source")),
-            ("c", Some("verification")),
-            ("d", Some("other")),
-            ("e", None),
-        ];
-        let expected: Vec<(String, Option<String>)> = expected
+        let expected: Vec<(String, Option<String>)> = ROWS
             .iter()
-            .map(|(id, p)| ((*id).to_string(), p.map(str::to_string)))
+            .map(|(id, _, p)| ((*id).to_string(), p.map(str::to_string)))
             .collect();
         assert_eq!(files, expected);
         let jobs: Vec<(String, Option<String>)> =

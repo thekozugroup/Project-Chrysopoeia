@@ -119,9 +119,15 @@ before (even when one is left), so the history is rebuilt from the
 finished conversions on record; each file's latest conversion is kept by
 trimming, so they cover the 30 days shown (unless the history was cleared).
 6 = `jobs.problem` and `files.problem` (see Problems below). Errors recorded
-before are sorted by the few causes whose wording was fixed and known
-(missing file, damaged original, failed verification, full disk, unusable
-temp folder, refused hardware); the rest become `other`.
+before are sorted by the wording that version used (`problem_from_error` in
+`db/migrate.rs`): a missing or moved file → `source_changed`; a damaged,
+unreadable or slow-to-read original or no read permission (also as the last
+of several attempts) → `unreadable_source`; a failed check → `verification`;
+a full disk or quota → `disk_full`; an unusable temp folder →
+`work_folder`; refused hardware or no working encoder →
+`hardware_unavailable`; no write permission, a name already taken, no
+output folder or a failed move → `destination`; an encoder that stopped,
+hung or wrote nothing → `encoder`; the rest become `other`.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -359,7 +365,10 @@ with `JobSpec.force` uses it when `decide` says skip.
    jobs hold). The input's size+mtime (`FileIdentity`) is recorded.
 2. Transcoding: for each candidate, an attempt with `hw_decode` as given; a
    failed hardware attempt is retried with CPU decoding, then the next
-   candidate. Stop at the first success. Cancellation kills ffmpeg at once
+   candidate. Stop at the first success. A failure that any encoder would
+   hit the same way ends the job at once, without the "None of the N ways"
+   prefix: a `disk_full`, `work_folder` or `destination` problem, or ffmpeg
+   not starting at all. Cancellation kills ffmpeg at once
    (SIGKILL: the temp output is discarded anyway, and x265/SVT-AV1 ignore
    SIGTERM for seconds while they flush) and removes the temp file. A
    process silent for 10 min counts as hung and is killed the same way.
@@ -384,9 +393,13 @@ with `JobSpec.force` uses it when `decide` says skip.
 
 stderr noise that means nothing (libnuma's `set_mempolicy: Operation not
 permitted` from libx265 under Docker's seccomp profile) is kept out of error
-reasons and log tails. Every ffmpeg/ffprobe child is started with
-`core::process::end_with_parent` (Linux `PR_SET_PDEATHSIG` = SIGKILL), so no
-encode outlives a killed server.
+reasons and log tails. With `low_priority` ffmpeg runs under `nice -n 10`;
+the program is checked first (found on `PATH` or at its path, and
+executable), and `nice` exiting 126/127 with its own message counts too, so
+a missing ffmpeg is "not started" (`other`, "ffmpeg wasn't found at …")
+either way, never an encoder error quoting `nice`. Every ffmpeg/ffprobe
+child is started with `core::process::end_with_parent` (Linux
+`PR_SET_PDEATHSIG` = SIGKILL), so no encode outlives a killed server.
 
 **validate_output** by level (checks stop at the first failure):
 - `quick`: ffprobe opens the output; stream counts match the plan; video codec
@@ -407,9 +420,12 @@ encode outlives a killed server.
   ("The new file is shorter than the original (0.1 s instead of 8.0 s)");
   `streams`, `decode` and `visual` lead with the problem ("The new file
   doesn't look like the original. A frame near 0:10 looks very different
-  …"); a `visual` check that couldn't compare the pictures at all (no video
-  track found, no picture readable) leads with "The new file couldn't be
-  compared with the original."
+  from the original"); a `visual` check that couldn't compare the pictures
+  at all (no video track found, no picture readable) leads with "The new
+  file couldn't be compared with the original." A similarity score stays in
+  the check's detail (the report), never in the error, and every error ends
+  with what to do: "The original was kept. Try again, or choose lighter
+  checks in Settings > Output."
 
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to
@@ -463,7 +479,11 @@ Settings > Output."). Messages never carry raw OS errors or error numbers
 (`chrysopoeia_core::plain::io_reason` turns an `io::Error` into a few words
 such as "the disk is full"), encoder names ("Converting on the NVIDIA GPU
 didn't work…", not `hevc_nvenc`), exit codes, or paths without saying what
-the folder is (the work folder, the output folder, next to the original).
+the folder is ("the work folder /temp", "the output folder /out/TV", "the
+original's folder /media/Films"); the fix fits the output mode (in folder
+mode: choose another output folder; replacing: make the drive writable or
+save to a separate folder). A copy refused for lack of room gives the new
+file's size, not the margin kept free.
 An unfamiliar ffmpeg failure is described plainly and then quoted
 ("Converting on the CPU stopped with an error, so the original was left
 unchanged. ffmpeg said: "…""); the job's `log_tail` keeps the details.
@@ -511,7 +531,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
-| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair counts the browsed folder itself by the same rules (left out when it can't be counted), so the picker can say what choosing it brings. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
+| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
 | `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 

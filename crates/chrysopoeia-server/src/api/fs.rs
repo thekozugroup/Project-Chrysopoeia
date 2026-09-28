@@ -61,8 +61,10 @@ pub struct BrowseResponse {
     pub parent: Option<String>,
     pub roots: Vec<String>,
     pub entries: Vec<BrowseEntry>,
-    /// Video files in the browsed folder itself and below it, counted like
-    /// an entry's, so the picker can say what choosing this folder brings.
+    /// Video files in the browsed folder itself plus its subfolders' counts
+    /// (links to folders, which a scan doesn't follow, left out), so the
+    /// picker can say what choosing this folder brings. Never less than a
+    /// subfolder's count; capped when any subfolder's is, or has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count: Option<u64>,
     /// Present with `media_count`: counting stopped at a limit.
@@ -186,15 +188,25 @@ fn count_videos(
     Ok(Some(VideoCount { videos, capped }))
 }
 
-/// List the visible, readable subfolders of `dir`.
-fn list_dirs(
-    dir: &Path,
-    roots: &[PathBuf],
-    toolkit: &Toolkit,
-) -> std::io::Result<Vec<BrowseEntry>> {
+/// The visible, readable subfolders of `dir`, and the video files in `dir`
+/// counted from them (see [`BrowseResponse::media_count`]).
+struct Listing {
+    entries: Vec<BrowseEntry>,
+    own: Option<VideoCount>,
+}
+
+/// List the visible, readable subfolders of `dir`, counting the video files
+/// in each and, from those, in `dir` itself.
+fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Result<Listing> {
     let mut out = Vec::new();
     let mut counting = true;
     let started = Instant::now();
+    // Summed from the direct files and the subfolders' counts, so the folder
+    // never shows fewer videos than one of its subfolders.
+    let mut own = Some(VideoCount {
+        videos: 0,
+        capped: false,
+    });
     for entry in std::fs::read_dir(dir)?.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -215,6 +227,15 @@ fn list_dirs(
             file_type.is_dir()
         };
         if !is_dir {
+            if (file_type.is_file() || file_type.is_symlink())
+                && let Some(c) = own.as_mut()
+            {
+                match toolkit.is_video_path_blocking(&path) {
+                    Ok(true) => c.videos += 1,
+                    Ok(false) => {}
+                    Err(_) => own = None,
+                }
+            }
             continue;
         }
         let left = COUNT_TIME_TOTAL.saturating_sub(started.elapsed());
@@ -230,6 +251,18 @@ fn list_dirs(
         let Some(path_str) = path.to_str() else {
             continue;
         };
+        // A scan doesn't follow links, so a linked folder adds nothing.
+        if !file_type.is_symlink()
+            && let Some(c) = own.as_mut()
+        {
+            match counted {
+                Some(sub) => {
+                    c.videos += sub.videos;
+                    c.capped |= sub.capped;
+                }
+                None => c.capped = true,
+            }
+        }
         out.push(BrowseEntry {
             name,
             path: path_str.to_string(),
@@ -244,7 +277,7 @@ fn list_dirs(
             .cmp(&b.name.to_lowercase())
             .then_with(|| a.name.cmp(&b.name))
     });
-    Ok(out)
+    Ok(Listing { entries: out, own })
 }
 
 /// `GET /api/fs/browse`
@@ -310,26 +343,14 @@ pub async fn browse(
     let toolkit = state.toolkit.clone();
     let dir = canonical.clone();
     let list_roots = roots.clone();
-    let (own, entries) = tokio::task::spawn_blocking(move || {
-        // The folder itself first, by the same rules as each entry; a
-        // folder that can't be counted is simply shown without a count.
-        let own = count_videos(
-            &dir,
-            &toolkit,
-            true,
-            MAX_COUNTED_ENTRIES,
-            COUNT_TIME_PER_FOLDER,
-        )
-        .ok()
-        .flatten();
-        (own, list_dirs(&dir, &list_roots, &toolkit))
-    })
-    .await
-    .map_err(ApiError::internal)?;
-    let entries = entries.map_err(|_| {
+    let listing = tokio::task::spawn_blocking(move || list_dirs(&dir, &list_roots, &toolkit))
+        .await
+        .map_err(ApiError::internal)?;
+    let Listing { entries, own } = listing.map_err(|_| {
         ApiError::bad_request(
             "not_readable",
-            "Chrysopoeia can't read that folder. Check its permissions.",
+            "Chrysopoeia can't read that folder. Check its permissions (in Docker, the \
+             PUID/PGID user needs read access).",
         )
     })?;
     Ok(Json(BrowseResponse {
@@ -397,6 +418,63 @@ mod tests {
             None
         );
         assert!(count_videos(&show.join("nope"), &toolkit, true, 10, long).is_err());
+    }
+
+    /// The folder's own count is summed from its subfolders' counts, so it
+    /// is never lower than one of them, even when a subfolder is too big to
+    /// count fully.
+    #[test]
+    fn the_folder_count_includes_its_subfolders() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let touch = |rel: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        };
+        touch("top.mkv");
+        touch("notes.txt");
+        touch("lib/a.mkv");
+        touch("lib/b.mp4");
+        for i in 0..(MAX_COUNTED_ENTRIES + 100) {
+            touch(&format!("big/sub/e{i}.mkv"));
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("lib"), root.join("linked")).unwrap();
+        let toolkit = Toolkit::new(Arc::new(crate::toolkit::RealToolkit::new(PathBuf::from(
+            "ffprobe",
+        ))));
+        let roots = [root.canonicalize().unwrap()];
+        let listing = list_dirs(&roots[0], &roots, &toolkit).unwrap();
+        let count_of = |name: &str| {
+            listing
+                .entries
+                .iter()
+                .find(|e| e.name == name)
+                .and_then(|e| e.media_count)
+                .unwrap()
+        };
+        let own = listing.own.unwrap();
+        assert!(own.capped);
+        assert_eq!(count_of("lib"), 2);
+        let big = count_of("big");
+        assert!(big > 0, "{big}");
+        // top.mkv + lib + big; the linked folder isn't scanned, so not counted.
+        assert_eq!(own.videos, 1 + 2 + big);
+        for entry in &listing.entries {
+            assert!(entry.media_count.unwrap_or(0) <= own.videos, "{entry:?}");
+        }
+
+        // A small folder: exact.
+        let listing = list_dirs(&roots[0].join("lib"), &roots, &toolkit).unwrap();
+        assert_eq!(
+            listing.own,
+            Some(VideoCount {
+                videos: 2,
+                capped: false
+            })
+        );
     }
 
     #[test]

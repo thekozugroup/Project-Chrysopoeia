@@ -670,6 +670,16 @@ pub async fn run_ffmpeg(
     } else {
         None
     };
+    // `nice` starts even when the program it should run can't, and then
+    // only its own exit code and message would tell. Check first, so a
+    // missing ffmpeg is reported the same way with or without low priority.
+    if nice.is_some()
+        && let Err(e) = check_runnable(cmd.program).await
+    {
+        return FfmpegExit::NotStarted {
+            error: not_started_message(cmd.program, &e),
+        };
+    }
     let mut command = match nice {
         Some(nice) => {
             let mut c = Command::new(nice);
@@ -739,7 +749,10 @@ pub async fn run_ffmpeg(
             status = child.wait(), if stdout.is_none() && stderr.is_none() => {
                 return match status {
                     Ok(s) if s.success() => FfmpegExit::Success { tail: tail.joined() },
-                    Ok(s) => FfmpegExit::Failed { code: s.code(), tail: tail.joined() },
+                    Ok(s) => match nice.and_then(|n| nice_could_not_run(n, s.code(), &tail)) {
+                        Some(e) => FfmpegExit::NotStarted { error: not_started_message(cmd.program, &e) },
+                        None => FfmpegExit::Failed { code: s.code(), tail: tail.joined() },
+                    },
                     Err(e) => FfmpegExit::Failed { code: None, tail: format!("{}\n{e}", tail.joined()) },
                 };
             }
@@ -780,6 +793,54 @@ pub async fn nice_binary() -> Option<&'static Path> {
         .ok()
         .flatten();
     NICE_BINARY.get_or_init(|| found).as_deref()
+}
+
+/// Whether `program` (a path, or a bare name looked up on `PATH`) is a file
+/// this process may run. The error is what starting it directly would give.
+async fn check_runnable(program: &Path) -> std::io::Result<()> {
+    let program = program.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let bare = program
+            .parent()
+            .is_none_or(|parent| parent.as_os_str().is_empty());
+        let path = if bare {
+            let name = program.to_string_lossy();
+            find_in_path(&name).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?
+        } else {
+            program
+        };
+        if std::fs::metadata(&path)?.is_dir() {
+            return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        }
+        may_execute(&path)
+    })
+    .await
+    .unwrap_or(Ok(()))
+}
+
+#[cfg(unix)]
+fn may_execute(path: &Path) -> std::io::Result<()> {
+    rustix::fs::access(path, rustix::fs::Access::EXEC_OK)
+        .map_err(|e| std::io::Error::from_raw_os_error(e.raw_os_error()))
+}
+
+#[cfg(not(unix))]
+fn may_execute(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// When `nice` itself says it couldn't run the program (exit code 126 when
+/// it isn't allowed to run, 127 when it isn't there), the matching error.
+fn nice_could_not_run(nice: &Path, code: Option<i32>, tail: &StderrTail) -> Option<std::io::Error> {
+    let kind = match code? {
+        126 => std::io::ErrorKind::PermissionDenied,
+        127 => std::io::ErrorKind::NotFound,
+        _ => return None,
+    };
+    let first = tail.lines().next()?;
+    let from_nice =
+        first.starts_with(&format!("{}:", nice.display())) || first.starts_with("nice:");
+    from_nice.then(|| std::io::Error::from(kind))
 }
 
 /// Look for an executable file named `name` in the `PATH` directories.
@@ -1179,6 +1240,66 @@ Conversion failed!";
         )
         .await;
         assert!(matches!(exit, FfmpegExit::NotStarted { .. }), "{exit:?}");
+    }
+
+    /// With low priority (the default) ffmpeg runs under `nice`, which
+    /// starts fine even when ffmpeg can't; the result must still say that
+    /// ffmpeg wasn't found or isn't allowed to run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_binary_is_not_started_under_nice() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let not_runnable = dir.path().join("ffmpeg");
+        std::fs::write(&not_runnable, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&not_runnable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let args = vec!["-version".to_string()];
+        let cases = [
+            (
+                Path::new("/nonexistent/ffmpeg-for-tests"),
+                "wasn't found at",
+            ),
+            (Path::new("ffmpeg-not-on-path-for-tests"), "wasn't found at"),
+            (not_runnable.as_path(), "isn't allowed to run"),
+            (dir.path(), "isn't allowed to run"),
+        ];
+        for (program, expected) in cases {
+            let mut cmd = FfmpegCommand::new(program, &args);
+            cmd.low_priority = true;
+            let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
+            match &exit {
+                FfmpegExit::NotStarted { error } => {
+                    assert!(error.contains(expected), "{program:?}: {error}");
+                    assert!(!error.contains("nice"), "{error}");
+                }
+                other => panic!("{program:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn nice_reports_a_program_it_could_not_run() {
+        let nice = Path::new("/usr/bin/nice");
+        let tail = |line: &str| {
+            let mut t = StderrTail::default();
+            t.push(line);
+            t
+        };
+        let missing = tail("/usr/bin/nice: '/x/ffmpeg': No such file or directory");
+        assert_eq!(
+            nice_could_not_run(nice, Some(127), &missing).map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
+        let busybox = tail("nice: can't execute '/x/ffmpeg': Permission denied");
+        assert_eq!(
+            nice_could_not_run(nice, Some(126), &busybox).map(|e| e.kind()),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
+        // ffmpeg's own failures are not mistaken for nice's.
+        let ffmpeg = tail("Error opening input file /x/in.mkv.");
+        assert!(nice_could_not_run(nice, Some(127), &ffmpeg).is_none());
+        assert!(nice_could_not_run(nice, Some(1), &missing).is_none());
+        assert!(nice_could_not_run(nice, None, &missing).is_none());
     }
 
     #[cfg(unix)]

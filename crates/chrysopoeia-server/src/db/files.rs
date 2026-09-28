@@ -192,6 +192,16 @@ pub async fn get_conn(
 /// disconnected).
 pub const MISSING_INPUT_ERROR: &str = "The file is no longer at ";
 
+/// The error a job records when its input file (at `path`) is gone, e.g.
+/// "The file is no longer at /media/a.mkv. It may have been moved or
+/// deleted. If it was moved, scan the library again to find it."
+pub fn missing_input_error(path: &str) -> String {
+    format!(
+        "{MISSING_INPUT_ERROR}{path}. It may have been moved or deleted. If it was moved, scan \
+         the library again to find it."
+    )
+}
+
 /// What a scan needs to know about a stored file. Also the guard for writing
 /// the scan's result: a row that changed since it was read (a job finished,
 /// a watch event, the user) is left alone.

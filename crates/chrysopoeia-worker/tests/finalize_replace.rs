@@ -261,7 +261,8 @@ async fn missing_original_is_reported() {
     assert_eq!(
         err.to_string(),
         "The original is no longer there, so the new file wasn't put in place. It may have been \
-         moved or deleted while it was being converted."
+         moved or deleted while it was being converted. If it was moved, scan the library again \
+         to find it."
     );
     assert_eq!(problem_of(&err), ProblemKind::SourceChanged);
 }
@@ -361,8 +362,9 @@ async fn a_failed_cross_device_copy_never_touches_the_original() {
     assert_eq!(
         err.to_string(),
         format!(
-            "The new file couldn't be put in {} because a folder is in the way where a file \
-             should be, so the original was kept.",
+            "The new file couldn't be put in the original's folder {} because a folder is in \
+             the way where a file should be, so the original was kept. Check that folder, then \
+             try again.",
             dir.path().join("media").display()
         )
     );

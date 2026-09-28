@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
-use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile};
+use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile, missing_input_error};
 use crate::db::jobs::{InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
@@ -717,13 +717,7 @@ async fn execute(
                 return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
             }
             return done(
-                failed(
-                    ProblemKind::SourceChanged,
-                    format!(
-                        "{MISSING_INPUT_ERROR}{}. It may have been moved or deleted.",
-                        file.path
-                    ),
-                ),
+                failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
                 ctx,
             );
         }
@@ -1476,7 +1470,7 @@ async fn remove_vanished(
             "{name} was moved or deleted while it was being converted, so it was taken off the list."
         )
     } else {
-        let error = format!("{MISSING_INPUT_ERROR}{path}. It may have been moved or deleted.");
+        let error = missing_input_error(path);
         let exists = db::jobs::finish(
             &mut tx,
             job.id,

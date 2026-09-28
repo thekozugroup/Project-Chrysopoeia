@@ -42,7 +42,7 @@ use crate::ffmpeg::{
 };
 use crate::finalize::{
     FileIdentity, FinalizeRequest, OriginalChanged, PlaceError, destination_conflict,
-    final_output_path, finalize, temp_output_path,
+    destination_name, final_output_path, finalize, temp_output_path,
 };
 use crate::plan::{Decision, FfmpegPlan, PlanRequest, where_encoded};
 use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
@@ -411,7 +411,8 @@ impl Job<'_> {
         // original is renamed there); find out now rather than after hours
         // of encoding.
         if let Some(dir) = final_path.parent()
-            && let Some(problem) = folder_not_writable(dir, Place::Destination).await
+            && let Some(problem) =
+                folder_not_writable(dir, Place::Destination, cfg.output_mode).await
         {
             return Err(failed(ProblemKind::Destination, problem));
         }
@@ -433,14 +434,14 @@ impl Job<'_> {
         let created_dirs = match create_dirs(&temp_dir).await {
             Ok(created) => created,
             Err(e) => {
-                let (problem, error) = folder_unusable(&temp_dir, place, &e);
+                let (problem, error) = folder_unusable(&temp_dir, place, cfg.output_mode, &e);
                 return Err(failed(problem, error));
             }
         };
         // A work folder of its own must take new files too (the folder the
         // new file goes to was checked above).
         if place == Place::WorkFolder
-            && let Some(problem) = folder_not_writable(&temp_dir, place).await
+            && let Some(problem) = folder_not_writable(&temp_dir, place, cfg.output_mode).await
         {
             remove_empty_dirs(&created_dirs).await;
             return Err(failed(ProblemKind::WorkFolder, problem));
@@ -609,6 +610,14 @@ impl Job<'_> {
                         self.temp_place(),
                         cfg.output_mode,
                     );
+                    let f = failure(problem, error, other.tail().map(str::to_string));
+                    // A full disk or a folder that can't be written stops
+                    // every way of converting alike, and so does a converter
+                    // that can't be started: say so now instead of starting
+                    // another (maybe hours long) encode that fails the same.
+                    if affects_every_attempt(problem, other) {
+                        return f.into_outcome();
+                    }
                     // The job's notes (or its error) tell the user; the log
                     // keeps the attempt-by-attempt detail at debug level.
                     let next = if is_last {
@@ -616,8 +625,8 @@ impl Job<'_> {
                     } else {
                         "; trying the next option"
                     };
-                    tracing::debug!(job = %spec.job_id, attempt, "{error}{next}");
-                    last_failure = Some(failure(problem, error, other.tail().map(str::to_string)));
+                    tracing::debug!(job = %spec.job_id, attempt, "{}{next}", f.error);
+                    last_failure = Some(f);
                     guard.clear().await;
                     continue;
                 }
@@ -699,7 +708,7 @@ impl Job<'_> {
                     return failed(
                         ProblemKind::SourceChanged,
                         "The file is no longer there. It was moved or deleted while it was being \
-                         converted.",
+                         converted. If it was moved, scan the library again to find it.",
                     );
                 }
             }
@@ -1065,7 +1074,7 @@ enum Place {
 
 /// Why new files can't be written in `dir` (or, when it doesn't exist yet,
 /// in the closest folder above it that does), if they can't.
-async fn folder_not_writable(dir: &Path, place: Place) -> Option<String> {
+async fn folder_not_writable(dir: &Path, place: Place, mode: OutputMode) -> Option<String> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let existing = dir.ancestors().find(|d| d.is_dir())?;
@@ -1081,21 +1090,34 @@ async fn folder_not_writable(dir: &Path, place: Place) -> Option<String> {
                  its permissions (in Docker, the PUID/PGID user needs write access), or choose \
                  another work folder in Settings > Output."
             ),
-            (Place::Destination, WriteBlock::ReadOnly) => format!(
-                "The folder {shown} is on a read-only drive, so the converted file can't be put \
-                 there. Make the drive writable, or save converted files to a separate folder \
-                 in Settings > Output."
-            ),
-            (Place::Destination, WriteBlock::Denied) => format!(
-                "Chrysopoeia doesn't have permission to write in {shown}, so the converted file \
-                 can't be put there. Check the folder's permissions (in Docker, the PUID/PGID \
-                 user needs write access)."
-            ),
+            (Place::Destination, blocked) => destination_blocked(existing, mode, blocked),
         })
     })
     .await
     .ok()
     .flatten()
+}
+
+/// The message when the folder the new file goes to (`dir`) doesn't take
+/// new files, e.g. "The output folder /out is on a read-only drive, …".
+fn destination_blocked(dir: &Path, mode: OutputMode, blocked: WriteBlock) -> String {
+    let folder = destination_name(dir, mode);
+    let other_place = match mode {
+        OutputMode::Folder => "choose another output folder in Settings > Output",
+        OutputMode::Replace => "save converted files to a separate folder in Settings > Output",
+    };
+    match blocked {
+        WriteBlock::ReadOnly => format!(
+            "{} is on a read-only drive, so the converted file can't be put there. Make the \
+             drive writable, or {other_place}.",
+            capitalize_first(&folder)
+        ),
+        WriteBlock::Denied => format!(
+            "Chrysopoeia doesn't have permission to write in {folder}, so the converted file \
+             can't be put there. Check the folder's permissions (in Docker, the PUID/PGID user \
+             needs write access), or {other_place}."
+        ),
+    }
 }
 
 /// Why a folder doesn't take new files.
@@ -1132,20 +1154,29 @@ fn write_access(dir: &Path) -> Result<(), WriteBlock> {
 
 /// The problem and message when the folder for the new file (`dir`, in
 /// `place`) couldn't be created, e.g. "The work folder /temp can't be used
-/// because a file with that name is in the way. Fix it in Settings >
-/// Output."
-fn folder_unusable(dir: &Path, place: Place, e: &std::io::Error) -> (ProblemKind, String) {
+/// because a file with that name is in the way. Fix it, or choose another
+/// work folder, in Settings > Output."
+fn folder_unusable(
+    dir: &Path,
+    place: Place,
+    mode: OutputMode,
+    e: &std::io::Error,
+) -> (ProblemKind, String) {
     use std::io::ErrorKind as K;
-    let shown = dir.display();
-    let (what, fix, problem) = match place {
-        Place::WorkFolder => (
-            format!("The work folder {shown}"),
+    let (what, fix, problem) = match (place, mode) {
+        (Place::WorkFolder, _) => (
+            format!("The work folder {}", dir.display()),
             "Fix it, or choose another work folder, in Settings > Output.",
             ProblemKind::WorkFolder,
         ),
-        Place::Destination => (
-            format!("The folder {shown} for the converted file"),
-            "Check the output folder in Settings > Output.",
+        (Place::Destination, OutputMode::Folder) => (
+            capitalize_first(&destination_name(dir, mode)),
+            "Fix it, or choose another output folder, in Settings > Output.",
+            ProblemKind::Destination,
+        ),
+        (Place::Destination, OutputMode::Replace) => (
+            capitalize_first(&destination_name(dir, mode)),
+            "Check that folder, then try again.",
             ProblemKind::Destination,
         ),
     };
@@ -1204,13 +1235,14 @@ fn no_room_message(dir: &Path, bytes: u64, place: Place, mode: OutputMode) -> St
 }
 
 /// What to say when a job's original file is gone before it started.
-const SOURCE_GONE: &str = "The file is no longer there. It may have been moved or deleted.";
+const SOURCE_GONE: &str = "The file is no longer there. It may have been moved or deleted. If \
+    it was moved, scan the library again to find it.";
 
 /// Why the original couldn't be read when the job started.
 fn unreadable_original(e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::PermissionDenied {
         "Chrysopoeia doesn't have permission to read this file. Check its permissions (in \
-         Docker, the PUID/PGID user needs read access)."
+         Docker, the PUID/PGID user needs read access), then try again."
             .to_string()
     } else {
         format!(
@@ -1233,6 +1265,15 @@ fn plan_failure(e: &anyhow::Error) -> (ProblemKind, String) {
         problem,
         chrysopoeia_core::plain::strip_os_error(&format!("{e:#}")),
     )
+}
+
+/// Whether a failed encode would fail the same way with any other encoder:
+/// the disk or a folder is the problem, or ffmpeg itself couldn't start.
+fn affects_every_attempt(problem: ProblemKind, exit: &FfmpegExit) -> bool {
+    matches!(
+        problem,
+        ProblemKind::DiskFull | ProblemKind::WorkFolder | ProblemKind::Destination
+    ) || matches!(exit, FfmpegExit::NotStarted { .. })
 }
 
 /// Longest part of ffmpeg's own words quoted in an error.
@@ -1297,7 +1338,7 @@ fn encode_failure(
         };
         let what = match place {
             Place::WorkFolder => format!("the work folder {shown}"),
-            Place::Destination => format!("{shown}"),
+            Place::Destination => destination_name(folder, mode),
         };
         format!(
             "The disk ran out of space while the new file was being written in {what}, so the \
@@ -1316,17 +1357,24 @@ fn encode_failure(
             Place::WorkFolder => ProblemKind::WorkFolder,
             Place::Destination => ProblemKind::Destination,
         };
-        let what = match place {
-            Place::WorkFolder => format!("the work folder {shown}"),
-            Place::Destination => format!("{shown}"),
+        let (what, other_place) = match (place, mode) {
+            (Place::WorkFolder, _) => (
+                format!("the work folder {shown}"),
+                ", or choose another work folder in Settings > Output",
+            ),
+            (Place::Destination, OutputMode::Folder) => (
+                destination_name(folder, mode),
+                ", or choose another output folder in Settings > Output",
+            ),
+            (Place::Destination, OutputMode::Replace) => (destination_name(folder, mode), ""),
         };
         return (
             problem,
             format!(
                 "The new file couldn't be written in {what}: the drive is read-only or \
                  Chrysopoeia doesn't have permission there. The original was left unchanged. \
-                 Check the folder (in Docker, the PUID/PGID user needs write access), or choose \
-                 another work folder in Settings > Output."
+                 Check the folder's permissions (in Docker, the PUID/PGID user needs write \
+                 access){other_place}."
             ),
         );
     }
@@ -1393,15 +1441,37 @@ async fn remove_empty_dirs(created: &[PathBuf]) {
     }
 }
 
-/// Why a result failed verification, for the job's error and the activity
-/// feed. A check's label says what passing means ("Same length as the
-/// original"), so it is never used here: the failure is phrased per check,
-/// e.g. "The new file is shorter than the original (0.1 s instead of 8.0 s)".
+/// What to do after a failed verification; the job's error ends with it.
+const VERIFICATION_FIX: &str =
+    "The original was kept. Try again, or choose lighter checks in Settings > Output.";
+
+/// Why a result failed verification, and what to do, for the job's error
+/// and the activity feed. A check's label says what passing means ("Same
+/// length as the original"), so it is never used here: the failure is
+/// phrased per check, e.g. "The new file is shorter than the original (0.1 s
+/// instead of 8.0 s). The original was kept. Try again, or …".
 pub(crate) fn verification_error(report: &ValidationReport) -> String {
+    let what = failed_check_sentence(report);
+    format!("{}. {VERIFICATION_FIX}", what.trim_end_matches('.'))
+}
+
+/// A check's detail without a trailing similarity score ("… (similarity
+/// 0.50)"), a number that means little to most people; the report keeps it.
+fn without_score(detail: &str) -> &str {
+    match detail.rfind(" (") {
+        Some(i) if detail.ends_with(')') && detail[i..].contains("similarity") => {
+            detail[..i].trim_end()
+        }
+        _ => detail,
+    }
+}
+
+/// What went wrong in the first failing check of `report`.
+fn failed_check_sentence(report: &ValidationReport) -> String {
     let Some(check) = report.first_failure() else {
-        return "The new file didn't pass verification, so the original was kept".to_string();
+        return "The new file didn't pass verification".to_string();
     };
-    let detail = check.detail.trim().trim_end_matches('.');
+    let detail = without_score(check.detail.trim().trim_end_matches('.'));
     // Checks whose detail names a measurement rather than the problem get a
     // plain statement of the problem first.
     let lead = match check.id.as_str() {
@@ -1436,11 +1506,18 @@ pub(crate) fn verification_error(report: &ValidationReport) -> String {
 /// Whether a failing visual check's detail says the pictures differ (rather
 /// than that they couldn't be compared).
 fn is_picture_mismatch(detail: &str) -> bool {
-    detail.contains("different from the original") || detail.contains("doesn't match the original")
+    [
+        "looks different",
+        "different from the original",
+        "doesn't match the original",
+        "is damaged",
+    ]
+    .iter()
+    .any(|phrase| detail.contains(phrase))
 }
 
 /// `text` with its first letter in upper case.
-fn capitalize_first(text: &str) -> String {
+pub(crate) fn capitalize_first(text: &str) -> String {
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -2034,7 +2111,8 @@ mod tests {
         };
         assert_eq!(
             verification_error(&report),
-            "The new file doesn't play start to finish. Found a playback error"
+            "The new file doesn't play start to finish. Found a playback error. The original \
+             was kept. Try again, or choose lighter checks in Settings > Output."
         );
     }
 
@@ -2082,14 +2160,28 @@ mod tests {
                 "Looks like the original",
                 "A frame near 0:10 looks very different from the original (similarity 0.40)",
                 "The new file doesn't look like the original. A frame near 0:10 looks very \
-                 different from the original (similarity 0.40)",
+                 different from the original",
             ),
             (
                 "visual",
                 "Looks like the original",
                 "The picture near 1:05 doesn't match the original (similarity 0.70)",
                 "The new file doesn't look like the original. The picture near 1:05 doesn't \
-                 match the original (similarity 0.70)",
+                 match the original",
+            ),
+            (
+                "visual",
+                "Looks like the original",
+                "The picture from 10.0 s to 11.7 s is damaged (similarity 0.20)",
+                "The new file doesn't look like the original. The picture from 10.0 s to 11.7 s \
+                 is damaged",
+            ),
+            (
+                "visual",
+                "Looks like the original",
+                "The picture from 1:00 to 1:02 suddenly looks different (similarity 0.35)",
+                "The new file doesn't look like the original. The picture from 1:00 to 1:02 \
+                 suddenly looks different",
             ),
             // Not a mismatch: the pictures couldn't be compared at all.
             (
@@ -2121,8 +2213,9 @@ mod tests {
         ];
         for (id, label, detail, expected) in cases {
             let error = verification_error(&failing(id, label, detail));
-            assert_eq!(error, expected, "{id}");
+            assert_eq!(error, format!("{expected}. {VERIFICATION_FIX}"), "{id}");
             assert!(!error.contains(label), "{id}: {error}");
+            assert!(!error.contains("similarity"), "{id}: {error}");
         }
     }
 
@@ -2186,7 +2279,35 @@ mod tests {
         );
         assert_eq!(problem, ProblemKind::Destination);
         assert!(
-            error.starts_with("The new file couldn't be written in /m:"),
+            error.starts_with("The new file couldn't be written in the original's folder /m:"),
+            "{error}"
+        );
+        assert!(!error.contains("work folder"), "{error}");
+        let (problem, error) = encode_failure(
+            &read_only,
+            HwApi::Software,
+            Path::new("/out/.a.tmp.mkv"),
+            Place::Destination,
+            OutputMode::Folder,
+        );
+        assert_eq!(problem, ProblemKind::Destination);
+        assert!(
+            error.starts_with("The new file couldn't be written in the output folder /out:"),
+            "{error}"
+        );
+        assert!(error.ends_with("or choose another output folder in Settings > Output."));
+        let (_, error) = encode_failure(
+            &disk_full,
+            HwApi::Software,
+            Path::new("/out/.a.tmp.mkv"),
+            Place::Destination,
+            OutputMode::Folder,
+        );
+        assert!(
+            error.starts_with(
+                "The disk ran out of space while the new file was being written in the output \
+                 folder /out,"
+            ),
             "{error}"
         );
         let (problem, _) = encode_failure(
@@ -2272,7 +2393,12 @@ mod tests {
     #[test]
     fn unusable_work_folders_say_what_is_in_the_way() {
         let exists = std::io::Error::from_raw_os_error(17);
-        let (problem, error) = folder_unusable(Path::new("/temp"), Place::WorkFolder, &exists);
+        let (problem, error) = folder_unusable(
+            Path::new("/temp"),
+            Place::WorkFolder,
+            OutputMode::Replace,
+            &exists,
+        );
         assert_eq!(problem, ProblemKind::WorkFolder);
         assert_eq!(
             error,
@@ -2280,15 +2406,62 @@ mod tests {
              Fix it, or choose another work folder, in Settings > Output."
         );
         let full = std::io::Error::from_raw_os_error(28);
-        let (problem, error) = folder_unusable(Path::new("/out/TV"), Place::Destination, &full);
+        let (problem, error) = folder_unusable(
+            Path::new("/out/TV"),
+            Place::Destination,
+            OutputMode::Folder,
+            &full,
+        );
         assert_eq!(problem, ProblemKind::DiskFull);
-        assert!(!error.contains("os error"), "{error}");
+        assert_eq!(
+            error,
+            "The output folder /out/TV can't be created because the disk is full. Free up some \
+             space there. Fix it, or choose another output folder, in Settings > Output."
+        );
         let odd = std::io::Error::from_raw_os_error(5);
-        let (problem, error) = folder_unusable(Path::new("/temp"), Place::WorkFolder, &odd);
+        let (problem, error) = folder_unusable(
+            Path::new("/temp"),
+            Place::WorkFolder,
+            OutputMode::Replace,
+            &odd,
+        );
         assert_eq!(problem, ProblemKind::WorkFolder);
         assert!(
             error.contains("because the disk reported a read or write error"),
             "{error}"
+        );
+    }
+
+    /// A folder the new file can't go to is named for what it is, with the
+    /// fix that fits the output mode.
+    #[test]
+    fn blocked_destinations_say_which_folder_and_what_to_do() {
+        let dir = Path::new("/out/TV");
+        assert_eq!(
+            destination_blocked(dir, OutputMode::Folder, WriteBlock::ReadOnly),
+            "The output folder /out/TV is on a read-only drive, so the converted file can't be \
+             put there. Make the drive writable, or choose another output folder in Settings > \
+             Output."
+        );
+        assert_eq!(
+            destination_blocked(dir, OutputMode::Folder, WriteBlock::Denied),
+            "Chrysopoeia doesn't have permission to write in the output folder /out/TV, so the \
+             converted file can't be put there. Check the folder's permissions (in Docker, the \
+             PUID/PGID user needs write access), or choose another output folder in Settings > \
+             Output."
+        );
+        let dir = Path::new("/media/Films");
+        assert_eq!(
+            destination_blocked(dir, OutputMode::Replace, WriteBlock::ReadOnly),
+            "The original's folder /media/Films is on a read-only drive, so the converted file \
+             can't be put there. Make the drive writable, or save converted files to a \
+             separate folder in Settings > Output."
+        );
+        assert!(
+            destination_blocked(dir, OutputMode::Replace, WriteBlock::Denied).starts_with(
+                "Chrysopoeia doesn't have permission to write in the original's folder \
+                 /media/Films, so"
+            )
         );
     }
 
