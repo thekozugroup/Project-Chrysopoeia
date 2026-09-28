@@ -71,6 +71,10 @@ pub struct Job {
     pub command: Option<String>,
     /// Last lines of ffmpeg output when something went wrong.
     pub log_tail: Option<String>,
+    /// Plain-language notes about compromises the conversion made, e.g.
+    /// "Removed 2 picture-based subtitles because MP4 can't hold them".
+    #[serde(default)]
+    pub notes: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,

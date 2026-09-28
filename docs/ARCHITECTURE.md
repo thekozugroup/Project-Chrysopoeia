@@ -310,3 +310,33 @@ secondary detail; every destructive action is reversible or confirmed.
 - `unraid/chrysopoeia.xml`: Community Applications template with those fields.
 - `docker-compose.yml` (CPU), `docker-compose.nvidia.yml`,
   `docker-compose.intel-amd.yml` overlays.
+
+## Contract additions after integration (normative)
+
+- `Job.notes: string[]` — plain-language compromises the conversion made
+  (worker `JobOutcome::Done.notes`). Persisted in `jobs.notes` (JSON) and shown
+  in the job sheet.
+- `HardwareInfo.detecting: bool` — true only for the placeholder returned
+  while the first detection runs. The UI shows "Checking your hardware…" from
+  this flag, never from `ffmpeg.found`.
+- `GET /api/system` → `SystemInfo { version, default_temp_dir, browse_roots,
+  data_dir, in_container }`, so the UI can name the automatic work folder.
+- Validation errors from `PATCH /api/settings` and library/profile PATCHes
+  add `"field": "<settings key>"` to the error body when one field is at
+  fault, e.g. `{"error":"…","code":"invalid_settings","field":"temp_dir"}`.
+- `ALLOWED_HOSTS` (comma-separated, `*` = any) extends the Host/Origin check.
+  IP literals, `localhost`, single-label names and `.local`, `.lan`, `.home`,
+  `.home.arpa`, `.internal`, `.localdomain`, `.localhost`, `.ts.net` names are
+  always allowed; other names (reverse proxies) must be listed or the API
+  answers 403 `host_not_allowed`.
+- `HW_ACCEL` applies on first run and again whenever its value changes;
+  `MAX_JOBS` stands in for the automatic count while `settings.max_jobs` is
+  null.
+- Verification thresholds actually used: fail if any frame SSIM < 0.60 or any
+  segment mean < 0.85 (measured on ~640x360 area-downscaled frames, aligned
+  within ±3 frames); warn if the overall mean < 0.93. The decode check counts
+  error/fatal lines plus "corrupt decoded frame"/concealment reports; damage
+  already present in the original only warns.
+- When the chosen encoder for a job is software, at most
+  `recommended_jobs.cpu_jobs` software encodes run at once, even when
+  `max_jobs` follows the GPU count.

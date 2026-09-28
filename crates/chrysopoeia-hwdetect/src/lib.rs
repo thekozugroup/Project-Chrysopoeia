@@ -96,6 +96,7 @@ pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
     });
 
     let mut info = HardwareInfo {
+        detecting: false,
         cpu: found_devices.cpu.clone(),
         memory: found_devices.memory.clone(),
         gpus: found_devices.gpu_devices(),

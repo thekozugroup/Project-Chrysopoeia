@@ -438,6 +438,7 @@ mod tests {
 
     fn hw(cores: u32, limit: Option<f64>, mem_gb: u64, mem_limit_gb: Option<u64>) -> HardwareInfo {
         HardwareInfo {
+            detecting: false,
             cpu: CpuInfo {
                 model: "Test CPU".into(),
                 logical_cores: cores,

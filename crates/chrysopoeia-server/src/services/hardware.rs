@@ -84,6 +84,7 @@ pub fn jobs_before_detection() -> u32 {
 pub fn placeholder(config: &Config) -> HardwareInfo {
     let cores = logical_cores();
     HardwareInfo {
+        detecting: true,
         cpu: CpuInfo {
             model: "Unknown CPU".into(),
             logical_cores: cores,
@@ -119,6 +120,7 @@ pub fn placeholder(config: &Config) -> HardwareInfo {
 /// hint explaining what happened.
 pub fn fallback(config: &Config, problem: &str) -> HardwareInfo {
     let mut info = placeholder(config);
+    info.detecting = false;
     info.encoders = VIDEO_ENCODERS
         .iter()
         .filter(|e| e.api == HwApi::Software)

@@ -169,6 +169,10 @@ pub struct HardwareInfo {
     pub hints: Vec<SetupHint>,
     /// True when running inside a container.
     pub in_container: bool,
+    /// True while the first detection is still running; the other fields
+    /// are placeholders until a `hardware.updated` event arrives.
+    #[serde(default)]
+    pub detecting: bool,
     pub detected_at: DateTime<Utc>,
 }
 

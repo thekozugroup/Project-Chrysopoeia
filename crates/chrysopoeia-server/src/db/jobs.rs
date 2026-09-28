@@ -29,6 +29,7 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let priority: i64 = row.try_get("priority")?;
     let attempt: i64 = row.try_get("attempt")?;
     Ok(Job {
+        notes: Vec::new(),
         id: uuid_col(row, "id")?,
         file_id: uuid_col(row, "file_id")?,
         library_id: uuid_col(row, "library_id")?,

@@ -17,6 +17,7 @@ pub mod paths;
 pub mod profile;
 pub mod settings;
 pub mod stats;
+pub mod system;
 pub mod validation;
 
 pub use codec::{AudioCodec, Container, SubtitleAction, VideoCodec};
@@ -33,4 +34,5 @@ pub use media::{HdrFormat, ProbeInfo, StreamInfo, StreamKind};
 pub use profile::{Goal, QualityLevel, SpeedPreset, SubtitlePolicy, TranscodeProfile};
 pub use settings::{ActiveHours, OutputMode, Settings, ValidationLevel};
 pub use stats::{CodecCount, Overview, SavingsPoint};
+pub use system::SystemInfo;
 pub use validation::{CheckStatus, ValidationCheck, ValidationReport};

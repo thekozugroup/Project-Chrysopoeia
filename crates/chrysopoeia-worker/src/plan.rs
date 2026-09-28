@@ -976,14 +976,6 @@ const AAC_STANDARD_LAYOUTS: [Option<&str>; 8] = [
 const VORBIS_ORDER_ANY: &str = "aformat=channel_layouts=7.1|6.1|5.1|5.0|quad|3.0|stereo|mono";
 const AAC_ANY: &str = "aformat=channel_layouts=7.1|5.1|5.0|4.0|3.0|stereo|mono";
 
-/// Matroska muxer cannot store these even though `Container::can_copy_audio`
-/// allows everything for MKV (Blu-ray/DVD PCM and SMPTE 302M from TS).
-const MKV_UNCOPYABLE_AUDIO: &[&str] = &["pcm_bluray", "pcm_dvd", "s302m", "pcm_s24daud"];
-/// MPEG-1 Layer II is allowed by `Container::can_copy_audio` for MP4, but MP4
-/// labels it as generic MPEG audio: ffprobe then reports it as MP3 and Apple
-/// players, which only decode Layer III, play it silently. It is re-encoded.
-const MP4_UNCOPYABLE_AUDIO: &[&str] = &["mp2"];
-
 /// How well the probe could read an audio track.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AudioHealth {
@@ -1191,13 +1183,9 @@ fn plan_audio(
     })
 }
 
-/// `Container::can_copy_audio` plus the muxers' real limits.
+/// `Container::can_copy_audio` (which follows the muxers' real limits).
 fn can_copy_audio(container: Container, codec: &str) -> bool {
-    let refused = match container {
-        Container::Mkv | Container::Webm => MKV_UNCOPYABLE_AUDIO,
-        Container::Mp4 => MP4_UNCOPYABLE_AUDIO,
-    };
-    container.can_copy_audio(codec) && !refused.contains(&codec)
+    container.can_copy_audio(codec)
 }
 
 /// Codec for a track that "Keep original" cannot copy: FLAC for lossless
@@ -1242,13 +1230,9 @@ fn is_high_resolution_audio(stream: &StreamInfo) -> bool {
     (is_lossless_audio(&codec) && !pcm_16) || dts_hd_ma
 }
 
-/// Most channels ffmpeg's encoder for `codec` accepts. ffmpeg's E-AC-3
-/// encoder stops at 5.1 even though the format allows 7.1.
+/// Most channels ffmpeg's encoder for `codec` accepts.
 fn max_output_channels(codec: AudioCodec) -> u32 {
-    match codec {
-        AudioCodec::Eac3 => 6,
-        other => other.max_channels(),
-    }
+    codec.max_channels()
 }
 
 /// The one layout an Opus, Vorbis or AAC encoder must receive for a source
@@ -1544,41 +1528,11 @@ struct SubtitleTrack {
     codec: &'static str,
 }
 
-/// Subtitle codecs the Matroska muxer can store (its codec tag table in
-/// ffmpeg 6.1). `Container::subtitle_action` copies every text and picture
-/// codec into MKV, but the muxer refuses the rest with "Subtitle codec is
-/// not supported", which would fail every attempt.
-const MATROSKA_SUBTITLES: &[&str] = &[
-    "subrip",
-    "ass",
-    "webvtt",
-    "text",
-    "dvd_subtitle",
-    "dvb_subtitle",
-    "hdmv_pgs_subtitle",
-    "hdmv_text_subtitle",
-    "arib_caption",
-];
-
-/// `Container::subtitle_action` plus the Matroska muxer's real limits: text
-/// formats it can't store (MicroDVD, SAMI, old `ssa`, ...) are converted
-/// (to ASS for `ssa`, which keeps the styling, otherwise to SubRip) and
-/// picture formats it can't store (DivX XSUB) are dropped.
+/// `Container::subtitle_action`, which follows the muxers' real limits: text
+/// formats Matroska can't store are converted (old `ssa` to ASS, the rest to
+/// SubRip) and picture formats it can't store (DivX XSUB) are dropped.
 fn subtitle_action(container: Container, codec: &str) -> SubtitleAction {
-    let action = container.subtitle_action(codec);
-    if !is_matroska(container)
-        || action != SubtitleAction::Copy
-        || MATROSKA_SUBTITLES.contains(&codec)
-    {
-        return action;
-    }
-    if is_image_subtitle(codec) {
-        SubtitleAction::Drop
-    } else if codec == "ssa" {
-        SubtitleAction::Convert("ass")
-    } else {
-        SubtitleAction::Convert("srt")
-    }
+    container.subtitle_action(codec)
 }
 
 fn plan_subtitles(
@@ -2259,7 +2213,10 @@ mod tests {
         // Every text codec the core knows ends up somewhere Matroska can store.
         for codec in chrysopoeia_core::codec::TEXT_SUBTITLE_CODECS {
             match subtitle_action(Container::Mkv, codec) {
-                SubtitleAction::Copy => assert!(MATROSKA_SUBTITLES.contains(codec), "{codec}"),
+                SubtitleAction::Copy => assert!(
+                    chrysopoeia_core::codec::MATROSKA_SUBTITLES.contains(codec),
+                    "{codec}"
+                ),
                 SubtitleAction::Convert(to) => assert!(matches!(to, "srt" | "ass"), "{codec}"),
                 SubtitleAction::Drop => panic!("{codec} dropped"),
             }

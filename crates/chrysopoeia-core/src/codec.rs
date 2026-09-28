@@ -153,10 +153,11 @@ impl AudioCodec {
     }
 
     /// Maximum channels the encoder accepts; sources with more are downmixed.
+    /// ffmpeg's E-AC-3 encoder stops at 5.1 even though the format allows 7.1.
     pub fn max_channels(self) -> u32 {
         match self {
             Self::Mp3 => 2,
-            Self::Ac3 => 6,
+            Self::Ac3 | Self::Eac3 => 6,
             _ => 8,
         }
     }
@@ -185,8 +186,7 @@ impl AudioCodec {
             },
             Self::Eac3 => match ch {
                 1 | 2 => 224,
-                3..=6 => 640,
-                _ => 1024,
+                _ => 640,
             },
             Self::Mp3 => 192,
             Self::Vorbis => match ch {
@@ -247,6 +247,21 @@ pub const IMAGE_SUBTITLE_CODECS: &[&str] = &[
     "dvb_subtitle",
     "dvbsub",
     "xsub",
+];
+
+/// Subtitle codecs the Matroska muxer can store as they are (its codec tag
+/// table in ffmpeg 6.1). Other text formats are converted, other picture
+/// formats dropped.
+pub const MATROSKA_SUBTITLES: &[&str] = &[
+    "subrip",
+    "ass",
+    "webvtt",
+    "text",
+    "dvd_subtitle",
+    "dvb_subtitle",
+    "hdmv_pgs_subtitle",
+    "hdmv_text_subtitle",
+    "arib_caption",
 ];
 
 pub fn is_text_subtitle(codec_name: &str) -> bool {
@@ -314,14 +329,18 @@ impl Container {
 
     /// Whether a *source* audio stream (ffprobe codec name) can be stream-copied
     /// into this container.
+    ///
+    /// Matroska refuses Blu-ray/DVD PCM and SMPTE 302M. MP2 is excluded from
+    /// MP4: it is stored as generic MPEG audio, which Apple players (Layer III
+    /// only) play silently.
     pub fn can_copy_audio(self, codec_name: &str) -> bool {
         let c = codec_name.to_ascii_lowercase();
         match self {
-            Self::Mkv => true,
-            Self::Mp4 => matches!(
+            Self::Mkv => !matches!(
                 c.as_str(),
-                "aac" | "ac3" | "eac3" | "mp3" | "opus" | "alac" | "mp2"
+                "pcm_bluray" | "pcm_dvd" | "s302m" | "pcm_s24daud"
             ),
+            Self::Mp4 => matches!(c.as_str(), "aac" | "ac3" | "eac3" | "mp3" | "opus" | "alac"),
             Self::Webm => matches!(c.as_str(), "opus" | "vorbis"),
         }
     }
@@ -339,14 +358,17 @@ impl Container {
     pub fn subtitle_action(self, codec_name: &str) -> SubtitleAction {
         let c = codec_name.to_ascii_lowercase();
         let text = is_text_subtitle(&c);
-        let image = is_image_subtitle(&c);
         match self {
             Self::Mkv => {
-                if c == "mov_text" {
-                    SubtitleAction::Convert("srt")
-                } else if text || image {
+                if MATROSKA_SUBTITLES.contains(&c.as_str()) {
                     SubtitleAction::Copy
+                } else if c == "ssa" {
+                    // Old SSA becomes ASS, which keeps the styling.
+                    SubtitleAction::Convert("ass")
+                } else if text {
+                    SubtitleAction::Convert("srt")
                 } else {
+                    // Includes picture formats the muxer can't store (DivX XSUB).
                     SubtitleAction::Drop
                 }
             }

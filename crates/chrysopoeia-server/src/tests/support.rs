@@ -405,6 +405,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
             let _permit = me.detect_gate.acquire().await;
             let total = me.recommended_total.load(Ordering::SeqCst) as u32;
             HardwareInfo {
+                detecting: false,
                 cpu: CpuInfo {
                     model: "Fake CPU".into(),
                     logical_cores: 8,
