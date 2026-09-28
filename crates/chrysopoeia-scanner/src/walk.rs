@@ -34,7 +34,7 @@
 //! `BDMV` too). Their files only play correctly together, through the disc's
 //! menus and playlists, so converting them one by one would break the copy.
 //! Such folders are never looked into; each one is noted in
-//! [`WalkResult::errors`](crate::WalkResult::errors) with a plain explanation
+//! [`WalkResult::notes`](crate::WalkResult::notes) with a plain explanation
 //! so the user can see why nothing inside was listed.
 //!
 //! # Links
@@ -42,7 +42,7 @@
 //! Unless [`ScanOptions::follow_links`](crate::ScanOptions::follow_links) is
 //! set, symbolic links are never followed, so nothing outside the library can
 //! be changed through a link. Links to folders and links named like media
-//! files are noted in [`WalkResult::errors`](crate::WalkResult::errors) so a
+//! files are noted in [`WalkResult::notes`](crate::WalkResult::notes) so a
 //! library made of links does not look empty without a reason.
 
 use std::ffi::{OsStr, OsString};
@@ -360,11 +360,11 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
     let rules = IgnoreRules::new(&opts.ignore_patterns);
     let mut result = WalkResult::default();
     for problem in rules.invalid_patterns() {
-        result.errors.push((root.to_path_buf(), problem.clone()));
+        result.notes.push((root.to_path_buf(), problem.clone()));
     }
     // A library folder that is itself (inside) a disc copy lists nothing.
     if let Some(note) = disc_structure_note(root) {
-        result.errors.push((root.to_path_buf(), note.to_string()));
+        result.notes.push((root.to_path_buf(), note.to_string()));
         return Ok(result);
     }
 
@@ -380,11 +380,14 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
                     bail!(
                         "The folder {} could not be read: {}.",
                         root.display(),
-                        describe_walk_error(&error)
+                        describe_walk_error(&error).text()
                     );
                 }
                 let path = error.path().unwrap_or(root).to_path_buf();
-                result.errors.push((path, describe_walk_error(&error)));
+                match describe_walk_error(&error) {
+                    WalkProblem::Note(note) => result.notes.push((path, note)),
+                    WalkProblem::Error(text) => result.errors.push((path, text)),
+                }
                 continue;
             }
         };
@@ -401,11 +404,11 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
             if rules.is_ignored_dir(relative) {
                 entries.skip_current_dir();
             } else if let Some(note) = disc_folder_note(entry.file_name()) {
-                result.errors.push((path.to_path_buf(), note.to_string()));
+                result.notes.push((path.to_path_buf(), note.to_string()));
                 entries.skip_current_dir();
             } else if path.to_str().is_none() {
                 // Paths are stored as text, so nothing below can be tracked.
-                result.errors.push((
+                result.notes.push((
                     path.to_path_buf(),
                     "Folder name is not valid UTF-8, so its contents were skipped. Renaming the \
                      folder fixes this"
@@ -418,7 +421,7 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
         if file_type.is_symlink() {
             // Only seen when links are not followed.
             if let Some(note) = skipped_link_note(path, relative, &rules) {
-                result.errors.push((path.to_path_buf(), note.to_string()));
+                result.notes.push((path.to_path_buf(), note.to_string()));
             }
             continue;
         }
@@ -434,7 +437,7 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
             continue;
         }
         if path.to_str().is_none() {
-            result.errors.push((
+            result.notes.push((
                 path.to_path_buf(),
                 "File name is not valid UTF-8, so it was skipped. Renaming the file fixes this"
                     .to_string(),
@@ -444,9 +447,10 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
-                result
-                    .errors
-                    .push((path.to_path_buf(), describe_walk_error(&error)));
+                match describe_walk_error(&error) {
+                    WalkProblem::Note(note) => result.notes.push((path.to_path_buf(), note)),
+                    WalkProblem::Error(text) => result.errors.push((path.to_path_buf(), text)),
+                }
                 continue;
             }
         };
@@ -468,6 +472,7 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
     result.files.sort_unstable_by(|a, b| a.path.cmp(&b.path));
     result.artifacts.sort_unstable();
     result.errors.sort_by(|a, b| a.0.cmp(&b.0));
+    result.notes.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(result)
 }
 
@@ -516,32 +521,51 @@ fn check_root(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A per-entry walk problem: something deliberately skipped, or something
+/// that could not be read.
+enum WalkProblem {
+    /// Left alone on purpose (a link loop, a broken link).
+    Note(String),
+    /// Could not be read.
+    Error(String),
+}
+
+impl WalkProblem {
+    fn text(self) -> String {
+        match self {
+            Self::Note(text) | Self::Error(text) => text,
+        }
+    }
+}
+
 /// Describe a per-entry walk error in plain language.
-fn describe_walk_error(error: &walkdir::Error) -> String {
+fn describe_walk_error(error: &walkdir::Error) -> WalkProblem {
     if let Some(ancestor) = error.loop_ancestor() {
-        return format!(
+        return WalkProblem::Note(format!(
             "This linked folder points back to {}, so it was skipped to avoid an endless loop",
             ancestor.display()
-        );
+        ));
     }
     let Some(io_error) = error.io_error() else {
-        return "Could not be read".to_string();
+        return WalkProblem::Error("Could not be read".to_string());
     };
     match io_error.kind() {
         io::ErrorKind::PermissionDenied => {
-            "Chrysopoeia does not have permission to read this".to_string()
+            WalkProblem::Error("Chrysopoeia does not have permission to read this".to_string())
         }
         io::ErrorKind::NotFound => {
             let is_broken_link = error.path().is_some_and(|path| {
                 std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
             });
             if is_broken_link {
-                BROKEN_LINK_NOTE.to_string()
+                WalkProblem::Note(BROKEN_LINK_NOTE.to_string())
             } else {
-                "This disappeared while the library was being scanned".to_string()
+                WalkProblem::Error(
+                    "This disappeared while the library was being scanned".to_string(),
+                )
             }
         }
-        _ => format!("Could not be read ({io_error})"),
+        _ => WalkProblem::Error(format!("Could not be read ({io_error})")),
     }
 }
 
@@ -754,9 +778,10 @@ mod tests {
         };
         let result = walk(root, &opts).unwrap();
         assert_eq!(relative_files(root, &result), ["Movies/A.mkv"]);
-        assert_eq!(result.errors.len(), 1);
-        assert_eq!(result.errors[0].0, root);
-        assert!(result.errors[0].1.contains("not valid"));
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(result.notes.len(), 1);
+        assert_eq!(result.notes[0].0, root);
+        assert!(result.notes[0].1.contains("not valid"));
     }
 
     #[test]
@@ -844,7 +869,8 @@ mod tests {
             relative_files(root, &followed),
             ["Linked.mkv", "Movies/A.mkv"]
         );
-        let messages: Vec<&str> = followed.errors.iter().map(|e| e.1.as_str()).collect();
+        assert!(followed.errors.is_empty(), "{:?}", followed.errors);
+        let messages: Vec<&str> = followed.notes.iter().map(|e| e.1.as_str()).collect();
         assert!(
             messages.iter().any(|m| m.contains("endless loop")),
             "{messages:?}"
@@ -858,8 +884,9 @@ mod tests {
         // explained so a library of links does not look empty for no reason.
         let not_followed = walk(root, &ScanOptions::default()).unwrap();
         assert_eq!(relative_files(root, &not_followed), ["Movies/A.mkv"]);
+        assert!(not_followed.errors.is_empty(), "{:?}", not_followed.errors);
         let notes: Vec<(String, &str)> = not_followed
-            .errors
+            .notes
             .iter()
             .map(|(path, note)| {
                 let relative = path.strip_prefix(root).unwrap().to_string_lossy();
@@ -891,6 +918,7 @@ mod tests {
         let result = walk(root, &default_options()).unwrap();
         assert_eq!(relative_files(root, &result), ["Movies/A.mkv"]);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert!(result.notes.is_empty(), "{:?}", result.notes);
     }
 
     #[test]
@@ -928,8 +956,9 @@ mod tests {
                 "Movies/Movie B (2010)/Movie B (2010).m2ts"
             ]
         );
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
         let notes: Vec<(&Path, &str)> = result
-            .errors
+            .notes
             .iter()
             .map(|(path, note)| (path.strip_prefix(root).unwrap(), note.as_str()))
             .collect();
@@ -945,10 +974,10 @@ mod tests {
         // A library whose root is (inside) a disc copy lists nothing.
         let inside = walk(&dvd, &default_options()).unwrap();
         assert!(inside.files.is_empty());
-        assert_eq!(inside.errors, [(dvd.clone(), DVD_NOTE.to_string())]);
+        assert_eq!(inside.notes, [(dvd.clone(), DVD_NOTE.to_string())]);
         let deeper = walk(&blu_ray.join("STREAM"), &default_options()).unwrap();
         assert!(deeper.files.is_empty());
-        assert_eq!(deeper.errors.len(), 1);
+        assert_eq!(deeper.notes.len(), 1);
 
         assert!(!is_media(&dvd.join("VTS_01_1.VOB")));
         assert!(!is_media(Path::new("x/Video_TS/VTS_01_1.vob")));
@@ -990,7 +1019,8 @@ mod tests {
             relative_files(root, &result),
             ["Movies/A/A.mkv", "Movies/A/Extras/x.mkv"]
         );
-        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
+        assert_eq!(result.notes.len(), 2, "{:?}", result.notes);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
     }
 
     #[cfg(target_os = "linux")]
@@ -1008,17 +1038,12 @@ mod tests {
 
         let result = walk(root, &ScanOptions::default()).unwrap();
         assert_eq!(relative_files(root, &result), ["Good.mkv"]);
-        let mut reported: Vec<&Path> = result.errors.iter().map(|e| e.0.as_path()).collect();
+        let mut reported: Vec<&Path> = result.notes.iter().map(|e| e.0.as_path()).collect();
         reported.sort();
         let mut expected = vec![bad_file.as_path(), bad_dir.as_path()];
         expected.sort();
         assert_eq!(reported, expected);
-        assert!(
-            result
-                .errors
-                .iter()
-                .all(|e| e.1.contains("not valid UTF-8"))
-        );
+        assert!(result.notes.iter().all(|e| e.1.contains("not valid UTF-8")));
     }
 
     /// Benchmark: `cargo test -p chrysopoeia-scanner --release -- --ignored

@@ -183,14 +183,20 @@ fn temp_dirs(state: &AppState) -> Vec<PathBuf> {
 }
 
 /// Hand every leftover temp/backup file to the worker's crash recovery. The
-/// temp folders are always checked; library folders only after an unclean
-/// shutdown (a clean one lets every job remove its own files).
+/// temp folders are always checked; library folders and the output folder
+/// (where folder mode writes when no temp folder is set) only after an
+/// unclean shutdown (a clean one lets every job remove its own files).
 pub async fn recover_artifacts(state: &AppState, include_libraries: bool) {
     let mut roots = temp_dirs(state);
     if include_libraries {
         match db::libraries::list(state.db.pool()).await {
             Ok(libs) => roots.extend(libs.into_iter().map(|l| PathBuf::from(l.path))),
             Err(e) => tracing::error!("could not list libraries for recovery: {e}"),
+        }
+        if let Some(out) = state.settings().output_folder.map(PathBuf::from)
+            && !roots.contains(&out)
+        {
+            roots.push(out);
         }
     }
     let mut artifacts: Vec<PathBuf> = Vec::new();
@@ -260,6 +266,7 @@ pub fn start_background(state: &AppState, startup: Startup) {
     tokio::spawn(async move { watcher::sync(&s).await });
 
     tokio::spawn(dispatcher::run(state.clone()));
+    tokio::spawn(hardware::recheck_loop(state.clone()));
     tokio::spawn(rescan::run(state.clone()));
     tokio::spawn(rescan::trim_history_loop(state.clone()));
 

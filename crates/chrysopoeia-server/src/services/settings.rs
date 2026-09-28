@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use chrysopoeia_core::{Event, OutputMode, Settings};
-use globset::Glob;
+use chrysopoeia_scanner::validate_ignore_pattern;
 use serde_json::Value;
 
 use crate::db;
@@ -14,6 +14,11 @@ use crate::state::AppState;
 
 fn invalid(message: impl Into<String>) -> ApiError {
     ApiError::bad_request("invalid_settings", message)
+}
+
+/// An invalid value for the setting `field`.
+fn invalid_field(field: &'static str, message: impl Into<String>) -> ApiError {
+    invalid(message).with_field(field)
 }
 
 /// Merge a partial settings object onto `current` (top level only; nested
@@ -32,7 +37,8 @@ pub fn merge(current: &Settings, patch: Value) -> ApiResult<Settings> {
             return Err(ApiError::bad_request(
                 "unknown_setting",
                 format!("There's no setting called \"{key}\"."),
-            ));
+            )
+            .with_field(key.clone()));
         }
     }
     let keys: Vec<String> = patch.keys().cloned().collect();
@@ -51,7 +57,9 @@ pub fn merge(current: &Settings, patch: Value) -> ApiResult<Settings> {
             serde_json::from_value::<Settings>(Value::Object(probe)).is_err()
         });
         match culprit {
-            Some(k) => invalid(format!("The value for \"{k}\" isn't valid: {e}")),
+            Some(k) => {
+                invalid(format!("The value for \"{k}\" isn't valid: {e}")).with_field(k.clone())
+            }
             None => invalid(format!("The settings aren't valid: {e}")),
         }
     })
@@ -65,25 +73,32 @@ fn blank_to_none(value: &mut Option<String>) {
     }
 }
 
-/// Check that `dir` is an existing, writable folder.
-async fn check_writable_dir(dir: &str, what: &str) -> ApiResult<()> {
+/// Check that `dir` is an existing, writable folder. `field` names the
+/// setting in errors.
+async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiResult<()> {
     let path = Path::new(dir);
     if !path.is_absolute() {
-        return Err(invalid(format!(
-            "The {what} must be a full path starting with /."
-        )));
+        return Err(invalid_field(
+            field,
+            format!("The {what} must be a full path starting with /."),
+        ));
     }
     match tokio::fs::metadata(path).await {
         Ok(m) if m.is_dir() => {}
         Ok(_) => {
-            return Err(invalid(format!(
-                "The {what} {dir} is a file, not a folder."
-            )));
+            return Err(invalid_field(
+                field,
+                format!("The {what} {dir} is a file, not a folder."),
+            ));
         }
         Err(_) => {
-            return Err(invalid(format!(
-                "The {what} {dir} doesn't exist on the server. In Docker, check that it is mounted."
-            )));
+            return Err(invalid_field(
+                field,
+                format!(
+                    "The {what} {dir} doesn't exist on the server. In Docker, check that it is \
+                     mounted."
+                ),
+            ));
         }
     }
     let probe = path.join(format!(
@@ -95,10 +110,13 @@ async fn check_writable_dir(dir: &str, what: &str) -> ApiResult<()> {
             let _ = tokio::fs::remove_file(&probe).await;
             Ok(())
         }
-        Err(_) => Err(invalid(format!(
-            "Chrysopoeia can't write to the {what} {dir}. Check its permissions (in Docker, the \
-             PUID/PGID user needs write access)."
-        ))),
+        Err(_) => Err(invalid_field(
+            field,
+            format!(
+                "Chrysopoeia can't write to the {what} {dir}. Check its permissions (in Docker, \
+                 the PUID/PGID user needs write access)."
+            ),
+        )),
     }
 }
 
@@ -112,47 +130,61 @@ pub async fn validate(state: &AppState, s: &mut Settings) -> ApiResult<()> {
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect();
+    crate::services::library_admin::check_profile(&s.default_profile, "default_profile")?;
     s.default_profile.normalize();
 
     if let Some(n) = s.max_jobs
         && !(1..=MAX_JOBS_LIMIT).contains(&n)
     {
-        return Err(invalid(format!(
-            "Jobs at once must be between 1 and {MAX_JOBS_LIMIT}."
-        )));
+        return Err(invalid_field(
+            "max_jobs",
+            format!("Jobs at once must be between 1 and {MAX_JOBS_LIMIT}."),
+        ));
     }
     if let Some(h) = s.active_hours
         && (h.start > 23 || h.end > 23)
     {
-        return Err(invalid("Active hours must be whole hours from 0 to 23."));
+        return Err(invalid_field(
+            "active_hours",
+            "Active hours must be whole hours from 0 to 23.",
+        ));
     }
+    // The scanner's own check: it also refuses patterns that would silently
+    // match nothing (backslashes, `!` exceptions).
     for p in &s.ignore_patterns {
-        if let Err(e) = Glob::new(p) {
-            return Err(invalid(format!(
-                "\"{p}\" isn't a valid ignore pattern: {e}"
-            )));
+        if let Err(e) = validate_ignore_pattern(p) {
+            // The scanner words it for its log ("…, so it was not used").
+            let reason = e.replace(", so it was not used", "");
+            return Err(invalid_field(
+                "ignore_patterns",
+                format!("{}.", reason.trim_end_matches('.')),
+            ));
         }
     }
     if let Some(dir) = s.temp_dir.clone() {
-        check_writable_dir(&dir, "temporary folder").await?;
+        check_writable_dir(&dir, "temporary folder", "temp_dir").await?;
     }
     if s.output_mode == OutputMode::Folder {
         let Some(dir) = s.output_folder.clone() else {
-            return Err(invalid(
+            return Err(invalid_field(
+                "output_folder",
                 "Choose an output folder, or switch back to replacing the originals.",
             ));
         };
-        check_writable_dir(&dir, "output folder").await?;
+        check_writable_dir(&dir, "output folder", "output_folder").await?;
         let out = tokio::fs::canonicalize(&dir)
             .await
             .unwrap_or_else(|_| Path::new(&dir).to_path_buf());
         for lib in db::libraries::list(state.db.pool()).await? {
             if out.starts_with(&lib.path) {
-                return Err(invalid(format!(
-                    "The output folder can't be inside the library {}, or Chrysopoeia would \
-                     convert its own results.",
-                    lib.name
-                )));
+                return Err(invalid_field(
+                    "output_folder",
+                    format!(
+                        "The output folder can't be inside the library {}, or Chrysopoeia would \
+                         convert its own results.",
+                        lib.name
+                    ),
+                ));
             }
         }
     }
@@ -174,7 +206,12 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     if old.hardware != new.hardware {
         hardware::apply_preference(state, new.hardware).await;
     }
-    if old.watch_folders != new.watch_folders {
+    // The watcher filters events like a scan does, so it follows the ignore
+    // patterns and minimum size too.
+    if old.watch_folders != new.watch_folders
+        || old.ignore_patterns != new.ignore_patterns
+        || old.min_file_size_mb != new.min_file_size_mb
+    {
         watcher::sync(state).await;
     }
     state.dispatcher.wake();

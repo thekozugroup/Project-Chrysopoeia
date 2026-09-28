@@ -2,7 +2,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use chrysopoeia_core::{AudioCodec, Container, Goal, TranscodeProfile, VideoCodec};
+use chrysopoeia_core::{AudioCodec, Container, Goal, HardwareInfo, TranscodeProfile, VideoCodec};
 use serde::Serialize;
 
 use crate::state::AppState;
@@ -75,9 +75,41 @@ pub fn goal_text(goal: Goal) -> (&'static str, &'static str) {
     }
 }
 
-/// `GET /api/presets`
+/// Video codecs this machine can encode: those with a verified encoder (or
+/// a listed CPU encoder, when detection itself failed and nothing could be
+/// verified). Every codec while hardware detection hasn't finished yet.
+pub fn usable_video_codecs(hw: Option<&HardwareInfo>) -> Vec<VideoCodec> {
+    VideoCodec::ALL
+        .into_iter()
+        .filter(|c| {
+            hw.is_none_or(|h| {
+                h.encoders
+                    .iter()
+                    .any(|e| e.codec == *c && (e.verified || (e.available && !e.api.is_hardware())))
+            })
+        })
+        .collect()
+}
+
+/// Audio codecs this machine can write: copy, and those whose ffmpeg
+/// encoder is available. Every codec while detection hasn't finished yet.
+pub fn usable_audio_codecs(hw: Option<&HardwareInfo>) -> Vec<AudioCodec> {
+    AudioCodec::ALL
+        .into_iter()
+        .filter(|a| {
+            *a == AudioCodec::Copy
+                || hw.is_none_or(|h| h.audio_encoders.iter().any(|e| e == a.ffmpeg_encoder()))
+        })
+        .collect()
+}
+
+/// `GET /api/presets`. Only codecs this machine can actually write are
+/// offered (hardware detection lists every known encoder, including ones
+/// missing from this ffmpeg build).
 pub async fn get(State(state): State<AppState>) -> Json<Presets> {
     let hw = state.hardware.current();
+    let video_ok = usable_video_codecs(hw.as_deref());
+    let audio_ok = usable_audio_codecs(hw.as_deref());
     let goals = [
         Goal::SaveSpace,
         Goal::Balanced,
@@ -95,8 +127,9 @@ pub async fn get(State(state): State<AppState>) -> Json<Presets> {
         }
     })
     .collect();
-    let video_codecs = VideoCodec::ALL
-        .into_iter()
+    let video_codecs = video_ok
+        .iter()
+        .copied()
         .map(|codec| VideoCodecPreset {
             codec,
             label: codec.label(),
@@ -108,8 +141,9 @@ pub async fn get(State(state): State<AppState>) -> Json<Presets> {
                 .unwrap_or_default(),
         })
         .collect();
-    let audio_codecs = AudioCodec::ALL
-        .into_iter()
+    let audio_codecs = audio_ok
+        .iter()
+        .copied()
         .map(|codec| AudioCodecPreset {
             codec,
             label: codec.label(),
@@ -120,12 +154,14 @@ pub async fn get(State(state): State<AppState>) -> Json<Presets> {
         .map(|container| ContainerPreset {
             container,
             label: container.label(),
-            video: VideoCodec::ALL
-                .into_iter()
+            video: video_ok
+                .iter()
+                .copied()
                 .filter(|v| container.supports_video(*v))
                 .collect(),
-            audio: AudioCodec::ALL
-                .into_iter()
+            audio: audio_ok
+                .iter()
+                .copied()
                 .filter(|a| container.supports_audio(*a))
                 .collect(),
         })

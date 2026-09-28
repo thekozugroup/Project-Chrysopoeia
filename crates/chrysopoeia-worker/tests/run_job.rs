@@ -759,3 +759,34 @@ async fn a_failed_folder_mode_job_leaves_no_empty_folders() {
     assert!(!dir.path().join("converted").exists());
     assert_eq!(support::walk(dir.path()), [input]);
 }
+
+/// A cut-off original (the truncated MKV from the test library claims the
+/// full clip length but holds a fraction of a second) fails with a plain
+/// explanation, with verification on and off, and is left as it was.
+#[tokio::test]
+async fn a_damaged_original_is_reported_as_damaged() {
+    require_ffmpeg!();
+    for validation in [ValidationLevel::Standard, ValidationLevel::Off] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = support::copy_media("Broken/Truncated.mkv", dir.path());
+        let before = std::fs::read(&input).unwrap();
+        let spec = spec(&input, dir.path(), profile());
+        let claimed = spec.probe.duration_secs.unwrap_or_default();
+        assert!(claimed >= 3.0, "the sample claims {claimed} s");
+        let (outcome, _) = run(&config(validation), &spec, &fake_plan).await;
+        match outcome {
+            JobOutcome::Failed { error, .. } => {
+                assert!(
+                    error.starts_with(
+                        "The original file appears damaged or incomplete (it stops after"
+                    ),
+                    "{validation:?}: {error}"
+                );
+                assert!(error.ends_with("It was left unchanged."), "{error}");
+            }
+            other => panic!("{validation:?}: expected Failed, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert_eq!(support::walk(dir.path()), [input]);
+    }
+}

@@ -41,9 +41,12 @@ q -f lavfi -i "testsrc2=size=720x576:rate=25:duration=$DUR" -f lavfi -i "sine=fr
   -vf "tinterlace=mode=interleave_top,setfield=tff" -c:v mpeg2video -flags +ilme+ildct -top 1 -b:v 4M \
   -c:a mp2 -b:a 192k -f mpegts "$OUT/TV/Show/Season 01/Show - S01E03.ts"
 
-# 5. Legacy AVI (MPEG-4 Part 2 + MP3), odd dimensions
-q -f lavfi -i "testsrc2=size=639x359:rate=25:duration=$DUR" -f lavfi -i "sine=frequency=880:duration=$DUR" \
-  -c:v mpeg4 -q:v 4 -c:a libmp3lame -b:a 128k "$OUT/Movies/Old Home Video.avi"
+# 5. Legacy AVI (Motion JPEG 4:4:4 + MP3, like old cameras), odd dimensions.
+#    testsrc2 and 4:2:0 formats round sizes to even numbers, so crop a 4:4:4
+#    picture: the file really is 639x359 and exercises the odd-size path.
+q -f lavfi -i "testsrc2=size=640x360:rate=25:duration=$DUR" -f lavfi -i "sine=frequency=880:duration=$DUR" \
+  -vf "format=yuv444p,crop=639:359:0:0" -c:v mjpeg -q:v 4 -pix_fmt yuvj444p \
+  -c:a libmp3lame -b:a 128k "$OUT/Movies/Old Home Video.avi"
 
 # 6. Audio only (should be skipped)
 q -f lavfi -i "sine=frequency=440:duration=$DUR" -c:a flac "$OUT/Music/Tone.flac"

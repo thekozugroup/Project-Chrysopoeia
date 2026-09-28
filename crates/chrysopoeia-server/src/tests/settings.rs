@@ -137,6 +137,7 @@ async fn hardware_placeholder_until_detection_finishes() {
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.json["hints"][0]["title"], "Checking your hardware…");
     assert_eq!(r.json["hints"][0]["level"], "info");
+    assert_eq!(r.json["detecting"], true);
 
     // Jobs wait for detection.
     app.write("Movies/a.mkv", h264());
@@ -148,6 +149,7 @@ async fn hardware_placeholder_until_detection_finishes() {
     app.wait_ready().await;
     let r = app.get("/api/hardware").await;
     assert_eq!(r.json["cpu"]["model"], "Fake CPU");
+    assert_eq!(r.json["detecting"], false);
     assert_eq!(r.json["recommended_jobs"]["total"], 2);
     app.wait_queue_idle().await;
     assert_eq!(fake.started(), ["a.mkv"]);

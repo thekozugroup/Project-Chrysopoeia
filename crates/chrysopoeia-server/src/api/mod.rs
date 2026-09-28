@@ -13,6 +13,7 @@ pub mod overview;
 pub mod presets;
 pub mod queue;
 pub mod settings;
+pub mod system;
 
 use axum::extract::DefaultBodyLimit;
 use axum::extract::OriginalUri;
@@ -60,6 +61,7 @@ async fn method_not_allowed() -> ApiError {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
+        .route("/system", get(system::get))
         .route("/overview", get(overview::get))
         .route("/libraries", get(libraries::list).post(libraries::create))
         .route(

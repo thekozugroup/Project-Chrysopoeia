@@ -3,6 +3,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use chrysopoeia_core::Settings;
 use chrysopoeia_scanner::WatchEvent;
 use serde_json::json;
 
@@ -42,7 +43,11 @@ async fn scan_new_changed_unchanged_removed() {
     assert_eq!(files["already.mkv"]["relative_path"], "sub/already.mkv");
     assert_eq!(files["broken.mkv"]["status"], "failed");
     let err = files["broken.mkv"]["error"].as_str().unwrap();
-    assert!(err.contains("can't be read"), "{err}");
+    // One clean sentence, not a sentence wrapped around another.
+    assert_eq!(
+        err,
+        "This file can't be read as a video: its data is invalid or cut short."
+    );
     assert!(files["broken.mkv"]["video_codec"].is_null());
     assert_eq!(files["song.flac"]["status"], "skipped");
     assert!(
@@ -198,9 +203,34 @@ async fn watch_events_upsert_and_remove() {
     app.patch(&format!("/api/libraries/{id}"), json!({ "enabled": true }))
         .await;
     assert!(app.fake.watched.lock().unwrap().contains(&root));
+    // Roots are watched with the scan filters (sizes in decimal megabytes),
+    // and watched again when those settings change.
+    let last_call = |fake: &FakeToolkit| fake.watch_calls.lock().unwrap().last().cloned().unwrap();
+    let (called_root, patterns, min) = last_call(&app.fake);
+    assert_eq!(called_root, root);
+    assert_eq!(patterns, Settings::default().ignore_patterns);
+    assert_eq!(min, 0);
+    app.patch(
+        "/api/settings",
+        json!({ "min_file_size_mb": 50, "ignore_patterns": ["**/Extras/**"] }),
+    )
+    .await;
+    let (_, patterns, min) = last_call(&app.fake);
+    assert_eq!(patterns, ["**/Extras/**"]);
+    assert_eq!(min, 50_000_000);
+    let calls = app.fake.watch_calls.lock().unwrap().len();
+    app.patch("/api/settings", json!({ "auto_queue": true }))
+        .await;
+    assert_eq!(app.fake.watch_calls.lock().unwrap().len(), calls);
+
     app.patch("/api/settings", json!({ "watch_folders": false }))
         .await;
-    assert!(app.fake.watched.lock().unwrap().is_empty());
+    let fake = app.fake.clone();
+    wait_until("watcher dropped", move || {
+        let fake = fake.clone();
+        async move { fake.watched.lock().unwrap().is_empty() }
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -814,6 +814,8 @@ fn parse_stream(s: &Value) -> StreamInfo {
         color_range: text(&s["color_range"]),
         hdr,
         interlaced: matches!(field_order, "tt" | "bb" | "tb" | "bt"),
+        mastering_display: None,
+        content_light: None,
         channels: num(&s["channels"]),
         channel_layout: text(&s["channel_layout"]),
         sample_rate: num(&s["sample_rate"]),

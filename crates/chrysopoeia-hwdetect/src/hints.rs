@@ -29,6 +29,10 @@ pub const DRI_DOCKER_FIX: &str = "--device=/dev/dri";
 /// Docker flag that gives a container enough memory for a few encodes.
 pub const MEMORY_DOCKER_FIX: &str = "--memory=4g";
 
+/// Title of the hint shown when every NVENC session was taken during the
+/// test encodes.
+pub const NVIDIA_BUSY_TITLE: &str = "NVIDIA GPU is busy";
+
 /// Everything hints are derived from.
 #[derive(Debug, Clone, Copy)]
 pub struct HintInput<'a> {
@@ -259,10 +263,10 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     if any(FailureKind::NvencSessionLimit) && !any(FailureKind::NvidiaDriverMissing) {
         out.push(hint(
             fallback.level(),
-            "NVIDIA GPU is busy",
+            NVIDIA_BUSY_TITLE,
             format!(
                 "Your {name} has no free encoding sessions because other apps, such as Plex or Jellyfin, are using them all, \
-                 {clause} for now. Select Detect again in Settings once they finish."
+                 {clause} for now. Chrysopoeia checks again by itself in a few minutes, or select Check again in Settings once they finish."
             ),
             None,
         ));
@@ -329,7 +333,7 @@ fn hung_hint(label: &str, name: &str, fallback: Fallback) -> SetupHint {
         format!("{label} GPU didn't respond"),
         format!(
             "Your {name} didn't finish a one-second test encode in time, {}. \
-             Restart the container (or the server, if that doesn't help), then select Detect again in Settings.",
+             Restart the container (or the server, if that doesn't help), then select Check again in Settings.",
             fallback.clause()
         ),
         None,

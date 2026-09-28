@@ -1,7 +1,9 @@
 //! API errors: `{"error": "<plain sentence>", "code": "<snake_case>"}`.
 //!
 //! Client errors carry a sentence the UI can show as is. Server errors (500)
-//! show a generic sentence; the details go to the log.
+//! show a generic sentence; the details go to the log. Validation errors
+//! caused by one setting or request field also name it:
+//! `{"error", "code", "field": "temp_dir"}`.
 
 use std::borrow::Cow;
 
@@ -24,12 +26,16 @@ pub struct ApiError {
     pub code: Cow<'static, str>,
     /// Plain-language sentence.
     pub message: String,
+    /// The settings key or request field at fault, when one is.
+    pub field: Option<Cow<'static, str>>,
 }
 
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
     code: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
 }
 
 impl ApiError {
@@ -39,6 +45,26 @@ impl ApiError {
             status,
             code: Cow::Borrowed(code),
             message: message.into(),
+            field: None,
+        }
+    }
+
+    /// Name the field at fault: a settings key such as `temp_dir`, or a
+    /// request field such as `profile` or `name`.
+    #[must_use]
+    pub fn with_field(mut self, field: impl Into<Cow<'static, str>>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
+    /// Name `field` as the one at fault, unless the error already names one
+    /// or isn't about the request (server errors).
+    #[must_use]
+    pub fn about(self, field: &'static str) -> Self {
+        if self.field.is_none() && self.status.is_client_error() {
+            self.with_field(field)
+        } else {
+            self
         }
     }
 
@@ -86,6 +112,7 @@ impl IntoResponse for ApiError {
         let body = ErrorBody {
             error: &self.message,
             code: &self.code,
+            field: self.field.as_deref(),
         };
         (self.status, Json(body)).into_response()
     }
@@ -125,6 +152,19 @@ fn rejection_detail(text: &str) -> String {
     detail.trim().trim_end_matches('.').to_string()
 }
 
+/// The field a JSON data error is about: the path serde reports before the
+/// first `": "` (e.g. `profile.quality` in "profile.quality: unknown
+/// variant"), when there is one.
+fn field_of(detail: &str) -> Option<String> {
+    let (path, _) = detail.split_once(": ")?;
+    let valid = !path.is_empty()
+        && path != "."
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']'));
+    valid.then(|| path.to_string())
+}
+
 impl From<JsonRejection> for ApiError {
     fn from(rej: JsonRejection) -> Self {
         match rej {
@@ -140,13 +180,17 @@ impl From<JsonRejection> for ApiError {
                     rejection_detail(&e.body_text())
                 ),
             ),
-            JsonRejection::JsonDataError(e) => Self::bad_request(
-                "invalid_request",
-                format!(
-                    "The request has a wrong or missing field ({}).",
-                    rejection_detail(&e.body_text())
-                ),
-            ),
+            JsonRejection::JsonDataError(e) => {
+                let detail = rejection_detail(&e.body_text());
+                let error = Self::bad_request(
+                    "invalid_request",
+                    format!("The request has a wrong or missing field ({detail})."),
+                );
+                match field_of(&detail) {
+                    Some(field) => error.with_field(field),
+                    None => error,
+                }
+            }
             JsonRejection::BytesRejection(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
                 Self::new(
                     StatusCode::PAYLOAD_TOO_LARGE,
@@ -205,6 +249,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["code"], "library_exists");
         assert_eq!(v["error"], "That folder is already a library.");
+        assert!(v.get("field").is_none());
+
+        let resp = ApiError::bad_request("invalid_settings", "Pick a folder.")
+            .with_field("temp_dir")
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["field"], "temp_dir");
+        assert_eq!(v["code"], "invalid_settings");
     }
 
     #[test]
@@ -215,6 +268,17 @@ mod tests {
             ),
             "bogus: unknown field `bogus`"
         );
+    }
+
+    #[test]
+    fn data_errors_name_their_field() {
+        assert_eq!(
+            field_of("profile.quality: unknown variant `x`").as_deref(),
+            Some("profile.quality")
+        );
+        assert_eq!(field_of("missing field `path`"), None);
+        assert_eq!(field_of(".: invalid type: string"), None);
+        assert_eq!(field_of("expected value: at position 3"), None);
     }
 
     #[test]

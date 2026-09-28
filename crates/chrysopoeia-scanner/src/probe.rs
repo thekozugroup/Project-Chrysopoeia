@@ -15,15 +15,19 @@
 //!   it and reports such files as HDR10.
 //! - A Dolby Vision stream whose base layer is not a standard picture
 //!   (profile 5) is reported with no colour primaries, transfer or matrix:
-//!   `hdr == DolbyVision` without a PQ or HLG `color_transfer` means the video
-//!   cannot be re-encoded without ruining its colours.
+//!   `hdr == DolbyVision` without a `color_transfer` means the video cannot
+//!   be re-encoded without ruining its colours. The worker's skip decision
+//!   reads exactly this signal. Dolby Vision with a standard base layer keeps
+//!   its transfer: PQ (profiles 7, 8.1), HLG (8.4) or SDR (8.2, 9).
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
-use chrysopoeia_core::{HdrFormat, ProbeInfo, StreamInfo, StreamKind};
+use chrysopoeia_core::{
+    ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind,
+};
 use serde_json::{Map, Value};
 use tokio::process::Command;
 
@@ -55,16 +59,18 @@ pub(crate) async fn probe(
     let mut info = tokio::time::timeout_at(deadline, probe_streams(ffprobe, path))
         .await
         .map_err(|_| ProbeError::Timeout(timeout))??;
-    refine_hdr10_plus(ffprobe, path, &mut info, deadline).await;
+    refine_hdr(ffprobe, path, &mut info, deadline).await;
     Ok(info)
 }
 
 /// ffprobe ships HDR10+ metadata per frame (HEVC SEI messages, Matroska
 /// block additions), never in the stream-level side data `-show_streams`
-/// prints. When the main video looks like plain HDR10, decode its first few
-/// frames and upgrade it to [`HdrFormat::Hdr10Plus`] when they carry
-/// SMPTE 2094-40 metadata.
-async fn refine_hdr10_plus(
+/// prints, and HEVC files usually carry their HDR10 mastering display and
+/// light levels the same way. So for PQ (HDR10-style) video, decode the
+/// first few frames: upgrade plain HDR10 to [`HdrFormat::Hdr10Plus`] when
+/// they carry SMPTE 2094-40 metadata, and fill in the mastering display and
+/// content light levels when the container didn't state them.
+async fn refine_hdr(
     ffprobe: &Path,
     path: &Path,
     info: &mut ProbeInfo,
@@ -77,27 +83,51 @@ async fn refine_hdr10_plus(
     else {
         return;
     };
-    if video.hdr != Some(HdrFormat::Hdr10) {
+    let pq = video
+        .color_transfer
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("smpte2084"));
+    let wants_plus = video.hdr == Some(HdrFormat::Hdr10);
+    let wants_static = pq && (video.mastering_display.is_none() || video.content_light.is_none());
+    if !wants_plus && !wants_static {
         return;
     }
-    let check = frames_have_hdr10_plus(ffprobe, path, video.index);
+    let check = read_frame_hdr(ffprobe, path, video.index);
     match tokio::time::timeout_at(deadline, check).await {
-        Ok(Some(true)) => video.hdr = Some(HdrFormat::Hdr10Plus),
-        Ok(Some(false)) => {}
+        Ok(Some(frames)) => {
+            if wants_plus && frames.hdr10_plus {
+                video.hdr = Some(HdrFormat::Hdr10Plus);
+            }
+            if video.mastering_display.is_none() {
+                video.mastering_display = frames.mastering_display;
+            }
+            if video.content_light.is_none() {
+                video.content_light = frames.content_light;
+            }
+        }
         Ok(None) => tracing::debug!(
             path = %path.display(),
-            "could not look for HDR10+ metadata; reporting HDR10"
+            "could not read the first frames for HDR metadata"
         ),
         Err(_) => tracing::debug!(
             path = %path.display(),
-            "ran out of time looking for HDR10+ metadata; reporting HDR10"
+            "ran out of time reading the first frames for HDR metadata"
         ),
     }
 }
 
-/// Whether the first frames of stream `index` carry HDR10+ metadata, or
-/// `None` when ffprobe could not tell.
-async fn frames_have_hdr10_plus(ffprobe: &Path, path: &Path, index: u32) -> Option<bool> {
+/// HDR metadata found on the first frames of a video.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct FrameHdr {
+    /// SMPTE 2094-40 (HDR10+) dynamic metadata.
+    pub hdr10_plus: bool,
+    pub mastering_display: Option<MasteringDisplay>,
+    pub content_light: Option<ContentLight>,
+}
+
+/// The HDR metadata on the first frames of stream `index`, or `None` when
+/// ffprobe could not tell.
+async fn read_frame_hdr(ffprobe: &Path, path: &Path, index: u32) -> Option<FrameHdr> {
     let output = Command::new(ffprobe)
         .args(["-v", "error", "-select_streams"])
         .arg(index.to_string())
@@ -115,24 +145,100 @@ async fn frames_have_hdr10_plus(ffprobe: &Path, path: &Path, index: u32) -> Opti
     if !output.status.success() {
         return None;
     }
-    parse_hdr10_plus_frames(&output.stdout)
+    parse_frame_hdr(&output.stdout)
+}
+
+/// HDR metadata in ffprobe `-show_frames` JSON, or `None` when the output is
+/// not understood.
+pub(crate) fn parse_frame_hdr(json: &[u8]) -> Option<FrameHdr> {
+    let root: Value = serde_json::from_slice(json).ok()?;
+    let frames = root.get("frames")?.as_array()?;
+    let mut found = FrameHdr::default();
+    for list in frames
+        .iter()
+        .filter_map(|frame| frame.get("side_data_list").and_then(Value::as_array))
+    {
+        found.hdr10_plus |= list
+            .iter()
+            .filter_map(|entry| str_field(entry, "side_data_type"))
+            .any(is_hdr10_plus_side_data);
+        if found.mastering_display.is_none() {
+            found.mastering_display = mastering_display_of(list);
+        }
+        if found.content_light.is_none() {
+            found.content_light = content_light_of(list);
+        }
+    }
+    Some(found)
 }
 
 /// Whether ffprobe `-show_frames` JSON lists SMPTE 2094-40 (HDR10+) side
 /// data on any frame, or `None` when the output is not understood.
+#[cfg(test)]
 pub(crate) fn parse_hdr10_plus_frames(json: &[u8]) -> Option<bool> {
-    let root: Value = serde_json::from_slice(json).ok()?;
-    let frames = root.get("frames")?.as_array()?;
-    Some(frames.iter().any(|frame| {
-        frame
-            .get("side_data_list")
-            .and_then(Value::as_array)
-            .is_some_and(|list| {
-                list.iter()
-                    .filter_map(|entry| str_field(entry, "side_data_type"))
-                    .any(is_hdr10_plus_side_data)
-            })
-    }))
+    parse_frame_hdr(json).map(|f| f.hdr10_plus)
+}
+
+/// The side data entry whose type contains `name` (ignoring case).
+fn side_data_entry<'a>(list: &'a [Value], name: &str) -> Option<&'a Value> {
+    list.iter().find(|entry| {
+        str_field(entry, "side_data_type").is_some_and(|t| t.to_ascii_lowercase().contains(name))
+    })
+}
+
+/// A number ffprobe prints as a rational (`"34000/50000"`), a numeric
+/// string or a plain number.
+fn rational(value: Option<&Value>) -> Option<f64> {
+    let v = match value? {
+        Value::Number(n) => n.as_f64()?,
+        Value::String(s) => match s.split_once('/') {
+            Some((num, den)) => {
+                let den: f64 = den.trim().parse().ok()?;
+                if den == 0.0 {
+                    return None;
+                }
+                num.trim().parse::<f64>().ok()? / den
+            }
+            None => s.trim().parse().ok()?,
+        },
+        _ => return None,
+    };
+    v.is_finite().then_some(v)
+}
+
+/// HDR10 mastering display metadata from a side data list.
+pub(crate) fn mastering_display_of(list: &[Value]) -> Option<MasteringDisplay> {
+    let entry = side_data_entry(list, "mastering display")?;
+    let get = |key: &str| rational(entry.get(key));
+    let xy = |x: &str, y: &str| -> Option<[f64; 2]> {
+        let (x, y) = (get(x)?, get(y)?);
+        ((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y)).then_some([x, y])
+    };
+    let display = MasteringDisplay {
+        red: xy("red_x", "red_y")?,
+        green: xy("green_x", "green_y")?,
+        blue: xy("blue_x", "blue_y")?,
+        white_point: xy("white_point_x", "white_point_y")?,
+        max_luminance: get("max_luminance")?,
+        min_luminance: get("min_luminance")?,
+    };
+    (display.max_luminance > 0.0 && display.min_luminance >= 0.0).then_some(display)
+}
+
+/// HDR10 content light levels from a side data list. All-zero levels mean
+/// "unknown" and are left out.
+pub(crate) fn content_light_of(list: &[Value]) -> Option<ContentLight> {
+    let entry = side_data_entry(list, "content light level")?;
+    let level = |key: &str| {
+        u64_value(entry.get(key))
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(0)
+    };
+    let light = ContentLight {
+        max_cll: level("max_content"),
+        max_fall: level("max_average"),
+    };
+    (light.max_cll > 0 || light.max_fall > 0).then_some(light)
 }
 
 /// Whether a side data type names HDR10+ dynamic metadata.
@@ -149,17 +255,17 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
         .map_err(|error| ProbeError::Unreadable(describe_open_error(&error)))?;
     if metadata.is_dir() {
         return Err(ProbeError::Unreadable(
-            "This is a folder, not a media file".to_string(),
+            "This is a folder, not a media file.".to_string(),
         ));
     }
     if !metadata.is_file() {
         return Err(ProbeError::Unreadable(
-            "This is not a regular file (it may be a device, socket or pipe)".to_string(),
+            "This is not a regular file (it may be a device, socket or pipe).".to_string(),
         ));
     }
     let size_bytes = metadata.len();
     if size_bytes == 0 {
-        return Err(ProbeError::Unreadable("The file is empty".to_string()));
+        return Err(ProbeError::Unreadable("The file is empty.".to_string()));
     }
 
     let input = input_argument(path);
@@ -220,11 +326,11 @@ fn input_argument(path: &Path) -> PathBuf {
 
 fn describe_open_error(error: &io::Error) -> String {
     match error.kind() {
-        io::ErrorKind::NotFound => "The file no longer exists".to_string(),
+        io::ErrorKind::NotFound => "The file no longer exists.".to_string(),
         io::ErrorKind::PermissionDenied => {
-            "Chrysopoeia does not have permission to read this file".to_string()
+            "Chrysopoeia doesn't have permission to read this file.".to_string()
         }
-        _ => format!("The file could not be opened ({error})"),
+        _ => format!("The file couldn't be opened ({error})."),
     }
 }
 
@@ -242,44 +348,45 @@ fn describe_spawn_error(ffprobe: &Path, error: &io::Error) -> String {
     }
 }
 
-/// Turn ffprobe's stderr into one plain-language reason.
+/// Turn ffprobe's stderr into one plain-language sentence.
 fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> String {
     // Checked in order: the first match wins, so specific causes come first.
     const KNOWN: &[(&str, &str)] = &[
         (
             "permission denied",
-            "Chrysopoeia does not have permission to read this file",
+            "Chrysopoeia doesn't have permission to read this file.",
         ),
         (
             "operation not permitted",
-            "Chrysopoeia is not allowed to read this file",
+            "Chrysopoeia isn't allowed to read this file.",
         ),
-        ("no such file or directory", "The file no longer exists"),
-        ("is a directory", "This is a folder, not a media file"),
+        ("no such file or directory", "The file no longer exists."),
+        ("is a directory", "This is a folder, not a media file."),
         (
             "input/output error",
-            "The disk reported a read error for this file (it may be damaged)",
+            "The disk reported a read error for this file, so it may be damaged.",
         ),
         (
             "moov atom not found",
-            "Not a readable media file (the MP4 index is missing, so the file is probably \
-             incomplete)",
+            "This file can't be read as a video: it has no MP4 index, so it's incomplete or \
+             not really a video.",
         ),
         (
             "ebml header parsing failed",
-            "Not a readable media file (the Matroska header is damaged)",
+            "This file can't be read as a video: its MKV header is damaged.",
         ),
         (
             "invalid data found when processing input",
-            "Not a readable media file (the data is invalid or truncated)",
+            "This file can't be read as a video: its data is invalid or cut short.",
         ),
         (
             "end of file",
-            "Not a readable media file (it ends too early; the copy may be incomplete)",
+            "This file can't be read as a video: it ends too early, so the copy may be \
+             incomplete.",
         ),
         (
             "cannot allocate memory",
-            "ffprobe ran out of memory while reading this file",
+            "ffprobe ran out of memory while reading this file.",
         ),
     ];
 
@@ -298,10 +405,15 @@ fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> 
     match (detail, status.code()) {
         (Some(detail), _) => {
             let detail: String = detail.chars().take(MAX_REASON_CHARS).collect();
-            format!("ffprobe could not read this file: {detail}")
+            format!(
+                "This file can't be read as a video (ffprobe said: {}).",
+                detail.trim_end_matches('.')
+            )
         }
-        (None, Some(code)) => format!("ffprobe could not read this file (exit code {code})"),
-        (None, None) => "ffprobe stopped unexpectedly while reading this file".to_string(),
+        (None, Some(code)) => {
+            format!("This file can't be read as a video (ffprobe stopped with exit code {code}).")
+        }
+        (None, None) => "ffprobe stopped unexpectedly while reading this file.".to_string(),
     }
 }
 
@@ -432,6 +544,9 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
             stream.color_space = known_str(raw, "color_space");
             stream.color_range = known_str(raw, "color_range");
             stream.hdr = detect_hdr(raw, stream.color_transfer.as_deref(), codec_tag);
+            let side_data = raw.get("side_data_list").and_then(Value::as_array);
+            stream.mastering_display = side_data.and_then(|l| mastering_display_of(l));
+            stream.content_light = side_data.and_then(|l| content_light_of(l));
             if dolby_vision_without_standard_base_layer(raw) {
                 // The picture is in Dolby's own IPT colour space; whatever
                 // the colour tags claim, it is not a standard picture.
@@ -496,12 +611,13 @@ fn detect_hdr(raw: &Value, transfer: Option<&str>, codec_tag: Option<&str>) -> O
 
 /// Whether the stream's Dolby Vision configuration record says the base
 /// layer is compatible with no standard picture (`dv_bl_signal_compatibility_id`
-/// 0: profile 5, and profile 10.0 for AV1). Such a base layer uses Dolby's IPT
-/// colour space and only looks right on a Dolby Vision display; re-encoding
-/// it without the Dolby Vision layer gives green and purple colours.
+/// 0, or `dv_profile` 5 when an older ffprobe leaves the id out: profile 5,
+/// and profile 10.0 for AV1). Such a base layer uses Dolby's IPT colour
+/// space and only looks right on a Dolby Vision display; re-encoding it
+/// without the Dolby Vision layer gives green and purple colours.
 ///
 /// The core types have no field for this, so it is signalled by leaving the
-/// colour tags empty: a [`HdrFormat::DolbyVision`] stream without a PQ or HLG
+/// colour tags empty: a [`HdrFormat::DolbyVision`] stream without a
 /// `color_transfer` has no usable base layer and must be left alone.
 fn dolby_vision_without_standard_base_layer(raw: &Value) -> bool {
     raw.get("side_data_list")
@@ -512,7 +628,12 @@ fn dolby_vision_without_standard_base_layer(raw: &Value) -> bool {
             str_field(entry, "side_data_type")
                 .is_some_and(|t| t.to_ascii_lowercase().contains("dovi"))
         })
-        .any(|record| u64_value(record.get("dv_bl_signal_compatibility_id")) == Some(0))
+        .any(
+            |record| match u64_value(record.get("dv_bl_signal_compatibility_id")) {
+                Some(id) => id == 0,
+                None => u64_value(record.get("dv_profile")) == Some(5),
+            },
+        )
 }
 
 /// Bit depth implied by an ffmpeg pixel format name, when it is one we know.
@@ -883,7 +1004,7 @@ mod tests {
         let video = probe.primary_video().unwrap();
         assert_eq!(video.bit_depth, Some(10));
         // The documented signal for "no standard base layer": Dolby Vision
-        // without a PQ or HLG transfer.
+        // without a transfer.
         assert_eq!(video.color_transfer, None);
         assert_eq!(video.color_primaries, None);
         assert_eq!(video.color_space, None);
@@ -909,6 +1030,71 @@ mod tests {
         let video = parse(json, 1).unwrap().streams.remove(0);
         assert_eq!(video.hdr, Some(HdrFormat::DolbyVision));
         assert_eq!(video.color_transfer.as_deref(), Some("arib-std-b67"));
+
+        // An ffprobe that leaves the compatibility id out: profile 5 alone
+        // says there is no standard layer.
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "hevc",
+            "color_transfer": "bt709", "side_data_list": [
+                {"side_data_type": "DOVI configuration record", "dv_profile": 5}]}]}"#;
+        let video = parse(json, 1).unwrap().streams.remove(0);
+        assert_eq!(video.hdr, Some(HdrFormat::DolbyVision));
+        assert_eq!(video.color_transfer, None);
+        // Profile 8 without the id keeps its tags (8.2 has an SDR layer).
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "hevc",
+            "color_transfer": "bt709", "side_data_list": [
+                {"side_data_type": "DOVI configuration record", "dv_profile": 8}]}]}"#;
+        let video = parse(json, 1).unwrap().streams.remove(0);
+        assert_eq!(video.color_transfer.as_deref(), Some("bt709"));
+    }
+
+    #[test]
+    fn hdr10_static_metadata_is_read_from_frames_and_streams() {
+        // What ffprobe 6.1 prints for the first frame of an x265 HDR10 file.
+        let frames = br#"{"frames": [{"media_type": "video", "side_data_list": [
+            {"side_data_type": "H.26[45] User Data Unregistered SEI message"},
+            {"side_data_type": "Mastering display metadata",
+             "red_x": "34000/50000", "red_y": "16000/50000",
+             "green_x": "13250/50000", "green_y": "34500/50000",
+             "blue_x": "7500/50000", "blue_y": "3000/50000",
+             "white_point_x": "15635/50000", "white_point_y": "16450/50000",
+             "min_luminance": "1/10000", "max_luminance": "10000000/10000"},
+            {"side_data_type": "Content light level metadata",
+             "max_content": 1000, "max_average": 400}]}]}"#;
+        let found = parse_frame_hdr(frames).unwrap();
+        assert!(!found.hdr10_plus);
+        let m = found.mastering_display.unwrap();
+        assert_eq!(m.red, [0.68, 0.32]);
+        assert_eq!(m.green, [0.265, 0.69]);
+        assert_eq!(m.white_point, [0.3127, 0.329]);
+        assert_eq!(m.max_luminance, 1000.0);
+        assert_eq!(m.min_luminance, 0.0001);
+        assert_eq!(
+            found.content_light,
+            Some(ContentLight {
+                max_cll: 1000,
+                max_fall: 400
+            })
+        );
+        // Stream-level side data (Matroska Colour, MP4 mdcv/clli) works too;
+        // unknown light levels (0, 0) are left out.
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "hevc",
+            "color_transfer": "smpte2084", "side_data_list": [
+            {"side_data_type": "Mastering display metadata",
+             "red_x": "0.68", "red_y": "0.32", "green_x": "0.265", "green_y": "0.69",
+             "blue_x": "0.15", "blue_y": "0.06", "white_point_x": "0.3127",
+             "white_point_y": "0.329", "min_luminance": "0.005", "max_luminance": "4000"},
+            {"side_data_type": "Content light level metadata",
+             "max_content": 0, "max_average": 0}]}]}"#;
+        let video = parse(json, 1).unwrap().streams.remove(0);
+        assert_eq!(
+            video.mastering_display.map(|m| m.max_luminance),
+            Some(4000.0)
+        );
+        assert_eq!(video.content_light, None);
+        // Broken values are ignored rather than passed on.
+        let bad = br#"{"frames": [{"side_data_list": [
+            {"side_data_type": "Mastering display metadata", "red_x": "1/0"}]}]}"#;
+        assert_eq!(parse_frame_hdr(bad).unwrap().mastering_display, None);
     }
 
     #[test]
@@ -1161,33 +1347,36 @@ mod tests {
         let input = Path::new("/media/Broken/Fake.mp4");
         let fake = b"[mov,mp4,m4a,3gp,3g2,mj2 @ 0x5573] moov atom not found\n\
                      /media/Broken/Fake.mp4: Invalid data found when processing input\n";
-        assert!(
-            describe_ffprobe_failure(fake, input, exit_status(1)).contains("MP4 index is missing")
+        // One clean sentence (the server shows it as is).
+        assert_eq!(
+            describe_ffprobe_failure(fake, input, exit_status(1)),
+            "This file can't be read as a video: it has no MP4 index, so it's incomplete or not \
+             really a video."
         );
         let invalid = b"/media/Broken/Fake.mp4: Invalid data found when processing input\n";
         assert_eq!(
             describe_ffprobe_failure(invalid, input, exit_status(1)),
-            "Not a readable media file (the data is invalid or truncated)"
+            "This file can't be read as a video: its data is invalid or cut short."
         );
         let denied = b"/media/Broken/Fake.mp4: Permission denied\n";
         assert_eq!(
             describe_ffprobe_failure(denied, input, exit_status(1)),
-            "Chrysopoeia does not have permission to read this file"
+            "Chrysopoeia doesn't have permission to read this file."
         );
         let missing = b"/media/Broken/Fake.mp4: No such file or directory\n";
         assert_eq!(
             describe_ffprobe_failure(missing, input, exit_status(1)),
-            "The file no longer exists"
+            "The file no longer exists."
         );
         let other =
             b"[matroska,webm @ 0x1] Something odd\n/media/Broken/Fake.mp4: Weird failure\n\n";
         assert_eq!(
             describe_ffprobe_failure(other, input, exit_status(1)),
-            "ffprobe could not read this file: Weird failure"
+            "This file can't be read as a video (ffprobe said: Weird failure)."
         );
         assert_eq!(
             describe_ffprobe_failure(b"", input, exit_status(3)),
-            "ffprobe could not read this file (exit code 3)"
+            "This file can't be read as a video (ffprobe stopped with exit code 3)."
         );
     }
 
@@ -1323,11 +1512,9 @@ mod tests {
                     let p = result.unwrap();
                     assert_eq!(p.container, "avi");
                     let v = p.primary_video().unwrap();
-                    assert_eq!(v.codec, "mpeg4");
-                    // The script asks for 639x359; ffmpeg's mpeg4 encoder
-                    // rounds odd sizes down to even ones.
-                    assert!(matches!(v.width, Some(638 | 639)), "{v:?}");
-                    assert!(matches!(v.height, Some(358 | 359)), "{v:?}");
+                    assert_eq!(v.codec, "mjpeg");
+                    // Really odd-sized, so the odd-size path is exercised.
+                    assert_eq!((v.width, v.height), (Some(639), Some(359)), "{v:?}");
                     assert_eq!(p.audio_codec(), Some("mp3"));
                 }
                 "Tone.flac" => {
@@ -1342,7 +1529,10 @@ mod tests {
                 },
                 "Fake.mp4" => match result {
                     Err(ProbeError::Unreadable(reason)) => {
-                        assert!(reason.starts_with("Not a readable media file"), "{reason}");
+                        assert!(
+                            reason.starts_with("This file can't be read as a video"),
+                            "{reason}"
+                        );
                     }
                     other => panic!("a text file must not probe: {other:?}"),
                 },
@@ -1362,14 +1552,14 @@ mod tests {
         };
 
         let reason = unreadable(probe(ffprobe, &dir.path().join("gone.mkv"), timeout).await);
-        assert_eq!(reason, "The file no longer exists");
+        assert_eq!(reason, "The file no longer exists.");
         let reason = unreadable(probe(ffprobe, dir.path(), timeout).await);
-        assert_eq!(reason, "This is a folder, not a media file");
+        assert_eq!(reason, "This is a folder, not a media file.");
         let empty = dir.path().join("empty.mkv");
         std::fs::write(&empty, b"").unwrap();
         assert_eq!(
             unreadable(probe(ffprobe, &empty, timeout).await),
-            "The file is empty"
+            "The file is empty."
         );
     }
 
@@ -1617,7 +1807,7 @@ mod tests {
             Err(ProbeError::Unreadable(reason)) => {
                 assert_eq!(
                     reason,
-                    "Chrysopoeia does not have permission to read this file"
+                    "Chrysopoeia doesn't have permission to read this file."
                 );
             }
             other => panic!("{other:?}"),

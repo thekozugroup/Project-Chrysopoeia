@@ -29,11 +29,19 @@ use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// A running folder watcher. Dropping it stops watching. Only `Send` is
-/// required: the server keeps it behind a mutex.
-pub trait FolderWatcher: Send {
+/// A running folder watcher. Dropping it stops watching. Its methods take
+/// `&self` and may block for seconds (they walk the folder tree), so the
+/// server calls them from blocking threads and never under a lock.
+pub trait FolderWatcher: Send + Sync {
     /// Start watching a root recursively.
     fn watch(&self, root: &Path) -> anyhow::Result<()>;
+    /// Start watching a root, filtering events with the ignore patterns and
+    /// minimum size in `opts` like a scan does. Calling it again for a
+    /// watched root applies new options.
+    fn watch_with_options(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<()> {
+        let _ = opts;
+        self.watch(root)
+    }
     /// Stop watching a root.
     fn unwatch(&self, root: &Path) -> anyhow::Result<()>;
 }
@@ -113,6 +121,10 @@ struct RealWatcher(chrysopoeia_scanner::LibraryWatcher);
 impl FolderWatcher for RealWatcher {
     fn watch(&self, root: &Path) -> anyhow::Result<()> {
         self.0.watch(root)
+    }
+
+    fn watch_with_options(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<()> {
+        self.0.watch_with_options(root, opts)
     }
 
     fn unwatch(&self, root: &Path) -> anyhow::Result<()> {

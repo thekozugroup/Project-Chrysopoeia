@@ -32,6 +32,22 @@ pub const CHECK_DEADLINE: Duration = Duration::from_secs(30);
 /// Pause before testing again an NVIDIA GPU whose sessions were all busy.
 pub const NVENC_BUSY_RETRY_DELAY: Duration = Duration::from_secs(3);
 
+/// How an encoder that failed only because every NVENC session was taken
+/// is described (the start of [`EncoderStatus::error`]).
+pub const NVENC_BUSY_SENTENCE: &str =
+    "The NVIDIA GPU has no free encoding sessions; other apps are using them all.";
+
+/// Whether an encoder is unverified only because its GPU was busy (every
+/// NVENC session taken, e.g. by Chrysopoeia's own running jobs or by Plex),
+/// so the result says nothing about whether it works.
+pub fn is_busy_failure(status: &EncoderStatus) -> bool {
+    !status.verified
+        && status
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(NVENC_BUSY_SENTENCE))
+}
+
 /// Longest `ffmpeg -version`, `-encoders` or `-filters` may take.
 const INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -355,10 +371,7 @@ impl FailureKind {
                 "The NVIDIA driver isn't installed or isn't working.".into()
             }
             Self::NvidiaDriverTooOld => "The NVIDIA driver is too old for this ffmpeg.".into(),
-            Self::NvencSessionLimit => {
-                "The NVIDIA GPU has no free encoding sessions; other apps are using them all."
-                    .into()
-            }
+            Self::NvencSessionLimit => NVENC_BUSY_SENTENCE.into(),
             Self::VaapiUnavailable => match device {
                 Some(d) => format!(
                     "The VA-API device {d} can't be used; the GPU's media driver may be missing."

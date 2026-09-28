@@ -601,47 +601,113 @@ pub async fn skip_many(
     Ok((skipped, processing))
 }
 
+/// What a deleted row knew about its file, kept for a while in case the
+/// same file turns up under another name (a renamed file or folder), so it
+/// keeps its state instead of being probed and converted again.
+#[derive(Debug, Clone)]
+pub struct RemovedRow {
+    pub library_id: Uuid,
+    pub size_bytes: u64,
+    /// Stored timestamp string (compare with [`ts`] of the disk mtime).
+    pub modified_at: String,
+    pub status: FileStatus,
+    pub probe: Option<ProbeInfo>,
+    pub skip_reason: Option<String>,
+    pub error: Option<String>,
+    pub original_size_bytes: Option<u64>,
+    pub saved_bytes: Option<i64>,
+}
+
+const REMOVED_COLUMNS: &str = "library_id, size_bytes, modified_at, status, probe, \
+    skip_reason, error, original_size_bytes, saved_bytes";
+
+fn removed_from_row(row: &SqliteRow) -> sqlx::Result<RemovedRow> {
+    let status: String = row.try_get("status")?;
+    let probe: Option<String> = row.try_get("probe")?;
+    Ok(RemovedRow {
+        library_id: uuid_col(row, "library_id")?,
+        size_bytes: u64_col(row, "size_bytes")?,
+        modified_at: row.try_get("modified_at")?,
+        status: FileStatus::parse(&status)
+            .ok_or_else(|| super::decode_error(format!("bad file status {status:?}")))?,
+        // A probe that doesn't parse is just not carried over.
+        probe: probe.as_deref().and_then(|p| parse_json(p).ok()),
+        skip_reason: row.try_get("skip_reason")?,
+        error: row.try_get("error")?,
+        original_size_bytes: opt_u64_col(row, "original_size_bytes")?,
+        saved_bytes: row.try_get("saved_bytes")?,
+    })
+}
+
 /// Delete the rows of files a scan no longer found, unless a row changed
 /// since the scan read it (a job moved it to a new name, a watch event) or
-/// is being processed. Their jobs cascade. Returns how many were deleted.
+/// is being processed. Their jobs cascade. Returns what the deleted rows
+/// knew.
 pub async fn delete_unchanged(
     conn: &mut SqliteConnection,
     seen: &[IndexEntry],
-) -> sqlx::Result<u64> {
-    let mut deleted = 0;
+) -> sqlx::Result<Vec<RemovedRow>> {
+    let mut deleted = Vec::new();
     for e in seen {
-        deleted += sqlx::query(
-            "DELETE FROM files WHERE id = ? AND updated_at = ? AND status != 'processing'",
-        )
+        let row = sqlx::query(&format!(
+            "DELETE FROM files WHERE id = ? AND updated_at = ? AND status != 'processing' \
+             RETURNING {REMOVED_COLUMNS}"
+        ))
         .bind(e.id.to_string())
         .bind(&e.updated_at)
-        .execute(&mut *conn)
-        .await?
-        .rows_affected();
+        .fetch_optional(&mut *conn)
+        .await?;
+        if let Some(row) = row {
+            deleted.push(removed_from_row(&row)?);
+        }
     }
     Ok(deleted)
 }
 
 /// Delete the file at `path`, or every file under the folder `path`, except
-/// files being processed right now. Returns the affected library ids.
-pub async fn delete_path_or_prefix(pool: &SqlitePool, path: &str) -> sqlx::Result<Vec<Uuid>> {
+/// files being processed right now. Returns what the deleted rows knew.
+pub async fn delete_path_or_prefix(pool: &SqlitePool, path: &str) -> sqlx::Result<Vec<RemovedRow>> {
     let prefix = format!("{}/", path.trim_end_matches('/'));
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "DELETE FROM files WHERE status != 'processing' \
-         AND (path = ? OR substr(path, 1, length(?)) = ?) RETURNING library_id",
-    )
+         AND (path = ? OR substr(path, 1, length(?)) = ?) RETURNING {REMOVED_COLUMNS}"
+    ))
     .bind(path)
     .bind(&prefix)
     .bind(&prefix)
     .fetch_all(pool)
     .await?;
-    let mut libs = rows
-        .iter()
-        .map(|r| uuid_col(r, "library_id"))
-        .collect::<sqlx::Result<Vec<_>>>()?;
-    libs.sort_unstable();
-    libs.dedup();
-    Ok(libs)
+    rows.iter().map(removed_from_row).collect()
+}
+
+/// Insert the row of a file that was removed under another name moments ago
+/// (see [`RemovedRow`]): its status, probe, reasons and savings carry over,
+/// its job history does not. Returns the new id, or `None` when the path
+/// already has a row.
+pub async fn insert_moved(
+    conn: &mut SqliteConnection,
+    f: &FileUpsert,
+    from: &RemovedRow,
+) -> sqlx::Result<Option<Uuid>> {
+    let row = FileUpsert {
+        status: from.status,
+        probe: from.probe.clone(),
+        skip_reason: from.skip_reason.clone(),
+        error: from.error.clone(),
+        ..f.clone()
+    };
+    let Some(id) = insert(&mut *conn, &row).await? else {
+        return Ok(None);
+    };
+    if from.original_size_bytes.is_some() || from.saved_bytes.is_some() {
+        sqlx::query("UPDATE files SET original_size_bytes = ?, saved_bytes = ? WHERE id = ?")
+            .bind(from.original_size_bytes.map(i64_of))
+            .bind(from.saved_bytes)
+            .bind(id.to_string())
+            .execute(conn)
+            .await?;
+    }
+    Ok(Some(id))
 }
 
 /// A file whose decision can be recomputed after a profile change.

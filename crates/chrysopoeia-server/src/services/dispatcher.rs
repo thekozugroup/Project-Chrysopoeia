@@ -76,6 +76,8 @@ pub enum CancelIntent {
 struct RunningJob {
     file_id: Uuid,
     library_id: Uuid,
+    /// Its first-choice encoder runs on the CPU.
+    software: bool,
     cancel: CancellationToken,
     intent: Option<CancelIntent>,
 }
@@ -173,6 +175,11 @@ impl DispatcherHandle {
     /// Jobs running right now.
     pub fn running_count(&self) -> usize {
         lock(&self.running).len()
+    }
+
+    /// Running jobs whose first-choice encoder runs on the CPU.
+    pub fn software_running_count(&self) -> usize {
+        lock(&self.running).values().filter(|j| j.software).count()
     }
 
     /// Whether a job is running.
@@ -344,25 +351,71 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
     if d.is_paused() || outside {
         return Ok(());
     }
-    let (max_jobs, _) = effective_max_jobs(state);
+    let (max_jobs, auto) = effective_max_jobs(state);
     if d.running_count() >= max_jobs as usize {
         return Ok(());
     }
     recheck_offline(state).await;
-    let skip_libraries: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
+    let offline: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
     let skip_jobs: Vec<Uuid> = {
         let now = Instant::now();
         let mut deferred = lock(&d.deferred);
         deferred.retain(|_, until| *until > now);
         deferred.keys().copied().collect()
     };
+    let software_libraries = software_libraries(state, &settings).await?;
+    let software_cap = auto.then(|| software_job_cap(state, max_jobs)).flatten();
     while d.running_count() < max_jobs as usize && !state.shutdown.is_cancelled() {
+        // CPU encodes beyond the CPU's own job count would only slow each
+        // other down, even when the limit follows the GPU: pass over the
+        // libraries whose jobs encode on the CPU until one finishes.
+        let cpu_full = software_cap.is_some_and(|cap| d.software_running_count() >= cap);
+        let mut skip_libraries = offline.clone();
+        if cpu_full {
+            skip_libraries.extend(software_libraries.iter().copied());
+        }
         let Some(job) = db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs).await? else {
             break;
         };
-        start_job(state, job);
+        let software = software_libraries.contains(&job.library_id);
+        start_job(state, job, software);
     }
     Ok(())
+}
+
+/// How many CPU encodes may run at once when the automatic job limit is
+/// higher than the CPU's own count (it follows the GPU): the hardware's
+/// recommended CPU jobs. `None` when that is no limit at all.
+fn software_job_cap(state: &AppState, max_jobs: u32) -> Option<usize> {
+    let hw = state.hardware.current()?;
+    let cap = hw.recommended_jobs.cpu_jobs.max(1);
+    (cap < max_jobs).then_some(cap as usize)
+}
+
+/// Libraries whose jobs would encode on the CPU first: no verified hardware
+/// encoder for their codec under the current preference.
+async fn software_libraries(state: &AppState, settings: &Settings) -> sqlx::Result<Vec<Uuid>> {
+    let Some(hw) = state.hardware.current() else {
+        return Ok(Vec::new());
+    };
+    let libs = db::libraries::list(state.db.pool()).await?;
+    let mut by_codec: HashMap<chrysopoeia_core::VideoCodec, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for lib in libs {
+        let codec = lib.profile.video_codec;
+        let software = *by_codec.entry(codec).or_insert_with(|| {
+            state
+                .toolkit
+                .encoder_candidates(&hw, codec, settings.hardware, settings.cpu_fallback)
+                .ok()
+                .and_then(|c| c.first().map(|c| c.api == HwApi::Software))
+                .unwrap_or(true)
+        });
+        if software {
+            out.push(lib.id);
+        }
+    }
+    Ok(out)
 }
 
 /// Check offline library folders that are due, and let the jobs of those
@@ -411,13 +464,14 @@ async fn recheck_offline(state: &AppState) {
     }
 }
 
-fn start_job(state: &AppState, job: Job) {
+fn start_job(state: &AppState, job: Job, software: bool) {
     let cancel = CancellationToken::new();
     lock(&state.dispatcher.running).insert(
         job.id,
         RunningJob {
             file_id: job.file_id,
             library_id: job.library_id,
+            software,
             cancel: cancel.clone(),
             intent: None,
         },
@@ -577,7 +631,7 @@ async fn execute(
         return (Disposition::Requeue(Requeue::Settling), ctx);
     }
     let probe = match file.probe.clone() {
-        Some(p) if unchanged => p,
+        Some(p) if unchanged && !lacks_hdr10_metadata(&p) => p,
         _ => match state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT).await {
             Ok(p) => {
                 if let Err(e) =
@@ -642,6 +696,19 @@ async fn execute(
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
     }
     done(outcome, ctx)
+}
+
+/// Whether a stored probe of PQ (HDR10-style) video has no mastering
+/// display or light levels: probes made by older versions never read them,
+/// so the file is probed again and the conversion keeps them.
+fn lacks_hdr10_metadata(probe: &chrysopoeia_core::ProbeInfo) -> bool {
+    probe.primary_video().is_some_and(|v| {
+        v.color_transfer
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("smpte2084"))
+            && v.mastering_display.is_none()
+            && v.content_light.is_none()
+    })
 }
 
 /// Forward worker progress: every update to the WebSocket, and to the
@@ -877,6 +944,7 @@ async fn apply_outcome(
                     output_size: Some(output_size),
                     validation,
                     command: Some(command),
+                    notes: notes.clone(),
                     ..JobFinish::default()
                 },
             )
@@ -940,11 +1008,11 @@ async fn apply_outcome(
             if verified {
                 message.push_str(", verified");
             }
-            for note in notes {
+            for note in &notes {
                 message.push_str(". ");
                 message.push_str(note.trim_end_matches('.'));
             }
-            tracing::info!(job = %job.id, encoder, "job done");
+            tracing::debug!(job = %job.id, encoder, "job done");
             state.activity(ActivityLevel::Success, message, refs).await;
         }
         JobOutcome::Skipped {
@@ -1016,7 +1084,8 @@ async fn apply_outcome(
             }
             tx.commit().await?;
             if exists {
-                tracing::warn!(job = %job.id, "job failed: {error}");
+                // The activity entry below is the one warning in the log.
+                tracing::debug!(job = %job.id, "job failed: {error}");
                 state
                     .activity(
                         ActivityLevel::Error,

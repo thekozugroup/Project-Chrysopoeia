@@ -204,7 +204,8 @@ fn dolby_vision_without_a_standard_layer_is_skipped() {
     dv5.hdr = Some(HdrFormat::DolbyVision);
     let p = probe_of("matroska", vec![dv5.clone()]);
     let save = chrysopoeia_core::TranscodeProfile::from_goal(chrysopoeia_core::Goal::SaveSpace);
-    let reason_text = "Dolby Vision video without a standard HDR layer — left unchanged";
+    let reason_text =
+        "Dolby Vision profile 5 can't be converted without losing its colours — left unchanged";
     assert_eq!(reason(decide(&p, &save)), reason_text);
     let hevc_mp4 = profile(VideoCodec::Hevc, AudioCodec::Aac, Container::Mp4);
     assert_eq!(reason(decide(&p, &hevc_mp4)), reason_text);
@@ -227,6 +228,30 @@ fn dolby_vision_without_a_standard_layer_is_skipped() {
     dv84.color_transfer = Some("arib-std-b67".into());
     let p = probe_of("matroska", vec![dv84]);
     assert_eq!(decide(&p, &save), Decision::Transcode);
+    // Profile 8.2 (SDR base layer) too.
+    let mut dv82 = video_10bit(0, "hevc", 3840, 2160);
+    dv82.hdr = Some(HdrFormat::DolbyVision);
+    dv82.color_transfer = Some("bt709".into());
+    let p = probe_of("matroska", vec![dv82]);
+    assert_eq!(decide(&p, &save), Decision::Transcode);
+}
+
+/// The scanner's signal for profile 5 (Dolby Vision with its colour tags
+/// cleared) and the skip decision agree on the real ffprobe output.
+#[test]
+fn scanner_and_planner_agree_on_dolby_vision_profile_5() {
+    let json = br#"{"format": {"format_name": "matroska,webm", "duration": "60"},
+        "streams": [{"index": 0, "codec_type": "video", "codec_name": "hevc",
+        "width": 3840, "height": 2160, "pix_fmt": "yuv420p10le",
+        "color_transfer": "smpte2084", "color_primaries": "bt2020",
+        "side_data_list": [{"side_data_type": "DOVI configuration record",
+        "dv_profile": 5, "dv_bl_signal_compatibility_id": 0}]}]}"#;
+    let probe = chrysopoeia_scanner::parse_ffprobe_json(json, 1_000_000).unwrap();
+    let save = chrysopoeia_core::TranscodeProfile::from_goal(chrysopoeia_core::Goal::SaveSpace);
+    assert_eq!(
+        reason(decide(&probe, &save)),
+        "Dolby Vision profile 5 can't be converted without losing its colours — left unchanged"
+    );
 }
 
 #[test]

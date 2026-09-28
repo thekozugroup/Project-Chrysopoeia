@@ -58,11 +58,41 @@ pub struct StreamInfo {
     pub color_range: Option<String>,
     pub hdr: Option<HdrFormat>,
     pub interlaced: bool,
+    /// HDR10 static metadata: the mastering display (SMPTE ST 2086).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mastering_display: Option<MasteringDisplay>,
+    /// HDR10 static metadata: content light levels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_light: Option<ContentLight>,
 
     // Audio
     pub channels: Option<u32>,
     pub channel_layout: Option<String>,
     pub sample_rate: Option<u32>,
+}
+
+/// The colour volume of the display an HDR video was mastered on (SMPTE ST
+/// 2086), carried with HDR10 video so TVs can map it to their own range.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MasteringDisplay {
+    /// CIE 1931 xy chromaticity of the red primary.
+    pub red: [f64; 2],
+    pub green: [f64; 2],
+    pub blue: [f64; 2],
+    pub white_point: [f64; 2],
+    /// Peak luminance in cd/m² (nits).
+    pub max_luminance: f64,
+    /// Black level in cd/m².
+    pub min_luminance: f64,
+}
+
+/// Content light levels of an HDR10 video (CTA-861.3), in cd/m².
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLight {
+    /// Brightest pixel of the whole video (MaxCLL).
+    pub max_cll: u32,
+    /// Brightest frame on average (MaxFALL).
+    pub max_fall: u32,
 }
 
 /// Everything ffprobe told us about a file.

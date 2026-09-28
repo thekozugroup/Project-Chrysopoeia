@@ -167,12 +167,33 @@ async fn note_adjustments(state: &AppState, name: &str, notes: &[String], id: Uu
         .await;
 }
 
+/// Smallest `max_height` accepted (144p).
+pub const MIN_MAX_HEIGHT: u32 = 144;
+
+/// Check the values of a profile that `normalize` can't fix. `field` is the
+/// profile's own name in the request (`profile`, `default_profile`), used
+/// to name the field at fault.
+pub fn check_profile(profile: &TranscodeProfile, field: &str) -> ApiResult<()> {
+    if let Some(h) = profile.max_height
+        && h < MIN_MAX_HEIGHT
+    {
+        return Err(ApiError::bad_request(
+            "invalid_profile",
+            format!("The largest picture height must be at least {MIN_MAX_HEIGHT} lines."),
+        )
+        .with_field(format!("{field}.max_height")));
+    }
+    Ok(())
+}
+
 /// Create a library and start scanning it.
 pub async fn create(state: &AppState, new: NewLibrary) -> ApiResult<Library> {
-    let path = validate_library_path(state, &new.path).await?;
+    let path = validate_library_path(state, &new.path)
+        .await
+        .map_err(|e| e.about("path"))?;
     let path_str = path.to_str().unwrap_or_default().to_string();
     let name = match new.name.as_deref().filter(|n| !n.trim().is_empty()) {
-        Some(n) => clean_name(n)?,
+        Some(n) => clean_name(n).map_err(|e| e.about("name"))?,
         None => path
             .file_name()
             .map_or_else(|| path_str.clone(), |n| n.to_string_lossy().into_owned()),
@@ -182,6 +203,7 @@ pub async fn create(state: &AppState, new: NewLibrary) -> ApiResult<Library> {
         (None, Some(goal)) => TranscodeProfile::from_goal(goal),
         (None, None) => state.settings().default_profile,
     };
+    check_profile(&profile, "profile")?;
     let notes = profile.normalize();
     let row = LibraryRow {
         id: Uuid::new_v4(),
@@ -194,10 +216,10 @@ pub async fn create(state: &AppState, new: NewLibrary) -> ApiResult<Library> {
     };
     if let Err(e) = db::libraries::insert(state.db.pool(), &row).await {
         if matches!(&e, sqlx::Error::Database(d) if d.is_unique_violation()) {
-            return Err(ApiError::conflict(
-                "library_exists",
-                "That folder is already a library.",
-            ));
+            return Err(
+                ApiError::conflict("library_exists", "That folder is already a library.")
+                    .with_field("path"),
+            );
         }
         return Err(e.into());
     }
@@ -233,7 +255,7 @@ pub async fn update(state: &AppState, id: Uuid, patch: LibraryPatch) -> ApiResul
         .ok_or_else(library_not_found)?;
     let was_enabled = row.enabled;
     if let Some(name) = &patch.name {
-        row.name = clean_name(name)?;
+        row.name = clean_name(name).map_err(|e| e.about("name"))?;
     }
     if let Some(enabled) = patch.enabled {
         row.enabled = enabled;
@@ -241,6 +263,7 @@ pub async fn update(state: &AppState, id: Uuid, patch: LibraryPatch) -> ApiResul
     let mut notes = Vec::new();
     let previous_profile = row.profile.clone();
     if let Some(mut profile) = patch.profile {
+        check_profile(&profile, "profile")?;
         notes = profile.normalize();
         row.profile = profile;
     }

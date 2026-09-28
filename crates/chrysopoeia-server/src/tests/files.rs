@@ -484,11 +484,11 @@ async fn scan_writes_never_touch_rows_changed_since_they_were_read() {
     };
     let mut tx = app.state.db.write_tx().await.unwrap();
     assert!(!update_scanned(&mut tx, &seen, &upsert).await.unwrap());
-    assert_eq!(
+    assert!(
         crate::db::files::delete_unchanged(&mut tx, std::slice::from_ref(&seen))
             .await
-            .unwrap(),
-        0
+            .unwrap()
+            .is_empty()
     );
     tx.commit().await.unwrap();
     let r = app.get(&format!("/api/files/{}", seen.id)).await;

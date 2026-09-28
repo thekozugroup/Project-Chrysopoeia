@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -111,8 +111,12 @@ const MIGRATION_V2: &[&str] = &[
     "CREATE INDEX idx_jobs_file ON jobs(file_id, created_at)",
 ];
 
+/// Version 3: `jobs.notes`, a JSON array of plain-language notes about
+/// compromises a finished conversion made (NULL when there are none).
+const MIGRATION_V3: &[&str] = &["ALTER TABLE jobs ADD COLUMN notes TEXT"];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
-const MIGRATIONS: &[(i64, &[&str])] = &[(2, MIGRATION_V2)];
+const MIGRATIONS: &[(i64, &[&str])] = &[(2, MIGRATION_V2), (3, MIGRATION_V3)];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -321,6 +325,16 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(finished.as_deref(), Some("2026-01-02T00:00:00.000Z"));
+        // Version 3 added job notes; old jobs have none.
+        let job = crate::db::jobs::get(db.pool(), uuid::Uuid::nil())
+            .await
+            .unwrap();
+        assert!(job.is_none());
+        let notes: Option<String> = sqlx::query_scalar("SELECT notes FROM jobs WHERE id = 'j'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(notes, None);
         // The job pages read an index in order instead of sorting the table.
         for filter in [
             crate::db::jobs::JobFilter::History,

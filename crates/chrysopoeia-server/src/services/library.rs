@@ -17,7 +17,7 @@ use chrysopoeia_core::{
     ActivityLevel, Event, FileStatus, Library, LibraryStats, ProbeInfo, ScanPhase, ScanProgress,
     TranscodeProfile,
 };
-use chrysopoeia_scanner::{DiscoveredFile, ProbeError, ScanOptions, WatchEvent};
+use chrysopoeia_scanner::{DiscoveredFile, IgnoreRules, ProbeError, ScanOptions, WatchEvent};
 use chrysopoeia_worker::Decision;
 use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
-use crate::db::files::{FileUpsert, IndexEntry};
+use crate::db::files::{FileUpsert, IndexEntry, RemovedRow};
 use crate::db::jobs::NewJob;
 use crate::db::libraries::LibraryRow;
 use crate::db::{self, ts};
@@ -58,7 +58,24 @@ pub struct LibraryHandle {
     pub(crate) watcher_sync: tokio::sync::Mutex<()>,
     /// Watcher problems already reported, so the feed says each only once.
     pub(crate) reported_watch_problems: std::sync::Mutex<HashSet<String>>,
+    /// Scan problems and notes already reported, per library.
+    reported_walk_problems: std::sync::Mutex<HashMap<Uuid, HashSet<String>>>,
+    /// Rows of files removed a moment ago, in case they turn up under
+    /// another name (see [`remember_removed`]).
+    removed: std::sync::Mutex<RecentlyRemoved>,
     probes: Arc<Semaphore>,
+}
+
+/// How long a removed file's row is remembered for a rename or move.
+const MOVE_WINDOW: Duration = Duration::from_secs(3600);
+/// Most removed rows remembered at once.
+const MOVE_MEMORY: usize = 50_000;
+
+/// Recently removed rows by (library, size, modification time).
+#[derive(Default)]
+pub(crate) struct RecentlyRemoved {
+    rows: HashMap<(Uuid, u64, String), Vec<(Instant, RemovedRow)>>,
+    count: usize,
 }
 
 impl Default for LibraryHandle {
@@ -68,6 +85,8 @@ impl Default for LibraryHandle {
             watcher: std::sync::Mutex::new(None),
             watcher_sync: tokio::sync::Mutex::new(()),
             reported_watch_problems: std::sync::Mutex::new(HashSet::new()),
+            reported_walk_problems: std::sync::Mutex::new(HashMap::new()),
+            removed: std::sync::Mutex::new(RecentlyRemoved::default()),
             probes: Arc::new(Semaphore::new(PROBE_CONCURRENCY)),
         }
     }
@@ -97,6 +116,99 @@ impl LibraryHandle {
             token.cancel();
         }
     }
+}
+
+/// Remember the rows of files that were just removed. A renamed file or
+/// folder shows up as a removal plus a new file with the same size and
+/// modification time; the new file then keeps the old row's state (a
+/// finished conversion, a skip) instead of being probed and converted again.
+/// Queued files and files whose last job found them missing are not
+/// remembered: they are decided afresh.
+fn remember_removed(state: &AppState, rows: Vec<RemovedRow>) {
+    let now = Instant::now();
+    let mut memory = lock(&state.library.removed);
+    if memory.count + rows.len() > MOVE_MEMORY {
+        memory.rows.retain(|_, v| {
+            v.iter()
+                .any(|(at, _)| now.duration_since(*at) < MOVE_WINDOW)
+        });
+        memory.count = memory.rows.values().map(Vec::len).sum();
+        if memory.count + rows.len() > MOVE_MEMORY {
+            memory.rows.clear();
+            memory.count = 0;
+        }
+    }
+    for row in rows {
+        let missing = row
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(db::files::MISSING_INPUT_ERROR));
+        if matches!(row.status, FileStatus::Queued | FileStatus::Processing) || missing {
+            continue;
+        }
+        let key = (row.library_id, row.size_bytes, row.modified_at.clone());
+        memory.rows.entry(key).or_default().push((now, row));
+        memory.count += 1;
+    }
+}
+
+/// The remembered row of a file removed from `library` within the last hour
+/// with this size and modification time, if there is exactly one.
+fn take_moved(
+    state: &AppState,
+    library: Uuid,
+    size: u64,
+    modified: DateTime<Utc>,
+) -> Option<RemovedRow> {
+    let mut memory = lock(&state.library.removed);
+    let key = (library, size, ts(modified));
+    let entries = memory.rows.get_mut(&key)?;
+    entries.retain(|(at, _)| at.elapsed() < MOVE_WINDOW);
+    let found = match entries.len() {
+        // Two removed files alike: can't tell which one this is.
+        1 => entries.pop().map(|(_, row)| row),
+        _ => None,
+    };
+    if entries.is_empty() {
+        memory.rows.remove(&key);
+    }
+    if found.is_some() {
+        memory.count = memory.count.saturating_sub(1);
+    }
+    found
+}
+
+/// Store a file found under a new name with the state of its removed row.
+/// Returns the new row's id (`None` when the path has a row already).
+async fn store_moved(
+    state: &AppState,
+    lib: &LibraryRow,
+    file: &DiscoveredFile,
+    from: &RemovedRow,
+) -> sqlx::Result<Option<Uuid>> {
+    let Some((path, relative_path, file_name)) = row_names(Path::new(&lib.path), file) else {
+        return Ok(None);
+    };
+    // Status, probe and reasons come from `from`.
+    let upsert = FileUpsert {
+        library_id: lib.id,
+        path,
+        relative_path,
+        file_name,
+        size_bytes: file.size,
+        modified_at: file.modified,
+        status: from.status,
+        probe: None,
+        skip_reason: None,
+        error: None,
+    };
+    let mut tx = state.db.write_tx().await?;
+    let id = db::files::insert_moved(&mut tx, &upsert, from).await?;
+    tx.commit().await?;
+    if id.is_some() {
+        tracing::debug!(path = %file.path.display(), "a moved or renamed file kept its state");
+    }
+    Ok(id)
 }
 
 /// Removes a scan from the in-progress set when dropped, even on panic.
@@ -168,30 +280,41 @@ pub async fn scan_all(state: &AppState) -> sqlx::Result<usize> {
     Ok(started)
 }
 
-/// Options for walking a library under the current settings.
+/// Options for walking a library under the current settings (the same the
+/// folder watcher filters with).
 fn scan_options(state: &AppState) -> ScanOptions {
-    let settings = state.settings();
-    ScanOptions {
-        ignore_patterns: settings.ignore_patterns,
-        min_size_bytes: u64::from(settings.min_file_size_mb) * 1_000_000,
-        follow_links: false,
-    }
+    ScanOptions::from_settings(&state.settings())
 }
 
-/// Plain-language message for a probe failure.
+/// `text` as a sentence: trimmed, first letter capitalized, ending with a
+/// full stop (or another closing punctuation mark).
+fn sentence(text: &str) -> String {
+    let text = text.trim();
+    let mut chars = text.chars();
+    let mut out: String = match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => return String::new(),
+    };
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    out
+}
+
+/// Plain-language message for a probe failure. The scanner's reasons for
+/// unreadable files are already sentences for users.
 pub fn probe_error_message(e: &ProbeError) -> String {
     match e {
-        ProbeError::Spawn(msg) => {
-            format!("ffprobe couldn't be started, so this file wasn't checked: {msg}")
-        }
+        ProbeError::Spawn(msg) => format!(
+            "ffprobe couldn't be started, so this file wasn't checked. {}",
+            sentence(msg)
+        ),
         ProbeError::Timeout(_) => "Reading this file took longer than 60 seconds. It may be \
             damaged, or the drive may be very slow."
             .to_string(),
-        ProbeError::Unreadable(msg) => {
-            format!("This file can't be read as a video. It may be damaged or incomplete: {msg}")
-        }
+        ProbeError::Unreadable(msg) => sentence(msg),
         ProbeError::Parse(msg) => {
-            format!("ffprobe's answer about this file couldn't be understood: {msg}")
+            format!("ffprobe's answer about this file couldn't be understood ({msg}).")
         }
     }
 }
@@ -232,15 +355,9 @@ struct Analyzed {
     upsert: FileUpsert,
 }
 
-/// The row to store for a probed and decided file.
-fn build_upsert(
-    library_id: Uuid,
-    root: &Path,
-    file: &DiscoveredFile,
-    probe: Result<ProbeInfo, ProbeError>,
-    verdict: Verdict,
-    auto_queue: bool,
-) -> Option<FileUpsert> {
+/// A file's path, path relative to the library root, and name, as stored.
+/// `None` when the path isn't valid UTF-8.
+fn row_names(root: &Path, file: &DiscoveredFile) -> Option<(String, String, String)> {
     let path = file.path.to_str()?.to_string();
     let relative_path = file
         .path
@@ -252,6 +369,19 @@ fn build_upsert(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.clone());
+    Some((path, relative_path, file_name))
+}
+
+/// The row to store for a probed and decided file.
+fn build_upsert(
+    library_id: Uuid,
+    root: &Path,
+    file: &DiscoveredFile,
+    probe: Result<ProbeInfo, ProbeError>,
+    verdict: Verdict,
+    auto_queue: bool,
+) -> Option<FileUpsert> {
+    let (path, relative_path, file_name) = row_names(root, file)?;
     let (status, skip_reason, error) = match verdict {
         Verdict::Transcode if auto_queue => (FileStatus::Queued, None, None),
         Verdict::Transcode => (FileStatus::Pending, None, None),
@@ -483,6 +613,92 @@ fn scan_progress(
     })
 }
 
+/// Paths a walk couldn't read or left alone, as the feed shows them:
+/// relative to the library, at most [`NAMED_PROBLEMS`] named, then a count.
+fn describe_problems(root: &Path, items: &[&(PathBuf, String)]) -> String {
+    let mut parts: Vec<String> = items
+        .iter()
+        .take(NAMED_PROBLEMS)
+        .map(|(path, reason)| {
+            let shown = path
+                .strip_prefix(root)
+                .ok()
+                .filter(|r| !r.as_os_str().is_empty())
+                .unwrap_or(path);
+            format!(
+                "{}: {}",
+                shown.to_string_lossy(),
+                reason.trim().trim_end_matches('.')
+            )
+        })
+        .collect();
+    if items.len() > NAMED_PROBLEMS {
+        parts.push(format!("and {} more", items.len() - NAMED_PROBLEMS));
+    }
+    format!("{}.", parts.join("; "))
+}
+
+/// Tell the user, once per server run, about folders a scan couldn't read
+/// (a warning) and about what it deliberately left alone, such as disc
+/// copies and links (an informational note). Details go to the debug log.
+async fn report_walk_problems(
+    state: &AppState,
+    lib: &LibraryRow,
+    errors: &[(PathBuf, String)],
+    notes: &[(PathBuf, String)],
+) {
+    for (path, reason) in errors {
+        tracing::debug!(library = %lib.name, path = %path.display(), "couldn't read: {reason}");
+    }
+    for (path, note) in notes {
+        tracing::debug!(library = %lib.name, path = %path.display(), "left alone: {note}");
+    }
+    let (new_errors, new_notes) = {
+        let mut reported = lock(&state.library.reported_walk_problems);
+        let seen = reported.entry(lib.id).or_default();
+        let mut fresh = |items: &'_ [(PathBuf, String)]| -> Vec<(PathBuf, String)> {
+            items
+                .iter()
+                .filter(|(p, r)| seen.insert(format!("{}\n{r}", p.display())))
+                .cloned()
+                .collect()
+        };
+        (fresh(errors), fresh(notes))
+    };
+    let root = Path::new(&lib.path);
+    if !new_errors.is_empty() {
+        let items: Vec<&(PathBuf, String)> = new_errors.iter().collect();
+        state
+            .library_activity(
+                ActivityLevel::Warning,
+                format!(
+                    "Some of {} couldn't be read, so it was left out of the scan. {}",
+                    lib.name,
+                    describe_problems(root, &items)
+                ),
+                lib.id,
+            )
+            .await;
+    }
+    if !new_notes.is_empty() {
+        let items: Vec<&(PathBuf, String)> = new_notes.iter().collect();
+        state
+            .library_activity(
+                ActivityLevel::Info,
+                format!(
+                    "Left alone in {}: {}",
+                    lib.name,
+                    describe_problems(root, &items)
+                ),
+                lib.id,
+            )
+            .await;
+    }
+}
+
+/// How many paths a scan problem message names one by one.
+const NAMED_PROBLEMS: usize = 3;
+
 /// Whether `path` is inside one of the folders that could not be read.
 fn under_unreadable(path: &str, unreadable: &[PathBuf]) -> bool {
     let p = Path::new(path);
@@ -554,9 +770,7 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         0,
         0,
     ));
-    for (path, reason) in walk.errors.iter().take(5) {
-        tracing::warn!(library = %lib.name, path = %path.display(), "unreadable: {reason}");
-    }
+    report_walk_problems(state, &lib, &walk.errors, &walk.notes).await;
 
     let mut seen: HashSet<&str> = HashSet::with_capacity(walk.files.len());
     let mut to_analyze: Vec<(Option<IndexEntry>, DiscoveredFile)> = Vec::new();
@@ -594,8 +808,15 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     }
 
     // Files that disappeared. An empty walk of a library that had files is
-    // almost always an unmounted drive, so nothing is removed then.
-    let unreadable: Vec<PathBuf> = walk.errors.iter().map(|(p, _)| p.clone()).collect();
+    // almost always an unmounted drive, so nothing is removed then. Nothing
+    // below a folder that couldn't be read (or was left alone) was listed,
+    // so its files are kept too.
+    let unreadable: Vec<PathBuf> = walk
+        .errors
+        .iter()
+        .chain(&walk.notes)
+        .map(|(p, _)| p.clone())
+        .collect();
     let removed: Vec<IndexEntry> = index
         .values()
         .filter(|e| !seen.contains(e.path.as_str()))
@@ -619,10 +840,29 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     } else {
         for chunk in removed.chunks(DELETE_CHUNK) {
             let mut tx = state.db.write_tx().await?;
-            removed_count += db::files::delete_unchanged(&mut tx, chunk).await?;
+            let rows = db::files::delete_unchanged(&mut tx, chunk).await?;
             tx.commit().await?;
+            removed_count += rows.len() as u64;
+            remember_removed(state, rows);
         }
     }
+
+    // New files that are removed ones under another name (a renamed file or
+    // folder) keep their state instead of being probed and decided again.
+    let mut moved = 0u64;
+    let mut still_new = Vec::with_capacity(to_analyze.len());
+    for (existing, file) in to_analyze {
+        if existing.is_none()
+            && let Some(from) = take_moved(state, id, file.size, file.modified)
+            && store_moved(state, &lib, &file, &from).await?.is_some()
+        {
+            moved += 1;
+            continue;
+        }
+        still_new.push((existing, file));
+    }
+    let to_analyze = still_new;
+    removed_count = removed_count.saturating_sub(moved);
 
     // Probe new and changed files, then decide and store them in batches.
     // Each batch is decided with the profile read right before it is
@@ -722,6 +962,9 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     if removed_count > 0 {
         message.push_str(&format!(", {} removed", count(removed_count)));
     }
+    if moved > 0 {
+        message.push_str(&format!(", {} moved or renamed", count(moved)));
+    }
     if !settling.is_empty() {
         message.push_str(&format!(
             ", {} still being copied (checked again when {} finished)",
@@ -799,7 +1042,11 @@ pub async fn handle_watch_event(state: &AppState, event: WatchEvent) -> anyhow::
             let Some(p) = path.to_str() else {
                 return Ok(());
             };
-            let libs = db::files::delete_path_or_prefix(state.db.pool(), p).await?;
+            let rows = db::files::delete_path_or_prefix(state.db.pool(), p).await?;
+            let mut libs: Vec<Uuid> = rows.iter().map(|r| r.library_id).collect();
+            libs.sort_unstable();
+            libs.dedup();
+            remember_removed(state, rows);
             for lib in &libs {
                 state.emit(Event::FilesChanged {
                     library_id: Some(*lib),
@@ -833,16 +1080,19 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
         return Ok(Single::Handled);
     };
     let settings = state.settings();
+    let opts = ScanOptions::from_settings(&settings);
     let root = PathBuf::from(&lib.path);
+    // The same filters as a scan: the scanner's ignore rules (a pattern that
+    // matches a folder excludes everything in it) and the minimum size.
     if let Ok(rel) = path.strip_prefix(&root)
-        && compile_ignore(&settings.ignore_patterns).is_match(rel)
+        && IgnoreRules::new(&opts.ignore_patterns).excludes_file(rel)
     {
         return Ok(Single::Handled);
     }
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return Ok(Single::Handled);
     };
-    if !meta.is_file() || meta.len() < u64::from(settings.min_file_size_mb) * 1_000_000 {
+    if !meta.is_file() || meta.len() < opts.min_size_bytes {
         return Ok(Single::Handled);
     }
     let modified: DateTime<Utc> = meta
@@ -867,6 +1117,17 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
         size: meta.len(),
         modified,
     };
+    // A file removed under another name moments ago (a rename or move)
+    // keeps its state.
+    if existing.is_none()
+        && let Some(from) = take_moved(state, lib.id, file.size, file.modified)
+        && let Some(id) = store_moved(state, &lib, &file, &from).await?
+    {
+        state.broadcast_file(id).await;
+        state.broadcast_library(lib.id).await;
+        state.broadcast_stats().await;
+        return Ok(Single::Handled);
+    }
     let probe = probe_limited(state, file.path.clone()).await;
     if vanished(&probe, &file.path).await {
         return Ok(Single::Handled);

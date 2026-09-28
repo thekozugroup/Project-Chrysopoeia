@@ -531,6 +531,50 @@ fn hdr_colour_passes_through() {
     assert!(has_pair(&plan.args, "-color_trc", "arib-std-b67"));
 }
 
+/// HDR10 static metadata (mastering display, light levels) is written by
+/// the CPU encoders, which don't copy it from the decoded frames.
+#[test]
+fn hdr10_mastering_metadata_is_passed_to_cpu_encoders() {
+    let mut v = hdr10(video_10bit(0, "hevc", 3840, 2160));
+    v.mastering_display = Some(chrysopoeia_core::MasteringDisplay {
+        red: [0.68, 0.32],
+        green: [0.265, 0.69],
+        blue: [0.15, 0.06],
+        white_point: [0.3127, 0.329],
+        max_luminance: 1000.0,
+        min_luminance: 0.0001,
+    });
+    v.content_light = Some(chrysopoeia_core::ContentLight {
+        max_cll: 1000,
+        max_fall: 400,
+    });
+    let p = probe_of("matroska", vec![v]);
+    let hevc = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let plan = common::plan(&p, &hevc, &software(VideoCodec::Hevc));
+    assert_eq!(
+        value(&plan.args, "-x265-params").as_deref(),
+        Some(
+            "log-level=error:hdr-opt=1:repeat-headers=1:\
+             master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)\
+             L(10000000,1):max-cll=1000,400"
+        )
+    );
+    let av1 = profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mkv);
+    let plan = common::plan(&p, &av1, &software(VideoCodec::Av1));
+    assert_eq!(
+        value(&plan.args, "-svtav1-params").as_deref(),
+        Some(
+            "mastering-display=G(0.2650,0.6900)B(0.1500,0.0600)R(0.6800,0.3200)\
+             WP(0.3127,0.3290)L(1000.0000,0.0001):content-light=1000,400"
+        )
+    );
+    // H.264 (8-bit, SDR) never gets HDR metadata; plain HDR10 without
+    // metadata gets no SVT-AV1 options.
+    let p = probe_of("matroska", vec![hdr10(video_10bit(0, "hevc", 3840, 2160))]);
+    let plan = common::plan(&p, &av1, &software(VideoCodec::Av1));
+    assert_absent(&plan.args, "-svtav1-params");
+}
+
 #[test]
 fn unknown_and_rgb_colour_values_are_not_copied() {
     let mut v = video(0, "h264", 1920, 1080);

@@ -23,6 +23,9 @@ pub mod hints;
 mod process;
 pub mod recommend;
 
+pub use encoders::{NVENC_BUSY_SENTENCE, is_busy_failure};
+pub use hints::NVIDIA_BUSY_TITLE;
+
 /// Inputs for [`detect`].
 #[derive(Debug, Clone)]
 pub struct DetectOptions {
@@ -116,7 +119,8 @@ pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
     };
     info.recommended_jobs = recommend_jobs(&info, opts.preference);
 
-    tracing::info!(
+    // The server logs the summary users see; this is the detailed one.
+    tracing::debug!(
         cpu = %info.cpu.model,
         cores = info.cpu.logical_cores,
         gpus = info.gpus.len(),

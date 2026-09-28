@@ -135,6 +135,18 @@ async fn interrupted_jobs_are_requeued_and_leftovers_recovered() {
     std::fs::write(&backup, h264()).unwrap();
     let lib_tmp = movies.join(temp_file_name("a", id, "mkv"));
     std::fs::write(&lib_tmp, "partial").unwrap();
+    // Folder mode without a temp folder encodes into the output folder.
+    let out = app.dir.path().join("converted");
+    std::fs::create_dir_all(out.join("Movies")).unwrap();
+    let r = app
+        .patch(
+            "/api/settings",
+            json!({ "output_mode": "folder", "output_folder": out.to_str().unwrap() }),
+        )
+        .await;
+    assert_eq!(r.status, axum::http::StatusCode::OK, "{}", r.text);
+    let out_tmp = out.join("Movies").join(temp_file_name("c", id, "mkv"));
+    std::fs::write(&out_tmp, "partial").unwrap();
 
     // Simulate a crash: no clean shutdown flag, no graceful stop.
     app.state.shutdown.cancel();
@@ -160,11 +172,12 @@ async fn interrupted_jobs_are_requeued_and_leftovers_recovered() {
     let fake_c = fake.clone();
     wait_until("leftovers handled", move || {
         let fake = fake_c.clone();
-        async move { fake.recovered.lock().unwrap().len() == 3 }
+        async move { fake.recovered.lock().unwrap().len() == 4 }
     })
     .await;
     assert!(!stale_tmp.exists());
     assert!(!lib_tmp.exists());
+    assert!(!out_tmp.exists(), "leftover in the output folder");
     assert!(!backup.exists());
     assert!(movies.join("b.mkv").exists(), "backup restored");
     let act = app.get("/api/activity").await;
