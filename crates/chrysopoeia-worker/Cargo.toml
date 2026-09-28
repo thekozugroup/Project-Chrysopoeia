@@ -17,6 +17,14 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+# Copying the original's modification/access times onto the new file.
+filetime = "0.2"
+# Scratch directory for SSIM/PSNR statistics during verification.
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Free-space checks (statvfs) and graceful termination of ffmpeg (SIGTERM).
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

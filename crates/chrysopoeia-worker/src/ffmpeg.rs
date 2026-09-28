@@ -1,2 +1,859 @@
 //! Spawning ffmpeg, parsing `-progress` output, capturing stderr.
-//! Implemented by the worker-run agent.
+//!
+//! Every ffmpeg (and verification) process the worker starts goes through
+//! [`run_ffmpeg`]: stdin is closed, the child is killed if the future is
+//! dropped, stdout is parsed as `-progress pipe:1` key/value blocks, and the
+//! last [`STDERR_TAIL_LINES`] stderr lines are kept for error reports.
+//! Cancellation asks ffmpeg to stop (SIGTERM) and kills it after
+//! [`KILL_GRACE`]. A process that prints nothing for its stall timeout is
+//! treated as hung and stopped the same way.
+
+use std::borrow::Cow;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Split};
+use tokio::process::{Child, Command};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+
+/// Number of stderr lines kept for error reports.
+pub const STDERR_TAIL_LINES: usize = 40;
+
+/// How long ffmpeg gets to exit after SIGTERM before it is killed.
+pub const KILL_GRACE: Duration = Duration::from_secs(5);
+
+/// Default time without any output after which an encode counts as hung.
+/// ffmpeg prints a progress block every half second while it works, so ten
+/// silent minutes only happen when it is stuck (for example in a GPU driver).
+pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Niceness used for low-priority encodes.
+const NICE_LEVEL: &str = "10";
+
+/// One `-progress` report. ffmpeg prints a block of `key=value` lines ending
+/// with `progress=continue` (or `progress=end` for the last one).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ProgressBlock {
+    /// Frames written so far.
+    pub frame: Option<u64>,
+    /// Position in the output, in seconds.
+    pub out_time_secs: Option<f64>,
+    /// Encoding frames per second.
+    pub fps: Option<f32>,
+    /// Realtime multiple (2.31 for `speed=2.31x`).
+    pub speed: Option<f32>,
+    /// Bytes written so far.
+    pub total_size: Option<u64>,
+    /// True for the final block (`progress=end`).
+    pub end: bool,
+}
+
+/// Incremental parser for `-progress` output.
+#[derive(Debug, Default)]
+pub struct ProgressParser {
+    current: ProgressBlock,
+}
+
+impl ProgressParser {
+    /// An empty parser.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed one line. Returns the finished block when the line is the
+    /// `progress=` terminator.
+    pub fn push_line(&mut self, line: &str) -> Option<ProgressBlock> {
+        let (key, value) = line.trim().split_once('=')?;
+        let value = value.trim();
+        match key.trim() {
+            "frame" => self.current.frame = value.parse().ok(),
+            // Despite its name, `out_time_ms` is also in microseconds.
+            "out_time_us" | "out_time_ms" => {
+                if let Some(secs) = parse_out_time_us(value) {
+                    self.current.out_time_secs = Some(secs);
+                }
+            }
+            "out_time" => {
+                if self.current.out_time_secs.is_none() {
+                    self.current.out_time_secs = parse_clock(value);
+                }
+            }
+            "fps" => self.current.fps = value.parse::<f32>().ok().filter(|f| f.is_finite()),
+            "speed" => self.current.speed = parse_speed(value),
+            "total_size" => self.current.total_size = value.parse().ok(),
+            "progress" => {
+                let mut block = std::mem::take(&mut self.current);
+                block.end = value == "end";
+                return Some(block);
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
+/// Parse an `out_time_us`/`out_time_ms` value (microseconds) into seconds.
+/// `N/A` gives `None`; negative values (before the first frame) give 0.
+pub fn parse_out_time_us(value: &str) -> Option<f64> {
+    let micros: i64 = value.trim().parse().ok()?;
+    Some(micros.max(0) as f64 / 1_000_000.0)
+}
+
+/// Parse an ffmpeg speed value such as `2.31x` or ` 0.5x`. `N/A` and
+/// non-positive values give `None`.
+pub fn parse_speed(value: &str) -> Option<f32> {
+    let number = value.trim().trim_end_matches('x').trim();
+    number
+        .parse::<f32>()
+        .ok()
+        .filter(|s| s.is_finite() && *s > 0.0)
+}
+
+/// Parse `HH:MM:SS.fraction` (the `out_time` field, Matroska `DURATION`
+/// tags) into seconds. Negative values give 0.
+pub(crate) fn parse_clock(value: &str) -> Option<f64> {
+    let value = value.trim();
+    let negative = value.starts_with('-');
+    let mut parts = value.trim_start_matches('-').split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let total = hours * 3600.0 + minutes * 60.0 + seconds;
+    Some(if negative { 0.0 } else { total })
+}
+
+/// Progress of an encode, derived from a [`ProgressBlock`] and the source
+/// duration.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Progress {
+    /// 0..=100.
+    pub percent: f32,
+    /// Encoding frames per second.
+    pub fps: Option<f32>,
+    /// Realtime multiple.
+    pub speed: Option<f32>,
+    /// Estimated seconds left.
+    pub eta_secs: Option<u64>,
+}
+
+/// Turn a progress block into percent/ETA.
+///
+/// `duration_secs` is the source duration (unknown durations give 0 % until
+/// the final block). `elapsed_secs` is the wall-clock time since the encode
+/// started; it estimates the ETA when ffmpeg reports no speed.
+pub fn compute_progress(
+    block: &ProgressBlock,
+    duration_secs: Option<f64>,
+    elapsed_secs: f64,
+) -> Progress {
+    let duration = duration_secs.filter(|d| d.is_finite() && *d > 0.0);
+    let done = block.out_time_secs.unwrap_or(0.0).max(0.0);
+    let percent = if block.end {
+        100.0
+    } else {
+        match duration {
+            Some(d) => ((done / d) * 100.0).clamp(0.0, 100.0) as f32,
+            None => 0.0,
+        }
+    };
+    let eta_secs = if block.end {
+        Some(0)
+    } else {
+        duration.and_then(|d| {
+            let remaining = (d - done).max(0.0);
+            let rate = match block.speed {
+                Some(speed) if speed > 0.01 => Some(f64::from(speed)),
+                _ if elapsed_secs > 1.0 && done > 0.0 => Some(done / elapsed_secs),
+                _ => None,
+            }?;
+            let eta = remaining / rate;
+            (eta.is_finite() && eta >= 0.0).then(|| eta.round() as u64)
+        })
+    };
+    Progress {
+        percent,
+        fps: block.fps,
+        speed: block.speed,
+        eta_secs,
+    }
+}
+
+/// Ring buffer of the most recent stderr lines.
+#[derive(Debug, Clone)]
+pub struct StderrTail {
+    lines: VecDeque<String>,
+    capacity: usize,
+}
+
+impl Default for StderrTail {
+    fn default() -> Self {
+        Self::new(STDERR_TAIL_LINES)
+    }
+}
+
+impl StderrTail {
+    /// A buffer keeping at most `capacity` lines.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            lines: VecDeque::with_capacity(capacity.min(64)),
+            capacity: capacity.max(1),
+        }
+    }
+
+    /// Add a line, dropping the oldest one when full. Empty lines are ignored.
+    pub fn push(&mut self, line: &str) {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            return;
+        }
+        if self.lines.len() == self.capacity {
+            self.lines.pop_front();
+        }
+        self.lines.push_back(line.to_string());
+    }
+
+    /// The kept lines, oldest first.
+    pub fn lines(&self) -> impl DoubleEndedIterator<Item = &str> {
+        self.lines.iter().map(String::as_str)
+    }
+
+    /// The kept lines joined with newlines.
+    pub fn joined(&self) -> String {
+        self.lines().collect::<Vec<_>>().join("\n")
+    }
+
+    /// The most useful line for an error message: the last line that is not
+    /// ffmpeg's generic closing remark, without the `[codec @ 0x…]` prefix.
+    pub fn last_meaningful(&self) -> Option<String> {
+        last_meaningful_line(self.lines())
+    }
+}
+
+/// See [`StderrTail::last_meaningful`].
+pub fn last_meaningful_line<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -> Option<String> {
+    const NOISE: &[&str] = &[
+        "Conversion failed!",
+        "Exiting normally, received signal",
+        "Error closing file",
+    ];
+    lines
+        .rev()
+        .map(|l| strip_log_prefix(l).trim())
+        .find(|l| !l.is_empty() && !NOISE.iter().any(|n| l.starts_with(n)))
+        .map(str::to_string)
+}
+
+/// Remove a leading `[context @ 0x…] ` and `[level] ` from an ffmpeg log line.
+pub fn strip_log_prefix(line: &str) -> &str {
+    split_log_line(line).2
+}
+
+/// Split an ffmpeg log line (as printed with `-loglevel level+…`) into its
+/// context (e.g. `h264`), level (e.g. `error`) and message.
+pub fn split_log_line(line: &str) -> (Option<&str>, Option<&str>, &str) {
+    let mut rest = line.trim_start();
+    let mut context = None;
+    let mut level = None;
+    for _ in 0..2 {
+        let Some(inner) = rest.strip_prefix('[') else {
+            break;
+        };
+        let Some(close) = inner.find(']') else {
+            break;
+        };
+        let tag = &inner[..close];
+        let after = inner[close + 1..].trim_start();
+        if let Some((name, _addr)) = tag.split_once(" @ ") {
+            if context.is_some() {
+                break;
+            }
+            context = Some(name.trim());
+        } else if is_log_level(tag) {
+            level = Some(tag);
+            rest = after;
+            break;
+        } else {
+            break;
+        }
+        rest = after;
+    }
+    (context, level, rest)
+}
+
+fn is_log_level(tag: &str) -> bool {
+    matches!(
+        tag,
+        "quiet" | "panic" | "fatal" | "error" | "warning" | "info" | "verbose" | "debug" | "trace"
+    )
+}
+
+/// Split raw output bytes into lines. ffmpeg uses `\r` for in-place status
+/// lines, so both `\r` and `\n` end a line. Invalid UTF-8 (odd file names) is
+/// replaced rather than rejected.
+pub fn split_output_lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .split(['\r', '\n'])
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How an ffmpeg run ended.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FfmpegExit {
+    /// Exit status 0.
+    Success {
+        /// Last stderr lines.
+        tail: String,
+    },
+    /// Non-zero exit status.
+    Failed {
+        /// Exit code; `None` when killed by a signal.
+        code: Option<i32>,
+        /// Last stderr lines.
+        tail: String,
+    },
+    /// Stopped because it printed nothing for the stall timeout.
+    Stalled {
+        /// The stall timeout that was exceeded.
+        after: Duration,
+        /// Last stderr lines.
+        tail: String,
+    },
+    /// Stopped because the cancellation token fired.
+    Cancelled,
+    /// The process could not be started at all.
+    NotStarted {
+        /// Why, in plain language.
+        error: String,
+    },
+}
+
+impl FfmpegExit {
+    /// Plain-language description of a failed run, for error messages.
+    pub fn describe_failure(&self, program: &str) -> Option<String> {
+        match self {
+            Self::Success { .. } | Self::Cancelled => None,
+            Self::Failed { code, tail } => {
+                let reason = last_meaningful_line(tail.lines());
+                let status = match code {
+                    Some(c) => format!("stopped with exit code {c}"),
+                    None => "was stopped by the system".to_string(),
+                };
+                Some(match reason {
+                    Some(r) => format!("{program} {status}: {r}"),
+                    None => format!("{program} {status}"),
+                })
+            }
+            Self::Stalled { after, .. } => Some(format!(
+                "{program} stopped responding for {} minutes and was stopped",
+                after.as_secs().div_ceil(60)
+            )),
+            Self::NotStarted { error } => Some(format!("Could not start {program}: {error}")),
+        }
+    }
+
+    /// The captured stderr tail, if any.
+    pub fn tail(&self) -> Option<&str> {
+        match self {
+            Self::Success { tail } | Self::Failed { tail, .. } | Self::Stalled { tail, .. } => {
+                Some(tail.as_str())
+            }
+            Self::Cancelled | Self::NotStarted { .. } => None,
+        }
+    }
+}
+
+/// One process to run with [`run_ffmpeg`].
+#[derive(Debug, Clone, Copy)]
+pub struct FfmpegCommand<'a> {
+    /// The ffmpeg (or ffprobe) binary.
+    pub program: &'a Path,
+    /// Arguments after the binary.
+    pub args: &'a [String],
+    /// Run under `nice -n 10` when a `nice` binary exists.
+    pub low_priority: bool,
+    /// Stop the process when it prints nothing for this long.
+    pub stall_timeout: Duration,
+}
+
+impl<'a> FfmpegCommand<'a> {
+    /// A normal-priority command with the default stall timeout.
+    pub fn new(program: &'a Path, args: &'a [String]) -> Self {
+        Self {
+            program,
+            args,
+            low_priority: false,
+            stall_timeout: DEFAULT_STALL_TIMEOUT,
+        }
+    }
+}
+
+/// Run ffmpeg to completion.
+///
+/// `on_progress` receives every `-progress` block printed on stdout and
+/// `on_stderr` every stderr line (already split and decoded). Never panics;
+/// every problem is reported through [`FfmpegExit`].
+pub async fn run_ffmpeg(
+    cmd: &FfmpegCommand<'_>,
+    cancel: &CancellationToken,
+    on_progress: &mut (dyn FnMut(&ProgressBlock) + Send),
+    on_stderr: &mut (dyn FnMut(&str) + Send),
+) -> FfmpegExit {
+    if cancel.is_cancelled() {
+        return FfmpegExit::Cancelled;
+    }
+    let nice = if cmd.low_priority {
+        nice_binary().await
+    } else {
+        None
+    };
+    let mut command = match nice {
+        Some(nice) => {
+            let mut c = Command::new(nice);
+            c.arg("-n").arg(NICE_LEVEL).arg(cmd.program);
+            c
+        }
+        None => Command::new(cmd.program),
+    };
+    command
+        .args(cmd.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let error = if e.kind() == std::io::ErrorKind::NotFound {
+                format!("{} was not found", cmd.program.display())
+            } else {
+                e.to_string()
+            };
+            return FfmpegExit::NotStarted { error };
+        }
+    };
+
+    let mut stdout = child.stdout.take().map(|s| BufReader::new(s).split(b'\n'));
+    let mut stderr = child.stderr.take().map(|s| BufReader::new(s).split(b'\n'));
+    let mut parser = ProgressParser::new();
+    let mut tail = StderrTail::default();
+    let stall = tokio::time::sleep(cmd.stall_timeout);
+    tokio::pin!(stall);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                drop((stdout.take(), stderr.take()));
+                stop_child(&mut child).await;
+                return FfmpegExit::Cancelled;
+            }
+            () = &mut stall => {
+                drop((stdout.take(), stderr.take()));
+                tracing::warn!(program = %cmd.program.display(), "ffmpeg printed nothing for {:?}; stopping it", cmd.stall_timeout);
+                stop_child(&mut child).await;
+                return FfmpegExit::Stalled { after: cmd.stall_timeout, tail: tail.joined() };
+            }
+            segment = next_segment(&mut stdout), if stdout.is_some() => match segment {
+                Some(bytes) => {
+                    stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
+                    for line in split_output_lines(&bytes) {
+                        if let Some(block) = parser.push_line(&line) {
+                            on_progress(&block);
+                        }
+                    }
+                }
+                None => stdout = None,
+            },
+            segment = next_segment(&mut stderr), if stderr.is_some() => match segment {
+                Some(bytes) => {
+                    stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
+                    for line in split_output_lines(&bytes) {
+                        on_stderr(&line);
+                        tail.push(&line);
+                    }
+                }
+                None => stderr = None,
+            },
+            status = child.wait(), if stdout.is_none() && stderr.is_none() => {
+                return match status {
+                    Ok(s) if s.success() => FfmpegExit::Success { tail: tail.joined() },
+                    Ok(s) => FfmpegExit::Failed { code: s.code(), tail: tail.joined() },
+                    Err(e) => FfmpegExit::Failed { code: None, tail: format!("{}\n{e}", tail.joined()) },
+                };
+            }
+        }
+    }
+}
+
+/// Next `\n`-terminated chunk from a reader; `None` at EOF or on a read
+/// error. Cancel-safe (`Split::next_segment` keeps partial data).
+async fn next_segment<R: AsyncBufRead + Unpin>(reader: &mut Option<Split<R>>) -> Option<Vec<u8>> {
+    match reader {
+        Some(r) => r.next_segment().await.ok().flatten(),
+        None => std::future::pending().await,
+    }
+}
+
+/// Ask the child to stop, then kill it after [`KILL_GRACE`]; always reaps it.
+async fn stop_child(child: &mut Child) {
+    if send_terminate(child) && tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok() {
+        return;
+    }
+    if let Err(e) = child.start_kill() {
+        tracing::debug!("could not kill ffmpeg: {e}");
+    }
+    if let Err(e) = child.wait().await {
+        tracing::debug!("could not reap ffmpeg: {e}");
+    }
+}
+
+/// Send SIGTERM. Returns false when no signal could be sent.
+#[cfg(unix)]
+fn send_terminate(child: &Child) -> bool {
+    use rustix::process::{Pid, Signal, kill_process};
+    let Some(pid) = child
+        .id()
+        .and_then(|id| i32::try_from(id).ok())
+        .and_then(Pid::from_raw)
+    else {
+        return false;
+    };
+    kill_process(pid, Signal::TERM).is_ok()
+}
+
+#[cfg(not(unix))]
+fn send_terminate(_child: &Child) -> bool {
+    false
+}
+
+static NICE_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The `nice` binary, looked up on `PATH` once and cached.
+pub async fn nice_binary() -> Option<&'static Path> {
+    if let Some(found) = NICE_BINARY.get() {
+        return found.as_deref();
+    }
+    let found = tokio::task::spawn_blocking(|| find_in_path("nice"))
+        .await
+        .ok()
+        .flatten();
+    NICE_BINARY.get_or_init(|| found).as_deref()
+}
+
+/// Look for an executable file named `name` in the `PATH` directories.
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// The command line for display: program and arguments, shell-quoted where
+/// needed so it can be pasted into a terminal.
+pub fn display_command(program: &Path, args: &[String]) -> String {
+    let program = program.to_string_lossy();
+    std::iter::once(shell_quote(&program))
+        .chain(args.iter().map(|a| shell_quote(a)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Quote one argument for a POSIX shell.
+pub fn shell_quote(arg: &str) -> Cow<'_, str> {
+    let safe = !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:=+,@%^".contains(c));
+    if safe {
+        Cow::Borrowed(arg)
+    } else {
+        Cow::Owned(format!("'{}'", arg.replace('\'', r"'\''")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FIXTURE: &str = "frame=0\nfps=0.00\nstream_0_0_q=0.0\nbitrate=  82.9kbits/s\n\
+total_size=1203\nout_time_us=116100\nout_time_ms=116100\nout_time=00:00:00.116100\n\
+dup_frames=0\ndrop_frames=0\nspeed=1.52x\nprogress=continue\n\
+frame=131\nfps=121.17\nstream_0_0_q=27.0\nbitrate=3225.6kbits/s\ntotal_size=2359296\n\
+out_time_us=5851429\nout_time_ms=5851429\nout_time=00:00:05.851429\ndup_frames=0\n\
+drop_frames=0\nspeed=5.41x\nprogress=continue\n\
+frame=144\nfps=129.28\nbitrate=3974.0kbits/s\ntotal_size=2975915\nout_time_us=6000000\n\
+out_time_ms=6000000\nout_time=00:00:06.000000\nspeed=5.39x\nprogress=end\n";
+
+    fn parse_all(text: &str) -> Vec<ProgressBlock> {
+        let mut parser = ProgressParser::new();
+        text.lines().filter_map(|l| parser.push_line(l)).collect()
+    }
+
+    #[test]
+    fn parses_progress_blocks() {
+        let blocks = parse_all(FIXTURE);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].frame, Some(0));
+        assert_eq!(blocks[0].out_time_secs, Some(0.1161));
+        assert_eq!(blocks[0].speed, Some(1.52));
+        assert_eq!(blocks[0].total_size, Some(1203));
+        assert!(!blocks[0].end);
+        assert_eq!(blocks[1].fps, Some(121.17));
+        assert!((blocks[1].out_time_secs.unwrap() - 5.851429).abs() < 1e-9);
+        assert!(blocks[2].end);
+        assert_eq!(blocks[2].out_time_secs, Some(6.0));
+    }
+
+    #[test]
+    fn out_time_ms_is_microseconds() {
+        let blocks = parse_all("out_time_ms=2500000\nprogress=continue\n");
+        assert_eq!(blocks[0].out_time_secs, Some(2.5));
+    }
+
+    #[test]
+    fn handles_not_available_values() {
+        let text = "frame=0\nfps=N/A\nout_time_us=N/A\nout_time_ms=N/A\n\
+out_time=N/A\ntotal_size=N/A\nspeed=N/A\nprogress=continue\n";
+        let blocks = parse_all(text);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].out_time_secs, None);
+        assert_eq!(blocks[0].fps, None);
+        assert_eq!(blocks[0].speed, None);
+        assert_eq!(blocks[0].total_size, None);
+    }
+
+    #[test]
+    fn negative_out_time_is_zero() {
+        let blocks = parse_all("out_time_us=-23000\nprogress=continue\n");
+        assert_eq!(blocks[0].out_time_secs, Some(0.0));
+    }
+
+    #[test]
+    fn falls_back_to_clock_out_time() {
+        let blocks = parse_all("out_time=01:02:03.500000\nprogress=continue\n");
+        assert_eq!(blocks[0].out_time_secs, Some(3723.5));
+    }
+
+    #[test]
+    fn speed_values() {
+        assert_eq!(parse_speed("2.31x"), Some(2.31));
+        assert_eq!(parse_speed(" 0.5x"), Some(0.5));
+        assert_eq!(parse_speed("N/A"), None);
+        assert_eq!(parse_speed("0x"), None);
+        assert_eq!(parse_speed(""), None);
+    }
+
+    #[test]
+    fn progress_percent_and_eta() {
+        let block = ProgressBlock {
+            out_time_secs: Some(30.0),
+            speed: Some(2.0),
+            fps: Some(48.0),
+            ..Default::default()
+        };
+        let p = compute_progress(&block, Some(120.0), 15.0);
+        assert!((p.percent - 25.0).abs() < 1e-4);
+        assert_eq!(p.eta_secs, Some(45));
+        assert_eq!(p.fps, Some(48.0));
+
+        // No speed: estimate from wall-clock rate (30 s of media in 60 s).
+        let slow = ProgressBlock {
+            out_time_secs: Some(30.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_progress(&slow, Some(120.0), 60.0).eta_secs,
+            Some(180)
+        );
+
+        // Unknown duration: no percent, no ETA.
+        let p = compute_progress(&block, None, 15.0);
+        assert_eq!(p.percent, 0.0);
+        assert_eq!(p.eta_secs, None);
+
+        // Overshoot is clamped; the end block is always 100 %.
+        let over = ProgressBlock {
+            out_time_secs: Some(130.0),
+            ..Default::default()
+        };
+        assert_eq!(compute_progress(&over, Some(120.0), 1.0).percent, 100.0);
+        let end = ProgressBlock {
+            end: true,
+            ..Default::default()
+        };
+        let p = compute_progress(&end, Some(120.0), 1.0);
+        assert_eq!(p.percent, 100.0);
+        assert_eq!(p.eta_secs, Some(0));
+    }
+
+    #[test]
+    fn stderr_tail_keeps_last_lines() {
+        let mut tail = StderrTail::new(3);
+        for i in 0..5 {
+            tail.push(&format!("line {i}"));
+        }
+        tail.push("   ");
+        assert_eq!(
+            tail.lines().collect::<Vec<_>>(),
+            ["line 2", "line 3", "line 4"]
+        );
+        assert_eq!(tail.joined(), "line 2\nline 3\nline 4");
+    }
+
+    #[test]
+    fn meaningful_line_skips_noise_and_prefixes() {
+        let mut tail = StderrTail::default();
+        tail.push("[hevc_nvenc @ 0x55d1c2a4b940] OpenEncodeSessionEx failed: unsupported device (2): (no details)");
+        tail.push("[vost#0:0/hevc_nvenc @ 0x55d1c2a4a1c0] Error initializing output stream: Error while opening encoder");
+        tail.push("Conversion failed!");
+        assert_eq!(
+            tail.last_meaningful().as_deref(),
+            Some("Error initializing output stream: Error while opening encoder")
+        );
+        assert_eq!(StderrTail::default().last_meaningful(), None);
+    }
+
+    #[test]
+    fn splits_log_lines() {
+        assert_eq!(
+            split_log_line("[h264 @ 0x5600295240c0] [error] cbp too large (353) at 76 4"),
+            (Some("h264"), Some("error"), "cbp too large (353) at 76 4")
+        );
+        assert_eq!(
+            split_log_line("[info] Input #0, matroska,webm, from 'x.mkv':"),
+            (None, Some("info"), "Input #0, matroska,webm, from 'x.mkv':")
+        );
+        assert_eq!(
+            split_log_line("[h264 @ 0x1] error while decoding MB 76 4"),
+            (Some("h264"), None, "error while decoding MB 76 4")
+        );
+        assert_eq!(split_log_line("plain text"), (None, None, "plain text"));
+        assert_eq!(
+            split_log_line("[Parsed_ssim_0 @ 0x1] [info] SSIM Y:0.99"),
+            (Some("Parsed_ssim_0"), Some("info"), "SSIM Y:0.99")
+        );
+    }
+
+    #[test]
+    fn splits_carriage_returns_and_bad_utf8() {
+        let lines = split_output_lines(b"frame=1\rframe=2\r\nname=caf\xe9\n\n");
+        assert_eq!(lines, ["frame=1", "frame=2", "name=caf\u{fffd}"]);
+    }
+
+    #[test]
+    fn quotes_commands() {
+        let args = vec![
+            "-i".to_string(),
+            "/media/Movie (2020)/It's here.mkv".to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            String::new(),
+        ];
+        assert_eq!(
+            display_command(Path::new("/usr/bin/ffmpeg"), &args),
+            r"/usr/bin/ffmpeg -i '/media/Movie (2020)/It'\''s here.mkv' -c:v libx264 ''"
+        );
+    }
+
+    #[test]
+    fn describes_failures() {
+        let failed = FfmpegExit::Failed {
+            code: Some(1),
+            tail: "[libx264 @ 0x1] Unknown option\nConversion failed!".into(),
+        };
+        assert_eq!(
+            failed.describe_failure("libx264").as_deref(),
+            Some("libx264 stopped with exit code 1: Unknown option")
+        );
+        let stalled = FfmpegExit::Stalled {
+            after: Duration::from_secs(600),
+            tail: String::new(),
+        };
+        assert_eq!(
+            stalled.describe_failure("ffmpeg").as_deref(),
+            Some("ffmpeg stopped responding for 10 minutes and was stopped")
+        );
+        assert_eq!(FfmpegExit::Cancelled.describe_failure("ffmpeg"), None);
+    }
+
+    #[tokio::test]
+    async fn missing_binary_is_not_started() {
+        let args = vec!["-version".to_string()];
+        let program = Path::new("/nonexistent/ffmpeg-for-tests");
+        let exit = run_ffmpeg(
+            &FfmpegCommand::new(program, &args),
+            &CancellationToken::new(),
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await;
+        assert!(matches!(exit, FfmpegExit::NotStarted { .. }), "{exit:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_a_process_and_collects_output() {
+        // `sh` stands in for ffmpeg: progress on stdout, messages on stderr.
+        let script = "printf 'out_time_us=1000000\\nspeed=2.0x\\nprogress=continue\\n\
+out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
+        let args = vec!["-c".to_string(), script.to_string()];
+        let mut blocks = Vec::new();
+        let mut errors = Vec::new();
+        let exit = run_ffmpeg(
+            &FfmpegCommand::new(Path::new("sh"), &args),
+            &CancellationToken::new(),
+            &mut |b| blocks.push(b.clone()),
+            &mut |l| errors.push(l.to_string()),
+        )
+        .await;
+        assert_eq!(
+            exit,
+            FfmpegExit::Failed {
+                code: Some(3),
+                tail: "warning line".into()
+            }
+        );
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[1].end);
+        assert_eq!(errors, ["warning line"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_stops_the_process() {
+        let args = vec!["-c".to_string(), "sleep 30".to_string()];
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = std::time::Instant::now();
+        let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
+        cmd.low_priority = true;
+        let exit = run_ffmpeg(&cmd, &cancel, &mut |_| {}, &mut |_| {}).await;
+        assert_eq!(exit, FfmpegExit::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn silent_process_counts_as_stalled() {
+        let args = vec!["-c".to_string(), "sleep 30".to_string()];
+        let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
+        cmd.stall_timeout = Duration::from_millis(300);
+        let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
+        assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
+    }
+}

@@ -348,6 +348,8 @@ dependencies = [
  "chrono",
  "chrysopoeia-core",
  "chrysopoeia-scanner",
+ "filetime",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
