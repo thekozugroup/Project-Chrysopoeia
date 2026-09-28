@@ -22,7 +22,7 @@ import {
   Sun,
   WifiOff,
 } from "lucide-react";
-import { useEffect, useId, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { Brand } from "@/components/brand";
 import { finishedPercent } from "@/components/library-bar";
 import { Tooltip } from "@/components/ui/overlays";
@@ -92,10 +92,11 @@ function QueuePill({ className }: { className?: string }) {
   const scanning = useAnyScanning();
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
+  const serverDown = useLive((s) => s.serverDown);
   const summary = queueSummary(queue.data, settings.data, scanning);
-  // Without live updates (and before polling catches up) this is only the
-  // last known state.
-  const stale = connection !== "open" && !polling;
+  // Without live updates (and before polling catches up), or while the
+  // server can't be reached, this is only the last known state.
+  const stale = connection !== "open" && (serverDown || !polling);
   return (
     <a
       href={href("/queue")}
@@ -133,9 +134,14 @@ const CONNECTION_TEXT: Record<Exclude<ConnectionState, "open">, string> = {
 function ConnectionNotice({ className, compact = false }: { className?: string; compact?: boolean }) {
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
+  const serverDown = useLive((s) => s.serverDown);
   if (connection === "open") return null;
-  const text = CONNECTION_TEXT[connection];
-  const detail = polling ? "Refreshing every 5 seconds instead." : undefined;
+  const text = serverDown ? "Server not answering" : CONNECTION_TEXT[connection];
+  const detail = serverDown
+    ? "Trying again every few seconds."
+    : polling
+      ? "Refreshing every 5 seconds instead."
+      : undefined;
   const icon =
     connection === "connecting" ? <LoaderCircle className="spin" aria-hidden /> : <WifiOff aria-hidden />;
   const body = (
@@ -157,6 +163,46 @@ function ConnectionNotice({ className, compact = false }: { className?: string; 
     </p>
   );
   return compact ? <Tooltip content={detail ? `${text}. ${detail}` : text}>{body}</Tooltip> : body;
+}
+
+/** Whether `value` has been true for at least `ms` (false again at once). */
+function useSustained(value: boolean, ms: number): boolean {
+  const [sustained, setSustained] = useState(false);
+  useEffect(() => {
+    if (!value) return;
+    const timer = setTimeout(() => setSustained(true), ms);
+    return () => {
+      clearTimeout(timer);
+      setSustained(false);
+    };
+  }, [value, ms]);
+  return value && sustained;
+}
+
+/**
+ * A calm note above every screen while the server can't be reached (the
+ * container stopped or is restarting). What's on screen stays as it was, and
+ * the app reconnects on its own; nothing needs reloading.
+ */
+function ServerDownBanner() {
+  const down = useLive((s) => s.serverDown && s.connection !== "open");
+  // A single failed request during a blip shouldn't flash a banner.
+  const show = useSustained(down, 1500);
+  return (
+    <div role="status" aria-live="polite">
+      {show ? (
+        <div className="mb-6 flex items-start gap-3 rounded-lg border border-line bg-raised px-4 py-3 md:mb-8">
+          <LoaderCircle className="spin mt-0.5 size-4 shrink-0 text-muted" aria-hidden />
+          <div className="min-w-0 text-[0.8125rem] leading-relaxed">
+            <p className="font-semibold text-fg">Can&apos;t reach Chrysopoeia right now</p>
+            <p className="text-muted">
+              It may be restarting. You&apos;re seeing the last known state, and this page reconnects on its own.
+            </p>
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
 }
 
 const THEMES: { value: ThemeChoice; label: string; icon: ReactNode }[] = [
@@ -425,6 +471,7 @@ export function Shell({ route, children }: { route: Route; children: ReactNode }
           tabIndex={-1}
           className="mx-auto w-full max-w-[78rem] flex-1 px-4 pt-6 pb-28 outline-none sm:px-6 md:px-10 md:pt-9 md:pb-16"
         >
+          <ServerDownBanner />
           {children}
         </main>
       </div>

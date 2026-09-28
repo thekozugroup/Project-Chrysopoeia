@@ -112,8 +112,10 @@ export function Breakdown({
   limit?: number;
 }) {
   const sorted = [...items].sort((a, b) => b.files - a.files);
-  const top = sorted.slice(0, limit);
-  const rest = sorted.slice(limit);
+  // "Other" standing in for a single row would hide its name for nothing.
+  const shown = sorted.length > limit + 1 ? limit : sorted.length;
+  const top = sorted.slice(0, shown);
+  const rest = sorted.slice(shown);
   const rows =
     rest.length > 0
       ? [

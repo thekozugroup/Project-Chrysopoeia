@@ -5,11 +5,11 @@
  * (from the probe), and its conversion history.
  */
 
-import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw } from "lucide-react";
+import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { ReactNode } from "react";
 import { ConvertAgainButton, SheetSection, savingsText } from "@/components/jobs";
 import { FileStatusBadge, JobStateBadge } from "@/components/status";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge, Callout, Detail, Meter, Skeleton } from "@/components/ui/display";
 import { Sheet } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
@@ -21,11 +21,25 @@ import {
   formatRelative,
   middleTruncate,
 } from "@/lib/format";
-import { channelsLabel, HDR_LABEL, JOB_STAGE_LABEL, languageLabel, sourceCodecLabel } from "@/lib/labels";
+import { channelsLabel, HDR_LABEL, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
 import { useFile } from "@/lib/queries";
-import { openSheet } from "@/lib/router";
+import { href, openSheet } from "@/lib/router";
 import { useFileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo } from "@/lib/types";
+import { cn } from "@/lib/utils";
+
+/**
+ * Whether the library's settings decided to skip this file and could decide
+ * otherwise: it has real video, and the skip wasn't the user's own. Audio-only
+ * and unreadable files are left alone whatever the settings say.
+ */
+export function skipFollowsSettings(file: MediaFile): boolean {
+  if (file.status !== "skipped" || skippedByUser(file.skip_reason)) return false;
+  const hasVideo = file.probe
+    ? file.probe.streams.some((s) => s.kind === "video" && !s.is_attached_pic)
+    : Boolean(file.video_codec);
+  return hasVideo && (file.duration_secs ?? 0) >= 1;
+}
 
 function StreamRow({ icon, title, meta, tags }: { icon: ReactNode; title: ReactNode; meta: ReactNode; tags?: ReactNode }) {
   return (
@@ -65,10 +79,23 @@ function audioMeta(s: StreamInfo): string {
     .join(" · ");
 }
 
+/** "English audio", or just "Audio" when the track has no language tag. */
+export function trackTitle(kind: "audio" | "subtitles", language: string | null, title: string | null): string {
+  const known = language && language.toLowerCase() !== "und" ? languageLabel(language) : null;
+  const noun = known ? `${known} ${kind}` : kind === "audio" ? "Audio" : "Subtitles";
+  return title ? `${noun} · ${title}` : noun;
+}
+
 function Streams({ detail }: { detail: FileDetail }) {
   const probe = detail.file.probe;
   if (!probe) {
-    return <p className="text-sm text-muted">This file hasn&apos;t been analysed yet.</p>;
+    return (
+      <p className="text-sm text-muted">
+        {detail.file.status === "failed"
+          ? "No tracks could be read from this file."
+          : "This file hasn't been analysed yet."}
+      </p>
+    );
   }
   const video = probe.streams.filter((s) => s.kind === "video" && !s.is_attached_pic);
   const audio = probe.streams.filter((s) => s.kind === "audio");
@@ -95,7 +122,7 @@ function Streams({ detail }: { detail: FileDetail }) {
           <StreamRow
             key={s.index}
             icon={<AudioLines aria-hidden />}
-            title={`${languageLabel(s.language)} audio${s.title ? ` · ${s.title}` : ""}`}
+            title={trackTitle("audio", s.language, s.title)}
             meta={audioMeta(s)}
             tags={s.is_default ? <Badge>Default</Badge> : null}
           />
@@ -104,7 +131,7 @@ function Streams({ detail }: { detail: FileDetail }) {
           <StreamRow
             key={s.index}
             icon={<Captions aria-hidden />}
-            title={`${languageLabel(s.language)} subtitles${s.title ? ` · ${s.title}` : ""}`}
+            title={trackTitle("subtitles", s.language, s.title)}
             meta={`${s.codec} · ${sourceCodecLabel(s.codec)}`}
             tags={
               <>
@@ -140,7 +167,13 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   if (file.status === "skipped") {
     return (
       <Callout tone="info" title="Left as it is">
-        {file.skip_reason ?? "No conversion needed."}
+        <p>{file.skip_reason ?? "No conversion needed."}</p>
+        {skipFollowsSettings(file) ? (
+          <p className="mt-1.5">
+            That follows this library&apos;s settings. To convert files like this one, change its goal or advanced
+            options in the library settings.
+          </p>
+        ) : null}
       </Callout>
     );
   }
@@ -194,7 +227,19 @@ function FileActions({ file }: { file: MediaFile }) {
       />
     );
   }
-  const queueLabel = file.status === "failed" ? "Try again" : file.status === "skipped" ? "Convert anyway" : "Convert";
+  if (file.status === "skipped" && !skippedByUser(file.skip_reason)) {
+    // Queueing it again would reach the same verdict; the settings decide.
+    return skipFollowsSettings(file) ? (
+      <a
+        href={href(`/library/${file.library_id}/settings`)}
+        className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "ml-auto")}
+      >
+        <SlidersHorizontal aria-hidden />
+        Library settings
+      </a>
+    ) : null;
+  }
+  const queueLabel = file.status === "failed" ? "Try again" : "Convert";
   return (
     <>
       {canSkip ? (

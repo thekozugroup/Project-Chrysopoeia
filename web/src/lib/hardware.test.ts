@@ -58,6 +58,14 @@ describe("isDetecting", () => {
     ).toBe(false);
   });
 
+  it("trusts the server's detecting flag over the look of the report", () => {
+    // Newer servers say so outright; a stand-in without the hint still counts.
+    expect(isDetecting({ ...placeholder, hints: [], detecting: true })).toBe(true);
+    // And a finished detection that happens to find nothing is real.
+    expect(isDetecting({ ...placeholder, detecting: false })).toBe(false);
+    expect(codecSpeedHint({ ...placeholder, detecting: false }, "hevc").tone).toBe("blocked");
+  });
+
   it("never reports the stand-in as missing ffmpeg", () => {
     expect(codecSpeedHint(placeholder, "hevc").text).toBe("Checking your hardware…");
   });

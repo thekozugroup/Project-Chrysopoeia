@@ -23,7 +23,10 @@ export interface Route {
 /** Parse a hash (with or without `#`) into a route. */
 export function parseRoute(hash: string): Route {
   const raw = hash.replace(/^#/, "") || "/";
-  const [pathPart, queryPart = ""] = raw.split("?", 2);
+  // Split at the first "?" only: a typed search may contain another one.
+  const mark = raw.indexOf("?");
+  const pathPart = mark === -1 ? raw : raw.slice(0, mark);
+  const queryPart = mark === -1 ? "" : raw.slice(mark + 1);
   const segments = pathPart
     .split("/")
     .filter(Boolean)

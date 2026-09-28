@@ -5,7 +5,7 @@
  * before/after, verification report, ffmpeg command and log.
  */
 
-import { ArrowRight, Check, CircleSlash, FileVideo, RotateCcw, ArrowUpToLine, X } from "lucide-react";
+import { ArrowRight, Check, CircleSlash, FileVideo, Info, RotateCcw, ArrowUpToLine, SlidersHorizontal, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
@@ -69,7 +69,8 @@ function StageSteps({ stage }: { stage: JobStage }) {
 
 function speedText(job: Job): string | null {
   const parts = [
-    job.fps ? `${Math.round(job.fps)} fps` : null,
+    // Slow CPU encodes run below 10 fps; "0 fps" would read as stuck.
+    job.fps && job.fps >= 0.05 ? `${job.fps >= 10 ? Math.round(job.fps) : job.fps.toFixed(1)} fps` : null,
     job.speed ? `${job.speed >= 10 ? Math.round(job.speed) : job.speed.toFixed(1)}×` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : null;
@@ -337,7 +338,7 @@ function Verification({ job }: { job: Job }) {
         <dl className="grid grid-cols-3 divide-x divide-line border-b border-line">
           {metrics.map((m) => (
             <div key={m.label} className="min-w-0 px-3.5 py-2.5">
-              <dt className="truncate text-xs text-muted">{m.label}</dt>
+              <dt className="text-xs leading-snug text-muted">{m.label}</dt>
               <dd
                 className={cn(
                   "mt-0.5 font-mono text-sm font-medium tabular",
@@ -389,7 +390,11 @@ function Outcome({ job }: { job: Job }) {
   if (job.state === "skipped") {
     return (
       <Callout tone="info" title="Kept the original">
-        {job.skip_reason ?? "The new file wasn't worth keeping."}
+        <p>{job.skip_reason ?? "The new file wasn't worth keeping."}</p>
+        <p className="mt-1.5">
+          That follows the library&apos;s settings, so converting it again would end the same way. To keep results like
+          this, change the goal or the minimum savings in the library settings.
+        </p>
       </Callout>
     );
   }
@@ -456,6 +461,19 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
 
       <Outcome job={job} />
 
+      {job.notes && job.notes.length > 0 ? (
+        <SheetSection title="What changed">
+          <ul className="divide-y divide-line overflow-hidden rounded-lg border border-line">
+            {job.notes.map((note, i) => (
+              <li key={`${i}-${note}`} className="flex gap-3 px-3.5 py-3 text-sm leading-snug text-fg">
+                <Info className="mt-0.5 size-4 shrink-0 text-info" aria-hidden />
+                <span className="min-w-0">{note}</span>
+              </li>
+            ))}
+          </ul>
+        </SheetSection>
+      ) : null}
+
       <SheetSection title="Size">
         <BeforeAfter job={job} />
       </SheetSection>
@@ -472,7 +490,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
           </Detail>
           <Detail label="Done by">
             {job.hw_api ? HW_API_LABEL[job.hw_api] : "—"}
-            {job.encoder ? <span className="ml-1.5 font-mono text-xs text-muted">{job.encoder}</span> : null}
+            {job.encoder ? <span className="ml-1.5 font-mono text-xs text-muted"><span className="sr-only">, encoder </span>{job.encoder}</span> : null}
           </Detail>
           {job.attempt > 1 ? <Detail label="Attempts">{job.attempt}</Detail> : null}
           <Detail label="Added">{formatDateTime(job.created_at)}</Detail>
@@ -566,7 +584,7 @@ function JobSheetActions({ job }: { job: Job }) {
         </>
       ) : null}
       {job.state === "running" ? <CancelJobButton job={job} variant="secondary" /> : null}
-      {job.state === "failed" || job.state === "cancelled" || job.state === "skipped" ? (
+      {job.state === "failed" || job.state === "cancelled" ? (
         <Button
           variant={job.state === "failed" ? "primary" : "secondary"}
           size="sm"
@@ -574,8 +592,18 @@ function JobSheetActions({ job }: { job: Job }) {
           loading={retry.isPending}
         >
           <RotateCcw aria-hidden />
-          {job.state === "failed" ? "Try again" : job.state === "skipped" ? "Convert anyway" : "Queue again"}
+          {job.state === "failed" ? "Try again" : "Queue again"}
         </Button>
+      ) : null}
+      {job.state === "skipped" ? (
+        // Queueing it again would reach the same verdict; the settings decide.
+        <a
+          href={href(`/library/${job.library_id}/settings`)}
+          className={buttonVariants({ variant: "secondary", size: "sm" })}
+        >
+          <SlidersHorizontal aria-hidden />
+          Library settings
+        </a>
       ) : null}
       {job.state === "done" ? (
         <ConvertAgainButton fileName={job.file_name} onConfirm={() => retry.mutate(job)} loading={retry.isPending} />

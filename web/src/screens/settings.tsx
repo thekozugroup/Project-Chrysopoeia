@@ -21,10 +21,10 @@ import { NavTabs } from "@/components/ui/nav-tabs";
 import { api, errorMessage } from "@/lib/api";
 import { formatHour } from "@/lib/format";
 import { VALIDATION_HELP, VALIDATION_LABEL } from "@/lib/labels";
-import { keys, useHardwareInfo, usePresets, useSettings } from "@/lib/queries";
+import { keys, useHardwareInfo, usePresets, useSettings, useSystem } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import { changedKeys, errorsFrom, type FieldErrors } from "@/lib/settings-form";
-import type { Settings, ValidationLevel } from "@/lib/types";
+import type { Settings, SystemInfo, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
 
@@ -238,9 +238,32 @@ function ProcessingSection({ draft, onChange, errors }: SectionProps) {
   );
 }
 
+/**
+ * What "Automatic" means for the work folder on this server. `undefined`
+ * while loading and `null` from servers without `/api/system` give the
+ * general rule.
+ */
+export function automaticWorkFolderText(system: SystemInfo | null | undefined): ReactNode {
+  if (!system) {
+    return "The server's work folder when it has one (the Docker image uses /temp when it's mapped), otherwise next to each file, which needs free space on the same drive as the video.";
+  }
+  if (system.default_temp_dir) {
+    return (
+      <>
+        Uses <span className="font-mono text-[0.8125rem] text-fg">{system.default_temp_dir}</span>, the work folder this
+        server was started with.
+      </>
+    );
+  }
+  return system.in_container
+    ? "Next to each file, which needs free space on the same drive as the video. Map a /temp folder into the container to use a faster drive instead."
+    : "Next to each file, which needs free space on the same drive as the video.";
+}
+
 function OutputSection({ draft, onChange, errors }: SectionProps) {
   const name = useId();
   const tempName = useId();
+  const system = useSystem();
   return (
     <>
       <Block title="Finished files" description="Nothing is written anywhere until the new file has passed its checks.">
@@ -299,7 +322,7 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
             checked={draft.temp_dir === null}
             onChange={() => onChange({ temp_dir: null })}
             title="Automatic"
-            description="The server's work folder when it has one (the Docker image uses /temp when it's mapped), otherwise next to each file, which needs free space on the same drive as the video."
+            description={automaticWorkFolderText(system.data)}
           />
           <ChoiceCard
             name={tempName}

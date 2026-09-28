@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { profileForGoal } from "./profile";
-import { changedKeys, errorsFrom } from "./settings-form";
+import { changedKeys, errorsFrom, settingForField } from "./settings-form";
 import type { Settings } from "./types";
 
 const base: Settings = {
@@ -79,5 +79,39 @@ describe("errorsFrom", () => {
 
   it("still honours field-specific codes", () => {
     expect(errorsFrom(new ApiError(400, "temp_dir_not_writable", "Nope."))).toEqual({ temp_dir: "Nope." });
+  });
+
+  it("puts the error on the field the server names, before any guessing", () => {
+    // The wording alone would point at output_folder; the server knows better.
+    const err = new ApiError(
+      400,
+      "invalid_settings",
+      "The output folder can't be the temporary folder.",
+      "temp_dir",
+    );
+    expect(errorsFrom(err, ["output_folder", "temp_dir"])).toEqual({
+      temp_dir: "The output folder can't be the temporary folder.",
+    });
+  });
+
+  it("maps a field inside the default profile to the profile", () => {
+    const err = new ApiError(400, "invalid_settings", "That quality value is too high for AV1.", "default_profile.quality_override");
+    expect(errorsFrom(err)).toEqual({ default_profile: "That quality value is too high for AV1." });
+  });
+
+  it("falls back to the old heuristics when the field is unknown", () => {
+    const err = new ApiError(400, "invalid_settings", "Active hours must be whole hours from 0 to 23.", "schedule");
+    expect(errorsFrom(err)).toHaveProperty("active_hours");
+  });
+});
+
+describe("settingForField", () => {
+  it("knows every top-level setting and nothing else", () => {
+    expect(settingForField("temp_dir")).toBe("temp_dir");
+    expect(settingForField("ignore_patterns[2]")).toBe("ignore_patterns");
+    expect(settingForField("default_profile.audio_languages")).toBe("default_profile");
+    expect(settingForField("colour")).toBeNull();
+    expect(settingForField("")).toBeNull();
+    expect(settingForField(null)).toBeNull();
   });
 });

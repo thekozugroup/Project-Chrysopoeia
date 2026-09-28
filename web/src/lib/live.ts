@@ -13,7 +13,7 @@
  */
 
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
-import { wsUrl } from "./api";
+import { onReachability, wsUrl } from "./api";
 import { keys } from "./queries";
 import { navigate, parseRoute } from "./router";
 import { useLive } from "./store";
@@ -30,7 +30,12 @@ import type {
 } from "./types";
 
 const MIN_BACKOFF_MS = 1000;
-const MAX_BACKOFF_MS = 30_000;
+/**
+ * Longest wait between reconnect attempts. Short, because the server is on
+ * the LAN and a restart should be picked up within seconds; a failed attempt
+ * costs one refused connection.
+ */
+export const MAX_BACKOFF_MS = 8000;
 /** How long the socket may be down before polling starts. */
 export const POLL_GRACE_MS = 4000;
 /** How often the live views refresh while polling. */
@@ -332,6 +337,7 @@ export function connectLive(client: QueryClient): () => void {
       attempts = 0;
       failures = 0;
       stopPolling();
+      live.setServerDown(false);
       live.setConnection("open");
       if (everOpened) {
         // Events sent while we were away are lost: refetch everything.
@@ -378,6 +384,14 @@ export function connectLive(client: QueryClient): () => void {
   };
   window.addEventListener("online", onOnline);
   document.addEventListener("visibilitychange", onVisible);
+  // Requests say whether the server is there. When one gets through again
+  // (it restarted), reconnect right away instead of waiting out the backoff.
+  let serverWasDown = false;
+  const stopReachability = onReachability((reachable) => {
+    useLive.getState().setServerDown(!reachable);
+    if (reachable && serverWasDown) reconnectNow();
+    serverWasDown = !reachable;
+  });
 
   open();
 
@@ -388,6 +402,7 @@ export function connectLive(client: QueryClient): () => void {
     stopPolling();
     window.removeEventListener("online", onOnline);
     document.removeEventListener("visibilitychange", onVisible);
+    stopReachability();
     if (socket) {
       retire(socket);
       socket = null;

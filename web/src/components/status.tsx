@@ -112,7 +112,7 @@ export function EncoderBadge({ api, encoder }: { api: HwApi | null; encoder: str
     >
       {hardware ? <MonitorPlay aria-hidden /> : <Cpu aria-hidden />}
       {text}
-      {encoder ? <span className="sr-only">, encoder {encoder}</span> : null}
+      {encoder ? <span className="sr-only"> (encoder {encoder})</span> : null}
     </span>
   );
   return encoder ? (

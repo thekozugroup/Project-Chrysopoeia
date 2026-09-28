@@ -31,15 +31,50 @@ const MESSAGE_FIELDS: [RegExp, keyof Settings][] = [
   [/rescan/i, "rescan_interval_hours"],
 ];
 
+/** Every top-level setting, to recognise a `field` the server names. */
+const SETTING_KEYS: readonly (keyof Settings)[] = [
+  "auto_queue",
+  "watch_folders",
+  "rescan_interval_hours",
+  "max_jobs",
+  "hardware",
+  "cpu_fallback",
+  "validation",
+  "output_mode",
+  "output_folder",
+  "temp_dir",
+  "keep_file_dates",
+  "low_priority",
+  "active_hours",
+  "ignore_patterns",
+  "min_file_size_mb",
+  "default_profile",
+  "onboarded",
+];
+
 /**
- * Put an API error on the field it is about. The server answers every
- * validation failure with `invalid_settings`, so the field is found from (in
- * order) a field-specific code, the setting named in `"value for \"key\""`,
- * the words of the message, or the only key that was sent.
+ * The setting a server-named `field` belongs to: `temp_dir` as is, and
+ * anything inside the default profile (`default_profile.quality_override`)
+ * on `default_profile`.
+ */
+export function settingForField(field: string | null | undefined): keyof Settings | null {
+  if (!field) return null;
+  const top = field.split(/[.[]/, 1)[0] as keyof Settings;
+  return SETTING_KEYS.includes(top) ? top : null;
+}
+
+/**
+ * Put an API error on the field it is about. Newer servers name it in the
+ * error's `field`; otherwise (every validation failure is
+ * `invalid_settings`) the field is found from, in order, a field-specific
+ * code, the setting named in `"value for \"key\""`, the words of the
+ * message, or the only key that was sent.
  */
 export function errorsFrom(err: unknown, sent: (keyof Settings)[] = []): FieldErrors {
   const message = errorMessage(err);
   if (!(err instanceof ApiError) || err.status >= 500 || err.isNetwork) return { general: message };
+  const fromServer = settingForField(err.field);
+  if (fromServer) return { [fromServer]: message };
   const code = err.code;
   const byCode: [string, keyof Settings][] = [
     ["output", "output_folder"],

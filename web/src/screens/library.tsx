@@ -714,7 +714,13 @@ function SettingsTab({ library }: { library: Library }) {
           : "Files not yet converted are re-checked against the new settings.",
       });
     },
-    onError: (err) => setError(errorMessage(err)),
+    onError: (err) => {
+      // A bad name belongs on the name field; profile errors stay on the save bar.
+      if (err instanceof ApiError && err.field === "name") {
+        setNameError(err.message);
+        setError("Fix the highlighted fields to save.");
+      } else setError(errorMessage(err));
+    },
   });
 
   const canSave = () => {

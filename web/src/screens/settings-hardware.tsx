@@ -26,7 +26,7 @@ import { Button } from "@/components/ui/button";
 import { Field, Select, SwitchRow } from "@/components/ui/controls";
 import { Callout, CodeBlock, SectionHeading, Skeleton } from "@/components/ui/display";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { formatBytes, formatRelative } from "@/lib/format";
+import { ffmpegVersionLabel, formatBytes, formatRelative } from "@/lib/format";
 import { encoderCell, isDetecting, matrixApis, preferenceChoices } from "@/lib/hardware";
 import {
   GPU_VENDOR_LABEL,
@@ -333,7 +333,7 @@ export function HardwareSection({
             <div className="flex flex-col gap-3">
               <p className="flex items-center gap-2 text-sm text-fg">
                 <Server className="size-4 text-muted" aria-hidden />
-                {hw.ffmpeg.version ?? "Version unknown"}
+                {ffmpegVersionLabel(hw.ffmpeg.version)}
               </p>
               <p className="font-mono text-xs text-muted">
                 {hw.ffmpeg.ffmpeg_path} · {hw.ffmpeg.ffprobe_path}

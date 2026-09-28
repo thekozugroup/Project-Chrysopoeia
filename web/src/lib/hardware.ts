@@ -96,11 +96,14 @@ const DETECTING_HINT = "Checking your hardware";
 
 /**
  * Whether this report is the server's stand-in while the first detection is
- * still running (HTTP 200 with no encoders and a "Checking…" hint), rather
- * than real results. It must never be shown as "ffmpeg wasn't found".
+ * still running, rather than real results. It must never be shown as
+ * "ffmpeg wasn't found". The server says so with `detecting`; servers from
+ * before that flag are recognised by their stand-in (no encoders and a
+ * "Checking…" hint).
  */
 export function isDetecting(hw: HardwareInfo | undefined): boolean {
   if (!hw) return false;
+  if (typeof hw.detecting === "boolean") return hw.detecting;
   return hw.encoders.length === 0 && hw.hints.some((h) => h.title.startsWith(DETECTING_HINT));
 }
 

@@ -2,7 +2,7 @@
 
 /** Queue: Running / Up next / History, with queue controls and job actions. */
 
-import { ArrowUpToLine, CircleCheck, FolderPlus, History, ListVideo, RotateCcw, Trash2, X } from "lucide-react";
+import { ArrowUpToLine, CircleCheck, CirclePause, FolderPlus, History, ListVideo, RotateCcw, Trash2, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { JobCard, JobCardSkeleton, savingsText } from "@/components/jobs";
 import { QueueControls, queueSentence } from "@/components/queue-controls";
@@ -14,7 +14,7 @@ import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ConfirmDialog, Tooltip } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
-import { formatBytes, formatRelative } from "@/lib/format";
+import { formatBytes, formatRelative, plural } from "@/lib/format";
 import { useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, openSheet, updateParams, type Route } from "@/lib/router";
 import type { Job } from "@/lib/types";
@@ -99,6 +99,7 @@ function AddLibraryEmpty({ title }: { title: ReactNode }) {
 
 function RunningTab() {
   const running = useJobs({ state: "running", limit: 50 });
+  const queue = useQueueState();
   const noLibraries = useNoLibraries();
   if (running.isPending) {
     return (
@@ -112,6 +113,23 @@ function RunningTab() {
   const items = running.data?.items ?? [];
   if (!items.length) {
     if (noLibraries) return <AddLibraryEmpty title="Nothing to convert yet" />;
+    if (queue.data?.paused) {
+      return (
+        <EmptyState icon={<CirclePause aria-hidden />} title="The queue is paused">
+          {queue.data.queued
+            ? `${plural(queue.data.queued, "file")} waiting. Nothing new starts until you resume.`
+            : "Nothing new starts until you resume."}
+        </EmptyState>
+      );
+    }
+    if (queue.data && queue.data.running > 0) {
+      // A job just started; its card arrives with the next list refresh.
+      return (
+        <div className="grid gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
+          <JobCardSkeleton />
+        </div>
+      );
+    }
     return (
       <EmptyState icon={<ListVideo aria-hidden />} title="Nothing is converting">
         Files in the queue start automatically, a few at a time. How many run at once is set in{" "}
@@ -155,7 +173,8 @@ function UpNextTab({ offset }: { offset: number }) {
       <ol className="divide-y divide-line rounded-lg border border-line bg-surface">
         {items.map((job, i) => (
           <li key={job.id} className="flex items-center gap-3 px-3 py-2.5 sm:gap-4 sm:px-4">
-            <span className="w-7 shrink-0 text-right text-[0.8125rem] text-muted tabular" aria-label={`Position ${offset + i + 1}`}>
+            <span className="w-7 shrink-0 text-right text-[0.8125rem] text-muted tabular">
+              <span className="sr-only">Position </span>
               {offset + i + 1}
             </span>
             <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
@@ -250,7 +269,7 @@ function HistoryTab({ offset }: { offset: number }) {
                   </span>
                   <JobStateBadge job={job} />
                 </span>
-                <span className="mt-1 flex flex-wrap gap-x-2 text-[0.8125rem]">
+                <span className="mt-1 flex flex-wrap gap-x-1 text-[0.8125rem]">
                   <span
                     className={cn(
                       "min-w-0",

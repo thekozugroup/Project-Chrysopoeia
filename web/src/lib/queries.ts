@@ -8,11 +8,12 @@
 import { keepPreviousData, useQuery, type QueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
 import { isDetecting } from "./hardware";
-import type { FileQuery, HardwareInfo, JobQuery, Library } from "./types";
+import type { FileQuery, HardwareInfo, JobQuery, Library, SystemInfo } from "./types";
 
 /** Query keys. Lists take their parameters as the last element. */
 export const keys = {
   health: ["health"] as const,
+  system: ["system"] as const,
   overview: ["overview"] as const,
   libraries: ["libraries"] as const,
   files: (query?: FileQuery) => (query ? (["files", query] as const) : (["files"] as const)),
@@ -31,6 +32,28 @@ export const keys = {
 export function shouldRetry(failureCount: number, error: unknown): boolean {
   if (error instanceof ApiError && error.status >= 400 && error.status < 500) return false;
   return failureCount < 2;
+}
+
+/**
+ * Facts about the server (`GET /api/system`), e.g. the automatic work folder.
+ * `null` when the server is too old to have the endpoint (404), so callers
+ * can fall back to generic wording instead of showing an error.
+ */
+export async function fetchSystem(signal?: AbortSignal): Promise<SystemInfo | null> {
+  try {
+    return await api.system(signal);
+  } catch (err) {
+    if (err instanceof ApiError && (err.status === 404 || err.status === 405)) return null;
+    throw err;
+  }
+}
+
+export function useSystem() {
+  return useQuery({
+    queryKey: keys.system,
+    queryFn: ({ signal }) => fetchSystem(signal),
+    staleTime: 10 * 60_000,
+  });
 }
 
 export function useOverview() {

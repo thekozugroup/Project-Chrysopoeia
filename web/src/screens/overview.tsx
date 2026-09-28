@@ -134,7 +134,14 @@ function NowConverting() {
 
   let empty: ReactNode = null;
   if (jobs.length === 0 && queue) {
-    if (queue.paused) {
+    if (queue.running > 0) {
+      // A job just started; its card arrives with the next list refresh.
+      empty = (
+        <div className="grid gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
+          <JobCardSkeleton />
+        </div>
+      );
+    } else if (queue.paused) {
       empty = (
         <EmptyState title="Paused" action={<QueueControls queue={queue} />}>
           {queue.queued

@@ -358,3 +358,13 @@ export function languageLabel(code: string | null | undefined): string {
   if (!code) return "No language";
   return LANGUAGE_NAMES[code.toLowerCase()] ?? code;
 }
+
+/**
+ * Whether a skip was the user's own choice ("Skipped by you"). Queueing such
+ * a file converts it. Every other skip follows the library's settings (already
+ * efficient, not enough smaller, audio only), and the worker would reach the
+ * same verdict again, so offering "Convert anyway" would do nothing.
+ */
+export function skippedByUser(reason: string | null | undefined): boolean {
+  return /^skipped by you\b/i.test(reason?.trim() ?? "");
+}

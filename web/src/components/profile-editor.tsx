@@ -255,7 +255,7 @@ export function ProfileEditor({
 
   return (
     <div>
-      <Group level={headingLevel} title="Goal" description="What matters most for this library. You can change it any time.">
+      <Group level={headingLevel} title="Goal" description="What matters most. You can change it any time.">
         <GoalPicker
           label="Goal"
           value={profile.goal}

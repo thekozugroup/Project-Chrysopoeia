@@ -24,6 +24,7 @@ import type {
   Presets,
   QueueState,
   Settings,
+  SystemInfo,
   UpdateLibraryRequest,
   ActivityEntry,
 } from "./types";
@@ -49,17 +50,21 @@ export function wsUrl(): string {
 /**
  * An error from the API. `code` is the server's snake_case error code
  * (`path_not_found`, `library_exists`, ...), or one of the client-side codes
- * `network_error`, `bad_response` and `http_<status>`.
+ * `network_error`, `bad_response` and `http_<status>`. `field` names the
+ * setting (or profile field) at fault when the server knows it, e.g.
+ * `temp_dir`.
  */
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  readonly field: string | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(status: number, code: string, message: string, field: string | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
     this.code = code;
+    this.field = field;
   }
 
   /** True when the server could not be reached at all. */
@@ -78,6 +83,29 @@ export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message;
   if (error instanceof Error && error.message) return error.message;
   return "Something went wrong. Please try again.";
+}
+
+// ---------------------------------------------------------------------------
+// Reachability: whether the last request reached the server at all
+// ---------------------------------------------------------------------------
+
+type ReachabilityListener = (reachable: boolean) => void;
+const reachabilityListeners = new Set<ReachabilityListener>();
+
+/**
+ * Be told after every request whether the server answered (`true`) or could
+ * not be reached (`false`: no connection, or a proxy's 502/503/504 while the
+ * container restarts). Returns the unsubscribe function.
+ */
+export function onReachability(listener: ReachabilityListener): () => void {
+  reachabilityListeners.add(listener);
+  return () => {
+    reachabilityListeners.delete(listener);
+  };
+}
+
+function reportReachability(reachable: boolean): void {
+  for (const listener of reachabilityListeners) listener(reachable);
 }
 
 const FALLBACK_MESSAGES: Record<number, string> = {
@@ -104,20 +132,28 @@ function withQuery(path: string, query?: Query): string {
   return qs ? `${path}?${qs}` : path;
 }
 
+/** Build an `ApiError` from a status and a (possibly non-JSON) error body. */
+export function errorFromBody(status: number, body: unknown): ApiError {
+  let code = `http_${status}`;
+  let message = FALLBACK_MESSAGES[status] ?? `The server answered with an error (${status}).`;
+  let field: string | null = null;
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const record = body as Record<string, unknown>;
+    if (typeof record.error === "string" && record.error.trim()) message = record.error;
+    if (typeof record.code === "string" && record.code) code = record.code;
+    if (typeof record.field === "string" && record.field) field = record.field;
+  }
+  return new ApiError(status, code, message, field);
+}
+
 async function parseError(res: Response): Promise<ApiError> {
-  let code = `http_${res.status}`;
-  let message = FALLBACK_MESSAGES[res.status] ?? `The server answered with an error (${res.status}).`;
+  let body: unknown = null;
   try {
-    const body: unknown = await res.json();
-    if (body && typeof body === "object") {
-      const record = body as Record<string, unknown>;
-      if (typeof record.error === "string" && record.error) message = record.error;
-      if (typeof record.code === "string" && record.code) code = record.code;
-    }
+    body = await res.json();
   } catch {
     // Not JSON (e.g. a proxy error page); keep the fallback message.
   }
-  return new ApiError(res.status, code, message);
+  return errorFromBody(res.status, body);
 }
 
 interface RequestOptions {
@@ -144,10 +180,13 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
     });
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") throw err;
+    reportReachability(false);
     throw new ApiError(0, "network_error", "Can't reach the Chrysopoeia server.");
   }
 
-  if (!res.ok) throw await parseError(res);
+  const error = res.ok ? null : await parseError(res);
+  reportReachability(!error?.isUnavailable);
+  if (error) throw error;
   if (res.status === 204) return undefined as T;
 
   const text = await res.text();
@@ -172,6 +211,7 @@ export function isUuid(value: string | null | undefined): value is string {
 /** Typed endpoint helpers, one per route in docs/ARCHITECTURE.md. */
 export const api = {
   health: (signal?: AbortSignal) => request<Health>("/health", { signal }),
+  system: (signal?: AbortSignal) => request<SystemInfo>("/system", { signal }),
   overview: (signal?: AbortSignal) => request<Overview>("/overview", { signal }),
 
   libraries: (signal?: AbortSignal) => request<Library[]>("/libraries", { signal }),
