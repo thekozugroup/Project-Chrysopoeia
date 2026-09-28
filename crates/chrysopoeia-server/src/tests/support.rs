@@ -49,6 +49,8 @@ pub enum Behavior {
     Fail(String),
     /// Wait until cancelled, or until released (then behave like `Done`).
     Hold,
+    /// Wait until cancelled, or until released (then fail with this error).
+    HoldFail(String),
     /// Panic inside the transcoder.
     Panic,
 }
@@ -107,6 +109,9 @@ impl WalkGate {
     }
 }
 
+/// Recorded `watch_with_options` calls: root, ignore patterns, minimum size.
+pub type WatchCalls = Arc<Mutex<Vec<(PathBuf, Vec<String>, u64)>>>;
+
 /// Fake media tools with knobs for tests.
 pub struct FakeToolkit {
     pub walk_gate: Arc<WalkGate>,
@@ -124,6 +129,14 @@ pub struct FakeToolkit {
     pub walks: Mutex<Vec<PathBuf>>,
     pub watch_tx: Mutex<Option<mpsc::Sender<WatchEvent>>>,
     pub watched: Arc<Mutex<Vec<PathBuf>>>,
+    /// Every `watch_with_options` call: root, ignore patterns, minimum size.
+    pub watch_calls: WatchCalls,
+    /// Hardware to report instead of the default CPU-only machine.
+    pub hardware: Mutex<Option<HardwareInfo>>,
+    /// Notes every finished fake conversion reports.
+    pub done_notes: Mutex<Vec<String>>,
+    /// Hardware detections run so far.
+    pub detections: AtomicUsize,
 }
 
 impl Default for FakeToolkit {
@@ -144,6 +157,10 @@ impl Default for FakeToolkit {
             walks: Mutex::new(Vec::new()),
             watch_tx: Mutex::new(None),
             watched: Arc::new(Mutex::new(Vec::new())),
+            watch_calls: Arc::new(Mutex::new(Vec::new())),
+            hardware: Mutex::new(None),
+            done_notes: Mutex::new(Vec::new()),
+            detections: AtomicUsize::new(0),
         }
     }
 }
@@ -194,6 +211,10 @@ fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
     let meta = std::fs::metadata(root)?;
     anyhow::ensure!(meta.is_dir(), "not a folder");
     let mut out = WalkResult::default();
+    // Like the real walker: unusable patterns are noted on the root.
+    for problem in chrysopoeia_scanner::IgnoreRules::new(&opts.ignore_patterns).invalid_patterns() {
+        out.notes.push((root.to_path_buf(), problem.clone()));
+    }
     let ignore = crate::services::library::compile_ignore(&opts.ignore_patterns);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -245,7 +266,7 @@ fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
 pub fn fake_probe(content: &str, size: u64) -> Result<ProbeInfo, ProbeError> {
     if content.contains("broken") {
         return Err(ProbeError::Unreadable(
-            "Invalid data found when processing input".into(),
+            "This file can't be read as a video: its data is invalid or cut short.".into(),
         ));
     }
     let kv: HashMap<&str, &str> = content
@@ -293,6 +314,7 @@ pub fn fake_probe(content: &str, size: u64) -> Result<ProbeInfo, ProbeError> {
 
 struct FakeWatcher {
     watched: Arc<Mutex<Vec<PathBuf>>>,
+    calls: WatchCalls,
 }
 
 impl FolderWatcher for FakeWatcher {
@@ -302,6 +324,15 @@ impl FolderWatcher for FakeWatcher {
             w.push(root.to_path_buf());
         }
         Ok(())
+    }
+
+    fn watch_with_options(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<()> {
+        self.calls.lock().unwrap().push((
+            root.to_path_buf(),
+            opts.ignore_patterns.clone(),
+            opts.min_size_bytes,
+        ));
+        self.watch(root)
     }
 
     fn unwatch(&self, root: &Path) -> anyhow::Result<()> {
@@ -403,6 +434,10 @@ impl MediaToolkit for Arc<FakeToolkit> {
         let me = Arc::clone(self);
         Box::pin(async move {
             let _permit = me.detect_gate.acquire().await;
+            me.detections.fetch_add(1, Ordering::SeqCst);
+            if let Some(hw) = me.hardware.lock().unwrap().clone() {
+                return hw;
+            }
             let total = me.recommended_total.load(Ordering::SeqCst) as u32;
             HardwareInfo {
                 detecting: false,
@@ -460,12 +495,23 @@ impl MediaToolkit for Arc<FakeToolkit> {
 
     fn encoder_candidates(
         &self,
-        _hw: &HardwareInfo,
+        hw: &HardwareInfo,
         codec: VideoCodec,
         _preference: HwPreference,
         _cpu_fallback: bool,
     ) -> Vec<EncoderCandidate> {
-        chrysopoeia_core::encoder::encoders_for(codec)
+        // Verified hardware encoders first, then the CPU, like hwdetect.
+        let hardware = hw
+            .verified_encoders(codec)
+            .filter(|e| e.api.is_hardware())
+            .map(|e| EncoderCandidate {
+                name: e.name.clone(),
+                codec,
+                api: e.api,
+                device: e.device.clone(),
+                hw_decode: true,
+            });
+        let software = chrysopoeia_core::encoder::encoders_for(codec)
             .filter(|e| e.api == HwApi::Software)
             .take(1)
             .map(|e| EncoderCandidate {
@@ -474,8 +520,8 @@ impl MediaToolkit for Arc<FakeToolkit> {
                 api: HwApi::Software,
                 device: None,
                 hw_decode: false,
-            })
-            .collect()
+            });
+        hardware.chain(software).collect()
     }
 
     fn is_media_path(&self, path: &Path) -> bool {
@@ -551,8 +597,33 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     attempt: 1,
                 })
                 .await;
+            let notes = me.done_notes.lock().unwrap().clone();
+            let with_notes = |outcome: JobOutcome| match outcome {
+                JobOutcome::Done {
+                    output_path,
+                    output_size,
+                    original_size,
+                    encoder,
+                    hw_api,
+                    attempt,
+                    validation,
+                    command,
+                    ..
+                } => JobOutcome::Done {
+                    output_path,
+                    output_size,
+                    original_size,
+                    encoder,
+                    hw_api,
+                    attempt,
+                    validation,
+                    command,
+                    notes: notes.clone(),
+                },
+                other => other,
+            };
             match me.behavior_for(&name) {
-                Behavior::Done { ratio } => fake_done(&cfg, &spec, ratio).await,
+                Behavior::Done { ratio } => with_notes(fake_done(&cfg, &spec, ratio).await),
                 Behavior::Skip(reason) => JobOutcome::Skipped {
                     reason,
                     encoder: Some("libx265".into()),
@@ -566,6 +637,22 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     attempt: 2,
                     validation: None,
                 },
+                Behavior::HoldFail(error) => {
+                    tokio::select! {
+                        () = cancel.cancelled() => JobOutcome::Cancelled,
+                        permit = me.release.acquire() => {
+                            if let Ok(p) = permit { p.forget(); }
+                            JobOutcome::Failed {
+                                error,
+                                log_tail: None,
+                                command: None,
+                                encoder: None,
+                                attempt: 0,
+                                validation: None,
+                            }
+                        }
+                    }
+                }
                 Behavior::Hold => {
                     tokio::select! {
                         () = cancel.cancelled() => JobOutcome::Cancelled,
@@ -614,6 +701,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
         Ok((
             Box::new(FakeWatcher {
                 watched: Arc::clone(&self.watched),
+                calls: Arc::clone(&self.watch_calls),
             }),
             rx,
         ))

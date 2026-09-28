@@ -1,7 +1,9 @@
 //! Integration tests with a fake toolkit and a temp-file SQLite database.
 
 mod dispatcher;
+mod durability;
 mod files;
+mod followups;
 mod fs_browse;
 mod libraries;
 mod regressions;

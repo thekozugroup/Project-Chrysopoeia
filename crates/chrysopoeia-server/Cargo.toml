@@ -32,6 +32,10 @@ tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true, features = ["catch-panic"] }
 sqlx = { workspace = true }
 globset = { workspace = true }
+serde_path_to_error = "0.1"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

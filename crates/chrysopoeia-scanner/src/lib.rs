@@ -36,6 +36,10 @@ pub use walk::{
 };
 pub use watch::{LibraryWatcher, WatchEvent};
 
+/// Bytes in the megabyte of `Settings::min_file_size_mb` (decimal, like
+/// the "MB" the UI shows).
+pub const BYTES_PER_MB: u64 = 1_000_000;
+
 /// Options for [`walk_library`].
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
@@ -52,12 +56,12 @@ pub struct ScanOptions {
 
 impl ScanOptions {
     /// Options matching the user's settings: their ignore patterns and
-    /// minimum file size (`min_file_size_mb` is in mebibytes). Links are not
-    /// followed.
+    /// minimum file size. `min_file_size_mb` is in decimal megabytes
+    /// ([`BYTES_PER_MB`]), as the UI shows it. Links are not followed.
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
             ignore_patterns: settings.ignore_patterns.clone(),
-            min_size_bytes: u64::from(settings.min_file_size_mb) * 1024 * 1024,
+            min_size_bytes: u64::from(settings.min_file_size_mb) * BYTES_PER_MB,
             follow_links: false,
         }
     }
@@ -81,11 +85,17 @@ pub struct WalkResult {
     pub files: Vec<DiscoveredFile>,
     /// Chrysopoeia temp/backup files found (see `chrysopoeia_core::paths`).
     pub artifacts: Vec<PathBuf>,
-    /// Paths that could not be read or were deliberately left alone (a DVD
-    /// or Blu-ray disc copy, a link), with a plain-language reason. Nothing
-    /// below these paths is listed, so their absence from `files` does not
-    /// mean they were deleted.
+    /// Paths that could not be read (permissions, read errors, entries that
+    /// vanished mid-walk), with a plain-language reason. Nothing below these
+    /// paths is listed, so their absence from `files` does not mean they
+    /// were deleted.
     pub errors: Vec<(PathBuf, String)>,
+    /// Paths deliberately left alone, with a plain-language note: DVD and
+    /// Blu-ray disc copies, links that are not followed, names that aren't
+    /// valid UTF-8, and ignore patterns that can't be used (noted on the
+    /// root). Informational, not failures; nothing below them is listed
+    /// either.
+    pub notes: Vec<(PathBuf, String)>,
 }
 
 /// Why a file could not be probed.
@@ -153,7 +163,7 @@ mod tests {
             ..Settings::default()
         };
         let opts = ScanOptions::from_settings(&settings);
-        assert_eq!(opts.min_size_bytes, 50 * 1024 * 1024);
+        assert_eq!(opts.min_size_bytes, 50_000_000);
         assert_eq!(opts.ignore_patterns, settings.ignore_patterns);
         assert!(!opts.follow_links);
     }

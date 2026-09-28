@@ -14,6 +14,7 @@ pub mod job;
 pub mod library;
 pub mod media;
 pub mod paths;
+pub mod process;
 pub mod profile;
 pub mod settings;
 pub mod stats;
@@ -30,7 +31,7 @@ pub use hardware::{
 };
 pub use job::{Job, JobProgress, JobStage, JobState};
 pub use library::{FileStatus, Library, LibraryStats, MediaFile};
-pub use media::{HdrFormat, ProbeInfo, StreamInfo, StreamKind};
+pub use media::{ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind};
 pub use profile::{Goal, QualityLevel, SpeedPreset, SubtitlePolicy, TranscodeProfile};
 pub use settings::{ActiveHours, OutputMode, Settings, ValidationLevel};
 pub use stats::{CodecCount, Overview, SavingsPoint};

@@ -759,3 +759,98 @@ async fn a_failed_folder_mode_job_leaves_no_empty_folders() {
     assert!(!dir.path().join("converted").exists());
     assert_eq!(support::walk(dir.path()), [input]);
 }
+
+/// A cut-off original (the truncated MKV from the test library claims the
+/// full clip length but holds a fraction of a second) fails with a plain
+/// explanation, with verification on and off, and is left as it was.
+#[tokio::test]
+async fn a_damaged_original_is_reported_as_damaged() {
+    require_ffmpeg!();
+    for validation in [ValidationLevel::Standard, ValidationLevel::Off] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = support::copy_media("Broken/Truncated.mkv", dir.path());
+        let before = std::fs::read(&input).unwrap();
+        let spec = spec(&input, dir.path(), profile());
+        let claimed = spec.probe.duration_secs.unwrap_or_default();
+        assert!(claimed >= 3.0, "the sample claims {claimed} s");
+        let (outcome, _) = run(&config(validation), &spec, &fake_plan).await;
+        match outcome {
+            JobOutcome::Failed { error, .. } => {
+                assert!(
+                    error.starts_with(
+                        "The original file appears damaged or incomplete (it stops after"
+                    ),
+                    "{validation:?}: {error}"
+                );
+                assert!(error.ends_with("It was left unchanged."), "{error}");
+            }
+            other => panic!("{validation:?}: expected Failed, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+        assert_eq!(support::walk(dir.path()), [input]);
+    }
+}
+
+/// Like [`fake_plan`], but an attempt that decodes on the GPU stops after
+/// half a second, as a hardware decoder that gives up early would.
+fn gpu_stops_early_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
+    let mut plan = fake_plan(req)?;
+    if req.encoder.hw_decode {
+        let at = plan.args.len() - 1;
+        plan.args
+            .splice(at..at, ["-t".to_string(), "0.5".to_string()]);
+    }
+    Ok(plan)
+}
+
+/// A GPU decode that stops early says nothing about the original: the job
+/// moves on to CPU decoding instead of calling a good file damaged.
+#[tokio::test]
+async fn a_gpu_decode_that_stops_early_falls_back_instead_of_blaming_the_file() {
+    require_ffmpeg!();
+    for validation in [ValidationLevel::Standard, ValidationLevel::Off] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = support::copy_media(support::MP4_TWO_AUDIO, dir.path());
+        let mut spec = spec(&input, dir.path(), profile());
+        spec.candidates = vec![candidate("h264_qsv", HwApi::Qsv, true), software()];
+        let (outcome, _) = run(&config(validation), &spec, &gpu_stops_early_plan).await;
+        match outcome {
+            JobOutcome::Done {
+                encoder, attempt, ..
+            } => {
+                // The same encoder, decoding on the CPU.
+                assert_eq!(
+                    (encoder.as_str(), attempt),
+                    ("h264_qsv", 2),
+                    "{validation:?}"
+                );
+            }
+            other => panic!("{validation:?}: expected Done, got {other:?}"),
+        }
+        assert!(support::artifacts_in(dir.path()).is_empty());
+    }
+}
+
+/// A really cut-off original is still reported as damaged, once an attempt
+/// decoding on the CPU has confirmed it.
+#[tokio::test]
+async fn a_damaged_original_is_confirmed_with_cpu_decoding() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media("Broken/Truncated.mkv", dir.path());
+    let before = std::fs::read(&input).unwrap();
+    let mut spec = spec(&input, dir.path(), profile());
+    spec.candidates = vec![candidate("h264_qsv", HwApi::Qsv, true), software()];
+    let (outcome, _) = run(&config(ValidationLevel::Standard), &spec, &fake_plan).await;
+    match outcome {
+        JobOutcome::Failed { error, attempt, .. } => {
+            assert!(
+                error.starts_with("The original file appears damaged or incomplete"),
+                "{error}"
+            );
+            assert_eq!(attempt, 2, "decided by the CPU-decoding attempt");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+}

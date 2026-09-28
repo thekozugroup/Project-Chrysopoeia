@@ -12,7 +12,7 @@ use super::{
 
 const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, stage, priority, \
     progress, fps, speed, eta_secs, encoder, hw_api, attempt, input_size, output_size, error, \
-    skip_reason, validation, command, log_tail, created_at, started_at, finished_at";
+    skip_reason, validation, command, log_tail, notes, created_at, started_at, finished_at";
 
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
@@ -28,8 +28,13 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let speed: Option<f64> = row.try_get("speed")?;
     let priority: i64 = row.try_get("priority")?;
     let attempt: i64 = row.try_get("attempt")?;
+    let notes: Option<String> = row.try_get("notes")?;
     Ok(Job {
-        notes: Vec::new(),
+        notes: notes
+            .as_deref()
+            .map(parse_json::<Vec<String>>)
+            .transpose()?
+            .unwrap_or_default(),
         id: uuid_col(row, "id")?,
         file_id: uuid_col(row, "file_id")?,
         library_id: uuid_col(row, "library_id")?,
@@ -349,7 +354,7 @@ pub async fn claim_next(
     let mut qb = QueryBuilder::<Sqlite>::new(
         "UPDATE jobs SET state = 'running', stage = 'preparing', progress = 0, fps = NULL, \
          speed = NULL, eta_secs = NULL, attempt = 1, error = NULL, skip_reason = NULL, \
-         finished_at = NULL, started_at = ",
+         notes = NULL, finished_at = NULL, started_at = ",
     );
     qb.push_bind(now.clone()).push(
         " WHERE id = (SELECT j.id FROM jobs j JOIN libraries l ON l.id = j.library_id \
@@ -430,6 +435,8 @@ pub struct JobFinish {
     pub validation: Option<ValidationReport>,
     pub command: Option<String>,
     pub log_tail: Option<String>,
+    /// Plain-language notes about compromises the conversion made.
+    pub notes: Vec<String>,
 }
 
 /// Mark a job finished. Returns false when the job no longer exists.
@@ -440,11 +447,16 @@ pub async fn finish(
     f: &JobFinish,
 ) -> sqlx::Result<bool> {
     let validation = f.validation.as_ref().map(to_json).transpose()?;
+    let notes = if f.notes.is_empty() {
+        None
+    } else {
+        Some(to_json(&f.notes)?)
+    };
     let done = sqlx::query(
         "UPDATE jobs SET state = ?, error = ?, skip_reason = ?, \
          encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), \
          attempt = COALESCE(?, attempt), output_size = ?, validation = ?, command = ?, \
-         log_tail = ?, eta_secs = NULL, \
+         log_tail = ?, notes = ?, eta_secs = NULL, \
          progress = CASE WHEN ? = 'done' THEN 100 ELSE progress END, finished_at = ? \
          WHERE id = ?",
     )
@@ -458,6 +470,7 @@ pub async fn finish(
     .bind(validation)
     .bind(&f.command)
     .bind(&f.log_tail)
+    .bind(notes)
     .bind(enum_str(&state))
     .bind(now_ts())
     .bind(id.to_string())
@@ -595,6 +608,54 @@ pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
     .await?;
     tx.commit().await?;
     Ok(done.rows_affected())
+}
+
+/// Remember where a running job will put its result (see
+/// [`interrupted`]).
+pub async fn set_final_path(pool: &SqlitePool, id: Uuid, path: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE jobs SET final_path = ? WHERE id = ? AND state = 'running'")
+        .bind(path)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A job that was running when the server stopped, with where it was going
+/// to put its result.
+#[derive(Debug, Clone)]
+pub struct InterruptedJob {
+    pub job: Job,
+    pub final_path: Option<String>,
+}
+
+/// Jobs left `running` by the previous run (before [`recover_interrupted`]).
+pub async fn interrupted(pool: &SqlitePool) -> sqlx::Result<Vec<InterruptedJob>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS}, final_path FROM jobs WHERE state = 'running'"
+    ))
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(InterruptedJob {
+                job: from_row(row)?,
+                final_path: row.try_get("final_path")?,
+            })
+        })
+        .collect()
+}
+
+/// Whether a finished conversion other than `job` put its result at `path`.
+pub async fn other_done_at(pool: &SqlitePool, job: Uuid, path: &str) -> sqlx::Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM jobs WHERE final_path = ? AND id != ? AND state = 'done' LIMIT 1",
+    )
+    .bind(path)
+    .bind(job.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
 }
 
 /// Startup recovery: jobs left `running` go back to the queue, and files left

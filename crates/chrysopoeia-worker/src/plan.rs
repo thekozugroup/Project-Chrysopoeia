@@ -73,9 +73,10 @@ fn skip(reason: impl Into<String>) -> Decision {
 ///    Neither rule applies when the picture is larger than the profile's
 ///    `max_height` allows (see [`SizeLimit`]): the user asked for smaller
 ///    pictures, so the file is converted even if its codec is efficient.
-/// 4. Dolby Vision without a standard base layer (profile 5): skip. Without
-///    Dolby Vision reshaping its picture decodes with wrong colours, and
-///    verification would compare two equally wrong pictures.
+/// 4. Dolby Vision without a standard base layer (profile 5), or without
+///    any colour description: skip. Without Dolby Vision reshaping such a
+///    picture decodes with wrong colours, and verification would compare
+///    two equally wrong pictures.
 /// 5. H.264 target with an HDR source: skip. There is no tone mapping, and
 ///    8-bit H.264 cannot carry HDR, so the colours would be wrong.
 /// 6. Audio tracks exist but none of them can be read: skip rather than
@@ -121,7 +122,11 @@ pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
     }
 
     if video.hdr == Some(HdrFormat::DolbyVision) && !has_standard_base_layer(video) {
-        return skip("Dolby Vision video without a standard HDR layer — left unchanged");
+        return skip(if video.dolby_vision_without_base_layer {
+            DV_PROFILE_5_REASON
+        } else {
+            DV_UNKNOWN_COLOURS_REASON
+        });
     }
     if target == VideoCodec::H264 && is_hdr(video) {
         return skip("HDR video would lose its colours as H.264 — left unchanged");
@@ -158,16 +163,27 @@ fn container_family_label(target: Container) -> &'static str {
     }
 }
 
+/// Skip reason for Dolby Vision without a standard base layer.
+const DV_PROFILE_5_REASON: &str =
+    "Dolby Vision profile 5 can't be converted without losing its colours — left unchanged";
+
+/// Skip reason for Dolby Vision whose picture has no colour description: it
+/// may be profile 5 (older probes and some files don't say).
+const DV_UNKNOWN_COLOURS_REASON: &str = "This Dolby Vision video doesn't say which colours its \
+    picture uses, so converting it could ruin them — left unchanged";
+
 /// Dolby Vision streams carry a base layer other players can show when the
 /// stream is tagged with a standard transfer (PQ for profiles 7 and 8.1, HLG
-/// for 8.4, SDR for 8.2 and 9). Profile 5 has no such layer and leaves the
-/// colour description unset. `StreamInfo` has no Dolby Vision profile or
-/// compatibility id, so the transfer tag is the signal used.
+/// for 8.4, SDR for 8.2 and 9). Profile 5 has no such layer: the scanner
+/// flags it and clears its colour description (see
+/// `chrysopoeia_scanner::probe`). A Dolby Vision stream without a transfer
+/// tag can't be told apart from it, so it is treated the same way.
 fn has_standard_base_layer(video: &StreamInfo) -> bool {
-    video
-        .color_transfer
-        .as_deref()
-        .is_some_and(|t| !is_placeholder_colour(t))
+    !video.dolby_vision_without_base_layer
+        && video
+            .color_transfer
+            .as_deref()
+            .is_some_and(|t| !is_placeholder_colour(t))
 }
 
 /// Colour description values that mean "not specified".
@@ -356,8 +372,15 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
         .primary_video()
         .ok_or_else(|| anyhow!("This file has no video stream to convert."))?;
     if video.hdr == Some(HdrFormat::DolbyVision) && !has_standard_base_layer(video) {
+        if video.dolby_vision_without_base_layer {
+            bail!(
+                "This is Dolby Vision profile 5 video, which has no standard picture layer, so \
+                 converting it would ruin its colours."
+            );
+        }
         bail!(
-            "This Dolby Vision video has no standard HDR layer, so converting it would ruin its colours."
+            "This Dolby Vision video doesn't say which colours its picture uses, so converting \
+             it could ruin them."
         );
     }
     if encoder.codec != profile.video_codec {
@@ -674,13 +697,27 @@ fn plan_video(
         out.push(filters.join(","));
     }
     out.extend(color_args(video));
+    // HDR10 stays HDR10: the CPU encoders don't copy the mastering display
+    // and light levels from the decoded frames by themselves, so they are
+    // passed explicitly.
+    let keeps_hdr10 = ten_bit && is_pq(video);
     if encoder.name == "libx265" {
         let mut params = String::from("log-level=error");
-        if ten_bit && is_pq(video) {
+        if keeps_hdr10 {
             // Write HDR10 SEI/VUI on every keyframe and optimise for PQ.
             params.push_str(":hdr-opt=1:repeat-headers=1");
+            for p in x265_hdr10_params(video) {
+                params.push(':');
+                params.push_str(&p);
+            }
         }
         push(&mut out, &["-x265-params", &params]);
+    }
+    if encoder.name == "libsvtav1" && keeps_hdr10 {
+        let params = svtav1_hdr10_params(video);
+        if !params.is_empty() {
+            push(&mut out, &["-svtav1-params", &params.join(":")]);
+        }
     }
     if profile.container == Container::Mp4 && codec == VideoCodec::Hevc {
         // Apple devices only play HEVC in MP4 when tagged hvc1.
@@ -694,6 +731,55 @@ fn plan_video(
         input_args,
         output_args: out,
     }
+}
+
+/// libx265 options for the source's HDR10 static metadata: chromaticities
+/// in 0.00002 units and luminance in 0.0001 cd/m² (x265's notation).
+fn x265_hdr10_params(video: &StreamInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(m) = video.mastering_display {
+        let c = |v: f64| (v * 50_000.0).round().clamp(0.0, 50_000.0) as u32;
+        let l = |v: f64| (v * 10_000.0).round().clamp(0.0, 4.0e9) as u64;
+        out.push(format!(
+            "master-display=G({},{})B({},{})R({},{})WP({},{})L({},{})",
+            c(m.green[0]),
+            c(m.green[1]),
+            c(m.blue[0]),
+            c(m.blue[1]),
+            c(m.red[0]),
+            c(m.red[1]),
+            c(m.white_point[0]),
+            c(m.white_point[1]),
+            l(m.max_luminance),
+            l(m.min_luminance)
+        ));
+    }
+    if let Some(cl) = video.content_light {
+        out.push(format!("max-cll={},{}", cl.max_cll, cl.max_fall));
+    }
+    out
+}
+
+/// SVT-AV1 options for the source's HDR10 static metadata (chromaticities
+/// and cd/m² as decimals).
+fn svtav1_hdr10_params(video: &StreamInfo) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(m) = video.mastering_display {
+        let xy = |p: [f64; 2]| format!("({:.4},{:.4})", p[0], p[1]);
+        out.push(format!(
+            "mastering-display=G{}B{}R{}WP{}L({:.4},{:.4})",
+            xy(m.green),
+            xy(m.blue),
+            xy(m.red),
+            xy(m.white_point),
+            m.max_luminance,
+            m.min_luminance
+        ));
+    }
+    if let Some(cl) = video.content_light {
+        out.push(format!("content-light={},{}", cl.max_cll, cl.max_fall));
+    }
+    out
 }
 
 /// Whether an API can write 10-bit output for a codec (H.264 never is).

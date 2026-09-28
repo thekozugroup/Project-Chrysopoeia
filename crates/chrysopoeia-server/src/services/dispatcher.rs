@@ -24,6 +24,8 @@ use chrysopoeia_core::{
     ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
     JobState, MediaFile, OutputMode, QueueState, Settings,
 };
+use chrysopoeia_scanner::WatchEvent;
+use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
 use chrysopoeia_worker::{JobOutcome, JobSpec, RunConfig};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -31,7 +33,7 @@ use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
 use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile};
-use crate::db::jobs::JobFinish;
+use crate::db::jobs::{InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
 use crate::services::library::{
@@ -76,6 +78,8 @@ pub enum CancelIntent {
 struct RunningJob {
     file_id: Uuid,
     library_id: Uuid,
+    /// Its first-choice encoder runs on the CPU.
+    software: bool,
     cancel: CancellationToken,
     intent: Option<CancelIntent>,
 }
@@ -173,6 +177,11 @@ impl DispatcherHandle {
     /// Jobs running right now.
     pub fn running_count(&self) -> usize {
         lock(&self.running).len()
+    }
+
+    /// Running jobs whose first-choice encoder runs on the CPU.
+    pub fn software_running_count(&self) -> usize {
+        lock(&self.running).values().filter(|j| j.software).count()
     }
 
     /// Whether a job is running.
@@ -344,25 +353,71 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
     if d.is_paused() || outside {
         return Ok(());
     }
-    let (max_jobs, _) = effective_max_jobs(state);
+    let (max_jobs, auto) = effective_max_jobs(state);
     if d.running_count() >= max_jobs as usize {
         return Ok(());
     }
     recheck_offline(state).await;
-    let skip_libraries: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
+    let offline: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
     let skip_jobs: Vec<Uuid> = {
         let now = Instant::now();
         let mut deferred = lock(&d.deferred);
         deferred.retain(|_, until| *until > now);
         deferred.keys().copied().collect()
     };
+    let software_libraries = software_libraries(state, &settings).await?;
+    let software_cap = auto.then(|| software_job_cap(state, max_jobs)).flatten();
     while d.running_count() < max_jobs as usize && !state.shutdown.is_cancelled() {
+        // CPU encodes beyond the CPU's own job count would only slow each
+        // other down, even when the limit follows the GPU: pass over the
+        // libraries whose jobs encode on the CPU until one finishes.
+        let cpu_full = software_cap.is_some_and(|cap| d.software_running_count() >= cap);
+        let mut skip_libraries = offline.clone();
+        if cpu_full {
+            skip_libraries.extend(software_libraries.iter().copied());
+        }
         let Some(job) = db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs).await? else {
             break;
         };
-        start_job(state, job);
+        let software = software_libraries.contains(&job.library_id);
+        start_job(state, job, software);
     }
     Ok(())
+}
+
+/// How many CPU encodes may run at once when the automatic job limit is
+/// higher than the CPU's own count (it follows the GPU): the hardware's
+/// recommended CPU jobs. `None` when that is no limit at all.
+fn software_job_cap(state: &AppState, max_jobs: u32) -> Option<usize> {
+    let hw = state.hardware.current()?;
+    let cap = hw.recommended_jobs.cpu_jobs.max(1);
+    (cap < max_jobs).then_some(cap as usize)
+}
+
+/// Libraries whose jobs would encode on the CPU first: no verified hardware
+/// encoder for their codec under the current preference.
+async fn software_libraries(state: &AppState, settings: &Settings) -> sqlx::Result<Vec<Uuid>> {
+    let Some(hw) = state.hardware.current() else {
+        return Ok(Vec::new());
+    };
+    let libs = db::libraries::list(state.db.pool()).await?;
+    let mut by_codec: HashMap<chrysopoeia_core::VideoCodec, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for lib in libs {
+        let codec = lib.profile.video_codec;
+        let software = *by_codec.entry(codec).or_insert_with(|| {
+            state
+                .toolkit
+                .encoder_candidates(&hw, codec, settings.hardware, settings.cpu_fallback)
+                .ok()
+                .and_then(|c| c.first().map(|c| c.api == HwApi::Software))
+                .unwrap_or(true)
+        });
+        if software {
+            out.push(lib.id);
+        }
+    }
+    Ok(out)
 }
 
 /// Check offline library folders that are due, and let the jobs of those
@@ -411,13 +466,14 @@ async fn recheck_offline(state: &AppState) {
     }
 }
 
-fn start_job(state: &AppState, job: Job) {
+fn start_job(state: &AppState, job: Job, software: bool) {
     let cancel = CancellationToken::new();
     lock(&state.dispatcher.running).insert(
         job.id,
         RunningJob {
             file_id: job.file_id,
             library_id: job.library_id,
+            software,
             cancel: cancel.clone(),
             intent: None,
         },
@@ -444,6 +500,17 @@ fn start_job(state: &AppState, job: Job) {
         state.broadcast_library(job.library_id).await;
         state.broadcast_stats().await;
         state.broadcast_queue_state().await;
+        // Watch events for the file were ignored while it was being
+        // converted (an upgrade that replaced it, for instance); look at it
+        // again now. Nothing happens when it is as the database says.
+        if let Some(file) = &ctx.file
+            && !state.shutdown.is_cancelled()
+            && let Err(e) =
+                library::handle_watch_event(&state, WatchEvent::Upserted(PathBuf::from(&file.path)))
+                    .await
+        {
+            tracing::debug!(job = %job.id, "could not look at the file again: {e:#}");
+        }
     });
 }
 
@@ -577,7 +644,7 @@ async fn execute(
         return (Disposition::Requeue(Requeue::Settling), ctx);
     }
     let probe = match file.probe.clone() {
-        Some(p) if unchanged => p,
+        Some(p) if unchanged && !lacks_hdr10_metadata(&p) => p,
         _ => match state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT).await {
             Ok(p) => {
                 if let Err(e) =
@@ -614,6 +681,20 @@ async fn execute(
     };
 
     let cfg = run_config(state, &settings);
+    // Where the result goes, so start-up recovery can finish the
+    // replacement if the server stops while it is being put in place.
+    let final_path = final_output_path(
+        &input,
+        lib.profile.container,
+        cfg.output_mode,
+        cfg.output_folder.as_deref(),
+        Path::new(&lib.path),
+    );
+    if let Some(p) = final_path.to_str()
+        && let Err(e) = db::jobs::set_final_path(state.db.pool(), job.id, p).await
+    {
+        tracing::warn!(job = %job.id, "could not store where the result goes: {e}");
+    }
     let spec = JobSpec {
         job_id: job.id,
         file_id: file.id,
@@ -642,6 +723,19 @@ async fn execute(
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
     }
     done(outcome, ctx)
+}
+
+/// Whether a stored probe of PQ (HDR10-style) video has no mastering
+/// display or light levels: probes made by older versions never read them,
+/// so the file is probed again and the conversion keeps them.
+fn lacks_hdr10_metadata(probe: &chrysopoeia_core::ProbeInfo) -> bool {
+    probe.primary_video().is_some_and(|v| {
+        v.color_transfer
+            .as_deref()
+            .is_some_and(|t| t.eq_ignore_ascii_case("smpte2084"))
+            && v.mastering_display.is_none()
+            && v.content_light.is_none()
+    })
 }
 
 /// Forward worker progress: every update to the WebSocket, and to the
@@ -827,6 +921,14 @@ async fn apply_outcome(
         .as_ref()
         .map_or(job.file_name.as_str(), |f| f.file_name.as_str())
         .to_string();
+    let outcome = match outcome {
+        JobOutcome::Failed { error, .. }
+            if !error.starts_with(MISSING_INPUT_ERROR) && input_vanished(ctx).await =>
+        {
+            return remove_vanished(state, job, ctx, &name).await;
+        }
+        other => other,
+    };
     match outcome {
         JobOutcome::Done {
             output_path,
@@ -876,7 +978,8 @@ async fn apply_outcome(
                     attempt: Some(attempt),
                     output_size: Some(output_size),
                     validation,
-                    command: Some(command),
+                    command: (!command.is_empty()).then_some(command),
+                    notes: notes.clone(),
                     ..JobFinish::default()
                 },
             )
@@ -940,11 +1043,11 @@ async fn apply_outcome(
             if verified {
                 message.push_str(", verified");
             }
-            for note in notes {
+            for note in &notes {
                 message.push_str(". ");
                 message.push_str(note.trim_end_matches('.'));
             }
-            tracing::info!(job = %job.id, encoder, "job done");
+            tracing::debug!(job = %job.id, encoder, "job done");
             state.activity(ActivityLevel::Success, message, refs).await;
         }
         JobOutcome::Skipped {
@@ -1016,7 +1119,8 @@ async fn apply_outcome(
             }
             tx.commit().await?;
             if exists {
-                tracing::warn!(job = %job.id, "job failed: {error}");
+                // The activity entry below is the one warning in the log.
+                tracing::debug!(job = %job.id, "job failed: {error}");
                 state
                     .activity(
                         ActivityLevel::Error,
@@ -1066,6 +1170,200 @@ async fn apply_outcome(
         }
     }
     Ok(())
+}
+
+/// A file moved or deleted while it was being converted. The watcher left
+/// its row alone then; with watching on, take the row off the list now, as
+/// the watcher would have (its job history goes with it). Otherwise the
+/// file is marked as missing, and the next scan removes it (or finds it
+/// again).
+async fn remove_vanished(
+    state: &AppState,
+    job: &Job,
+    ctx: &ExecContext,
+    name: &str,
+) -> anyhow::Result<()> {
+    let path = ctx
+        .file
+        .as_ref()
+        .map_or(job.file_path.as_str(), |f| f.path.as_str());
+    let mut tx = state.db.write_tx().await?;
+    let message = if state.settings().watch_folders {
+        let removed = sqlx::query("DELETE FROM files WHERE id = ?")
+            .bind(job.file_id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        if removed == 0 {
+            return Ok(());
+        }
+        state.emit(Event::FilesChanged {
+            library_id: Some(job.library_id),
+        });
+        format!(
+            "{name} was moved or deleted while it was being converted, so it was taken off the list."
+        )
+    } else {
+        let error = format!("{MISSING_INPUT_ERROR}{path}. It may have been moved or deleted.");
+        let exists = db::jobs::finish(
+            &mut tx,
+            job.id,
+            JobState::Failed,
+            &JobFinish {
+                error: Some(error.clone()),
+                ..JobFinish::default()
+            },
+        )
+        .await?;
+        if exists {
+            db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(&error))
+                .await?;
+        }
+        tx.commit().await?;
+        if !exists {
+            return Ok(());
+        }
+        format!("{name} was moved or deleted while it was being converted.")
+    };
+    state
+        .activity(
+            ActivityLevel::Info,
+            message,
+            ActivityRefs {
+                library_id: Some(job.library_id),
+                ..ActivityRefs::default()
+            },
+        )
+        .await;
+    Ok(())
+}
+
+/// Whether the file a job worked on is gone while its library folder is
+/// there (a disconnected share is not a deleted file).
+async fn input_vanished(ctx: &ExecContext) -> bool {
+    let (Some(file), Some(root)) = (&ctx.file, &ctx.library_root) else {
+        return false;
+    };
+    let missing = matches!(
+        tokio::fs::symlink_metadata(&file.path).await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    );
+    missing
+        && library::root_unavailable(&root.to_string_lossy())
+            .await
+            .is_none()
+}
+
+/// Note on a conversion finished by start-up recovery.
+const RESUMED_NOTE: &str = "Chrysopoeia stopped just as the new file was being put in place. \
+    The new file was already complete, so it was kept";
+
+/// Start-up: finish the conversions a crash stopped while their result was
+/// being put in place, so their new file is recorded instead of being made
+/// again (or reported as a conflict with Chrysopoeia's own file). Runs
+/// before interrupted jobs are re-queued and before leftover backups are
+/// put back. Returns how many were finished.
+pub async fn complete_interrupted(state: &AppState) -> u64 {
+    let jobs = match db::jobs::interrupted(state.db.pool()).await {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::warn!("could not look for interrupted conversions: {e}");
+            return 0;
+        }
+    };
+    let mut targets: HashMap<String, usize> = HashMap::new();
+    for j in &jobs {
+        if let Some(p) = &j.final_path {
+            *targets.entry(p.clone()).or_default() += 1;
+        }
+    }
+    let mut completed = 0;
+    for InterruptedJob { job, final_path } in jobs {
+        let Some(final_path) = final_path else {
+            continue;
+        };
+        // Two interrupted jobs aiming at one name can't be told apart.
+        if targets.get(&final_path).copied().unwrap_or(0) > 1 {
+            continue;
+        }
+        let file = db::files::get(state.db.pool(), job.file_id, true)
+            .await
+            .ok()
+            .flatten();
+        let input = PathBuf::from(
+            file.as_ref()
+                .map_or(job.file_path.as_str(), |f| f.path.as_str()),
+        );
+        let target = PathBuf::from(&final_path);
+        let replace = target.parent() == input.parent();
+        let placed = if replace {
+            match state
+                .toolkit
+                .resume_replace(input.clone(), target.clone(), job.id)
+                .await
+            {
+                Ok(Interrupted::Placed {
+                    size,
+                    original_size,
+                }) => Some((size, original_size)),
+                Ok(Interrupted::NotPlaced) => None,
+                Err(e) => {
+                    tracing::warn!(job = %job.id, "could not check an interrupted conversion: {e:#}");
+                    None
+                }
+            }
+        } else {
+            // Folder mode never touches the original, so there is no backup
+            // to go by: the job had reached its last step, and the file is
+            // in the output folder (the name was free when the job started).
+            let there = tokio::fs::metadata(&target)
+                .await
+                .ok()
+                .filter(std::fs::Metadata::is_file);
+            let claimed = db::jobs::other_done_at(state.db.pool(), job.id, &final_path)
+                .await
+                .unwrap_or(true);
+            match there {
+                Some(meta) if job.stage == JobStage::Finalizing && !claimed => {
+                    Some((meta.len(), job.input_size))
+                }
+                _ => None,
+            }
+        };
+        let Some((size, original_size)) = placed else {
+            continue;
+        };
+        let lib = db::libraries::get(state.db.pool(), job.library_id)
+            .await
+            .ok()
+            .flatten();
+        let ctx = ExecContext {
+            file,
+            library_root: lib.as_ref().map(|l| PathBuf::from(&l.path)),
+            library_name: lib.map(|l| l.name),
+            output_mode: if replace {
+                OutputMode::Replace
+            } else {
+                OutputMode::Folder
+            },
+        };
+        let outcome = JobOutcome::Done {
+            output_path: target,
+            output_size: size,
+            original_size,
+            encoder: job.encoder.clone().unwrap_or_default(),
+            hw_api: job.hw_api.unwrap_or(HwApi::Software),
+            attempt: job.attempt.max(1),
+            validation: None,
+            command: String::new(),
+            notes: vec![RESUMED_NOTE.to_string()],
+        };
+        tracing::info!(job = %job.id, file = %job.file_path, "finished a conversion the last stop interrupted");
+        record(state, &job, Disposition::Finished(outcome), None, &ctx).await;
+        completed += 1;
+    }
+    completed
 }
 
 /// Stop starting jobs, cancel the running ones (they go back to the queue)

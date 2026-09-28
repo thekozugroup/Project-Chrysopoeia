@@ -362,7 +362,8 @@ async fn presets_describe_goals_and_codecs() {
     assert_eq!(av1["royalty_free"], true);
     assert_eq!(av1["hw_accelerated"], false);
     assert_eq!(av1["encoders"], json!(["libsvtav1"]));
-    assert_eq!(r.json["audio_codecs"].as_array().unwrap().len(), 8);
+    // Only audio encoders this ffmpeg has (the fake has Opus and AAC).
+    assert_eq!(r.json["audio_codecs"].as_array().unwrap().len(), 3);
     let webm = r.json["containers"]
         .as_array()
         .unwrap()
@@ -370,5 +371,5 @@ async fn presets_describe_goals_and_codecs() {
         .find(|c| c["container"] == "webm")
         .unwrap();
     assert_eq!(webm["video"], json!(["av1", "vp9"]));
-    assert_eq!(webm["audio"], json!(["copy", "opus", "vorbis"]));
+    assert_eq!(webm["audio"], json!(["copy", "opus"]));
 }

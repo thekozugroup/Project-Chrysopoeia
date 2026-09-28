@@ -51,7 +51,16 @@ pub fn test_media() -> &'static Path {
     static MEDIA: OnceLock<PathBuf> = OnceLock::new();
     MEDIA.get_or_init(|| {
         let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
-        let dir = root.join(format!("worker-media-{CLIP_SECS}s"));
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/make-test-media.sh");
+        // The cache is keyed by the script's contents, so a changed script
+        // never serves stale media.
+        let version = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::fs::read(&script).unwrap_or_default().hash(&mut h);
+            h.finish()
+        };
+        let dir = root.join(format!("worker-media-{CLIP_SECS}s-{version:016x}"));
         if dir.join(".complete").exists() {
             return dir;
         }
@@ -59,7 +68,6 @@ pub fn test_media() -> &'static Path {
             .prefix("worker-media-")
             .tempdir_in(&root)
             .expect("create staging dir");
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/make-test-media.sh");
         let status = Command::new("sh")
             .arg(&script)
             .arg(staging.path())

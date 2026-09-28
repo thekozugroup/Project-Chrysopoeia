@@ -1,16 +1,18 @@
 //! Folder watching: keeps the watcher in line with the `watch_folders`
-//! setting and the enabled libraries, and feeds settled events to the
-//! library service.
+//! setting, the enabled libraries and the scan filters (ignore patterns and
+//! minimum size), and feeds settled events to the library service.
 //!
 //! Adding a watch walks the whole folder tree (one inotify watch per folder),
 //! which takes seconds on big or slow shares, so every watcher call runs on a
-//! blocking thread and no lock is held across it.
+//! blocking thread and no lock is held across it: the watcher's own methods
+//! are safe to call from several threads.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use chrysopoeia_core::ActivityLevel;
+use chrysopoeia_scanner::ScanOptions;
 use tokio::task::JoinHandle;
 
 use crate::db;
@@ -19,11 +21,28 @@ use crate::services::library;
 use crate::state::{AppState, lock};
 use crate::toolkit::FolderWatcher;
 
+/// The filters a root is watched with, to notice when settings change them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Filters {
+    ignore_patterns: Vec<String>,
+    min_size_bytes: u64,
+}
+
+impl Filters {
+    fn of(opts: &ScanOptions) -> Self {
+        Self {
+            ignore_patterns: opts.ignore_patterns.clone(),
+            min_size_bytes: opts.min_size_bytes,
+        }
+    }
+}
+
 /// A running watcher and the task consuming its events.
 pub struct ActiveWatcher {
-    watcher: Arc<Mutex<Box<dyn FolderWatcher>>>,
+    watcher: Arc<dyn FolderWatcher>,
     task: JoinHandle<()>,
-    roots: HashSet<PathBuf>,
+    /// Watched roots, with the filters they were watched with.
+    roots: HashMap<PathBuf, Filters>,
 }
 
 impl Drop for ActiveWatcher {
@@ -37,7 +56,7 @@ pub fn watched_roots(state: &AppState) -> Vec<PathBuf> {
     let guard = lock(&state.library.watcher);
     let mut roots: Vec<PathBuf> = guard
         .as_ref()
-        .map(|w| w.roots.iter().cloned().collect())
+        .map(|w| w.roots.keys().cloned().collect())
         .unwrap_or_default();
     roots.sort();
     roots
@@ -73,10 +92,18 @@ async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
         }
     });
     Ok(ActiveWatcher {
-        watcher: Arc::new(Mutex::new(watcher)),
+        watcher: Arc::from(watcher),
         task,
-        roots: HashSet::new(),
+        roots: HashMap::new(),
     })
+}
+
+/// What [`sync`] changes, decided under the lock and done without it.
+struct Plan {
+    watcher: Arc<dyn FolderWatcher>,
+    stale: Vec<PathBuf>,
+    /// Roots to watch, or to watch again with new filters.
+    watch: Vec<(PathBuf, String)>,
 }
 
 /// Start, stop or re-target the watcher to match the settings and the
@@ -84,7 +111,8 @@ async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
 pub async fn sync(state: &AppState) {
     // One sync at a time; the watcher calls themselves run unlocked.
     let _serial = state.library.watcher_sync.lock().await;
-    if !state.settings().watch_folders || state.shutdown.is_cancelled() {
+    let settings = state.settings();
+    if !settings.watch_folders || state.shutdown.is_cancelled() {
         stop(state);
         return;
     }
@@ -100,6 +128,8 @@ pub async fn sync(state: &AppState) {
         .filter(|l| l.enabled)
         .map(|l| (PathBuf::from(l.path), l.name))
         .collect();
+    let opts = ScanOptions::from_settings(&settings);
+    let filters = Filters::of(&opts);
     let mut problems: Vec<String> = Vec::new();
 
     if lock(&state.library.watcher).is_none() {
@@ -109,44 +139,46 @@ pub async fn sync(state: &AppState) {
         }
     }
 
-    // What to change, decided under the lock; done without it.
     let plan = lock(&state.library.watcher).as_ref().map(|active| {
-        let wanted_roots: HashSet<&PathBuf> = wanted.iter().map(|(p, _)| p).collect();
         let stale: Vec<PathBuf> = active
             .roots
-            .iter()
-            .filter(|r| !wanted_roots.contains(r))
+            .keys()
+            .filter(|r| !wanted.iter().any(|(p, _)| p == *r))
             .cloned()
             .collect();
-        let missing: Vec<(PathBuf, String)> = wanted
+        let watch: Vec<(PathBuf, String)> = wanted
             .iter()
-            .filter(|(p, _)| !active.roots.contains(p))
+            .filter(|(p, _)| active.roots.get(p) != Some(&filters))
             .cloned()
             .collect();
-        (Arc::clone(&active.watcher), stale, missing)
+        Plan {
+            watcher: Arc::clone(&active.watcher),
+            stale,
+            watch,
+        }
     });
-    if let Some((handle, stale, missing)) = plan
-        && (!stale.is_empty() || !missing.is_empty())
+    if let Some(plan) = plan
+        && (!plan.stale.is_empty() || !plan.watch.is_empty())
     {
         let toolkit = state.toolkit.clone();
         let applied = tokio::task::spawn_blocking(move || {
-            let watcher = lock(&handle);
-            for root in &stale {
+            let watcher = &plan.watcher;
+            for root in &plan.stale {
                 if let Err(e) = toolkit.watcher_call(|| watcher.unwatch(root)) {
                     tracing::debug!(root = %root.display(), "unwatch failed: {e:#}");
                 }
             }
-            let added: Vec<(PathBuf, String, Result<(), String>)> = missing
+            let added: Vec<(PathBuf, String, Result<(), String>)> = plan
+                .watch
                 .into_iter()
                 .map(|(root, name)| {
                     let result = toolkit
-                        .watcher_call(|| watcher.watch(&root))
+                        .watcher_call(|| watcher.watch_with_options(&root, &opts))
                         .map_err(|e| format!("{e:#}"));
                     (root, name, result)
                 })
                 .collect();
-            drop(watcher);
-            (handle, stale, added)
+            (plan.watcher, plan.stale, added)
         })
         .await;
         match applied {
@@ -161,7 +193,7 @@ pub async fn sync(state: &AppState) {
                     }
                     for (root, _, result) in &added {
                         if result.is_ok() {
-                            active.roots.insert(root.clone());
+                            active.roots.insert(root.clone(), filters.clone());
                         }
                     }
                 }
@@ -194,9 +226,17 @@ pub async fn sync(state: &AppState) {
     }
 }
 
-/// Stop watching entirely.
+/// Stop watching entirely. The watcher itself is dropped on a blocking
+/// thread: dropping it closes one kernel watcher per library.
 pub fn stop(state: &AppState) {
     let old = lock(&state.library.watcher).take();
-    drop(old);
     lock(&state.library.reported_watch_problems).clear();
+    if let Some(old) = old {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || drop(old));
+            }
+            Err(_) => drop(old),
+        }
+    }
 }

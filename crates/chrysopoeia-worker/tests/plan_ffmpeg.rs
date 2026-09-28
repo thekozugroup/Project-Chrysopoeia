@@ -20,7 +20,7 @@ const MP4_TWO_AAC: &str = "Movies/Big Test (2020)/Big Test (2020).mp4";
 const MKV_SURROUND_SRT: &str = "TV/Show/Season 01/Show - S01E01.mkv";
 const MKV_HEVC_10BIT: &str = "TV/Show/Season 01/Show - S01E02.mkv";
 const TS_INTERLACED: &str = "TV/Show/Season 01/Show - S01E03.ts";
-const AVI_MPEG4: &str = "Movies/Old Home Video.avi";
+const AVI_ODD: &str = "Movies/Old Home Video.avi";
 const WEBM_ODD: &str = "Odd Size.webm";
 const MKV_HDR10: &str = "HDR10.mkv";
 const MKV_STYLED_FONT: &str = "Styled.mkv";
@@ -413,7 +413,7 @@ fn aom_av1() {
             Case {
                 expect_audio: &["flac"],
                 expect_size: Some((638, 358)),
-                ..Case::new(AVI_MPEG4, "libaom-av1", Container::Mkv, AudioCodec::Flac)
+                ..Case::new(AVI_ODD, "libaom-av1", Container::Mkv, AudioCodec::Flac)
             },
             // Odd-sized VP9 made even; Vorbis copied into WebM.
             Case {
@@ -562,7 +562,7 @@ fn vpx_vp9() {
             // AVI to MKV with Vorbis.
             Case {
                 expect_audio: &["vorbis"],
-                ..Case::new(AVI_MPEG4, "libvpx-vp9", Container::Mkv, AudioCodec::Vorbis)
+                ..Case::new(AVI_ODD, "libvpx-vp9", Container::Mkv, AudioCodec::Vorbis)
             },
             // 10-bit VP9 (Profile 2) with Opus in WebM.
             Case {
@@ -717,7 +717,7 @@ fn decide_agrees_with_the_sample_library() {
         MP4_TWO_AAC,
         MKV_SURROUND_SRT,
         TS_INTERLACED,
-        AVI_MPEG4,
+        AVI_ODD,
         WEBM_ODD,
         MKV_HDR10,
         MKV_STYLED_FONT,

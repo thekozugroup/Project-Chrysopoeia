@@ -207,10 +207,11 @@ impl StderrTail {
         }
     }
 
-    /// Add a line, dropping the oldest one when full. Empty lines are ignored.
+    /// Add a line, dropping the oldest one when full. Empty lines and
+    /// harmless noise (see [`is_harmless_noise`]) are ignored.
     pub fn push(&mut self, line: &str) {
         let line = line.trim_end();
-        if line.trim().is_empty() {
+        if line.trim().is_empty() || is_harmless_noise(line) {
             return;
         }
         if self.lines.len() == self.capacity {
@@ -233,6 +234,24 @@ impl StderrTail {
     pub fn last_meaningful(&self) -> Option<String> {
         failure_reason(self.lines())
     }
+}
+
+/// Lines some encoder libraries print straight to stderr that mean nothing
+/// for the result. libnuma (used by libx265) reports every NUMA memory call
+/// Docker's default seccomp profile refuses (`set_mempolicy: Operation not
+/// permitted`, many times per encode); x265 simply runs without NUMA
+/// placement, which makes no difference on a single-socket machine.
+const HARMLESS_NOISE: &[&str] = &[
+    "set_mempolicy: Operation not permitted",
+    "get_mempolicy: Operation not permitted",
+    "mbind: Operation not permitted",
+    "migrate_pages: Operation not permitted",
+];
+
+/// Whether a stderr line is harmless noise (see [`HARMLESS_NOISE`]): kept out
+/// of log tails and never taken for a failure reason.
+pub fn is_harmless_noise(line: &str) -> bool {
+    HARMLESS_NOISE.iter().any(|n| line.contains(n))
 }
 
 /// Messages ffmpeg prints as a consequence of an earlier error. They name
@@ -296,6 +315,32 @@ const DAMAGE: &[&str] = &[
     "Error submitting packet to decoder",
 ];
 
+/// Demuxer messages about an input that is cut off or has broken packets.
+const TRUNCATION: &[&str] = &[
+    "file ended prematurely",
+    "truncating packet",
+    "packet corrupt",
+    "partial file",
+    "unexpected end of file",
+    "premature end",
+    "invalid data found when processing input",
+];
+
+/// Whether a stderr line (at warning level or above, or untagged) reports a
+/// damaged or cut-off input: a demuxer finding the file ends early, or a
+/// decoder patching up broken frames.
+pub fn is_input_damage(line: &str) -> bool {
+    let (_, level, message) = split_log_line(line);
+    if matches!(level, Some("info" | "verbose" | "debug" | "trace")) || is_harmless_noise(line) {
+        return false;
+    }
+    let lower = message.to_ascii_lowercase();
+    TRUNCATION.iter().any(|n| lower.contains(n))
+        || DAMAGE
+            .iter()
+            .any(|n| lower.contains(&n.to_ascii_lowercase()))
+}
+
 /// Words that mark an untagged line (ffmpeg run without `level+`) as an
 /// error rather than a notice.
 const ERROR_WORDS: &[&str] = &[
@@ -326,6 +371,7 @@ const ERROR_WORDS: &[&str] = &[
 /// like an error, and only then the last line that is not statistics.
 pub fn failure_reason<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
     let parsed: Vec<(Option<&str>, &str)> = lines
+        .filter(|l| !is_harmless_noise(l))
         .map(|l| {
             let (_, level, message) = split_log_line(l);
             (level, message.trim())
@@ -592,6 +638,7 @@ pub async fn run_ffmpeg(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
 
     let mut child = match command.spawn() {
         Ok(child) => child,
@@ -747,6 +794,44 @@ pub fn shell_quote(arg: &str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// libx265 under Docker's seccomp profile: libnuma's complaints never
+    /// reach the log tail or the error message.
+    #[test]
+    fn numa_noise_is_ignored() {
+        let mut tail = StderrTail::new(5);
+        for _ in 0..20 {
+            tail.push("set_mempolicy: Operation not permitted");
+        }
+        tail.push("[libx265 @ 0x1] [error] Cannot open libx265 encoder.");
+        tail.push("mbind: Operation not permitted");
+        assert_eq!(
+            tail.joined(),
+            "[libx265 @ 0x1] [error] Cannot open libx265 encoder."
+        );
+        let untagged = ["set_mempolicy: Operation not permitted"; 3];
+        assert_eq!(failure_reason(untagged.into_iter()), None);
+    }
+
+    #[test]
+    fn input_damage_lines() {
+        assert!(is_input_damage(
+            "[matroska,webm @ 0x55fb] [error] File ended prematurely"
+        ));
+        assert!(is_input_damage(
+            "[h264 @ 0x1] [error] error while decoding MB 3 4, bytestream -5"
+        ));
+        assert!(is_input_damage(
+            "[mov @ 0x1] [warning] Packet corrupt (stream = 0, dts = 9)"
+        ));
+        assert!(!is_input_damage(
+            "[libx265 @ 0x1] [warning] some unrelated tuning note"
+        ));
+        assert!(!is_input_damage(
+            "[h264 @ 0x1] [info] concealing 3 DC, 3 AC, 3 MV errors"
+        ));
+        assert!(!is_input_damage("set_mempolicy: Operation not permitted"));
+    }
 
     const FIXTURE: &str = "frame=0\nfps=0.00\nstream_0_0_q=0.0\nbitrate=  82.9kbits/s\n\
 total_size=1203\nout_time_us=116100\nout_time_ms=116100\nout_time=00:00:00.116100\n\

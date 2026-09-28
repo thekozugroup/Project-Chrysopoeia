@@ -36,7 +36,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::ffmpeg::{
-    DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, compute_progress, display_command, run_ffmpeg,
+    DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, compute_progress, display_command,
+    is_input_damage, run_ffmpeg,
 };
 use crate::finalize::{
     FileIdentity, FinalizeRequest, OriginalChanged, destination_conflict, final_output_path,
@@ -215,8 +216,10 @@ fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
         JobOutcome::Skipped { reason, .. } => {
             tracing::info!(job = %spec.job_id, %file, "skipped: {reason}");
         }
+        // The caller reports failures to the user (and the log); a second
+        // warning here would only repeat it.
         JobOutcome::Failed { error, .. } => {
-            tracing::warn!(job = %spec.job_id, %file, "failed: {error}");
+            tracing::debug!(job = %spec.job_id, %file, "failed: {error}");
         }
         JobOutcome::Cancelled => tracing::info!(job = %spec.job_id, %file, "cancelled"),
     }
@@ -352,6 +355,14 @@ impl Job<'_> {
             destination_conflict(&spec.input, &final_path, cfg.output_mode).await
         {
             return Err(failed(conflict));
+        }
+        // The new file goes into this folder (and, when replacing, the
+        // original is renamed there); find out now rather than after hours
+        // of encoding.
+        if let Some(dir) = final_path.parent()
+            && let Some(problem) = folder_not_writable(dir).await
+        {
+            return Err(failed(problem));
         }
 
         // Without a temp folder the encode is written next to where it ends
@@ -519,7 +530,8 @@ impl Job<'_> {
             let command = display_command(&cfg.ffmpeg, &args);
             tracing::debug!(job = %spec.job_id, attempt, "running {command}");
 
-            let exit = self.encode(&args).await;
+            let run = self.encode(&args).await;
+            let exit = run.exit;
             let failure = |error: String, log_tail: Option<String>| Failure {
                 error,
                 log_tail,
@@ -535,7 +547,11 @@ impl Job<'_> {
                     let error = other
                         .describe_failure(&candidate.name)
                         .unwrap_or_else(|| format!("{} failed", candidate.name));
-                    tracing::warn!(job = %spec.job_id, attempt, "{error}");
+                    if is_last {
+                        tracing::debug!(job = %spec.job_id, attempt, "{error}");
+                    } else {
+                        tracing::info!(job = %spec.job_id, attempt, "{error}; trying the next option");
+                    }
                     last_failure = Some(failure(error, other.tail().map(str::to_string)));
                     guard.clear().await;
                     continue;
@@ -554,6 +570,38 @@ impl Job<'_> {
                 }
             };
             self.reporter.stage(JobStage::Transcoding, 100.0).await;
+
+            // An original that ends early (a cut-off download or copy) makes
+            // a short but otherwise fine encode; say so plainly instead of
+            // letting it fail verification (or, unverified, replace the
+            // original). Checked before the size rule: a stub is always small.
+            // Only a CPU decode tells about the file itself: a GPU decoder
+            // that gives up early gets the next attempt (CPU decoding) first.
+            let expected = self.spec.probe.duration_secs;
+            let unverified = cfg.validation == ValidationLevel::Off;
+            let conclusive = !(candidate.api.is_hardware() && candidate.hw_decode) || is_last;
+            if let Some(stop) = source_stops_early(
+                expected,
+                run.encoded_secs,
+                run.input_damage.is_some(),
+                unverified,
+            ) {
+                let f = failure(
+                    damaged_source_message(stop),
+                    exit.tail().map(str::to_string),
+                );
+                if conclusive {
+                    return f.into_outcome();
+                }
+                tracing::info!(
+                    job = %spec.job_id, attempt,
+                    "{} stopped early while decoding on the GPU; trying the next option",
+                    candidate.name
+                );
+                last_failure = Some(f);
+                guard.clear().await;
+                continue;
+            }
 
             if let Some(reason) = size_rule(
                 spec.profile.min_savings_pct,
@@ -613,10 +661,22 @@ impl Job<'_> {
             };
 
             if let Some(report) = validation.as_ref().filter(|r| !r.passed) {
+                // Too short, and the encoder saw the input end early: the
+                // original is what's incomplete, not the new file.
+                let too_short =
+                    conclusive && report.first_failure().is_some_and(|c| c.id == "duration");
+                if let Some(stop) = too_short
+                    .then(|| source_stops_early(expected, run.encoded_secs, true, false))
+                    .flatten()
+                {
+                    let mut f = failure(damaged_source_message(stop), None);
+                    f.validation = Some(report.clone());
+                    return f.into_outcome();
+                }
                 let mut f = failure(verification_error(report), None);
                 f.validation = Some(report.clone());
                 if candidate.api.is_hardware() && !is_last {
-                    tracing::warn!(
+                    tracing::info!(
                         job = %spec.job_id, attempt,
                         "{} output failed verification; trying the next option", candidate.name
                     );
@@ -690,7 +750,7 @@ impl Job<'_> {
     }
 
     /// Run ffmpeg for one attempt, reporting transcoding progress.
-    async fn encode(&self, args: &[String]) -> FfmpegExit {
+    async fn encode(&self, args: &[String]) -> EncodeRun {
         let duration = self
             .spec
             .probe
@@ -704,16 +764,86 @@ impl Job<'_> {
             low_priority: self.cfg.low_priority,
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         };
-        run_ffmpeg(
+        let mut encoded_secs: Option<f64> = None;
+        let mut input_damage: Option<String> = None;
+        let exit = run_ffmpeg(
             &cmd,
             self.cancel,
             &mut |block| {
+                if let Some(t) = block.out_time_secs {
+                    encoded_secs = Some(t);
+                }
                 let p = compute_progress(block, duration, started.elapsed().as_secs_f64());
                 self.reporter.tick(p.percent, p.fps, p.speed, p.eta_secs);
             },
-            &mut |_| {},
+            &mut |line| {
+                if input_damage.is_none() && is_input_damage(line) {
+                    input_damage = Some(line.trim().to_string());
+                }
+            },
         )
-        .await
+        .await;
+        EncodeRun {
+            exit,
+            encoded_secs,
+            input_damage,
+        }
+    }
+}
+
+/// One encode attempt: how ffmpeg ended, and what it said about the input.
+#[derive(Debug)]
+struct EncodeRun {
+    exit: FfmpegExit,
+    /// How far into the source the encode got (the last progress report).
+    encoded_secs: Option<f64>,
+    /// The first line in which ffmpeg reported a damaged or cut-off input.
+    input_damage: Option<String>,
+}
+
+/// Where the original stops, when an encode shows it ends clearly before
+/// the length its container claims (a cut-off download or copy). Needs
+/// evidence (`damage_seen`: ffmpeg reported the input damaged, or
+/// verification found the result too short), except that a result under
+/// half the claimed length is enough on its own when nothing verifies it.
+pub(crate) fn source_stops_early(
+    claimed_secs: Option<f64>,
+    encoded_secs: Option<f64>,
+    damage_seen: bool,
+    unverified: bool,
+) -> Option<f64> {
+    let claimed = claimed_secs.filter(|d| d.is_finite() && *d >= 1.0)?;
+    let encoded = encoded_secs
+        .filter(|t| t.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+    let clearly_short = claimed - encoded > (claimed * 0.05).max(2.0);
+    let evidence = damage_seen || (unverified && encoded < claimed / 2.0);
+    (clearly_short && evidence).then_some(encoded)
+}
+
+/// "The original file appears damaged or incomplete (it stops after 0.1 s).
+/// It was left unchanged."
+pub(crate) fn damaged_source_message(stop_secs: f64) -> String {
+    format!(
+        "The original file appears damaged or incomplete (it stops after {}). It was left \
+         unchanged.",
+        short_duration(stop_secs)
+    )
+}
+
+/// A length for messages: `0.1 s`, `42.5 s`, `3:07`, `1:02:09`.
+fn short_duration(secs: f64) -> String {
+    let secs = secs.max(0.1);
+    if secs < 60.0 {
+        return format!("{secs:.1} s");
+    }
+    let total = secs.round() as u64;
+    let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
     }
 }
 
@@ -822,6 +952,43 @@ fn verify_eta(percent: f32, elapsed: Duration) -> Option<u64> {
     }
     let secs = elapsed.as_secs_f64() * f64::from(100.0 - percent) / f64::from(percent);
     (secs.is_finite() && secs >= 0.0).then(|| secs.round() as u64)
+}
+
+/// Why new files can't be written in `dir` (or, when it doesn't exist yet,
+/// in the closest folder above it that does), if they can't.
+async fn folder_not_writable(dir: &Path) -> Option<String> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let existing = dir.ancestors().find(|d| d.is_dir())?;
+        if writable(existing) {
+            return None;
+        }
+        Some(format!(
+            "Chrysopoeia doesn't have permission to write in {}, so the converted file can't be \
+             put there. Check the folder's permissions (in Docker, the PUID/PGID user needs write \
+             access).",
+            existing.display()
+        ))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Whether this process may create files in `dir` (as the kernel sees it,
+/// so root may write in read-only folders).
+#[cfg(unix)]
+fn writable(dir: &Path) -> bool {
+    rustix::fs::access(
+        dir,
+        rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
+    )
+    .is_ok()
+}
+
+#[cfg(not(unix))]
+fn writable(dir: &Path) -> bool {
+    std::fs::metadata(dir).is_ok_and(|m| !m.permissions().readonly())
 }
 
 /// Create `dir` and any missing parents. Returns the folders that were
@@ -1287,6 +1454,47 @@ mod tests {
         assert_eq!(estimated_duration(&probe), Some(20.0));
         probe.bit_rate = Some(8_000_000);
         assert_eq!(estimated_duration(&probe), Some(10.0));
+    }
+
+    #[test]
+    fn cut_off_originals_are_recognised() {
+        // The truncated test MKV: its header claims 6 s, ffmpeg reported the
+        // file ends prematurely after the first frames.
+        assert_eq!(
+            source_stops_early(Some(6.0), Some(0.0), true, false),
+            Some(0.0)
+        );
+        assert_eq!(
+            damaged_source_message(0.0),
+            "The original file appears damaged or incomplete (it stops after 0.1 s). It was \
+             left unchanged."
+        );
+        // Complete encodes and small differences are fine.
+        assert_eq!(source_stops_early(Some(6.0), Some(5.96), true, false), None);
+        assert_eq!(
+            source_stops_early(Some(7200.0), Some(7150.0), true, false),
+            None
+        );
+        // Short without any sign of damage: verification decides.
+        assert_eq!(
+            source_stops_early(Some(600.0), Some(100.0), false, false),
+            None
+        );
+        // ...unless nothing verifies the result.
+        assert_eq!(
+            source_stops_early(Some(600.0), Some(100.0), false, true),
+            Some(100.0)
+        );
+        assert_eq!(
+            source_stops_early(Some(600.0), Some(400.0), false, true),
+            None
+        );
+        // Unknown or tiny claimed lengths prove nothing.
+        assert_eq!(source_stops_early(None, Some(1.0), true, true), None);
+        assert_eq!(source_stops_early(Some(0.5), Some(0.0), true, true), None);
+        assert_eq!(short_duration(187.0), "3:07");
+        assert_eq!(short_duration(3729.0), "1:02:09");
+        assert_eq!(short_duration(42.46), "42.5 s");
     }
 
     #[test]
