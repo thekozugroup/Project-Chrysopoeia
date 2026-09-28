@@ -69,6 +69,7 @@ export function QueueControls({ queue, compact = false }: { queue: QueueState; c
         onOpenChange={setConfirmStop}
         title="Stop converting now?"
         confirmLabel="Stop now"
+        cancelLabel="Keep converting"
         destructive
         loading={stop.isPending}
         onConfirm={() => stop.mutate(undefined, { onSettled: () => setConfirmStop(false) })}

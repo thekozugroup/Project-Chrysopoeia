@@ -126,6 +126,8 @@ interface ConfirmProps {
   /** Destructive actions get the red confirm button. */
   destructive?: boolean;
   loading?: boolean;
+  /** Label of the button that backs out; "Cancel" unless that would be ambiguous. */
+  cancelLabel?: string;
 }
 
 /** "Are you sure?" for actions that can't be undone. */
@@ -138,6 +140,7 @@ export function ConfirmDialog({
   onConfirm,
   destructive,
   loading,
+  cancelLabel = "Cancel",
 }: ConfirmProps) {
   return (
     <AlertDialog.Root open={open} onOpenChange={(next) => onOpenChange(next)}>
@@ -149,10 +152,47 @@ export function ConfirmDialog({
             {children}
           </AlertDialog.Description>
           <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-            <AlertDialog.Close className={buttonVariants({ variant: "secondary" })}>Cancel</AlertDialog.Close>
+            <AlertDialog.Close className={buttonVariants({ variant: "secondary" })}>{cancelLabel}</AlertDialog.Close>
             <Button variant={destructive ? "danger" : "primary"} onClick={onConfirm} loading={loading}>
               {confirmLabel}
             </Button>
+          </div>
+        </AlertDialog.Popup>
+      </AlertDialog.Portal>
+    </AlertDialog.Root>
+  );
+}
+
+interface UnsavedDialogProps {
+  open: boolean;
+  onSave: () => void;
+  onDiscard: () => void;
+  onStay: () => void;
+  saving?: boolean;
+}
+
+/** "Save your changes?" when leaving a form with unsaved edits. */
+export function UnsavedChangesDialog({ open, onSave, onDiscard, onStay, saving }: UnsavedDialogProps) {
+  return (
+    <AlertDialog.Root open={open} onOpenChange={(next) => !next && onStay()}>
+      <AlertDialog.Portal>
+        <AlertDialog.Backdrop className="fixed inset-0 z-40 bg-overlay transition-opacity duration-200 data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
+        <AlertDialog.Popup className="fixed top-1/2 left-1/2 z-50 w-[min(28rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded-xl border border-line bg-surface p-5 text-fg shadow-pop outline-none transition-[transform,opacity] duration-200 ease-[var(--ease-out-expo)] data-[ending-style]:scale-[0.98] data-[ending-style]:opacity-0 data-[starting-style]:scale-[0.98] data-[starting-style]:opacity-0">
+          <AlertDialog.Title className="text-base font-semibold text-fg">Save your changes?</AlertDialog.Title>
+          <AlertDialog.Description className="mt-2 text-sm leading-relaxed text-muted">
+            You changed some settings on this page but haven&apos;t saved them. If you leave now without saving,
+            they&apos;re lost.
+          </AlertDialog.Description>
+          <div className="mt-5 flex flex-col gap-2 sm:flex-row-reverse sm:justify-start">
+            <Button variant="primary" onClick={onSave} loading={saving}>
+              Save and leave
+            </Button>
+            <Button variant="secondary" onClick={onDiscard} disabled={saving}>
+              Discard changes
+            </Button>
+            <AlertDialog.Close className={cn(buttonVariants({ variant: "quiet" }), "sm:mr-auto")}>
+              Keep editing
+            </AlertDialog.Close>
           </div>
         </AlertDialog.Popup>
       </AlertDialog.Portal>

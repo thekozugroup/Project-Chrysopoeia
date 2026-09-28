@@ -26,7 +26,7 @@ export const FILE_STATUS_LABEL: Record<FileStatus, string> = {
   pending: "To convert",
   queued: "In queue",
   processing: "Converting",
-  done: "Done",
+  done: "Converted",
   skipped: "Skipped",
   failed: "Failed",
 };
@@ -94,7 +94,7 @@ export const GOALS: readonly Exclude<Goal, "custom">[] = [
 export const QUALITY_LABEL: Record<QualityLevel, string> = {
   smallest: "Smallest",
   small: "Small",
-  balanced: "Balanced",
+  balanced: "Recommended",
   high: "High",
   best: "Best quality",
 };
@@ -109,7 +109,7 @@ export const QUALITY_HELP: Record<QualityLevel, string> = {
 
 export const SPEED_LABEL: Record<SpeedPreset, string> = {
   fast: "Faster",
-  balanced: "Balanced",
+  balanced: "Normal",
   thorough: "Smaller files",
 };
 
@@ -294,7 +294,11 @@ export function sourceCodecLabel(name: string | null | undefined): string {
     mpegts: "MPEG-TS",
     avi: "AVI",
   };
-  return map[name.toLowerCase()] ?? name.toUpperCase();
+  const known = map[name.toLowerCase()];
+  if (known) return known;
+  // Short codec-like tokens ("dvvideo") read best in capitals; anything else
+  // (the server's "No video" bucket, for one) is already a label.
+  return /^[a-z0-9_]+$/.test(name) ? name.toUpperCase() : name;
 }
 
 /** Human channel count: `Stereo`, `5.1`, `7.1`, `Mono`. */

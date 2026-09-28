@@ -6,6 +6,10 @@
  * progress. The socket reconnects with exponential backoff and refetches
  * everything after a reconnect, because events sent while disconnected are
  * gone.
+ *
+ * When the socket stays down (a reverse proxy without WebSocket support is
+ * the usual cause on Unraid), the app falls back to refreshing the live
+ * views every few seconds until the socket opens again.
  */
 
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
@@ -27,9 +31,15 @@ import type {
 
 const MIN_BACKOFF_MS = 1000;
 const MAX_BACKOFF_MS = 30_000;
+/** How long the socket may be down before polling starts. */
+export const POLL_GRACE_MS = 4000;
+/** How often the live views refresh while polling. */
+export const POLL_INTERVAL_MS = 5000;
+/** Failed attempts, without ever connecting, before live updates count as unavailable. */
+export const UNAVAILABLE_AFTER = 3;
 
 /** Debounced invalidation, so bursts of events cause one refetch. */
-class Invalidator {
+export class Invalidator {
   private timers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor(private client: QueryClient) {}
@@ -104,14 +114,28 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
       invalidate.schedule(keys.jobs());
       if (job.state !== "running" && job.state !== "queued") {
         invalidate.schedule(keys.overview, 1500);
+        // A finished job may have replaced the file: its tracks changed.
+        invalidate.schedule(keys.file(job.file_id), 1000);
       }
       break;
     }
     case "file.updated": {
       const file: MediaFile = event.file;
-      client.setQueryData<FileDetail>(keys.file(file.id), (old) =>
-        old ? { ...old, file: { ...file, probe: file.probe ?? old.file.probe } } : old,
-      );
+      let reprobe = false;
+      client.setQueryData<FileDetail>(keys.file(file.id), (old) => {
+        if (!old) return old;
+        const before = old.file;
+        // Events carry no probe. When the file itself changed (converted,
+        // replaced), the cached tracks are stale: refetch them.
+        reprobe =
+          !file.probe &&
+          (before.size_bytes !== file.size_bytes ||
+            before.modified_at !== file.modified_at ||
+            before.path !== file.path ||
+            (before.status !== file.status && file.status === "done"));
+        return { ...old, file: { ...file, probe: file.probe ?? before.probe } };
+      });
+      if (reprobe) invalidate.schedule(keys.file(file.id), 300);
       const listFile: MediaFile = { ...file };
       delete listFile.probe;
       client.setQueriesData<ListResponse<MediaFile>>({ queryKey: keys.files() }, (old) =>
@@ -188,19 +212,66 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
   }
 }
 
+/** Query keys refreshed while polling: everything that moves on its own. */
+const LIVE_KEYS: QueryKey[] = [
+  keys.queue,
+  keys.overview,
+  keys.libraries,
+  keys.activity,
+  keys.jobs(),
+  ["job"],
+  ["file"],
+  keys.files(),
+];
+
+/** Refetch the live views that are on screen. */
+export function refreshLive(client: QueryClient): void {
+  for (const queryKey of LIVE_KEYS) void client.invalidateQueries({ queryKey });
+}
+
 /**
  * Open the live connection. Returns a function that closes it for good.
  * Safe to call once per QueryClient.
  */
 export function connectLive(client: QueryClient): () => void {
   const invalidate = new Invalidator(client);
+  const live = useLive.getState();
   let socket: WebSocket | null = null;
   let attempts = 0;
+  let failures = 0;
   let everOpened = false;
   let stopped = false;
   let retryTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollDelay: ReturnType<typeof setTimeout> | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
-  const setConnection = useLive.getState().setConnection;
+  const pollOnce = () => {
+    if (document.visibilityState === "hidden") return;
+    refreshLive(client);
+  };
+
+  /** Refresh by polling once the socket has been down for a moment. */
+  const startPolling = () => {
+    if (stopped || pollTimer || pollDelay) return;
+    pollDelay = setTimeout(() => {
+      pollDelay = null;
+      if (stopped || socket?.readyState === WebSocket.OPEN) return;
+      live.setPolling(true);
+      pollOnce();
+      pollTimer = setInterval(pollOnce, POLL_INTERVAL_MS);
+    }, POLL_GRACE_MS);
+  };
+
+  const stopPolling = () => {
+    if (pollDelay) clearTimeout(pollDelay);
+    if (pollTimer) clearInterval(pollTimer);
+    pollDelay = null;
+    pollTimer = null;
+    live.setPolling(false);
+  };
+
+  const downState = () =>
+    everOpened ? "reconnecting" : failures >= UNAVAILABLE_AFTER ? "unavailable" : "connecting";
 
   const scheduleReconnect = () => {
     if (stopped || retryTimer) return;
@@ -224,21 +295,44 @@ export function connectLive(client: QueryClient): () => void {
     open();
   };
 
+  /** Detach and close a socket that is no longer the current one. */
+  const retire = (ws: WebSocket) => {
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    try {
+      ws.close();
+    } catch {
+      // Already closed.
+    }
+  };
+
   function open() {
     if (stopped) return;
+    if (socket) {
+      // Never keep two sockets: events would be applied twice.
+      retire(socket);
+      socket = null;
+    }
     let ws: WebSocket;
     try {
       ws = new WebSocket(wsUrl());
     } catch {
-      setConnection(everOpened ? "reconnecting" : "connecting");
+      failures += 1;
+      live.setConnection(downState());
+      startPolling();
       scheduleReconnect();
       return;
     }
     socket = ws;
 
     ws.onopen = () => {
+      if (socket !== ws) return;
       attempts = 0;
-      setConnection("open");
+      failures = 0;
+      stopPolling();
+      live.setConnection("open");
       if (everOpened) {
         // Events sent while we were away are lost: refetch everything.
         void client.invalidateQueries();
@@ -247,7 +341,7 @@ export function connectLive(client: QueryClient): () => void {
     };
 
     ws.onmessage = (message) => {
-      if (typeof message.data !== "string") return;
+      if (socket !== ws || typeof message.data !== "string") return;
       let event: ServerEvent;
       try {
         event = JSON.parse(message.data) as ServerEvent;
@@ -260,10 +354,16 @@ export function connectLive(client: QueryClient): () => void {
     };
 
     ws.onclose = () => {
-      if (socket === ws) socket = null;
+      // A socket that was replaced by a newer one must not schedule anything.
+      if (socket !== ws) return;
+      socket = null;
       if (stopped) return;
-      setConnection(everOpened ? "reconnecting" : "connecting");
-      // Progress we hold may be stale now; the refetch after reconnect restores it.
+      failures += everOpened ? 0 : 1;
+      live.setConnection(downState());
+      // Progress and scan counts we hold are stale now; the views fall back
+      // to what the server last reported until the refetch or next event.
+      live.clearProgress();
+      startPolling();
       scheduleReconnect();
     };
 
@@ -285,11 +385,11 @@ export function connectLive(client: QueryClient): () => void {
     stopped = true;
     invalidate.cancelAll();
     if (retryTimer) clearTimeout(retryTimer);
+    stopPolling();
     window.removeEventListener("online", onOnline);
     document.removeEventListener("visibilitychange", onVisible);
     if (socket) {
-      socket.onclose = null;
-      socket.close();
+      retire(socket);
       socket = null;
     }
   };

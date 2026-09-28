@@ -13,23 +13,36 @@ export function formatCount(n: number): string {
   return integer.format(n);
 }
 
+/** Fraction digits for a value in a unit: whole KB, then 2, 1 or 0 by size. */
+function byteDigits(unit: number, value: number): number {
+  if (unit === 0) return 0;
+  const abs = Math.abs(value);
+  return abs < 10 ? 2 : abs < 100 ? 1 : 0;
+}
+
 /** Decimal bytes like Finder: `1.2 GB`, `345.6 MB`, `12 KB`, `980 bytes`. */
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || !Number.isFinite(bytes)) return "—";
-  const abs = Math.abs(bytes);
-  if (abs < 1000) return `${Math.round(bytes)} ${Math.abs(Math.round(bytes)) === 1 ? "byte" : "bytes"}`;
+  const whole = Math.round(bytes);
+  if (Math.abs(whole) < 1000) return `${whole} ${Math.abs(whole) === 1 ? "byte" : "bytes"}`;
   let value = bytes / 1000;
   let unit = 0;
-  while (Math.abs(value) >= 999.95 && unit < UNITS.length - 1) {
-    value /= 1000;
-    unit += 1;
+  // Round first, then promote, so 999.6 KB reads "1 MB" rather than "1,000 KB".
+  for (;;) {
+    const digits = byteDigits(unit, value);
+    const factor = 10 ** digits;
+    const rounded = Math.round(value * factor) / factor;
+    if (Math.abs(rounded) >= 1000 && unit < UNITS.length - 1) {
+      value /= 1000;
+      unit += 1;
+      continue;
+    }
+    const text = new Intl.NumberFormat(undefined, {
+      maximumFractionDigits: digits,
+      minimumFractionDigits: 0,
+    }).format(rounded);
+    return `${text} ${UNITS[unit]}`;
   }
-  const digits = unit === 0 ? 0 : Math.abs(value) < 10 ? 2 : Math.abs(value) < 100 ? 1 : 0;
-  const text = new Intl.NumberFormat(undefined, {
-    maximumFractionDigits: digits,
-    minimumFractionDigits: 0,
-  }).format(value);
-  return `${text} ${UNITS[unit]}`;
 }
 
 /** Split a byte count into number and unit, for large display type. */

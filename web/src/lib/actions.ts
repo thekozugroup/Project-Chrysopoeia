@@ -113,9 +113,15 @@ export function useFileActions() {
   const refresh = () => invalidateWork(client);
 
   const queue = useMutation({
-    mutationFn: ({ file, priority }: { file: MediaFile; priority?: number }) => api.queueFile(file.id, priority),
-    onSuccess: (job, { priority }) => {
-      toast.success(priority ? "Converting next" : "Added to the queue", { description: job.file_name });
+    mutationFn: async ({ file, next = false }: { file: MediaFile; next?: boolean }) => {
+      const job = await api.queueFile(file.id);
+      // "Convert next" means ahead of everything, including files moved to
+      // the top earlier, which a fixed priority can't promise.
+      if (next && job.state === "queued") return api.moveJobToTop(job.id);
+      return job;
+    },
+    onSuccess: (job, { next }) => {
+      toast.success(next ? "Converting next" : "Added to the queue", { description: job.file_name });
       refresh();
     },
     onError: fail("Couldn't add it to the queue"),

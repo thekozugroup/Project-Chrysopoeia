@@ -7,13 +7,20 @@
  */
 
 import { create } from "zustand";
-import type { Job, JobProgress, ScanProgress } from "./types";
+import { overallProgress } from "./progress";
+import type { Job, JobProgress, JobStage, ScanProgress } from "./types";
 
-/** WebSocket connection state as shown to the user. */
-export type ConnectionState = "connecting" | "open" | "reconnecting";
+/**
+ * WebSocket connection state as shown to the user. `unavailable` means the
+ * socket has never opened after several tries (typically a reverse proxy
+ * without WebSocket support); the app then refreshes by polling.
+ */
+export type ConnectionState = "connecting" | "open" | "reconnecting" | "unavailable";
 
 interface LiveState {
   connection: ConnectionState;
+  /** True while live updates are replaced by refreshing every few seconds. */
+  polling: boolean;
   /** Live progress by job id, from `job.progress` events. */
   jobs: Record<string, JobProgress>;
   /** Scan progress by library id, from `scan.progress` events. */
@@ -21,21 +28,25 @@ interface LiveState {
   /** Latest polite screen-reader announcement. */
   announcement: string;
   setConnection: (state: ConnectionState) => void;
+  setPolling: (polling: boolean) => void;
   setJobProgress: (progress: JobProgress) => void;
   clearJob: (jobId: string) => void;
   setScan: (scan: ScanProgress) => void;
   clearScan: (libraryId: string) => void;
+  /** Forget live progress, e.g. when the connection drops and it goes stale. */
+  clearProgress: () => void;
   announce: (text: string) => void;
 }
 
 export const useLive = create<LiveState>((set) => ({
   connection: "connecting",
+  polling: false,
   jobs: {},
   scans: {},
   announcement: "",
-  setConnection: (connection) => set({ connection }),
-  setJobProgress: (progress) =>
-    set((s) => ({ jobs: { ...s.jobs, [progress.job_id]: progress } })),
+  setConnection: (connection) => set((s) => (s.connection === connection ? s : { connection })),
+  setPolling: (polling) => set((s) => (s.polling === polling ? s : { polling })),
+  setJobProgress: (progress) => set((s) => ({ jobs: { ...s.jobs, [progress.job_id]: progress } })),
   clearJob: (jobId) =>
     set((s) => {
       if (!(jobId in s.jobs)) return s;
@@ -51,6 +62,8 @@ export const useLive = create<LiveState>((set) => ({
       delete scans[libraryId];
       return { scans };
     }),
+  clearProgress: () =>
+    set((s) => (Object.keys(s.jobs).length || Object.keys(s.scans).length ? { jobs: {}, scans: {} } : s)),
   announce: (announcement) => set({ announcement }),
 }));
 
@@ -71,12 +84,21 @@ export function useLiveJob(job: Job): Job {
   };
 }
 
-/** Live progress (0..100) of whichever running job belongs to a file. */
-export function useFileProgress(fileId: string): number | null {
-  return useLive((s) => {
+/** Live stage and whole-file progress of the running job for a file. */
+export interface FileLive {
+  stage: JobStage;
+  /** Progress through the whole job, 0..100. */
+  overall: number;
+}
+
+/** Live progress of whichever running job belongs to a file, or `null`. */
+export function useFileLive(fileId: string): FileLive | null {
+  const live = useLive((s) => {
     for (const p of Object.values(s.jobs)) {
-      if (p.file_id === fileId) return p.progress;
+      if (p.file_id === fileId) return p;
     }
     return null;
   });
+  if (!live) return null;
+  return { stage: live.stage, overall: overallProgress(live.stage, live.progress) };
 }

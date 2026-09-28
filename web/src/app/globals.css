@@ -24,6 +24,7 @@
   --color-on-accent: var(--on-accent);
   --color-accent-soft: var(--accent-soft);
   --color-meter: var(--meter);
+  --color-bar-todo: var(--bar-todo);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
   --color-danger: var(--danger);
@@ -63,6 +64,8 @@
   --on-accent: oklch(0.2 0.03 70);
   --accent-soft: oklch(0.79 0.135 82 / 0.2);
   --meter: oklch(0.62 0.125 76);
+  /* "To convert" in the library bar: ≥3:1 against the track, darker than gold. */
+  --bar-todo: oklch(0.5 0.014 78);
   --success: oklch(0.48 0.11 152);
   --success-soft: oklch(0.6 0.12 152 / 0.12);
   --danger: oklch(0.52 0.18 28);
@@ -90,6 +93,7 @@
   --on-accent: oklch(0.19 0.02 70);
   --accent-soft: oklch(0.8 0.125 82 / 0.14);
   --meter: oklch(0.8 0.125 82);
+  --bar-todo: oklch(0.56 0.012 78);
   --success: oklch(0.78 0.13 152);
   --success-soft: oklch(0.78 0.13 152 / 0.12);
   --danger: oklch(0.74 0.15 28);
@@ -284,6 +288,20 @@
   to {
     transform: translateX(250%);
   }
+}
+
+/*
+ * Library bar patterns, so segments differ by more than colour: files in
+ * the queue are gold stripes (converted ones solid gold), skipped files a
+ * neutral hatch (to-convert ones solid neutral). Each mark is at least 3:1
+ * against the track in both themes.
+ */
+.bar-active {
+  background-image: repeating-linear-gradient(-45deg, var(--meter) 0 3px, transparent 3px 6px);
+}
+
+.bar-skipped {
+  background-image: repeating-linear-gradient(-45deg, var(--bar-todo) 0 1.5px, transparent 1.5px 4.5px);
 }
 
 .progress-live {

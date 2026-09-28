@@ -6,12 +6,12 @@
  */
 
 import { ArrowRight, Check, CircleSlash, FileVideo, RotateCcw, ArrowUpToLine, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Callout, CodeBlock, Detail, Meter, Skeleton } from "@/components/ui/display";
-import { Sheet } from "@/components/ui/overlays";
+import { ConfirmDialog, Sheet } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
 import {
   formatBytes,
@@ -23,10 +23,11 @@ import {
   percentOf,
 } from "@/lib/format";
 import { HW_API_LABEL, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
-import { useJob, useLibraries } from "@/lib/queries";
+import { overallProgress } from "@/lib/progress";
+import { useJob, useLibraries, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
 import { useLiveJob } from "@/lib/store";
-import type { Job, JobStage } from "@/lib/types";
+import type { Job, JobStage, ValidationCheck, ValidationReport } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Where a job is in Preparing → Converting → Checking quality → Finishing. */
@@ -42,17 +43,18 @@ function StageSteps({ stage }: { stage: JobStage }) {
             {i > 0 ? <span aria-hidden className={cn("h-px w-3", done || active ? "bg-accent-ink/60" : "bg-line")} /> : null}
             <span
               aria-current={active ? "step" : undefined}
-              className={cn(
-                "inline-flex items-center gap-1",
-                active ? "font-semibold text-fg" : done ? "text-muted" : "text-muted/70",
-              )}
+              className={cn("inline-flex items-center gap-1", active ? "font-semibold text-fg" : "text-muted")}
             >
+              {/* Done: a check. Current: a gold dot. Not reached: a hollow ring. */}
               {done ? (
                 <Check className="size-3 text-success" aria-hidden />
               ) : (
                 <span
                   aria-hidden
-                  className={cn("size-1.5 rounded-full", active ? "bg-accent-ink" : "bg-line-strong/60")}
+                  className={cn(
+                    "size-1.5 rounded-full",
+                    active ? "bg-accent-ink" : "border border-line-strong bg-transparent",
+                  )}
                 />
               )}
               {JOB_STAGE_LABEL[s]}
@@ -73,6 +75,63 @@ function speedText(job: Job): string | null {
   return parts.length ? parts.join(" · ") : null;
 }
 
+/**
+ * Stop a running job (after asking: its work so far is lost) or take a
+ * queued one out of the queue (one click; nothing is lost).
+ */
+export function CancelJobButton({
+  job,
+  size = "sm",
+  variant = "quiet",
+}: {
+  job: Job;
+  size?: "sm" | "md";
+  variant?: "quiet" | "secondary";
+}) {
+  const { cancel } = useJobActions();
+  const [confirm, setConfirm] = useState(false);
+  if (job.state === "queued") {
+    return (
+      <Button variant={variant} size={size} onClick={() => cancel.mutate(job)} loading={cancel.isPending}>
+        <CircleSlash aria-hidden />
+        Remove from queue
+      </Button>
+    );
+  }
+  return (
+    <>
+      <Button variant={variant} size={size} onClick={() => setConfirm(true)}>
+        <X aria-hidden />
+        Cancel
+      </Button>
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={setConfirm}
+        title={`Stop converting ${middleTruncate(job.file_name, 60)}?`}
+        confirmLabel="Stop converting"
+        cancelLabel="Keep converting"
+        destructive
+        loading={cancel.isPending}
+        onConfirm={() => cancel.mutate(job, { onSettled: () => setConfirm(false) })}
+      >
+        <p>The work done on it so far is discarded. The original file is untouched.</p>
+        <p>It won&apos;t be converted again unless you queue it.</p>
+      </ConfirmDialog>
+    </>
+  );
+}
+
+/** Whole-file progress for a job (see `overallProgress`). */
+export function jobOverall(job: Pick<Job, "stage" | "progress">): number {
+  return overallProgress(job.stage, job.progress);
+}
+
+/** "Checking quality · 27%": the stage and how far into it, as secondary detail. */
+function stageDetail(job: Job): string {
+  const stage = JOB_STAGE_LABEL[job.stage];
+  return job.stage === "transcoding" || job.stage === "waiting" ? stage : `${stage} · ${Math.round(job.progress)}%`;
+}
+
 /** Live card for a running job. */
 export function JobCard({
   job: baseJob,
@@ -87,13 +146,13 @@ export function JobCard({
   const job = useLiveJob(baseJob);
   const libraries = useLibraries();
   const libraryName = libraries.data?.find((l) => l.id === job.library_id)?.name;
-  const { cancel } = useJobActions();
   const eta = formatEta(job.eta_secs);
   const speed = speedText(job);
   const stage = JOB_STAGE_LABEL[job.stage];
+  const overall = jobOverall(job);
 
   useThrottledAnnouncement(
-    announce ? `${job.file_name}: ${stage} ${Math.round(job.progress)}%${eta ? `, ${eta}` : ""}.` : null,
+    announce ? `${job.file_name}: ${Math.round(overall)}% done, ${stage.toLowerCase()}${eta ? `, ${eta}` : ""}.` : null,
     `${job.id}:${job.stage}`,
   );
 
@@ -120,13 +179,16 @@ export function JobCard({
       <StageSteps stage={job.stage} />
 
       <div>
-        <Meter value={job.progress} label={`${job.file_name}: ${stage}`} live size="md" />
+        <Meter value={overall} label={`${job.file_name}: whole file`} live size="md" />
         <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-[0.8125rem]">
           <p className="text-fg">
-            <span className="font-semibold tabular">{Math.round(job.progress)}%</span>
-            <span className="text-muted"> {eta ? `· ${eta}` : `· ${stage.toLowerCase()}`}</span>
+            <span className="font-semibold tabular">{Math.round(overall)}%</span>
+            <span className="text-muted"> · {eta ?? stage.toLowerCase()}</span>
           </p>
-          {speed ? <p className="font-mono text-xs text-muted tabular">{speed}</p> : null}
+          <p className="text-xs text-muted tabular">
+            {job.stage === "transcoding" ? null : <span>{stageDetail(job)}</span>}
+            {speed ? <span className="font-mono">{job.stage === "transcoding" ? "" : " · "}{speed}</span> : null}
+          </p>
         </div>
         {job.attempt > 1 ? (
           <p className="mt-2 text-[0.8125rem] text-warning">
@@ -136,10 +198,7 @@ export function JobCard({
       </div>
 
       <div className="flex items-center justify-end gap-2 border-t border-line pt-3">
-        <Button variant="quiet" size="sm" onClick={() => cancel.mutate(job)} loading={cancel.isPending}>
-          <X aria-hidden />
-          Cancel
-        </Button>
+        <CancelJobButton job={job} />
         <Button variant="secondary" size="sm" onClick={() => onOpen(job)}>
           Details
         </Button>
@@ -223,6 +282,31 @@ function BeforeAfter({ job }: { job: Job }) {
   );
 }
 
+/** Tone for the similarity numbers, from the worker's own verdict on the visual check. */
+function metricTone(report: ValidationReport): "danger" | "warning" | null {
+  const visual = report.checks.find((c) => c.id === "visual");
+  if (visual?.status === "fail") return "danger";
+  if (visual?.status === "warn") return "warning";
+  return null;
+}
+
+/** A check's measured value in words, or `null` when the sentence already says it all. */
+export function checkValueText(check: ValidationCheck): string | null {
+  const v = check.value;
+  if (v === null || !Number.isFinite(v)) return null;
+  switch (check.id) {
+    case "duration":
+      return v < 0.05 ? null : `${v < 10 ? v.toFixed(1) : Math.round(v)} s off`;
+    case "visual":
+      return `similarity ${v.toFixed(2)}`;
+    case "black_frames":
+    case "frozen_frames":
+      return v < 0.05 ? null : `+${v < 10 ? v.toFixed(1) : Math.round(v)} s`;
+    default:
+      return null;
+  }
+}
+
 function Verification({ job }: { job: Job }) {
   const report = job.validation;
   if (!report) {
@@ -234,67 +318,71 @@ function Verification({ job }: { job: Job }) {
       </p>
     );
   }
+  const tone = metricTone(report);
   const metrics = [
     report.ssim_min !== null
-      ? {
-          label: "Lowest similarity",
-          value: report.ssim_min.toFixed(3),
-          hint: "SSIM, 1.000 = identical",
-          bad: report.ssim_min < 0.9,
-        }
+      ? { label: "Lowest similarity", value: report.ssim_min.toFixed(3), hint: "SSIM, 1 = identical" }
       : null,
-    report.ssim_avg !== null
-      ? { label: "Average similarity", value: report.ssim_avg.toFixed(3), hint: "SSIM", bad: report.ssim_avg < 0.95 }
-      : null,
-    report.psnr_avg !== null
-      ? { label: "Signal to noise", value: `${report.psnr_avg.toFixed(1)} dB`, hint: "PSNR", bad: false }
-      : null,
-  ].filter((m): m is { label: string; value: string; hint: string; bad: boolean } => m !== null);
+    report.ssim_avg !== null ? { label: "Average similarity", value: report.ssim_avg.toFixed(3), hint: "SSIM" } : null,
+    report.psnr_avg !== null ? { label: "Signal to noise", value: `${report.psnr_avg.toFixed(1)} dB`, hint: "PSNR" } : null,
+  ].filter((m): m is { label: string; value: string; hint: string } => m !== null);
   return (
-    <div>
-      <p className="mb-3 text-[0.8125rem] text-muted">
-        {VALIDATION_LABEL[report.level]} checks · took {formatDuration(report.elapsed_secs)}
+    <div className="overflow-hidden rounded-lg border border-line">
+      <p className="border-b border-line px-3.5 py-2.5 text-[0.8125rem] text-muted">
+        {VALIDATION_LABEL[report.level]} checks, took {formatDuration(report.elapsed_secs)}
       </p>
       {metrics.length ? (
-        <dl className="mb-4 grid grid-cols-3 gap-2">
+        // One row of numbers with dividers, inside the checks box rather than
+        // as separate cards.
+        <dl className="grid grid-cols-3 divide-x divide-line border-b border-line">
           {metrics.map((m) => (
-            <div key={m.label} className="rounded-md border border-line px-3 py-2">
-              <dt className="text-xs text-muted">{m.label}</dt>
-              <dd className={cn("mt-0.5 font-mono text-sm font-medium tabular", m.bad ? "text-danger" : "text-fg")}>
+            <div key={m.label} className="min-w-0 px-3.5 py-2.5">
+              <dt className="truncate text-xs text-muted">{m.label}</dt>
+              <dd
+                className={cn(
+                  "mt-0.5 font-mono text-sm font-medium tabular",
+                  tone === "danger" ? "text-danger" : tone === "warning" ? "text-warning" : "text-fg",
+                )}
+              >
                 {m.value}
-                {m.bad ? <span className="sr-only"> (below the passing mark)</span> : null}
+                {tone ? <span className="sr-only"> ({tone === "danger" ? "failed the check" : "a warning"})</span> : null}
               </dd>
               <dd className="text-[0.6875rem] text-muted">{m.hint}</dd>
             </div>
           ))}
         </dl>
       ) : null}
-      <ul className="divide-y divide-line rounded-lg border border-line">
-        {report.checks.map((check) => (
-          <li key={check.id} className="flex gap-3 px-3.5 py-3">
-            <CheckIcon status={check.status} />
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-fg">{check.label}</p>
-              <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">{check.detail}</p>
-            </div>
-            {check.value !== null ? (
-              <span className="shrink-0 font-mono text-xs text-muted tabular">
-                {Number.isInteger(check.value) ? check.value : check.value.toFixed(3)}
-              </span>
-            ) : null}
-          </li>
-        ))}
+      <ul className="divide-y divide-line">
+        {report.checks.map((check) => {
+          const value = checkValueText(check);
+          return (
+            <li key={check.id} className="flex gap-3 px-3.5 py-3">
+              <CheckIcon status={check.status} />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-fg">{check.label}</p>
+                <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">{check.detail}</p>
+              </div>
+              {value ? <span className="shrink-0 text-xs text-muted tabular">{value}</span> : null}
+            </li>
+          );
+        })}
       </ul>
     </div>
   );
 }
 
+/** Whether a failure message says the original itself was affected. */
+function originalAffected(error: string | null): boolean {
+  return /original[^.]*\b(missing|deleted|removed|damaged|modified|overwritten|lost)\b/i.test(error ?? "");
+}
+
 function Outcome({ job }: { job: Job }) {
+  const settings = useSettings();
   if (job.state === "failed") {
     return (
       <Callout tone="danger" title="This file couldn't be converted">
         <p>{job.error ?? "ffmpeg stopped with an error."}</p>
-        {/original/i.test(job.error ?? "") ? null : <p className="mt-1.5">Your original file is untouched.</p>}
+        {originalAffected(job.error) ? null : <p className="mt-1.5">Your original file is untouched.</p>}
       </Callout>
     );
   }
@@ -312,10 +400,21 @@ function Outcome({ job }: { job: Job }) {
       </Callout>
     );
   }
-  if (job.state === "done" && job.validation?.passed) {
+  if (job.state === "done") {
+    const toFolder = settings.data?.output_mode === "folder";
+    const verified = Boolean(job.validation?.passed);
     return (
-      <Callout tone="success" title="Verified and replaced">
-        The new file passed every check before it took the original&apos;s place.
+      <Callout
+        tone="success"
+        title={verified ? (toFolder ? "Verified and saved" : "Verified and replaced") : toFolder ? "Saved" : "Replaced"}
+      >
+        {verified
+          ? toFolder
+            ? "The new file passed every check and was saved to the output folder. The original is untouched."
+            : "The new file passed every check before it took the original's place."
+          : toFolder
+            ? "The new file was saved to the output folder. Verification was off, so it wasn't checked."
+            : "The new file took the original's place. Verification was off, so it wasn't checked."}
       </Callout>
     );
   }
@@ -327,6 +426,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
   const libraries = useLibraries();
   const library = libraries.data?.find((l) => l.id === job.library_id);
   const eta = formatEta(job.eta_secs);
+  const overall = jobOverall(job);
   return (
     <>
       <div className="mb-6 flex flex-wrap items-center gap-2">
@@ -344,10 +444,11 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
       {job.state === "running" ? (
         <div className="mb-6">
           <StageSteps stage={job.stage} />
-          <Meter className="mt-3" value={job.progress} label={JOB_STAGE_LABEL[job.stage]} live size="md" />
+          <Meter className="mt-3" value={overall} label="Whole file" live size="md" />
           <p className="mt-2 text-[0.8125rem] text-muted">
-            <span className="font-semibold text-fg tabular">{Math.round(job.progress)}%</span>
+            <span className="font-semibold text-fg tabular">{Math.round(overall)}%</span>
             {eta ? ` · ${eta}` : ""}
+            {job.stage !== "transcoding" ? ` · ${stageDetail(job)}` : ""}
             {speedText(job) ? <span className="font-mono text-xs"> · {speedText(job)}</span> : null}
           </p>
         </div>
@@ -400,34 +501,72 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
   );
 }
 
-function JobSheetActions({ job, onClose }: { job: Job; onClose: () => void }) {
-  const { cancel, moveToTop, retry } = useJobActions();
+/** Queue a finished file again, asking first when that means a second lossy pass. */
+export function ConvertAgainButton({
+  fileName,
+  onConfirm,
+  loading,
+  label = "Convert again",
+}: {
+  fileName: string;
+  onConfirm: () => void;
+  loading: boolean;
+  label?: string;
+}) {
+  const settings = useSettings();
+  const [confirm, setConfirm] = useState(false);
+  const toFolder = settings.data?.output_mode === "folder";
+  return (
+    <>
+      <Button variant="secondary" size="sm" onClick={() => setConfirm(true)}>
+        <RotateCcw aria-hidden />
+        {label}
+      </Button>
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={setConfirm}
+        title={`Convert ${middleTruncate(fileName, 60)} again?`}
+        confirmLabel="Convert again"
+        loading={loading}
+        onConfirm={() => {
+          onConfirm();
+          setConfirm(false);
+        }}
+      >
+        {toFolder ? (
+          <p>The original is converted again and the file in the output folder is replaced with the new result.</p>
+        ) : (
+          <>
+            <p>This converts the already-converted file again. Quality can drop a little each time a file is converted.</p>
+            <p>Usually this is only worth it after changing the library&apos;s goal.</p>
+          </>
+        )}
+      </ConfirmDialog>
+    </>
+  );
+}
+
+function JobSheetActions({ job }: { job: Job }) {
+  const { moveToTop, retry } = useJobActions();
+  // A plain link: the new address has no `?job=`, which closes this sheet.
   const fileLink = href(`/library/${job.library_id}`, { file: job.file_id });
   return (
     <>
-      <a href={fileLink} onClick={onClose} className={cn(buttonVariants({ variant: "quiet", size: "sm" }), "mr-auto")}>
+      <a href={fileLink} className={cn(buttonVariants({ variant: "quiet", size: "sm" }), "mr-auto")}>
         <FileVideo aria-hidden />
         Show file
       </a>
       {job.state === "queued" ? (
         <>
-          <Button variant="secondary" size="sm" onClick={() => cancel.mutate(job)} loading={cancel.isPending}>
-            <CircleSlash aria-hidden />
-            Remove from queue
-          </Button>
+          <CancelJobButton job={job} variant="secondary" />
           <Button variant="primary" size="sm" onClick={() => moveToTop.mutate(job)} loading={moveToTop.isPending}>
             <ArrowUpToLine aria-hidden />
             Move to top
           </Button>
         </>
       ) : null}
-      {job.state === "running" ? (
-        <Button variant="secondary" size="sm" onClick={() => cancel.mutate(job)} loading={cancel.isPending}>
-          <X aria-hidden />
-          Cancel
-        </Button>
-      ) : null}
-      {job.state === "failed" || job.state === "cancelled" || job.state === "skipped" || job.state === "done" ? (
+      {job.state === "running" ? <CancelJobButton job={job} variant="secondary" /> : null}
+      {job.state === "failed" || job.state === "cancelled" || job.state === "skipped" ? (
         <Button
           variant={job.state === "failed" ? "primary" : "secondary"}
           size="sm"
@@ -435,8 +574,11 @@ function JobSheetActions({ job, onClose }: { job: Job; onClose: () => void }) {
           loading={retry.isPending}
         >
           <RotateCcw aria-hidden />
-          {job.state === "failed" ? "Try again" : "Convert again"}
+          {job.state === "failed" ? "Try again" : job.state === "skipped" ? "Convert anyway" : "Queue again"}
         </Button>
+      ) : null}
+      {job.state === "done" ? (
+        <ConvertAgainButton fileName={job.file_name} onConfirm={() => retry.mutate(job)} loading={retry.isPending} />
       ) : null}
     </>
   );
@@ -452,7 +594,7 @@ export function JobSheet({ jobId, onClose }: { jobId: string | null; onClose: ()
       onOpenChange={(open) => !open && onClose()}
       title={job ? middleTruncate(job.file_name, 80) : "Loading…"}
       description={job ? "Conversion details" : undefined}
-      footer={job ? <JobSheetActions job={job} onClose={onClose} /> : undefined}
+      footer={job ? <JobSheetActions job={job} /> : undefined}
     >
       {job ? (
         <JobSheetBody job={job} />

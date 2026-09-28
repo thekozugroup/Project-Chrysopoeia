@@ -14,6 +14,7 @@ needs no Node at runtime. Everything talks to `/api` on the same origin; see
 | `pnpm build` | Static export to `web/out` (`out/index.html` plus `_next/` assets) |
 | `pnpm lint` | ESLint |
 | `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm test` | Unit and component tests (Vitest + jsdom): live events, router and navigation guard, profiles, formatting |
 | `pnpm mock` | Dev-only mock API with fake sample data on http://localhost:8787 |
 
 ## Working on the UI
@@ -32,6 +33,8 @@ pnpm mock                        # a populated demo library
 MOCK_SCENARIO=fresh pnpm mock    # first run: shows the setup flow
 MOCK_SCENARIO=nogpu pnpm mock    # no GPU, with setup hints
 MOCK_SCENARIO=empty pnpm mock    # set up, but no libraries yet
+MOCK_DETECT_MS=8000 pnpm mock    # "Checking your hardware…" for the first 8 s
+MOCK_WS=off pnpm mock            # no WebSocket, like a proxy without it: the app polls
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 

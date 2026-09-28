@@ -9,6 +9,13 @@
  *   PORT=8787               port to listen on
  *   MOCK_SCENARIO=demo      demo (default) | fresh (first run) | nogpu | empty (no libraries)
  *   MOCK_TICK_MS=1000       progress tick interval
+ *   MOCK_DETECT_MS=0        answer GET /api/hardware with the server's "Checking your
+ *                           hardware…" stand-in for this long after start
+ *   MOCK_WS=on              "off" refuses WebSocket upgrades, like a reverse proxy
+ *                           without WebSocket support
+ *
+ * Error codes and messages follow the real server's, so the UI's error
+ * handling is exercised the same way.
  */
 
 import { randomUUID } from "node:crypto";
@@ -18,6 +25,9 @@ import { WebSocketServer } from "ws";
 const PORT = Number(process.env.PORT ?? 8787);
 const SCENARIO = process.env.MOCK_SCENARIO ?? "demo";
 const TICK_MS = Number(process.env.MOCK_TICK_MS ?? 1000);
+const DETECT_MS = Number(process.env.MOCK_DETECT_MS ?? 0);
+const WS_ON = (process.env.MOCK_WS ?? "on") !== "off";
+const STARTED = Date.now();
 
 // ---------------------------------------------------------------------------
 // Deterministic randomness so screenshots are stable between runs.
@@ -170,6 +180,37 @@ function makeHardware() {
 }
 
 let hardware = makeHardware();
+
+/** What the real server answers while its first detection runs (services/hardware.rs placeholder). */
+function detectingPlaceholder() {
+  return {
+    cpu: { model: "Unknown CPU", logical_cores: 16, physical_cores: null, cgroup_limit: null },
+    memory: { total_bytes: 0, available_bytes: 0, cgroup_limit_bytes: null },
+    gpus: [],
+    encoders: [],
+    audio_encoders: [],
+    filters: [],
+    ffmpeg: { ffmpeg_path: "ffmpeg", ffprobe_path: "ffprobe", found: false, ffprobe_found: false, version: null },
+    recommended_jobs: { cpu_jobs: 4, gpu_jobs: 0, total: 4, reason: "Checking your hardware…" },
+    hints: [
+      {
+        level: "info",
+        title: "Checking your hardware…",
+        detail: "Chrysopoeia is testing which encoders work on this machine. This takes a few seconds; conversions start right after.",
+        fix: null,
+      },
+    ],
+    in_container: true,
+    detected_at: iso(STARTED),
+  };
+}
+
+if (DETECT_MS > 0) {
+  setTimeout(() => {
+    hardware = { ...makeHardware(), detected_at: iso(Date.now()) };
+    broadcast({ type: "hardware.updated", hardware });
+  }, DETECT_MS);
+}
 
 const presets = {
   goals: [
@@ -502,7 +543,7 @@ function populateMovies(library, count, doneShare) {
     if (roll < doneShare) markDone(file, between(0.38, 0.62), between(60, 86400 * 29));
     else if (roll < doneShare + 0.08) {
       file.status = "skipped";
-      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller — kept the original";
+      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller, so the original was kept";
     }
   }
 }
@@ -527,7 +568,7 @@ function populateTv(library, shows) {
         if (s === 1 && roll < 0.85) markDone(file, between(0.32, 0.55), between(60, 86400 * 25));
         else if (roll < 0.1) {
           file.status = "skipped";
-          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC) — nothing to gain" : "Only 6% smaller — kept the original";
+          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC), nothing to gain" : "Only 6% smaller, so the original was kept";
         }
       }
     }
@@ -598,7 +639,7 @@ function seedDemo() {
   makeJob(cancelled, "cancelled", { stage: "transcoding", progress: 31, started_at: ago(20000), finished_at: ago(19000) });
   const skippedFile = pendingMovies[3];
   skippedFile.status = "skipped";
-  skippedFile.skip_reason = "Only 4% smaller — kept the original";
+  skippedFile.skip_reason = "Only 4% smaller, so the original was kept";
   makeJob(skippedFile, "skipped", {
     stage: "transcoding",
     progress: 100,
@@ -1042,7 +1083,7 @@ route("DELETE", "/api/libraries/:id", ({ id }) => {
 
 route("POST", "/api/libraries/:id/scan", ({ id }) => {
   const lib = getLibrary(id);
-  if (!simulateScan(lib, false)) throw new HttpError(409, "already_scanning", `${lib.name} is already being scanned.`);
+  if (!simulateScan(lib, false)) throw new HttpError(409, "scan_running", `${lib.name} is already being scanned.`);
   return [202, { started: true }];
 });
 route("POST", "/api/scan", () => {
@@ -1196,12 +1237,26 @@ route("GET", "/api/settings", () => settings);
 route("PATCH", "/api/settings", async (_p, _q, req) => {
   const patch = await readBody(req);
   const next = { ...settings, ...patch };
-  if (next.output_mode === "folder" && !next.output_folder)
-    throw new HttpError(400, "output_folder_required", "Choose an output folder, or switch back to replacing originals.");
-  if (next.output_folder && !(next.output_folder in FS))
-    throw new HttpError(400, "output_folder_not_found", `The folder ${next.output_folder} doesn't exist inside the container.`);
+  // Same code and wording as the server (services/settings.rs): one code,
+  // `invalid_settings`, for every validation failure.
+  const invalid = (message) => new HttpError(400, "invalid_settings", message);
+  if (next.max_jobs !== null && !(next.max_jobs >= 1 && next.max_jobs <= 32))
+    throw invalid("Jobs at once must be between 1 and 32.");
   if (next.temp_dir && !(next.temp_dir in FS))
-    throw new HttpError(400, "temp_dir_not_writable", `Chrysopoeia can't write to ${next.temp_dir}.`);
+    throw invalid(`The temporary folder ${next.temp_dir} doesn't exist on the server. In Docker, check that it is mounted.`);
+  if (next.output_mode === "folder" && !next.output_folder)
+    throw invalid("Choose an output folder, or switch back to replacing the originals.");
+  if (next.output_mode === "folder" && !(next.output_folder in FS))
+    throw invalid(`The output folder ${next.output_folder} doesn't exist on the server. In Docker, check that it is mounted.`);
+  if (next.output_mode === "folder") {
+    for (const lib of libraries.values()) {
+      if (next.output_folder === lib.path || next.output_folder.startsWith(`${lib.path}/`))
+        throw invalid(`The output folder can't be inside the library ${lib.name}, or Chrysopoeia would convert its own results.`);
+    }
+  }
+  for (const pattern of next.ignore_patterns ?? []) {
+    if (/\[[^\]]*$/.test(pattern)) throw invalid(`"${pattern}" isn't a valid ignore pattern: unclosed character class`);
+  }
   if (patch.default_profile) next.default_profile = normalizeProfile(patch.default_profile);
   Object.assign(settings, next);
   broadcast({ type: "settings.updated", settings });
@@ -1210,7 +1265,7 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
   return settings;
 });
 
-route("GET", "/api/hardware", () => hardware);
+route("GET", "/api/hardware", () => (DETECT_MS > 0 && Date.now() - STARTED < DETECT_MS ? detectingPlaceholder() : hardware));
 route("POST", "/api/hardware/detect", async () => {
   await new Promise((r) => setTimeout(r, 2500));
   hardware = { ...makeHardware(), detected_at: iso(Date.now()) };
@@ -1223,7 +1278,7 @@ route("GET", "/api/presets", () => presets);
 route("GET", "/api/fs/browse", (_p, q) => {
   const path = (q.get("path") || BROWSE_ROOTS[0]).replace(/(.)\/+$/, "$1");
   if (!BROWSE_ROOTS.some((r) => r === "/" || path === r || path.startsWith(r + "/")))
-    throw new HttpError(403, "outside_browse_roots", "That folder is outside the folders Chrysopoeia is allowed to show.");
+    throw new HttpError(403, "outside_roots", "That folder is outside the folders Chrysopoeia is allowed to show.");
   if (!(path in FS)) throw new HttpError(404, "path_not_found", `The folder ${path} doesn't exist inside the container.`);
   const parent = path === "/" ? null : path.slice(0, path.lastIndexOf("/")) || "/";
   return {
@@ -1263,7 +1318,7 @@ const server = http.createServer(async (req, res) => {
 const wss = new WebSocketServer({ noServer: true });
 server.on("upgrade", (req, socket, head) => {
   const { pathname } = new URL(req.url ?? "/", "http://localhost");
-  if (pathname !== "/api/ws") return socket.destroy();
+  if (pathname !== "/api/ws" || !WS_ON) return socket.destroy();
   wss.handleUpgrade(req, socket, head, (ws) => {
     sockets.add(ws);
     ws.on("close", () => sockets.delete(ws));
@@ -1276,5 +1331,7 @@ setInterval(() => {
 }, 30_000);
 
 server.listen(PORT, () => {
-  console.log(`Chrysopoeia mock API (FAKE sample data, scenario "${SCENARIO}") on http://localhost:${PORT}/api`);
+  console.log(
+    `Chrysopoeia mock API (FAKE sample data, scenario "${SCENARIO}"${WS_ON ? "" : ", WebSocket off"}) on http://localhost:${PORT}/api`,
+  );
 });

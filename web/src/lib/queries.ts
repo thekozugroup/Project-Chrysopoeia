@@ -7,7 +7,8 @@
 
 import { keepPreviousData, useQuery, type QueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
-import type { FileQuery, JobQuery, Library } from "./types";
+import { isDetecting } from "./hardware";
+import type { FileQuery, HardwareInfo, JobQuery, Library } from "./types";
 
 /** Query keys. Lists take their parameters as the last element. */
 export const keys = {
@@ -101,16 +102,39 @@ export function useSettings() {
 }
 
 /**
- * Hardware info. While the server is still running its first detection it
- * may answer 503; keep polling quietly until it is ready.
+ * Hardware info. While the server runs its first detection it answers with
+ * a "Checking your hardware…" stand-in (or 503 behind some proxies); keep
+ * polling quietly until the real results are in.
  */
 export function useHardware() {
   return useQuery({
     queryKey: keys.hardware,
     queryFn: ({ signal }) => api.hardware(signal),
     staleTime: 5 * 60_000,
-    refetchInterval: (query) => (query.state.error ? 4000 : false),
+    refetchInterval: (query) => (query.state.error || isDetecting(query.state.data) ? 2500 : false),
   });
+}
+
+/**
+ * Hardware info for display: `hw` is only set once detection has finished,
+ * so a stand-in is never shown as "ffmpeg wasn't found". `pending` covers
+ * loading, the first detection and a server that isn't ready yet.
+ */
+export function useHardwareInfo(): {
+  hw: HardwareInfo | undefined;
+  pending: boolean;
+  detecting: boolean;
+  error: Error | null;
+} {
+  const query = useHardware();
+  const detecting = isDetecting(query.data);
+  const hw = detecting ? undefined : query.data;
+  return {
+    hw,
+    detecting,
+    pending: !hw && (query.isPending || detecting || Boolean(query.error)),
+    error: hw ? null : query.error,
+  };
 }
 
 export function usePresets() {

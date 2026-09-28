@@ -159,41 +159,51 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   }
 }
 
+/** A path segment, encoded so an id from the address bar can't reach another endpoint. */
+function seg(value: string): string {
+  return encodeURIComponent(value);
+}
+
+/** Whether a string looks like a UUID (ids in `?job=` and `?file=` links). */
+export function isUuid(value: string | null | undefined): value is string {
+  return Boolean(value && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value));
+}
+
 /** Typed endpoint helpers, one per route in docs/ARCHITECTURE.md. */
 export const api = {
   health: (signal?: AbortSignal) => request<Health>("/health", { signal }),
   overview: (signal?: AbortSignal) => request<Overview>("/overview", { signal }),
 
   libraries: (signal?: AbortSignal) => request<Library[]>("/libraries", { signal }),
-  library: (id: string, signal?: AbortSignal) => request<Library>(`/libraries/${id}`, { signal }),
+  library: (id: string, signal?: AbortSignal) => request<Library>(`/libraries/${seg(id)}`, { signal }),
   createLibrary: (body: CreateLibraryRequest) =>
     request<Library>("/libraries", { method: "POST", body }),
   updateLibrary: (id: string, body: UpdateLibraryRequest) =>
-    request<Library>(`/libraries/${id}`, { method: "PATCH", body }),
-  deleteLibrary: (id: string) => request<void>(`/libraries/${id}`, { method: "DELETE" }),
+    request<Library>(`/libraries/${seg(id)}`, { method: "PATCH", body }),
+  deleteLibrary: (id: string) => request<void>(`/libraries/${seg(id)}`, { method: "DELETE" }),
   scanLibrary: (id: string) =>
-    request<{ started: boolean }>(`/libraries/${id}/scan`, { method: "POST" }),
+    request<{ started: boolean }>(`/libraries/${seg(id)}/scan`, { method: "POST" }),
   scanAll: () => request<{ started: boolean }>("/scan", { method: "POST" }),
 
   files: (query: FileQuery, signal?: AbortSignal) =>
     request<ListResponse<MediaFile>>("/files", { query: { ...query }, signal }),
-  file: (id: string, signal?: AbortSignal) => request<FileDetail>(`/files/${id}`, { signal }),
+  file: (id: string, signal?: AbortSignal) => request<FileDetail>(`/files/${seg(id)}`, { signal }),
   queueFile: (id: string, priority?: number) =>
-    request<Job>(`/files/${id}/queue`, {
+    request<Job>(`/files/${seg(id)}/queue`, {
       method: "POST",
       body: priority === undefined ? {} : { priority },
     }),
-  skipFile: (id: string) => request<MediaFile>(`/files/${id}/skip`, { method: "POST" }),
+  skipFile: (id: string) => request<MediaFile>(`/files/${seg(id)}/skip`, { method: "POST" }),
   bulk: (body: BulkRequest) => request<Affected>("/files/bulk", { method: "POST", body }),
 
   jobs: (query: JobQuery, signal?: AbortSignal) =>
     request<ListResponse<Job>>("/jobs", { query: { ...query }, signal }),
-  job: (id: string, signal?: AbortSignal) => request<Job>(`/jobs/${id}`, { signal }),
-  cancelJob: (id: string) => request<Job>(`/jobs/${id}/cancel`, { method: "POST" }),
+  job: (id: string, signal?: AbortSignal) => request<Job>(`/jobs/${seg(id)}`, { signal }),
+  cancelJob: (id: string) => request<Job>(`/jobs/${seg(id)}/cancel`, { method: "POST" }),
   moveJobToTop: (id: string) =>
-    request<Job>(`/jobs/${id}/priority`, { method: "POST", body: { move: "top" } }),
+    request<Job>(`/jobs/${seg(id)}/priority`, { method: "POST", body: { move: "top" } }),
   setJobPriority: (id: string, priority: number) =>
-    request<Job>(`/jobs/${id}/priority`, { method: "POST", body: { priority } }),
+    request<Job>(`/jobs/${seg(id)}/priority`, { method: "POST", body: { priority } }),
   clearHistory: () =>
     request<Affected>("/jobs/clear", { method: "POST", body: { state: "history" } }),
 

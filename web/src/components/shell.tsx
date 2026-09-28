@@ -17,6 +17,7 @@ import {
   LoaderCircle,
   Monitor,
   Moon,
+  ScanSearch,
   Settings as SettingsIcon,
   Sun,
   WifiOff,
@@ -28,7 +29,7 @@ import { Tooltip } from "@/components/ui/overlays";
 import { formatHour, formatPercent, plural } from "@/lib/format";
 import { useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
-import { useLive } from "@/lib/store";
+import { useLive, type ConnectionState } from "@/lib/store";
 import { setTheme, useTheme, type ThemeChoice } from "@/lib/theme";
 import type { Library, QueueState, Settings } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -44,10 +45,18 @@ function sectionOf(route: Route): Section {
   return "none";
 }
 
+/** Whether any library is being scanned (from the library list or live events). */
+export function useAnyScanning(): boolean {
+  const libraries = useLibraries();
+  const liveScan = useLive((s) => Object.values(s.scans).some((scan) => scan.phase !== "done"));
+  return liveScan || Boolean(libraries.data?.some((l) => l.scanning));
+}
+
 /** Queue state in a few words, e.g. "Converting 2 files" or "Paused". */
 export function queueSummary(
   queue: QueueState | undefined,
   settings: Settings | undefined,
+  scanning = false,
 ): { text: string; icon: ReactNode; tone: "active" | "paused" | "idle" | "waiting" } {
   if (!queue) return { text: "Loading…", icon: <Clock aria-hidden />, tone: "idle" };
   if (queue.paused) {
@@ -73,46 +82,81 @@ export function queueSummary(
     };
   }
   if (queue.queued > 0) return { text: `${plural(queue.queued, "file")} waiting`, icon: <Clock aria-hidden />, tone: "waiting" };
+  if (scanning) return { text: "Scanning", icon: <ScanSearch aria-hidden />, tone: "waiting" };
   return { text: "Idle", icon: <Clock aria-hidden />, tone: "idle" };
 }
 
 function QueuePill({ className }: { className?: string }) {
   const queue = useQueueState();
   const settings = useSettings();
-  const summary = queueSummary(queue.data, settings.data);
+  const scanning = useAnyScanning();
+  const connection = useLive((s) => s.connection);
+  const polling = useLive((s) => s.polling);
+  const summary = queueSummary(queue.data, settings.data, scanning);
+  // Without live updates (and before polling catches up) this is only the
+  // last known state.
+  const stale = connection !== "open" && !polling;
   return (
     <a
       href={href("/queue")}
+      title={stale ? "Last known state" : undefined}
       className={cn(
-        "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-colors [&_svg]:size-4 [&_svg]:shrink-0",
-        summary.tone === "active" && "bg-accent-soft text-accent-ink",
-        summary.tone === "paused" && "bg-warning-soft text-warning",
-        (summary.tone === "idle" || summary.tone === "waiting") && "bg-raised text-muted hover:text-fg",
+        "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-[color,background-color,opacity] [&_svg]:size-4 [&_svg]:shrink-0",
+        // Stale: neutral colours and a still icon, so it doesn't look live.
+        stale
+          ? "bg-raised text-muted hover:text-fg [&_.spin]:animate-none"
+          : summary.tone === "active"
+            ? "bg-accent-soft text-accent-ink"
+            : summary.tone === "paused"
+              ? "bg-warning-soft text-warning"
+              : "bg-raised text-muted hover:text-fg",
         className,
       )}
     >
       {summary.icon}
       <span className="truncate">{summary.text}</span>
+      {stale ? <span className="sr-only"> (last known state)</span> : null}
     </a>
   );
 }
 
-/** Shown only while the live connection is down. */
-function ConnectionNotice({ className }: { className?: string }) {
+const CONNECTION_TEXT: Record<Exclude<ConnectionState, "open">, string> = {
+  connecting: "Connecting…",
+  reconnecting: "Reconnecting…",
+  unavailable: "Live updates off",
+};
+
+/**
+ * Shown only while the live connection is down. `compact` (phones) keeps
+ * just the icon, with the words for screen readers and as a tooltip.
+ */
+function ConnectionNotice({ className, compact = false }: { className?: string; compact?: boolean }) {
   const connection = useLive((s) => s.connection);
+  const polling = useLive((s) => s.polling);
   if (connection === "open") return null;
-  return (
+  const text = CONNECTION_TEXT[connection];
+  const detail = polling ? "Refreshing every 5 seconds instead." : undefined;
+  const icon =
+    connection === "connecting" ? <LoaderCircle className="spin" aria-hidden /> : <WifiOff aria-hidden />;
+  const body = (
     <p
       role="status"
+      tabIndex={compact ? 0 : undefined}
       className={cn(
         "inline-flex items-center gap-1.5 text-[0.8125rem] text-muted [&_svg]:size-3.5 [&_svg]:shrink-0",
+        compact && "size-8 justify-center rounded-full bg-raised [&_svg]:size-4",
         className,
       )}
     >
-      {connection === "reconnecting" ? <WifiOff aria-hidden /> : <LoaderCircle className="spin" aria-hidden />}
-      {connection === "reconnecting" ? "Reconnecting…" : "Connecting…"}
+      {icon}
+      <span className={compact ? "sr-only" : undefined}>
+        {text}
+        {detail && !compact ? <span className="block text-xs">{detail}</span> : null}
+        {detail && compact ? ` ${detail}` : null}
+      </span>
     </p>
   );
+  return compact ? <Tooltip content={detail ? `${text}. ${detail}` : text}>{body}</Tooltip> : body;
 }
 
 const THEMES: { value: ThemeChoice; label: string; icon: ReactNode }[] = [
@@ -131,8 +175,8 @@ export function ThemeSwitch({ className }: { className?: string }) {
         <Tooltip key={t.value} content={t.label}>
           <label
             className={cn(
-              "grid size-7 cursor-pointer place-items-center rounded-[5px] text-muted transition-colors hover:text-fg has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink [&_svg]:size-4",
-              theme === t.value && "bg-surface text-fg shadow-card",
+              "grid size-7 cursor-pointer place-items-center rounded-[5px] text-muted transition-colors hover:text-fg has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink pointer-coarse:size-10 [&_svg]:size-4",
+              theme === t.value && "bg-surface text-fg shadow-card ring-[1.5px] ring-accent-ink ring-inset",
             )}
           >
             <input
@@ -204,7 +248,7 @@ function LibraryLink({ library, active }: { library: Library; active: boolean })
   } else if (library.stats.file_count === 0) {
     detail = "No files yet";
   } else {
-    detail = `${formatPercent(finishedPercent(library.stats))} done`;
+    detail = `${formatPercent(finishedPercent(library.stats))} finished`;
   }
   return (
     <a
@@ -307,8 +351,8 @@ function MobileTopBar() {
         <Brand className="[&_svg]:size-6 [&>span:last-child]:text-xl" />
       </a>
       <div className="flex min-w-0 items-center gap-2">
-        <ConnectionNotice />
-        <QueuePill className="max-w-44" />
+        <ConnectionNotice compact />
+        <QueuePill className="max-w-48" />
       </div>
     </header>
   );

@@ -10,12 +10,13 @@ import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { Brand } from "@/components/brand";
 import { FileSheet } from "@/components/files";
 import { JobSheet } from "@/components/jobs";
+import { NavigationPrompt } from "@/components/save-bar";
 import { Shell } from "@/components/shell";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { CodeBlock, EmptyState, Skeleton } from "@/components/ui/display";
-import { ApiError, apiBase, errorMessage } from "@/lib/api";
+import { ApiError, apiBase, errorMessage, isUuid } from "@/lib/api";
 import { useLibraries, useSettings } from "@/lib/queries";
-import { href, navigate, updateParams, useRoute, type Route } from "@/lib/router";
+import { closeSheet, href, navigate, useRoute, type Route } from "@/lib/router";
 import { AddLibraryScreen } from "@/screens/add-library";
 import { LibrariesScreen } from "@/screens/libraries";
 import { LibraryScreen } from "@/screens/library";
@@ -112,14 +113,19 @@ function Screen({ route }: { route: Route }) {
   }
 }
 
-/** Job and file detail sheets, opened from any screen via `?job=` / `?file=`. */
+/**
+ * Job and file detail sheets, opened from any screen via `?job=` / `?file=`.
+ * Ids that aren't UUIDs (a mangled or crafted link) are ignored.
+ */
 function RouteSheets({ route }: { route: Route }) {
-  const jobId = route.params.get("job");
-  const fileId = route.params.get("file");
+  const jobParam = route.params.get("job");
+  const fileParam = route.params.get("file");
+  const jobId = isUuid(jobParam) ? jobParam : null;
+  const fileId = isUuid(fileParam) ? fileParam : null;
   return (
     <>
-      <JobSheet jobId={jobId} onClose={() => updateParams({ job: null })} />
-      <FileSheet fileId={jobId ? null : fileId} onClose={() => updateParams({ file: null })} />
+      <JobSheet jobId={jobId} onClose={() => closeSheet(["job"])} />
+      <FileSheet fileId={jobId ? null : fileId} onClose={() => closeSheet(["file"])} />
     </>
   );
 }
@@ -228,6 +234,7 @@ export function App() {
         <Screen route={route} />
         <RouteSheets route={route} />
       </ErrorBoundary>
+      <NavigationPrompt />
     </Shell>
   );
 }

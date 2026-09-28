@@ -7,7 +7,18 @@
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { ChevronRight, CircleCheck, CircleMinus, CircleX, Cpu, MemoryStick, MonitorPlay, RefreshCw, Server } from "lucide-react";
+import {
+  ChevronRight,
+  CircleCheck,
+  CircleDashed,
+  CircleMinus,
+  CircleX,
+  Cpu,
+  MemoryStick,
+  MonitorPlay,
+  RefreshCw,
+  Server,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { toast } from "sonner";
 import { SetupHints } from "@/components/hints";
@@ -16,7 +27,7 @@ import { Field, Select, SwitchRow } from "@/components/ui/controls";
 import { Callout, CodeBlock, SectionHeading, Skeleton } from "@/components/ui/display";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { formatBytes, formatRelative } from "@/lib/format";
-import { relevantApis } from "@/lib/hardware";
+import { encoderCell, isDetecting, matrixApis, preferenceChoices } from "@/lib/hardware";
 import {
   GPU_VENDOR_LABEL,
   HW_API_LABEL,
@@ -82,13 +93,39 @@ function cellFor(encoders: EncoderStatus[], codec: string, api: HwApi) {
   return encoders.find((e) => e.codec === codec && e.api === api);
 }
 
+/** A disclosure listing encoders with ffmpeg's reason for each. */
+function EncoderReasons({ title, encoders }: { title: string; encoders: EncoderStatus[] }) {
+  if (!encoders.length) return null;
+  return (
+    <details className="group mt-4 rounded-lg border border-line bg-surface">
+      <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-fg [&::-webkit-details-marker]:hidden">
+        <ChevronRight className="size-4 text-muted transition-transform duration-200 group-open:rotate-90" aria-hidden />
+        {title}
+      </summary>
+      <ul className="divide-y divide-line border-t border-line">
+        {encoders.map((e) => (
+          <li key={e.name} className="px-4 py-3">
+            <p className="font-mono text-[0.8125rem] text-fg">{e.name}</p>
+            <p className="mt-1 text-[0.8125rem] leading-relaxed break-words whitespace-pre-wrap text-muted">{e.error}</p>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
 function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
-  const apis: HwApi[] = ["software", ...relevantApis(hw)];
-  const failures = hw.encoders.filter((e) => e.available && !e.verified && e.error);
+  // Only devices that are actually here get a column: ffmpeg lists NVENC,
+  // QSV and VA-API encoders even on a machine without those GPUs.
+  const apis: HwApi[] = ["software", ...matrixApis(hw)];
+  const shown = hw.encoders.filter((e) => apis.includes(e.api));
+  const failures = shown.filter((e) => e.error && encoderCell(hw, e) === "failed");
+  const unsupported = shown.filter((e) => e.error && encoderCell(hw, e) === "unsupported");
+  const notSetUp = shown.some((e) => encoderCell(hw, e) === "not_set_up");
   return (
     <div>
       <div className="overflow-x-auto rounded-lg border border-line bg-surface">
-        <table className="w-full min-w-[32rem] text-sm">
+        <table className={cn("w-full text-sm", apis.length > 2 && "min-w-[32rem]")}>
           <caption className="sr-only">Which video formats each device can encode</caption>
           <thead>
             <tr className="border-b border-line text-left text-xs text-muted">
@@ -98,7 +135,7 @@ function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
               {apis.map((api) => (
                 <th key={api} scope="col" className="px-3 py-2.5 font-medium">
                   {HW_API_LABEL[api]}
-                  {api !== "software" ? <span className="ml-1 font-mono text-[0.6875rem] opacity-80">{HW_API_TECH[api]}</span> : null}
+                  {api !== "software" ? <span className="ml-1 font-mono text-xs">{HW_API_TECH[api]}</span> : null}
                 </th>
               ))}
             </tr>
@@ -111,19 +148,34 @@ function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
                 </th>
                 {apis.map((api) => {
                   const e = cellFor(hw.encoders, codec, api);
+                  const cell = encoderCell(hw, e);
                   let content: ReactNode;
-                  if (!e || (!e.available && !e.verified)) {
+                  if (cell === "unavailable") {
                     content = (
                       <span className="inline-flex items-center gap-1.5 text-muted">
                         <CircleMinus className="size-4" aria-hidden />
                         <span>Not available</span>
                       </span>
                     );
-                  } else if (e.verified) {
+                  } else if (cell === "works") {
                     content = (
                       <span className="inline-flex items-center gap-1.5 text-success">
                         <CircleCheck className="size-4" aria-hidden />
                         <span className="text-fg">Works</span>
+                      </span>
+                    );
+                  } else if (cell === "unsupported") {
+                    content = (
+                      <span className="inline-flex items-center gap-1.5 text-muted">
+                        <CircleMinus className="size-4" aria-hidden />
+                        <span>Not supported</span>
+                      </span>
+                    );
+                  } else if (cell === "not_set_up") {
+                    content = (
+                      <span className="inline-flex items-center gap-1.5 text-muted">
+                        <CircleDashed className="size-4" aria-hidden />
+                        <span>Not set up</span>
                       </span>
                     );
                   } else {
@@ -137,7 +189,9 @@ function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
                   return (
                     <td key={api} className="px-3 py-3 text-[0.8125rem] whitespace-nowrap">
                       {content}
-                      {e ? <span className="mt-0.5 block font-mono text-[0.6875rem] text-muted">{e.name}</span> : null}
+                      {e && cell !== "unavailable" ? (
+                        <span className="mt-0.5 block font-mono text-[0.6875rem] text-muted">{e.name}</span>
+                      ) : null}
                     </td>
                   );
                 })}
@@ -148,35 +202,18 @@ function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
       </div>
       <p className="mt-2 text-[0.8125rem] text-muted">
         Hardware encoders are listed as working only after a short test encode succeeds on this machine.
+        {notSetUp ? " “Not set up” means the device isn't passed to the container; the setup tips above show how." : ""}
       </p>
-      {failures.length ? (
-        <details className="group mt-4 rounded-lg border border-line bg-surface">
-          <summary className="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-fg [&::-webkit-details-marker]:hidden">
-            <ChevronRight className="size-4 text-muted transition-transform duration-200 group-open:rotate-90" aria-hidden />
-            Why {failures.length === 1 ? "1 encoder" : `${failures.length} encoders`} failed the test
-          </summary>
-          <ul className="divide-y divide-line border-t border-line">
-            {failures.map((e) => (
-              <li key={e.name} className="px-4 py-3">
-                <p className="font-mono text-[0.8125rem] text-fg">{e.name}</p>
-                <p className="mt-1 text-[0.8125rem] leading-relaxed break-words whitespace-pre-wrap text-muted">{e.error}</p>
-              </li>
-            ))}
-          </ul>
-        </details>
-      ) : null}
+      <EncoderReasons
+        title={`Why ${failures.length === 1 ? "1 encoder" : `${failures.length} encoders`} failed the test`}
+        encoders={failures}
+      />
+      <EncoderReasons
+        title={`Why ${unsupported.length === 1 ? "1 format isn't" : `${unsupported.length} formats aren't`} supported by the GPU`}
+        encoders={unsupported}
+      />
     </div>
   );
-}
-
-function preferenceOptions(hw: HardwareInfo | undefined, current: HwPreference): HwPreference[] {
-  const options: HwPreference[] = ["auto", "cpu"];
-  const apis = hw ? relevantApis(hw) : [];
-  for (const [pref, api] of Object.entries(HW_PREFERENCE_API) as [HwPreference, HwApi | null][]) {
-    if (api && api !== "software" && apis.includes(api)) options.push(pref);
-  }
-  if (!options.includes(current)) options.push(current);
-  return options;
 }
 
 export function HardwareSection({
@@ -188,7 +225,9 @@ export function HardwareSection({
 }) {
   const client = useQueryClient();
   const hardware = useHardware();
-  const hw = hardware.data;
+  // The server's "Checking your hardware…" stand-in is not a result.
+  const detectingFirst = isDetecting(hardware.data);
+  const hw = detectingFirst ? undefined : hardware.data;
   const detect = useMutation({
     mutationFn: () => api.detectHardware(),
     onSuccess: (info) => {
@@ -199,7 +238,8 @@ export function HardwareSection({
     onError: (err) => toast.error("Couldn't check the hardware", { description: errorMessage(err) }),
   });
   const detecting = detect.isPending;
-  const stillStarting = hardware.error instanceof ApiError && hardware.error.status === 503;
+  const stillStarting =
+    detectingFirst || (hardware.error instanceof ApiError && hardware.error.status === 503);
 
   return (
     <div className="flex flex-col gap-10">
@@ -269,9 +309,10 @@ export function HardwareSection({
             }
           >
             <Select value={draft.hardware} onChange={(e) => onChange({ hardware: e.target.value as HwPreference })}>
-              {preferenceOptions(hw, draft.hardware).map((pref) => (
-                <option key={pref} value={pref}>
-                  {HW_PREFERENCE_LABEL[pref]}
+              {preferenceChoices(hw, draft.hardware, HW_PREFERENCE_API).map((choice) => (
+                <option key={choice.value} value={choice.value} disabled={choice.disabled}>
+                  {HW_PREFERENCE_LABEL[choice.value]}
+                  {choice.disabled ? " (not working on this machine)" : ""}
                 </option>
               ))}
             </Select>

@@ -2,8 +2,9 @@
 
 /**
  * The library bar: one horizontal bar per library showing how much of it is
- * converted (gold), on its way (soft gold), still to do, skipped and failed.
- * Every segment is also listed in words.
+ * converted (solid gold), on its way (gold stripes), still to convert (solid
+ * grey), skipped (grey hatch) and failed (red). Segments differ by pattern as
+ * well as colour, and every segment is also listed in words.
  */
 
 import { formatCount, percentOf } from "@/lib/format";
@@ -19,20 +20,24 @@ interface Segment {
 
 function segments(stats: LibraryStats): Segment[] {
   return [
-    { key: "done", label: "Done", count: stats.done, className: "bg-meter" },
+    { key: "done", label: "Converted", count: stats.done, className: "bg-meter" },
     {
       key: "active",
       label: "In queue or converting",
       count: stats.queued + stats.processing,
-      className: "bg-meter/45",
+      className: "bar-active",
     },
-    { key: "pending", label: "To convert", count: stats.pending, className: "bg-line-strong/60" },
-    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bg-line" },
+    { key: "pending", label: "To convert", count: stats.pending, className: "bg-bar-todo" },
+    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bar-skipped" },
     { key: "failed", label: "Failed", count: stats.failed, className: "bg-danger" },
   ];
 }
 
-/** Share of files that need no more work (done or skipped), 0..100. */
+/**
+ * Share of files that are finished: converted, or left as they are
+ * (skipped). Shown as "% finished", never "% done", because "Converted"
+ * counts only the first kind.
+ */
 export function finishedPercent(stats: LibraryStats): number {
   return percentOf(stats.done + stats.skipped, stats.file_count);
 }
@@ -46,7 +51,7 @@ export function remainingCount(stats: LibraryStats): number {
 export function statsSentence(stats: LibraryStats): string {
   if (stats.file_count === 0) return "No media files found yet.";
   const parts = [
-    `${formatCount(stats.done)} done`,
+    `${formatCount(stats.done)} converted`,
     stats.queued + stats.processing ? `${formatCount(stats.queued + stats.processing)} in queue or converting` : null,
     stats.pending ? `${formatCount(stats.pending)} to convert` : null,
     stats.skipped ? `${formatCount(stats.skipped)} skipped` : null,
@@ -98,7 +103,7 @@ export function LibraryLegend({ stats, className }: { stats: LibraryStats; class
         .filter((s) => s.count > 0 || s.key === "done")
         .map((s) => (
           <li key={s.key} className="inline-flex items-center gap-1.5">
-            <span aria-hidden className={cn("size-2.5 rounded-[3px]", s.className)} />
+            <span aria-hidden className={cn("size-2.5 rounded-[3px] ring-1 ring-line ring-inset", s.className)} />
             <span>
               {s.label} <span className="tabular font-medium text-fg">{formatCount(s.count)}</span>
             </span>

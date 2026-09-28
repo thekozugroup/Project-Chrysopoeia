@@ -1,0 +1,79 @@
+import { describe, expect, it } from "vitest";
+import { formatBytes, formatClock, formatDuration, formatEta, formatRelative, plural } from "./format";
+import { sourceCodecLabel } from "./labels";
+
+describe("formatBytes", () => {
+  it("uses decimal units like Finder", () => {
+    expect(formatBytes(0)).toBe("0 bytes");
+    expect(formatBytes(1)).toBe("1 byte");
+    expect(formatBytes(999)).toBe("999 bytes");
+    expect(formatBytes(12_345)).toBe("12 KB");
+    expect(formatBytes(1_234_567)).toBe("1.23 MB");
+    expect(formatBytes(345_600_000)).toBe("346 MB");
+    expect(formatBytes(34_560_000)).toBe("34.6 MB");
+    expect(formatBytes(1_200_000_000)).toBe("1.2 GB");
+    expect(formatBytes(3_250_000_000)).toBe("3.25 GB");
+  });
+
+  it("rounds before promoting, so values never read 1,000 of a unit", () => {
+    expect(formatBytes(999.6)).toBe("1 KB");
+    expect(formatBytes(999_600)).toBe("1 MB");
+    expect(formatBytes(999_700_000)).toBe("1 GB");
+    expect(formatBytes(999_960_000_000)).toBe("1 TB");
+    expect(formatBytes(99_960_000)).toBe("100 MB");
+  });
+
+  it("handles missing and negative values", () => {
+    expect(formatBytes(null)).toBe("—");
+    expect(formatBytes(undefined)).toBe("—");
+    expect(formatBytes(Number.NaN)).toBe("—");
+    expect(formatBytes(-2_500_000_000)).toBe("-2.5 GB");
+  });
+});
+
+describe("durations", () => {
+  it("formats clocks and words", () => {
+    expect(formatClock(3725)).toBe("1:02:05");
+    expect(formatClock(245)).toBe("4:05");
+    expect(formatDuration(45)).toBe("45 s");
+    expect(formatDuration(80 * 60)).toBe("1 h 20 min");
+    expect(formatDuration(2 * 86_400)).toBe("2 days");
+  });
+
+  it("says roughly how long is left", () => {
+    expect(formatEta(null)).toBeNull();
+    expect(formatEta(20)).toBe("less than a minute left");
+    expect(formatEta(70)).toBe("about a minute left");
+    expect(formatEta(12 * 60 + 10)).toBe("about 12 min left");
+    expect(formatEta(2 * 3600 + 7 * 60)).toBe("about 2 h 5 min left");
+  });
+
+  it("formats relative times", () => {
+    const now = Date.parse("2026-09-28T12:00:00Z");
+    expect(formatRelative("2026-09-28T11:59:40Z", now)).toBe("just now");
+    expect(formatRelative("2026-09-28T11:57:00Z", now)).toBe("3 min ago");
+    expect(formatRelative("2026-09-28T10:00:00Z", now)).toBe("2 h ago");
+    expect(formatRelative(null, now)).toBe("—");
+    expect(formatRelative("not a date", now)).toBe("—");
+  });
+
+  it("pluralises", () => {
+    expect(plural(1, "file")).toBe("1 file");
+    expect(plural(3, "file")).toBe("3 files");
+    expect(plural(2, "library", "libraries")).toBe("2 libraries");
+  });
+});
+
+describe("sourceCodecLabel", () => {
+  it("names known codecs and capitalises short unknown tokens", () => {
+    expect(sourceCodecLabel("hevc")).toBe("HEVC");
+    expect(sourceCodecLabel("mpeg2video")).toBe("MPEG-2");
+    expect(sourceCodecLabel("dvvideo")).toBe("DVVIDEO");
+  });
+
+  it("keeps labels the server already wrote", () => {
+    expect(sourceCodecLabel("No video")).toBe("No video");
+    expect(sourceCodecLabel("No audio")).toBe("No audio");
+    expect(sourceCodecLabel(null)).toBe("Unknown");
+  });
+});

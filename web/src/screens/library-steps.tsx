@@ -8,34 +8,83 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { FolderOpen } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { FolderPicker } from "@/components/folder-picker";
 import { GoalPicker } from "@/components/goal-picker";
 import { Button } from "@/components/ui/button";
 import { Field, Input } from "@/components/ui/controls";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { recommendedGoal } from "@/lib/hardware";
-import { keys, useHardware, usePresets, useSettings } from "@/lib/queries";
+import { defaultsCustomized, profileForNewLibrary } from "@/lib/profile";
+import { keys, useHardwareInfo, usePresets, useSettings } from "@/lib/queries";
 import type { Goal, Library } from "@/lib/types";
 import { titleFromFolder } from "@/lib/utils";
 
-/** Error codes that are about the folder rather than the goal. */
-const FOLDER_ERRORS = new Set(["path_not_found", "not_a_directory", "not_readable", "library_exists", "library_overlaps", "forbidden", "http_403"]);
+/**
+ * Error codes from `POST /libraries` that are about the folder rather than
+ * the goal, so the user is sent back to the folder step to pick another.
+ */
+export const FOLDER_ERRORS = new Set([
+  "path_required",
+  "path_not_absolute",
+  "path_not_found",
+  "path_not_supported",
+  "not_a_directory",
+  "not_readable",
+  "library_exists",
+  "library_overlaps",
+  "contains_output_folder",
+  "outside_roots",
+  "http_403",
+]);
+
+/**
+ * A step's heading, focused when the step appears so keyboard and screen
+ * reader users land on the new step instead of the top of the page.
+ */
+export function StepHeading({
+  children,
+  step,
+  className,
+  level = 2,
+  focusOnMount = true,
+}: {
+  children: ReactNode;
+  /** e.g. "Step 2 of 3", read before the heading. */
+  step?: string;
+  className?: string;
+  level?: 1 | 2;
+  focusOnMount?: boolean;
+}) {
+  const ref = useRef<HTMLHeadingElement>(null);
+  useEffect(() => {
+    if (focusOnMount) ref.current?.focus({ preventScroll: false });
+  }, [focusOnMount]);
+  const Tag = level === 1 ? "h1" : "h2";
+  return (
+    <Tag ref={ref} tabIndex={-1} className={className ?? "font-display text-[2rem] leading-tight text-fg outline-none"}>
+      {step ? <span className="sr-only">{step}: </span> : null}
+      {children}
+    </Tag>
+  );
+}
 
 export function FolderStep({
   initialPath,
   error,
   onPicked,
   onNavigate,
+  step,
 }: {
   initialPath?: string;
   error?: string | null;
   onPicked: (path: string) => void;
   onNavigate?: () => void;
+  step?: string;
 }) {
   return (
     <div>
-      <h2 className="font-display text-[2rem] leading-tight text-fg">Where are your videos?</h2>
+      <StepHeading step={step}>Where are your videos?</StepHeading>
       <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
         Choose the folder that holds your movies or shows; folders inside it are included. In Docker this is the
         path inside the container, such as <code className="font-mono text-[0.8125rem] text-fg">/media</code>.
@@ -59,7 +108,8 @@ interface GoalStepProps {
   submitLabel: string;
   /** Extra work after the library exists (e.g. marking setup done). */
   afterCreate?: () => Promise<void>;
-  secondary?: React.ReactNode;
+  secondary?: ReactNode;
+  step?: string;
 }
 
 export function GoalStep({
@@ -70,19 +120,32 @@ export function GoalStep({
   submitLabel,
   afterCreate,
   secondary,
+  step,
 }: GoalStepProps) {
   const client = useQueryClient();
   const presets = usePresets();
-  const hardware = useHardware();
+  const hardware = useHardwareInfo();
   const settings = useSettings();
-  const [chosen, setChosen] = useState<Goal | null>(null);
+  const [chosen, setChosen] = useState<Exclude<Goal, "custom"> | "defaults" | null>(null);
   const [name, setName] = useState(titleFromFolder(path));
   const [error, setError] = useState<string | null>(null);
-  const goal: Goal = chosen ?? recommendedGoal(hardware.data);
+  const defaults = settings.data?.default_profile;
+  // Defaults changed in Settings › Advanced win; untouched ones let the
+  // hardware suggest a goal.
+  const customized = defaults ? defaultsCustomized(presets.data, defaults) : false;
+  const choice: Exclude<Goal, "custom"> | "defaults" =
+    chosen ?? (customized ? "defaults" : recommendedGoal(hardware.hw));
+  const goal: Goal = choice === "defaults" ? (defaults?.goal ?? "save_space") : choice;
 
   const create = useMutation({
     mutationFn: async () => {
-      const library = await api.createLibrary({ path, name: name.trim() || undefined, goal });
+      const library = await api.createLibrary({
+        path,
+        name: name.trim() || undefined,
+        // Send the whole profile, so the defaults' tracks, resolution and
+        // thresholds carry over; `goal` alone would use the stock preset.
+        ...(defaults ? { profile: profileForNewLibrary(presets.data, defaults, choice) } : { goal }),
+      });
       if (afterCreate) await afterCreate();
       return library;
     },
@@ -111,7 +174,7 @@ export function GoalStep({
         create.mutate();
       }}
     >
-      <h2 className="font-display text-[2rem] leading-tight text-fg">What should happen to these videos?</h2>
+      <StepHeading step={step}>What should happen to these videos?</StepHeading>
       <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
         Pick what matters most. You can fine-tune quality, formats and tracks later in the library&apos;s settings.
       </p>
@@ -130,11 +193,16 @@ export function GoalStep({
         value={goal}
         onChange={setChosen}
         presets={presets.data}
-        hardware={hardware.data}
-        hardwarePending={hardware.isPending || Boolean(hardware.error)}
+        hardware={hardware.hw}
+        hardwarePending={hardware.pending}
         preference={settings.data?.hardware}
+        defaults={
+          defaults && customized
+            ? { profile: defaults, selected: choice === "defaults", onSelect: () => setChosen("defaults") }
+            : undefined
+        }
       />
-      {hardware.isPending || hardware.error ? (
+      {hardware.pending ? (
         <p className="mt-3 text-[0.8125rem] text-muted" role="status">
           Checking your hardware to estimate speed…
         </p>
@@ -154,13 +222,12 @@ export function GoalStep({
         </p>
       ) : null}
 
-      <div className="mt-8 flex flex-col-reverse gap-3 sm:flex-row sm:items-center">
+      {/* Primary first in the DOM (and tab order); shown on the right from sm up. */}
+      <div className="mt-8 flex flex-col gap-3 sm:flex-row-reverse sm:items-center sm:justify-between">
+        <Button type="submit" variant="primary" size="lg" loading={create.isPending}>
+          {submitLabel}
+        </Button>
         {secondary}
-        <div className="flex flex-col gap-2 sm:ml-auto sm:items-end">
-          <Button type="submit" variant="primary" size="lg" loading={create.isPending}>
-            {submitLabel}
-          </Button>
-        </div>
       </div>
       <p className="mt-3 text-[0.8125rem] text-muted sm:text-right">
         {settings.data?.auto_queue === false

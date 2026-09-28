@@ -54,6 +54,11 @@ interface GoalPickerProps {
   className?: string;
   /** Two columns on wide screens (default) or always one. */
   columns?: 1 | 2;
+  /**
+   * Offer the defaults for new libraries (Settings › Advanced) as the first
+   * card, when they were customized. While it is selected no goal is.
+   */
+  defaults?: { profile: TranscodeProfile; selected: boolean; onSelect: () => void };
 }
 
 export function GoalPicker({
@@ -67,13 +72,34 @@ export function GoalPicker({
   label,
   className,
   columns = 2,
+  defaults,
 }: GoalPickerProps) {
   const name = useId();
   const recommended = hardware ? recommendedGoal(hardware) : null;
+  const speedLine = (codec: TranscodeProfile["video_codec"]) =>
+    hardware ? (
+      <SpeedLine hint={codecSpeedHint(hardware, codec, preference)} />
+    ) : hardwarePending ? (
+      <Skeleton className="mt-2.5 h-3.5 w-3/4" />
+    ) : null;
   return (
     <fieldset className={className}>
       <legend className="sr-only">{label}</legend>
       <div className={cn("grid gap-3", columns === 2 && "sm:grid-cols-2")}>
+        {defaults ? (
+          <ChoiceCard
+            name={name}
+            value="defaults"
+            checked={defaults.selected}
+            onChange={defaults.onSelect}
+            title="Your defaults"
+            description="The settings for new libraries you chose in Settings › Advanced."
+            className={cn(columns === 2 && "sm:col-span-2")}
+          >
+            <span className="block font-mono text-xs text-muted">{profileSummary(defaults.profile)}</span>
+            {speedLine(defaults.profile.video_codec)}
+          </ChoiceCard>
+        ) : null}
         {GOALS.map((goal) => {
           const preset = presets?.goals.find((g) => g.goal === goal);
           const goalProfile = presetProfile(presets, goal);
@@ -82,7 +108,7 @@ export function GoalPicker({
               key={goal}
               name={name}
               value={goal}
-              checked={value === goal}
+              checked={!defaults?.selected && value === goal}
               onChange={() => onChange(goal)}
               title={preset?.title ?? GOAL_LABEL[goal]}
               description={preset?.summary ?? GOAL_SUMMARY[goal]}
@@ -95,15 +121,11 @@ export function GoalPicker({
               }
             >
               <span className="block font-mono text-xs text-muted">{profileSummary(goalProfile)}</span>
-              {hardware ? (
-                <SpeedLine hint={codecSpeedHint(hardware, goalProfile.video_codec, preference)} />
-              ) : hardwarePending ? (
-                <Skeleton className="mt-2.5 h-3.5 w-3/4" />
-              ) : null}
+              {speedLine(goalProfile.video_codec)}
             </ChoiceCard>
           );
         })}
-        {value === "custom" && profile ? (
+        {value === "custom" && profile && !defaults ? (
           <ChoiceCard
             name={name}
             value="custom"

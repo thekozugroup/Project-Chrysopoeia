@@ -18,12 +18,12 @@ import { Button } from "@/components/ui/button";
 import { ChoiceCard, Field, Input, Select, SwitchRow, Textarea } from "@/components/ui/controls";
 import { Badge, Callout, Skeleton } from "@/components/ui/display";
 import { NavTabs } from "@/components/ui/nav-tabs";
-import { ApiError, api, errorMessage } from "@/lib/api";
+import { api, errorMessage } from "@/lib/api";
 import { formatHour } from "@/lib/format";
 import { VALIDATION_HELP, VALIDATION_LABEL } from "@/lib/labels";
-import { sameProfile } from "@/lib/profile";
-import { keys, useHardware, usePresets, useSettings } from "@/lib/queries";
+import { keys, useHardwareInfo, usePresets, useSettings } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
+import { changedKeys, errorsFrom, type FieldErrors } from "@/lib/settings-form";
 import type { Settings, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
@@ -38,34 +38,31 @@ const SECTIONS: { id: SectionId; label: string; description: string }[] = [
   { id: "advanced", label: "Advanced", description: "Ignored files and defaults for new libraries." },
 ];
 
-type FieldErrors = Partial<Record<keyof Settings | "general", string>>;
-
-/** Put an API error on the field it is about, judging by its code. */
-function errorsFrom(err: unknown): FieldErrors {
-  const message = errorMessage(err);
-  if (!(err instanceof ApiError)) return { general: message };
-  const code = err.code;
-  if (code.includes("output")) return { output_folder: message };
-  if (code.includes("temp")) return { temp_dir: message };
-  if (code.includes("active_hours") || code.includes("hours")) return { active_hours: message };
-  if (code.includes("max_jobs") || code.includes("jobs")) return { max_jobs: message };
-  if (code.includes("ignore") || code.includes("pattern")) return { ignore_patterns: message };
-  if (code.includes("size")) return { min_file_size_mb: message };
-  return { general: message };
-}
-
-/** Top-level keys whose values differ. `default_profile` is compared whole. */
-function changedKeys(a: Settings, b: Settings): (keyof Settings)[] {
-  return (Object.keys(a) as (keyof Settings)[]).filter((key) =>
-    key === "default_profile" ? !sameProfile(a.default_profile, b.default_profile) : JSON.stringify(a[key]) !== JSON.stringify(b[key]),
-  );
-}
+/** Which section shows each setting, to point at it from the save bar. */
+const SECTION_OF: Partial<Record<keyof Settings, SectionId>> = {
+  max_jobs: "processing",
+  active_hours: "processing",
+  low_priority: "processing",
+  auto_queue: "processing",
+  watch_folders: "processing",
+  rescan_interval_hours: "processing",
+  output_mode: "output",
+  output_folder: "output",
+  keep_file_dates: "output",
+  temp_dir: "output",
+  validation: "verification",
+  hardware: "hardware",
+  cpu_fallback: "hardware",
+  ignore_patterns: "advanced",
+  min_file_size_mb: "advanced",
+  default_profile: "advanced",
+};
 
 function Block({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
   return (
     <section className="grid gap-4 border-t border-line py-7 first:border-t-0 first:pt-0 lg:grid-cols-[15rem_1fr] lg:gap-10">
       <div>
-        <h2 className="text-[0.9375rem] font-semibold text-fg">{title}</h2>
+        <h2 className="text-[1.0625rem] leading-snug font-semibold text-fg">{title}</h2>
         {description ? <p className="mt-1 text-[0.8125rem] leading-snug text-muted">{description}</p> : null}
       </div>
       <div className="flex min-w-0 max-w-2xl flex-col gap-5">{children}</div>
@@ -122,9 +119,10 @@ const RESCAN: { value: number; label: string }[] = [
 ];
 
 function ProcessingSection({ draft, onChange, errors }: SectionProps) {
-  const hardware = useHardware();
+  // The recommendation is a guess until detection has finished.
+  const { hw } = useHardwareInfo();
   const name = useId();
-  const auto = hardware.data?.recommended_jobs;
+  const auto = hw?.recommended_jobs;
   const hours = draft.active_hours;
   return (
     <>
@@ -300,8 +298,8 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
             value="next"
             checked={draft.temp_dir === null}
             onChange={() => onChange({ temp_dir: null })}
-            title="Next to each file"
-            description="Simplest. Needs free space on the same drive as the video."
+            title="Automatic"
+            description="The server's work folder when it has one (the Docker image uses /temp when it's mapped), otherwise next to each file, which needs free space on the same drive as the video."
           />
           <ChoiceCard
             name={tempName}
@@ -319,7 +317,7 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
             placeholder="No folder chosen"
             dialogTitle="Choose a work folder"
             dialogDescription="In-progress files are written here and moved into place when they pass their checks."
-            error={errors.temp_dir ?? (draft.temp_dir ? null : "Choose a folder, or use the folder next to each file.")}
+            error={errors.temp_dir ?? (draft.temp_dir ? null : "Choose a folder, or switch back to Automatic.")}
           />
         ) : null}
       </Block>
@@ -366,9 +364,9 @@ function VerificationSection({ draft, onChange }: SectionProps) {
   );
 }
 
-function AdvancedSection({ draft, onChange, errors, onValidity }: SectionProps) {
+function AdvancedSection({ draft, onChange, errors, onValidity, resetKey }: SectionProps) {
   const presets = usePresets();
-  const hardware = useHardware();
+  const hardware = useHardwareInfo();
   const [patternsText, setPatternsText] = useState(draft.ignore_patterns.join("\n"));
   const [lastPatterns, setLastPatterns] = useState(draft.ignore_patterns.join("\n"));
   const joined = draft.ignore_patterns.join("\n");
@@ -432,10 +430,11 @@ function AdvancedSection({ draft, onChange, errors, onValidity }: SectionProps) 
           profile={draft.default_profile}
           onChange={(default_profile) => onChange({ default_profile })}
           presets={presets.data}
-          hardware={hardware.data}
-          hardwarePending={hardware.isPending}
+          hardware={hardware.hw}
+          hardwarePending={hardware.pending}
           preference={draft.hardware}
           onValidityChange={onValidity}
+          resetKey={resetKey}
         />
       </section>
     </>
@@ -447,6 +446,8 @@ interface SectionProps {
   onChange: (patch: Partial<Settings>) => void;
   errors: FieldErrors;
   onValidity: (valid: boolean) => void;
+  /** Bumped by Discard, to clear text typed into free-text fields. */
+  resetKey: number;
 }
 
 function SettingsForm({ settings, section }: { settings: Settings; section: SectionId }) {
@@ -455,6 +456,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   const [draft, setDraft] = useState(settings);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [valid, setValid] = useState(true);
+  const [resetKey, setResetKey] = useState(0);
   const changed = changedKeys(draft, base);
   const dirty = changed.length > 0;
 
@@ -492,13 +494,23 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
       setErrors({});
       toast.success("Settings saved");
     },
-    onError: (err) => setErrors(errorsFrom(err)),
+    onError: (err) => setErrors(errorsFrom(err, changed)),
   });
 
-  const sectionProps: SectionProps = { draft, onChange, errors, onValidity: setValid };
+  const sectionProps: SectionProps = { draft, onChange, errors, onValidity: setValid, resetKey };
   // Only the Advanced section has free-text fields that can be invalid.
   const fieldsValid = section !== "advanced" || valid;
   const blocked = missingFolder ? "Choose a folder to save." : !fieldsValid ? "Fix the highlighted fields to save." : null;
+
+  // A field error names its section when that section isn't on screen.
+  const [firstField, firstMessage] =
+    (Object.entries(errors).find(([key]) => key !== "general") as [keyof Settings, string] | undefined) ?? [];
+  const fieldSection = firstField ? SECTION_OF[firstField] : undefined;
+  const fieldError = firstMessage
+    ? fieldSection && fieldSection !== section
+      ? `${firstMessage} (${SECTIONS.find((x) => x.id === fieldSection)?.label ?? "another section"})`
+      : firstMessage
+    : null;
 
   return (
     <>
@@ -514,9 +526,21 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
         onDiscard={() => {
           setDraft(base);
           setErrors({});
+          setResetKey((k) => k + 1);
         }}
-        error={errors.general ?? (Object.keys(errors).length ? "Some settings need attention." : blocked)}
+        error={errors.general ?? fieldError ?? blocked}
         disabled={Boolean(blocked)}
+        // Moving between settings sections keeps the draft; leaving Settings doesn't.
+        blocks={(target) => target.segments[0] !== "settings"}
+        saveAndLeave={async () => {
+          if (blocked) return false;
+          try {
+            await save.mutateAsync();
+            return true;
+          } catch {
+            return false;
+          }
+        }}
       />
     </>
   );

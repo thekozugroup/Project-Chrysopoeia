@@ -2,27 +2,28 @@
 
 /** Queue: Running / Up next / History, with queue controls and job actions. */
 
-import { ArrowUpToLine, CircleCheck, History, ListVideo, RotateCcw, Trash2, X } from "lucide-react";
-import { useState } from "react";
+import { ArrowUpToLine, CircleCheck, FolderPlus, History, ListVideo, RotateCcw, Trash2, X } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { JobCard, JobCardSkeleton, savingsText } from "@/components/jobs";
 import { QueueControls, queueSentence } from "@/components/queue-controls";
 import { PageHeader } from "@/components/shell";
 import { JobStateBadge } from "@/components/status";
-import { Button } from "@/components/ui/button";
-import { EmptyState, Skeleton } from "@/components/ui/display";
-import { NavTabs, Pager } from "@/components/ui/nav-tabs";
+import { Button, buttonVariants } from "@/components/ui/button";
+import { Callout, EmptyState, Skeleton } from "@/components/ui/display";
+import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ConfirmDialog, Tooltip } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
+import { errorMessage } from "@/lib/api";
 import { formatBytes, formatRelative } from "@/lib/format";
 import { useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
-import { href, updateParams, type Route } from "@/lib/router";
+import { href, openSheet, updateParams, type Route } from "@/lib/router";
 import type { Job } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE = 50;
 
 function openJob(job: Job) {
-  updateParams({ job: job.id }, { replace: false });
+  openSheet({ job: job.id });
 }
 
 function useLibraryName() {
@@ -44,8 +45,61 @@ function ListSkeleton() {
   );
 }
 
+/**
+ * A list that couldn't load: an error with a retry instead of an empty
+ * state that would claim there is nothing.
+ */
+function LoadFailed({ error, onRetry }: { error: unknown; onRetry: () => void }) {
+  return (
+    <Callout
+      tone="danger"
+      title="Couldn't load the queue"
+      action={
+        <Button size="sm" variant="secondary" onClick={onRetry}>
+          Try again
+        </Button>
+      }
+    >
+      {errorMessage(error)}
+    </Callout>
+  );
+}
+
+/** Above a list that failed to refresh but still shows what it last had. */
+function StaleNote({ show }: { show: boolean }) {
+  if (!show) return null;
+  return (
+    <p role="status" className="mb-3 text-[0.8125rem] text-muted">
+      Showing the last known state. Couldn&apos;t refresh just now; trying again shortly.
+    </p>
+  );
+}
+
+/** Empty states point at adding a library when there are none yet. */
+function useNoLibraries(): boolean {
+  const libraries = useLibraries();
+  return libraries.data !== undefined && libraries.data.length === 0;
+}
+
+function AddLibraryEmpty({ title }: { title: ReactNode }) {
+  return (
+    <EmptyState
+      icon={<FolderPlus aria-hidden />}
+      title={title}
+      action={
+        <a href={href("/libraries/new")} className={buttonVariants({ variant: "primary" })}>
+          Add a library
+        </a>
+      }
+    >
+      Add a folder of videos first. Files that are worth converting are queued automatically after it&apos;s scanned.
+    </EmptyState>
+  );
+}
+
 function RunningTab() {
   const running = useJobs({ state: "running", limit: 50 });
+  const noLibraries = useNoLibraries();
   if (running.isPending) {
     return (
       <div className="grid gap-4 lg:grid-cols-2">
@@ -54,30 +108,41 @@ function RunningTab() {
       </div>
     );
   }
+  if (running.error && !running.data) return <LoadFailed error={running.error} onRetry={() => running.refetch()} />;
   const items = running.data?.items ?? [];
   if (!items.length) {
+    if (noLibraries) return <AddLibraryEmpty title="Nothing to convert yet" />;
     return (
       <EmptyState icon={<ListVideo aria-hidden />} title="Nothing is converting">
-        Files in the queue start automatically, up to the number of jobs set in Settings › Processing.
+        Files in the queue start automatically, a few at a time. How many run at once is set in{" "}
+        <a href={href("/settings/processing")}>Settings › Processing</a>.
       </EmptyState>
     );
   }
   return (
-    <div className="grid gap-4 lg:grid-cols-2">
-      {items.map((job, i) => (
-        <JobCard key={job.id} job={job} onOpen={openJob} announce={i === 0} />
-      ))}
-    </div>
+    <>
+      <StaleNote show={Boolean(running.error)} />
+      <div className="grid gap-4 lg:grid-cols-2">
+        {items.map((job, i) => (
+          <JobCard key={job.id} job={job} onOpen={openJob} announce={i === 0} />
+        ))}
+      </div>
+    </>
   );
 }
 
 function UpNextTab({ offset }: { offset: number }) {
   const queued = useJobs({ state: "queued", limit: PAGE, offset });
   const libraryName = useLibraryName();
+  const noLibraries = useNoLibraries();
   const { cancel, moveToTop } = useJobActions();
+  useClampedOffset(offset, queued.data?.total, PAGE);
   if (queued.isPending) return <ListSkeleton />;
+  if (queued.error && !queued.data) return <LoadFailed error={queued.error} onRetry={() => queued.refetch()} />;
   const items = queued.data?.items ?? [];
   if (!items.length) {
+    if (offset > 0 && (queued.data?.total ?? 0) > 0) return <ListSkeleton />;
+    if (noLibraries) return <AddLibraryEmpty title="The queue is empty" />;
     return (
       <EmptyState icon={<CircleCheck aria-hidden />} title="The queue is empty">
         New files are added automatically after each scan. You can also queue files from a library.
@@ -86,6 +151,7 @@ function UpNextTab({ offset }: { offset: number }) {
   }
   return (
     <>
+      <StaleNote show={Boolean(queued.error)} />
       <ol className="divide-y divide-line rounded-lg border border-line bg-surface">
         {items.map((job, i) => (
           <li key={job.id} className="flex items-center gap-3 px-3 py-2.5 sm:gap-4 sm:px-4">
@@ -143,9 +209,12 @@ function HistoryTab({ offset }: { offset: number }) {
   const libraryName = useLibraryName();
   const { retry, clearHistory } = useJobActions();
   const [confirmClear, setConfirmClear] = useState(false);
+  useClampedOffset(offset, history.data?.total, PAGE);
   if (history.isPending) return <ListSkeleton />;
+  if (history.error && !history.data) return <LoadFailed error={history.error} onRetry={() => history.refetch()} />;
   const items = history.data?.items ?? [];
   if (!items.length) {
+    if (offset > 0 && (history.data?.total ?? 0) > 0) return <ListSkeleton />;
     return (
       <EmptyState icon={<History aria-hidden />} title="No history yet">
         Every finished, skipped or failed conversion is listed here with its checks and savings.
@@ -154,6 +223,7 @@ function HistoryTab({ offset }: { offset: number }) {
   }
   return (
     <>
+      <StaleNote show={Boolean(history.error)} />
       <div className="mb-3 flex justify-end">
         <Button variant="quiet" size="sm" onClick={() => setConfirmClear(true)}>
           <Trash2 aria-hidden />
@@ -170,7 +240,7 @@ function HistoryTab({ offset }: { offset: number }) {
                 ? (job.error ?? "Failed")
                 : job.state === "skipped"
                   ? (job.skip_reason ?? "Kept the original")
-                  : "Cancelled — the original was left as it is";
+                  : "Cancelled. The original was left as it is.";
           return (
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">
               <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">

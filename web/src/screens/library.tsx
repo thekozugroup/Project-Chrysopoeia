@@ -29,18 +29,18 @@ import { SaveBar } from "@/components/save-bar";
 import { PageHeader } from "@/components/shell";
 import { FileStatusBadge, fileStatusIcon } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Field, Input, Select, SwitchRow } from "@/components/ui/controls";
+import { Field, Input, Select } from "@/components/ui/controls";
 import { Badge, Callout, EmptyState, Skeleton } from "@/components/ui/display";
-import { NavTabs, Pager } from "@/components/ui/nav-tabs";
+import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ActionMenu, ConfirmDialog } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
-import { keys, useFiles, useHardware, useLibrary, usePresets, useSettings } from "@/lib/queries";
-import { href, navigate, updateParams, type Route } from "@/lib/router";
-import { useFileProgress, useLive } from "@/lib/store";
+import { keys, useFiles, useHardwareInfo, useLibrary, usePresets, useSettings } from "@/lib/queries";
+import { href, navigate, openSheet, updateParams, type Route } from "@/lib/router";
+import { useFileLive, useLive } from "@/lib/store";
 import type { FileSort, FileStatus, Library, MediaFile } from "@/lib/types";
 import { FILE_STATUSES } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -147,12 +147,12 @@ function Header({ library }: { library: Library }) {
               actions={[
                 library.enabled
                   ? {
-                      label: "Pause this library",
+                      label: "Pause library",
                       icon: <CirclePause aria-hidden />,
                       onSelect: () => setEnabled.mutate(false),
                     }
                   : {
-                      label: "Resume this library",
+                      label: "Resume library",
                       icon: <CirclePlay aria-hidden />,
                       onSelect: () => setEnabled.mutate(true),
                     },
@@ -226,8 +226,14 @@ function Summary({ library }: { library: Library }) {
     <section aria-label="Progress" className="rounded-lg border border-line bg-surface p-4 sm:p-5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
         <p className="text-sm text-fg">
-          <span className="font-semibold tabular">{formatCount(stats.done)}</span> of{" "}
-          <span className="tabular">{plural(stats.file_count, "file")}</span> converted
+          <span className="font-semibold tabular">{formatCount(stats.done + stats.skipped)}</span> of{" "}
+          <span className="tabular">{plural(stats.file_count, "file")}</span> finished
+          {stats.skipped > 0 ? (
+            <span className="text-muted">
+              {" "}
+              ({formatCount(stats.done)} converted, {formatCount(stats.skipped)} left as they were)
+            </span>
+          ) : null}
         </p>
         <p className="text-sm text-muted">
           {stats.saved_bytes > 0 ? (
@@ -313,7 +319,7 @@ function StatusChips({ library, status }: { library: Library; status: FileStatus
           >
             {chip.value ? <span className={cn(active ? "text-accent-ink" : "")}>{fileStatusIcon(chip.value)}</span> : null}
             {chip.label}
-            <span className="tabular text-xs opacity-80">{formatCount(chip.count)}</span>
+            <span className={cn("tabular text-xs", active ? "text-fg" : "text-muted")}>{formatCount(chip.count)}</span>
           </button>
         );
       })}
@@ -333,9 +339,10 @@ function SavedCell({ file }: { file: MediaFile }) {
   return <span className="text-accent-ink">{formatBytes(file.saved_bytes)}</span>;
 }
 
+/** Status with live whole-file progress while converting (see `overallProgress`). */
 function StatusCell({ file }: { file: MediaFile }) {
-  const live = useFileProgress(file.id);
-  return <FileStatusBadge status={file.status} progress={file.status === "processing" ? (live ?? file.progress) : null} />;
+  const live = useFileLive(file.id);
+  return <FileStatusBadge status={file.status} progress={file.status === "processing" ? (live?.overall ?? null) : null} />;
 }
 
 function Checkbox({
@@ -353,20 +360,23 @@ function Checkbox({
   useEffect(() => {
     if (ref.current) ref.current.indeterminate = Boolean(indeterminate);
   }, [indeterminate]);
+  // On touch screens the label pads the 16px box out to a 44px target.
   return (
-    <input
-      ref={ref}
-      type="checkbox"
-      aria-label={label}
-      checked={checked}
-      onChange={(e) => onChange(e.target.checked)}
-      className="checkbox"
-    />
+    <label className="-m-1 inline-flex cursor-pointer p-1 pointer-coarse:-m-3.5 pointer-coarse:p-3.5">
+      <input
+        ref={ref}
+        type="checkbox"
+        aria-label={label}
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="checkbox"
+      />
+    </label>
   );
 }
 
 function openFile(file: MediaFile) {
-  updateParams({ file: file.id }, { replace: false });
+  openSheet({ file: file.id });
 }
 
 function FilesTab({ library, route }: { library: Library; route: Route }) {
@@ -382,6 +392,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const [confirmSkip, setConfirmSkip] = useState(false);
   const items = useMemo(() => files.data?.items ?? [], [files.data]);
   const total = files.data?.total ?? 0;
+  useClampedOffset(offset, files.data?.total, PAGE);
 
   // Selection only covers what is on screen.
   const visibleIds = useMemo(() => new Set(items.map((f) => f.id)), [items]);
@@ -420,6 +431,9 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
         {errorMessage(files.error)}
       </Callout>
     );
+  } else if (items.length === 0 && offset > 0 && total > 0) {
+    // Past the last page; the offset is being corrected.
+    body = null;
   } else if (items.length === 0) {
     body = filtered ? (
       <EmptyState
@@ -663,37 +677,36 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
 function SettingsTab({ library }: { library: Library }) {
   const client = useQueryClient();
   const presets = usePresets();
-  const hardware = useHardware();
+  const hardware = useHardwareInfo();
   const settings = useSettings();
-  const { remove } = useLibraryActions(library);
+  const { remove, setEnabled } = useLibraryActions(library);
   const [confirmRemove, setConfirmRemove] = useState(false);
-  const [draft, setDraft] = useState(() => ({ name: library.name, enabled: library.enabled, profile: library.profile }));
+  const [draft, setDraft] = useState(() => ({ name: library.name, profile: library.profile }));
   const [base, setBase] = useState(library);
   const [valid, setValid] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [nameError, setNameError] = useState<string | null>(null);
+  const [resetKey, setResetKey] = useState(0);
 
-  const dirty =
-    draft.name !== base.name || draft.enabled !== base.enabled || !sameProfile(draft.profile, base.profile);
+  const dirty = draft.name !== base.name || !sameProfile(draft.profile, base.profile);
 
   // Follow server changes while the user hasn't edited anything.
   if (library !== base && !dirty) {
     setBase(library);
-    setDraft({ name: library.name, enabled: library.enabled, profile: library.profile });
+    setDraft({ name: library.name, profile: library.profile });
   }
 
   const save = useMutation({
     mutationFn: () =>
       api.updateLibrary(library.id, {
         name: draft.name.trim() !== base.name ? draft.name.trim() : undefined,
-        enabled: draft.enabled !== base.enabled ? draft.enabled : undefined,
         profile: !sameProfile(draft.profile, base.profile) ? draft.profile : undefined,
       }),
     onSuccess: (updated) => {
       client.setQueryData<Library[]>(keys.libraries, (old) => old?.map((l) => (l.id === updated.id ? updated : l)));
       void client.invalidateQueries({ queryKey: keys.files() });
       setBase(updated);
-      setDraft({ name: updated.name, enabled: updated.enabled, profile: updated.profile });
+      setDraft({ name: updated.name, profile: updated.profile });
       setError(null);
       toast.success("Saved", {
         description: sameProfile(updated.profile, base.profile)
@@ -704,20 +717,27 @@ function SettingsTab({ library }: { library: Library }) {
     onError: (err) => setError(errorMessage(err)),
   });
 
-  const onSave = () => {
+  const canSave = () => {
     if (!draft.name.trim()) {
       setNameError("Give the library a name.");
-      return;
+      return false;
     }
-    save.mutate();
+    return valid;
+  };
+
+  const discard = () => {
+    setDraft({ name: base.name, profile: base.profile });
+    setError(null);
+    setNameError(null);
+    setResetKey((k) => k + 1);
   };
 
   return (
     <div>
-      <div className="grid gap-6 border-b border-line pb-8 md:grid-cols-[14rem_1fr] md:gap-8">
+      <section className="grid gap-6 border-b border-line pb-8 md:grid-cols-[14rem_1fr] md:gap-8">
         <div>
-          <h3 className="text-sm font-semibold text-fg">Library</h3>
-          <p className="mt-1 text-[0.8125rem] leading-snug text-muted">Its name and whether it&apos;s active.</p>
+          <h2 className="text-sm font-semibold text-fg">Library</h2>
+          <p className="mt-1 text-[0.8125rem] leading-snug text-muted">Its name, and pausing it.</p>
         </div>
         <div className="flex max-w-xl flex-col gap-5">
           <Field label="Name" error={nameError}>
@@ -730,30 +750,46 @@ function SettingsTab({ library }: { library: Library }) {
               }}
             />
           </Field>
-          <SwitchRow
-            label="Active"
-            description="When off, this folder isn't scanned or converted. Nothing already converted changes."
-            checked={draft.enabled}
-            onCheckedChange={(enabled) => setDraft((d) => ({ ...d, enabled }))}
-          />
+          {/* Pausing takes effect right away, like the menu action: no save needed. */}
+          <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-fg">{library.enabled ? "Active" : "Paused"}</p>
+              <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">
+                {library.enabled
+                  ? "Scanned and converted as usual. Pausing stops both; nothing already converted changes."
+                  : "Not scanned or converted until you resume it. Nothing already converted changed."}
+              </p>
+            </div>
+            <Button
+              variant="secondary"
+              className="shrink-0"
+              onClick={() => setEnabled.mutate(!library.enabled)}
+              loading={setEnabled.isPending}
+            >
+              {library.enabled ? <CirclePause aria-hidden /> : <CirclePlay aria-hidden />}
+              {library.enabled ? "Pause library" : "Resume library"}
+            </Button>
+          </div>
         </div>
-      </div>
+      </section>
 
       <div className="pt-8">
         <ProfileEditor
           profile={draft.profile}
           onChange={(profile) => setDraft((d) => ({ ...d, profile }))}
           presets={presets.data}
-          hardware={hardware.data}
-          hardwarePending={hardware.isPending}
+          hardware={hardware.hw}
+          hardwarePending={hardware.pending}
           preference={settings.data?.hardware}
           onValidityChange={setValid}
+          resetKey={resetKey}
+          headingLevel={2}
         />
       </div>
 
       <section className="mt-10 grid gap-3 border-t border-line pt-8 md:grid-cols-[14rem_1fr] md:gap-8">
         <div>
-          <h3 className="text-sm font-semibold text-fg">Remove library</h3>
+          <h2 className="text-sm font-semibold text-fg">Remove library</h2>
         </div>
         <div className="flex flex-col items-start gap-3">
           <p className="max-w-xl text-[0.8125rem] leading-relaxed text-muted">
@@ -770,14 +806,24 @@ function SettingsTab({ library }: { library: Library }) {
       <SaveBar
         dirty={dirty}
         saving={save.isPending}
-        onSave={onSave}
-        onDiscard={() => {
-          setDraft({ name: base.name, enabled: base.enabled, profile: base.profile });
-          setError(null);
-          setNameError(null);
+        onSave={() => {
+          if (canSave()) save.mutate();
         }}
+        onDiscard={discard}
         error={error ?? (valid ? null : "Fix the highlighted fields to save.")}
         disabled={!valid}
+        blocks={(target) =>
+          !(target.segments[0] === "library" && target.segments[1] === library.id && target.segments[2] === "settings")
+        }
+        saveAndLeave={async () => {
+          if (!canSave()) return false;
+          try {
+            await save.mutateAsync();
+            return true;
+          } catch {
+            return false;
+          }
+        }}
       />
       <RemoveLibraryDialog
         library={library}

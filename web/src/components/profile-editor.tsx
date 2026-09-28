@@ -8,7 +8,7 @@
  */
 
 import { ChevronRight, Info } from "lucide-react";
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { GoalPicker } from "@/components/goal-picker";
 import { Field, Input, Segmented, Select, SwitchRow } from "@/components/ui/controls";
 import { codecSpeedHint } from "@/lib/hardware";
@@ -30,7 +30,9 @@ import {
   containersFor,
   normalizeProfile,
   parseLanguages,
-  presetProfile,
+  parseQualityOverride,
+  profileWithGoal,
+  qualityOverrideMax,
 } from "@/lib/profile";
 import type {
   AudioCodec,
@@ -56,18 +58,47 @@ interface ProfileEditorProps {
   preference?: HwPreference;
   /** Reports whether any field currently holds invalid input. */
   onValidityChange?: (valid: boolean) => void;
+  /**
+   * Change this (e.g. a counter bumped by Discard) to throw away text typed
+   * into fields that never became a valid change.
+   */
+  resetKey?: number;
+  /** Heading level of the group titles, to fit the page's outline. */
+  headingLevel?: 2 | 3;
 }
 
-function Group({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
+function Group({
+  title,
+  description,
+  children,
+  level,
+}: {
+  title: string;
+  description?: ReactNode;
+  children: ReactNode;
+  level: 2 | 3;
+}) {
+  const Heading = level === 2 ? "h2" : "h3";
   return (
     <section className="grid gap-3 border-t border-line py-6 first:border-t-0 first:pt-0 md:grid-cols-[14rem_1fr] md:gap-8">
       <div>
-        <h3 className="text-sm font-semibold text-fg">{title}</h3>
+        <Heading className="text-sm font-semibold text-fg">{title}</Heading>
         {description ? <p className="mt-1 text-[0.8125rem] leading-snug text-muted">{description}</p> : null}
       </div>
       <div className="min-w-0">{children}</div>
     </section>
   );
+}
+
+/** Calls `report` whenever `valid` changes (and once on mount). */
+function useReportValidity(valid: boolean, report: (valid: boolean) => void): void {
+  const latest = useRef(report);
+  useEffect(() => {
+    latest.current = report;
+  });
+  useEffect(() => {
+    latest.current(valid);
+  }, [valid]);
 }
 
 function LanguageField({
@@ -95,6 +126,9 @@ function LanguageField({
     setError(null);
   }
 
+  // Validity follows the error, so a reset from outside clears it too.
+  useReportValidity(error === null, onValidity);
+
   return (
     <Field label={label} description={description} error={error}>
       <Input
@@ -108,13 +142,62 @@ function LanguageField({
           setText(next);
           const parsed = parseLanguages(next);
           setError(parsed.error);
-          onValidity(parsed.error === null);
           if (!parsed.error) {
             setLastExternal(parsed.codes.join(", "));
             onChange(parsed.codes);
           }
         }}
         className="font-mono text-[0.8125rem]"
+      />
+    </Field>
+  );
+}
+
+/** Raw encoder quality, checked against the range the codec's encoders accept. */
+function QualityOverrideField({
+  value,
+  codec,
+  onChange,
+  onValidity,
+}: {
+  value: number | null;
+  codec: VideoCodec;
+  onChange: (value: number | null) => void;
+  onValidity: (valid: boolean) => void;
+}) {
+  const external = value === null ? "" : String(value);
+  const [text, setText] = useState(external);
+  const [lastExternal, setLastExternal] = useState(external);
+  const [lastCodec, setLastCodec] = useState(codec);
+  if (external !== lastExternal || codec !== lastCodec) {
+    setLastExternal(external);
+    setLastCodec(codec);
+    setText(external);
+  }
+  const error = parseQualityOverride(text, codec).error;
+  useReportValidity(error === null, onValidity);
+  const max = qualityOverrideMax(codec);
+  return (
+    <Field
+      label="Encoder quality value"
+      description={`Raw CRF / CQ / QP, 0 to ${max} for ${VIDEO_CODEC_LABEL[codec]}. Overrides Quality. Lower means higher quality.`}
+      error={error}
+    >
+      <Input
+        type="text"
+        inputMode="numeric"
+        placeholder="Automatic"
+        value={text}
+        onChange={(e) => {
+          const next = e.target.value;
+          setText(next);
+          const parsed = parseQualityOverride(next, codec);
+          if (!parsed.error) {
+            setLastExternal(parsed.value === null ? "" : String(parsed.value));
+            onChange(parsed.value);
+          }
+        }}
+        className="max-w-40 font-mono"
       />
     </Field>
   );
@@ -128,11 +211,22 @@ export function ProfileEditor({
   hardwarePending,
   preference = "auto",
   onValidityChange,
+  resetKey = 0,
+  headingLevel = 3,
 }: ProfileEditorProps) {
   const [notes, setNotes] = useState<string[]>([]);
   const [invalid, setInvalid] = useState<Record<string, boolean>>({});
   const [advancedOpen, setAdvancedOpen] = useState(profile.goal === "custom");
+  const [lastReset, setLastReset] = useState(resetKey);
   const advancedId = useId();
+
+  // Discard: the free-text fields remount (below, keyed by resetKey) and
+  // report themselves valid again; forget their old verdicts now.
+  if (resetKey !== lastReset) {
+    setLastReset(resetKey);
+    setInvalid({});
+    setNotes([]);
+  }
 
   useEffect(() => {
     onValidityChange?.(!Object.values(invalid).some(Boolean));
@@ -149,17 +243,9 @@ export function ProfileEditor({
   };
 
   const pickGoal = (goal: Exclude<Goal, "custom">) => {
-    const base = presetProfile(presets, goal);
     setNotes([]);
-    onChange({
-      ...base,
-      goal,
-      // Track and resolution choices are about the library, not the goal.
-      max_height: profile.max_height,
-      subtitles: profile.subtitles,
-      audio_languages: profile.audio_languages,
-      subtitle_languages: profile.subtitle_languages,
-    });
+    // Track and resolution choices are about the library, not the goal.
+    onChange(profileWithGoal(presets, goal, profile));
   };
 
   const videoCodecs = allVideoCodecs(presets);
@@ -169,7 +255,7 @@ export function ProfileEditor({
 
   return (
     <div>
-      <Group title="Goal" description="What matters most for this library. You can change it any time.">
+      <Group level={headingLevel} title="Goal" description="What matters most for this library. You can change it any time.">
         <GoalPicker
           label="Goal"
           value={profile.goal}
@@ -182,21 +268,22 @@ export function ProfileEditor({
         />
       </Group>
 
-      <Group title="Quality" description="How closely the new file matches the original.">
+      <Group level={headingLevel} title="Quality" description="How closely the new file matches the original.">
         <Segmented<QualityLevel>
           label="Quality"
           value={profile.quality}
           onChange={(quality) => update({ quality })}
           options={QUALITY_LEVELS.map((q) => ({ value: q, label: QUALITY_LABEL[q] }))}
+          stackOnPhones
         />
-        <div className="mt-2 flex justify-between text-xs text-muted" aria-hidden>
+        <div className="mt-2 hidden justify-between text-xs text-muted sm:flex" aria-hidden>
           <span>Smaller files</span>
           <span>Closer to the original</span>
         </div>
         <p className="mt-2 text-[0.8125rem] text-fg/85">{QUALITY_HELP[profile.quality]}</p>
       </Group>
 
-      <Group title="Speed" description="Encoder effort. Slower settings squeeze files a little more.">
+      <Group level={headingLevel} title="Speed" description="Encoder effort. Slower settings squeeze files a little more.">
         <Segmented<SpeedPreset>
           label="Speed"
           value={profile.speed}
@@ -220,7 +307,7 @@ export function ProfileEditor({
             aria-hidden
           />
           Advanced
-          <span className="font-normal text-muted">Formats, resolution, tracks and thresholds</span>
+          <span className="hidden font-normal text-muted sm:inline">Formats, resolution, tracks and thresholds</span>
         </button>
 
         <div id={advancedId} hidden={!advancedOpen} className="pt-4">
@@ -254,7 +341,7 @@ export function ProfileEditor({
                   return (
                     <option key={codec} value={codec}>
                       {VIDEO_CODEC_LABEL[codec]}
-                      {preset?.hw_accelerated ? " — GPU" : ""}
+                      {preset?.hw_accelerated ? " (GPU)" : ""}
                     </option>
                   );
                 })}
@@ -321,6 +408,7 @@ export function ProfileEditor({
 
           <div className="mt-6 grid gap-5 sm:grid-cols-2">
             <LanguageField
+              key={`audio-${resetKey}`}
               label="Audio languages to keep"
               description="Codes like eng, jpn. Empty keeps all. Untagged tracks and at least one track are always kept."
               value={profile.audio_languages}
@@ -328,6 +416,7 @@ export function ProfileEditor({
               onValidity={setValidity("audio_languages")}
             />
             <LanguageField
+              key={`subs-${resetKey}`}
               label="Subtitle languages to keep"
               description="Codes like eng, spa. Empty keeps all subtitles."
               value={profile.subtitle_languages}
@@ -356,27 +445,13 @@ export function ProfileEditor({
                   : "Every subtitle track is removed."}
               </p>
             </div>
-            <Field
-              label="Encoder quality value"
-              description="Raw CRF / CQ / QP for the encoder in use. Overrides Quality. Lower means higher quality."
-            >
-              <Input
-                type="number"
-                inputMode="numeric"
-                min={0}
-                max={63}
-                placeholder="Automatic"
-                value={profile.quality_override ?? ""}
-                onChange={(e) => {
-                  const raw = e.target.value;
-                  const n = Number(raw);
-                  update({
-                    quality_override: raw === "" || !Number.isFinite(n) ? null : Math.max(0, Math.min(63, Math.round(n))),
-                  });
-                }}
-                className="max-w-40 font-mono"
-              />
-            </Field>
+            <QualityOverrideField
+              key={`quality-${resetKey}`}
+              value={profile.quality_override}
+              codec={profile.video_codec}
+              onChange={(quality_override) => update({ quality_override })}
+              onValidity={setValidity("quality_override")}
+            />
           </div>
 
           <SwitchRow

@@ -7,7 +7,7 @@
 
 import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw } from "lucide-react";
 import type { ReactNode } from "react";
-import { SheetSection, savingsText } from "@/components/jobs";
+import { ConvertAgainButton, SheetSection, savingsText } from "@/components/jobs";
 import { FileStatusBadge, JobStateBadge } from "@/components/status";
 import { Button } from "@/components/ui/button";
 import { Badge, Callout, Detail, Meter, Skeleton } from "@/components/ui/display";
@@ -21,11 +21,11 @@ import {
   formatRelative,
   middleTruncate,
 } from "@/lib/format";
-import { channelsLabel, HDR_LABEL, languageLabel, sourceCodecLabel } from "@/lib/labels";
+import { channelsLabel, HDR_LABEL, JOB_STAGE_LABEL, languageLabel, sourceCodecLabel } from "@/lib/labels";
 import { useFile } from "@/lib/queries";
-import { updateParams } from "@/lib/router";
-import { useFileProgress } from "@/lib/store";
-import type { FileDetail, MediaFile, StreamInfo } from "@/lib/types";
+import { openSheet } from "@/lib/router";
+import { useFileLive } from "@/lib/store";
+import type { FileDetail, Job, MediaFile, StreamInfo } from "@/lib/types";
 
 function StreamRow({ icon, title, meta, tags }: { icon: ReactNode; title: ReactNode; meta: ReactNode; tags?: ReactNode }) {
   return (
@@ -127,15 +127,13 @@ function Streams({ detail }: { detail: FileDetail }) {
   );
 }
 
-function StatusExplanation({ file }: { file: MediaFile }) {
-  const live = useFileProgress(file.id);
+function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
+  const live = useFileLive(file.id);
   if (file.status === "failed") {
     return (
       <Callout tone="danger" title="The last attempt failed">
         <p>{file.error ?? "ffmpeg stopped with an error."}</p>
-        <p className="mt-1.5">
-          {/original/i.test(file.error ?? "") ? "" : "The original is untouched. "}You can try again, or skip the file.
-        </p>
+        <p className="mt-1.5">The original is untouched. You can try again, or skip the file.</p>
       </Callout>
     );
   }
@@ -147,20 +145,34 @@ function StatusExplanation({ file }: { file: MediaFile }) {
     );
   }
   if (file.status === "processing") {
-    const progress = live ?? file.progress ?? 0;
     return (
       <div className="rounded-lg border border-line p-4">
         <p className="text-sm font-medium text-fg">Converting now</p>
-        <Meter className="mt-2.5" value={progress} label="Conversion progress" live />
-        <p className="mt-1.5 text-[0.8125rem] text-muted tabular">{Math.round(progress)}%</p>
+        {live ? (
+          <>
+            <Meter className="mt-2.5" value={live.overall} label="Conversion progress, whole file" live />
+            <p className="mt-1.5 text-[0.8125rem] text-muted tabular">
+              {Math.round(live.overall)}% · {JOB_STAGE_LABEL[live.stage]}
+            </p>
+          </>
+        ) : (
+          <p className="mt-1 text-[0.8125rem] text-muted">Progress appears here in a moment.</p>
+        )}
       </div>
     );
   }
   if (file.status === "done") {
     const saved = file.original_size_bytes !== null ? savingsText(file.original_size_bytes, file.size_bytes) : null;
+    // Jobs are newest first; the latest finished one says whether it was checked.
+    const last = jobs.find((j) => j.state === "done");
+    const verified = Boolean(last?.validation?.passed);
     return (
-      <Callout tone="success" title="Converted and verified">
-        {saved ? saved.text : "The new file replaced the original after passing its checks."}
+      <Callout tone="success" title={verified ? "Converted and verified" : "Converted"}>
+        {saved
+          ? saved.text
+          : verified
+            ? "The new file passed its checks before it was kept."
+            : "Verification was off for this conversion."}
       </Callout>
     );
   }
@@ -171,14 +183,18 @@ function FileActions({ file }: { file: MediaFile }) {
   const { queue, skip } = useFileActions();
   const canQueue = file.status !== "queued" && file.status !== "processing";
   const canSkip = file.status === "pending" || file.status === "queued" || file.status === "failed";
-  const queueLabel =
-    file.status === "failed"
-      ? "Try again"
-      : file.status === "done"
-        ? "Convert again"
-        : file.status === "skipped"
-          ? "Convert anyway"
-          : "Convert";
+  if (file.status === "done") {
+    // Already converted: re-converting is a second lossy pass, so it is a
+    // quiet, confirmed action rather than the primary one.
+    return (
+      <ConvertAgainButton
+        fileName={file.file_name}
+        onConfirm={() => queue.mutate({ file })}
+        loading={queue.isPending}
+      />
+    );
+  }
+  const queueLabel = file.status === "failed" ? "Try again" : file.status === "skipped" ? "Convert anyway" : "Convert";
   return (
     <>
       {canSkip ? (
@@ -192,20 +208,26 @@ function FileActions({ file }: { file: MediaFile }) {
           <Button
             variant="secondary"
             size="sm"
-            onClick={() => queue.mutate({ file, priority: 100 })}
+            onClick={() => queue.mutate({ file, next: true })}
             disabled={queue.isPending}
           >
             <ArrowUpToLine aria-hidden />
             Convert next
           </Button>
           <Button variant="primary" size="sm" onClick={() => queue.mutate({ file })} loading={queue.isPending}>
-            {file.status === "failed" || file.status === "done" ? <RotateCcw aria-hidden /> : <Play aria-hidden />}
+            {file.status === "failed" ? <RotateCcw aria-hidden /> : <Play aria-hidden />}
             {queueLabel}
           </Button>
         </>
       ) : null}
     </>
   );
+}
+
+/** The status badge in the sheet's header, with live whole-file progress. */
+function SheetStatus({ file }: { file: MediaFile }) {
+  const live = useFileLive(file.id);
+  return <FileStatusBadge status={file.status} progress={file.status === "processing" ? (live?.overall ?? null) : null} />;
 }
 
 /** Detail sheet for one file. */
@@ -224,10 +246,10 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
       {detail && file ? (
         <>
           <div className="mb-5 flex flex-wrap items-center gap-2">
-            <FileStatusBadge status={file.status} progress={file.progress} />
+            <SheetStatus file={file} />
             <span className="text-[0.8125rem] text-muted">Updated {formatRelative(file.updated_at)}</span>
           </div>
-          <StatusExplanation file={file} />
+          <StatusExplanation file={file} jobs={detail.jobs} />
 
           <SheetSection title="File">
             <dl className="divide-y divide-line">
@@ -258,7 +280,7 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
                     <li key={job.id}>
                       <button
                         type="button"
-                        onClick={() => updateParams({ file: null, job: job.id }, { replace: false })}
+                        onClick={() => openSheet({ file: null, job: job.id })}
                         className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3.5 py-3 text-left hover:bg-raised"
                       >
                         <JobStateBadge job={job} />

@@ -206,6 +206,11 @@ interface SegmentedProps<T extends string> {
   className?: string;
   size?: "sm" | "md";
   disabled?: boolean;
+  /**
+   * Stack the options vertically on phones, for rows with more choices than
+   * fit side by side at 390px. Each option may then show `description`.
+   */
+  stackOnPhones?: boolean;
 }
 
 /**
@@ -220,6 +225,7 @@ export function Segmented<T extends string>({
   className,
   size = "md",
   disabled,
+  stackOnPhones,
 }: SegmentedProps<T>) {
   const name = useId();
   return (
@@ -227,7 +233,8 @@ export function Segmented<T extends string>({
       role="radiogroup"
       aria-label={label}
       className={cn(
-        "inline-flex w-full rounded-md border border-line-strong/60 bg-sunken p-0.5",
+        "w-full rounded-md border border-line-strong/60 bg-sunken p-0.5",
+        stackOnPhones ? "flex flex-col gap-0.5 sm:inline-flex sm:flex-row sm:gap-0" : "inline-flex",
         disabled && "opacity-60",
         className,
       )}
@@ -238,9 +245,14 @@ export function Segmented<T extends string>({
           <label
             key={option.value}
             className={cn(
-              "relative flex min-w-0 flex-1 cursor-pointer items-center justify-center rounded-[5px] px-2 text-center font-medium transition-[background-color,color,box-shadow] duration-150 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink",
-              size === "sm" ? "h-7 text-[0.8125rem]" : "h-8 text-sm",
-              selected ? "bg-surface text-fg shadow-card ring-1 ring-line-strong/50 dark:bg-raised" : "text-muted hover:text-fg",
+              "relative flex min-w-0 flex-1 cursor-pointer items-center rounded-[5px] px-2 font-medium transition-[background-color,color,box-shadow] duration-150 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink",
+              stackOnPhones ? "justify-start px-3 sm:justify-center sm:px-2 sm:text-center" : "justify-center text-center",
+              size === "sm" ? "h-7 text-[0.8125rem]" : stackOnPhones ? "h-10 text-sm sm:h-8" : "h-8 text-sm",
+              // The selected option carries a 1.5px gold ring (≥3:1 against the
+              // track in both themes), like a selected choice card.
+              selected
+                ? "bg-surface text-fg shadow-card ring-[1.5px] ring-accent-ink ring-inset dark:bg-raised"
+                : "text-muted hover:text-fg",
               disabled && "cursor-not-allowed",
             )}
           >
@@ -275,7 +287,11 @@ interface ChoiceCardProps {
   disabled?: boolean;
 }
 
-/** A large radio option: title, one-line explanation, optional detail. */
+/**
+ * A large radio option: title, one-line explanation, optional detail. The
+ * radio is named by its title alone and described by the rest, so screen
+ * readers don't read the whole card on every arrow key.
+ */
 export function ChoiceCard({
   name,
   value,
@@ -288,6 +304,14 @@ export function ChoiceCard({
   className,
   disabled,
 }: ChoiceCardProps) {
+  const id = useId();
+  const describedBy = [
+    badge ? `${id}-badge` : null,
+    description ? `${id}-description` : null,
+    children ? `${id}-detail` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
   return (
     <label
       className={cn(
@@ -306,6 +330,8 @@ export function ChoiceCard({
         checked={checked}
         onChange={onChange}
         disabled={disabled}
+        aria-labelledby={`${id}-title`}
+        aria-describedby={describedBy || undefined}
         className="sr-only"
       />
       <span className="flex items-start justify-between gap-3">
@@ -319,12 +345,20 @@ export function ChoiceCard({
           >
             <span className={cn("size-1.5 rounded-full", checked ? "bg-surface" : "bg-transparent")} />
           </span>
-          {title}
+          <span id={`${id}-title`}>{title}</span>
         </span>
-        {badge}
+        {badge ? <span id={`${id}-badge`}>{badge}</span> : null}
       </span>
-      {description ? <span className="pl-[1.625rem] text-[0.8125rem] leading-snug text-muted">{description}</span> : null}
-      {children ? <span className="pl-[1.625rem]">{children}</span> : null}
+      {description ? (
+        <span id={`${id}-description`} className="pl-[1.625rem] text-[0.8125rem] leading-snug text-muted">
+          {description}
+        </span>
+      ) : null}
+      {children ? (
+        <span id={`${id}-detail`} className="pl-[1.625rem]">
+          {children}
+        </span>
+      ) : null}
     </label>
   );
 }

@@ -67,8 +67,16 @@ export function FolderPicker({
   const listRef = useRef<HTMLUListElement>(null);
   const shouldFocusList = useRef(false);
   const browse = useBrowse(path);
-  const data = browse.data;
-  const current = data?.path ?? path ?? "";
+  // While a new folder loads, the previous listing stays on screen
+  // (placeholder data). It must not be picked or clicked as if it were the
+  // new one: "Use this folder" would choose the parent.
+  const loadingNew = browse.isPlaceholderData;
+  const data = browse.error ? undefined : browse.data;
+  const current = loadingNew ? (path ?? "") : (data?.path ?? path ?? "");
+  // The last folder that opened, to fall back to when another one fails.
+  const [lastGood, setLastGood] = useState<FsBrowse | null>(null);
+  if (data && !loadingNew && data !== lastGood) setLastGood(data);
+  const shown = data ?? (browse.error ? lastGood : undefined);
 
   const go = (next: string | undefined, focusList = true) => {
     shouldFocusList.current = focusList;
@@ -86,6 +94,7 @@ export function FolderPicker({
   }, [browse.isFetching, data]);
 
   const entries = data?.entries.filter((e) => e.is_dir) ?? [];
+  const parent = shown?.parent ?? null;
 
   const onKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
     const count = entries.length;
@@ -121,9 +130,9 @@ export function FolderPicker({
       }
       case "Backspace":
       case "ArrowLeft":
-        if (data?.parent) {
+        if (parent) {
           event.preventDefault();
-          go(data.parent);
+          go(parent);
         }
         break;
       default:
@@ -140,15 +149,15 @@ export function FolderPicker({
           variant="quiet"
           size="icon-sm"
           aria-label="Up one folder"
-          disabled={!data?.parent}
-          onClick={() => data?.parent && go(data.parent, false)}
+          disabled={!parent}
+          onClick={() => parent && go(parent, false)}
         >
           <ChevronLeft />
         </Button>
         <nav aria-label="Folder path" className="min-w-0 flex-1">
           <ol className="flex min-w-0 flex-wrap items-center gap-0.5 font-mono text-[0.8125rem]">
-            {data
-              ? crumbsFor(data).map((crumb, i, all) => {
+            {shown
+              ? crumbsFor(shown).map((crumb, i, all) => {
                   const last = i === all.length - 1;
                   return (
                     <li key={crumb.path} className="flex min-w-0 items-center gap-0.5">
@@ -206,9 +215,9 @@ export function FolderPicker({
         </form>
       ) : null}
 
-      {data && data.roots.length > 1 ? (
+      {shown && shown.roots.length > 1 ? (
         <div className="flex flex-wrap gap-1.5 border-b border-line px-3 py-2" aria-label="Allowed folders">
-          {data.roots.map((root) => (
+          {shown.roots.map((root) => (
             <button
               key={root}
               type="button"
@@ -240,9 +249,16 @@ export function FolderPicker({
               tone={forbidden ? "warning" : "danger"}
               title={forbidden ? "That folder isn't available" : "Couldn't open that folder"}
               action={
-                <Button variant="secondary" size="sm" onClick={() => go(undefined, false)}>
-                  Start from the top
-                </Button>
+                <div className="flex flex-wrap gap-2">
+                  {lastGood && lastGood.path !== path ? (
+                    <Button variant="secondary" size="sm" onClick={() => go(lastGood.path, false)}>
+                      Back to {lastGood.path}
+                    </Button>
+                  ) : null}
+                  <Button variant="quiet" size="sm" onClick={() => go(undefined, false)}>
+                    Start from the top
+                  </Button>
+                </div>
               }
             >
               {errorMessage(browse.error)}
@@ -258,7 +274,10 @@ export function FolderPicker({
           <ul
             ref={listRef}
             aria-label={`Folders in ${current}`}
+            aria-busy={loadingNew || undefined}
             onKeyDown={onKeyDown}
+            // The old listing can't be clicked while the new one loads.
+            inert={loadingNew || undefined}
             className={cn("py-1", browse.isFetching && "opacity-60 transition-opacity")}
           >
             {entries.map((entry, i) => (
@@ -291,8 +310,8 @@ export function FolderPicker({
         </p>
         <Button
           variant="primary"
-          onClick={() => current && onSelect(current)}
-          disabled={!data || Boolean(browse.error)}
+          onClick={() => data && !loadingNew && onSelect(data.path)}
+          disabled={!data || loadingNew || Boolean(browse.error)}
           loading={busy}
         >
           {actionLabel}

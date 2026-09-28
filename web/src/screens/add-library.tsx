@@ -24,6 +24,7 @@ export function AddLibraryScreen() {
       {step === "folder" ? (
         <>
           <FolderStep
+            step="Step 1 of 2"
             initialPath={path ?? undefined}
             error={folderError}
             onNavigate={() => setFolderError(null)}
@@ -41,6 +42,7 @@ export function AddLibraryScreen() {
         </>
       ) : path ? (
         <GoalStep
+          step="Step 2 of 2"
           path={path}
           submitLabel="Add library"
           onChangeFolder={() => setStep("folder")}
