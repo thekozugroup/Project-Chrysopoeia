@@ -1,18 +1,19 @@
 //! Start-up, background services and graceful shutdown.
 //!
 //! Order at start: data folder → database (migrated) → settings (first run
-//! applies `HW_ACCEL`, `MAX_JOBS` and `LIBRARIES`) → recovery of interrupted
-//! jobs → HTTP server. In the background: hardware detection, crash-artifact
-//! recovery (the dispatcher waits for both), the folder watcher, the
-//! dispatcher, periodic rescans, and a first scan of never-scanned libraries.
+//! applies `HW_ACCEL` and `LIBRARIES`; a changed `HW_ACCEL` is applied on
+//! later starts too) → recovery of interrupted jobs → HTTP server. In the
+//! background: hardware detection, crash-artifact recovery (the dispatcher
+//! waits for both), the folder watcher, the dispatcher, periodic rescans and
+//! history trimming, and a first scan of never-scanned libraries.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::Context;
-use chrysopoeia_core::ActivityLevel;
 use chrysopoeia_core::paths::is_artifact;
+use chrysopoeia_core::{ActivityLevel, HwApi, HwPreference, Settings};
 use chrysopoeia_scanner::ScanOptions;
 use chrysopoeia_worker::finalize::Recovery;
 use tokio::net::TcpListener;
@@ -50,9 +51,9 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
                 config.data_dir.display()
             )
         })?;
-    let db = Db::open(&config.data_dir.join(DB_FILE_NAME)).await?;
+    let db = Db::open_with(&config.data_dir.join(DB_FILE_NAME), config.db_busy_timeout).await?;
     let pool = db.pool();
-    let (settings, first_run) = match db::settings::load(pool).await? {
+    let (mut settings, first_run) = match db::settings::load(pool).await? {
         Some(s) => (s, false),
         None => {
             let s = crate::services::settings::first_run_settings(&config);
@@ -60,6 +61,7 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             (s, true)
         }
     };
+    let hw_note = apply_hw_accel(pool, &config, &mut settings, first_run).await?;
     let paused = db::settings::get_flag(pool, db::settings::QUEUE_PAUSED_KEY)
         .await?
         .unwrap_or(false);
@@ -69,6 +71,11 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
     db::settings::set_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY, false).await?;
 
     let state = AppState::new(config, db, toolkit, settings, paused);
+    for note in hw_note.into_iter().chain(max_jobs_note(&state)) {
+        state
+            .activity(ActivityLevel::Info, note, ActivityRefs::default())
+            .await;
+    }
     if first_run {
         tracing::info!("first start: settings created");
         for path in state.config.libraries.clone() {
@@ -112,6 +119,50 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             requeued_jobs,
         },
     ))
+}
+
+/// `HW_ACCEL` sets the hardware preference on the first start, and again
+/// whenever its value changes (so editing the container template works), but
+/// a choice made in Settings afterwards is kept while `HW_ACCEL` stays the
+/// same. Returns a note for the activity feed when it changed the setting.
+async fn apply_hw_accel(
+    pool: &sqlx::SqlitePool,
+    config: &Config,
+    settings: &mut Settings,
+    first_run: bool,
+) -> anyhow::Result<Option<String>> {
+    let wanted = db::enum_str(&config.hw);
+    let applied = db::settings::get_raw(pool, db::settings::HW_ACCEL_APPLIED_KEY).await?;
+    if applied.as_deref() == Some(wanted.as_str()) {
+        return Ok(None);
+    }
+    let mut note = None;
+    if !first_run && config.hw != HwPreference::Auto && settings.hardware != config.hw {
+        settings.hardware = config.hw;
+        db::settings::save(pool, settings).await?;
+        let label = config.hw.api().map_or("Automatic", HwApi::label);
+        note = Some(format!(
+            "Hardware preference set to {label}, because HW_ACCEL={wanted} is set for the \
+             container. You can still change it in Settings."
+        ));
+    }
+    db::settings::set_raw(pool, db::settings::HW_ACCEL_APPLIED_KEY, &wanted).await?;
+    Ok(note)
+}
+
+/// A note when `MAX_JOBS` is set but a number chosen in Settings wins.
+fn max_jobs_note(state: &AppState) -> Option<String> {
+    let env = state.config.max_jobs?;
+    let saved = state.settings().max_jobs?;
+    if env == saved {
+        return None;
+    }
+    let message = format!(
+        "MAX_JOBS={env} is not used because Jobs at once is set to {saved} in Settings. Choose \
+         Automatic there to use MAX_JOBS."
+    );
+    tracing::warn!("{message}");
+    Some(message)
 }
 
 /// Folders that may hold leftover temp files.
@@ -210,6 +261,7 @@ pub fn start_background(state: &AppState, startup: Startup) {
 
     tokio::spawn(dispatcher::run(state.clone()));
     tokio::spawn(rescan::run(state.clone()));
+    tokio::spawn(rescan::trim_history_loop(state.clone()));
 
     let s = state.clone();
     tokio::spawn(async move {

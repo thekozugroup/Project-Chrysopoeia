@@ -1,4 +1,5 @@
-//! Periodic rescans, every `rescan_interval_hours` per library.
+//! Periodic rescans, every `rescan_interval_hours` per library, and
+//! trimming of old job history.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -57,6 +58,30 @@ pub async fn run(state: AppState) {
                     tracing::info!(library = %lib.name, "periodic rescan started");
                 }
             }
+        }
+    }
+}
+
+/// How often old job history is trimmed (also once shortly after start).
+const TRIM_EVERY: Duration = Duration::from_secs(6 * 3600);
+
+/// Trim old finished jobs now and then, so the history (and the database)
+/// doesn't grow without limit. Returns when the server shuts down.
+pub async fn trim_history_loop(state: AppState) {
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(60),
+        TRIM_EVERY,
+    );
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            () = state.shutdown.cancelled() => break,
+            _ = tick.tick() => {}
+        }
+        match db::jobs::trim_history(&state.db).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!("removed {n} old entries from the job history"),
+            Err(e) => tracing::warn!("could not trim the job history: {e}"),
         }
     }
 }

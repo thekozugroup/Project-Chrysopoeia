@@ -101,23 +101,74 @@ impl JobFilter {
         })
     }
 
+    /// `WHERE` and `ORDER BY` for filters that are a single ordered range.
+    /// Ties are broken by `rowid`, which grows with every insert, so jobs
+    /// created in the same millisecond keep the order they were queued in.
     fn clause(self) -> String {
         match self {
-            Self::All => " ORDER BY created_at DESC, id".to_string(),
+            Self::All => " ORDER BY created_at DESC, rowid DESC".to_string(),
             Self::Active => " WHERE state IN ('running', 'queued') \
                 ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, \
-                priority DESC, created_at ASC, id"
+                priority DESC, created_at ASC, rowid ASC"
                 .to_string(),
-            Self::Running => " WHERE state = 'running' ORDER BY started_at ASC, id".to_string(),
-            Self::Queued => {
-                " WHERE state = 'queued' ORDER BY priority DESC, created_at ASC, id".to_string()
+            Self::Running => {
+                " WHERE state = 'running' ORDER BY started_at ASC, rowid ASC".to_string()
             }
+            Self::Queued => format!(" WHERE state = 'queued' ORDER BY {QUEUE_ORDER}"),
+            // Every finished job has `finished_at`, and the partial index
+            // `idx_jobs_finished` holds exactly these rows in this order.
+            // Without statistics SQLite would pick the state index and sort
+            // the whole history, so the index is named.
             Self::History => format!(
-                " WHERE state IN {FINISHED_STATES} \
-                 ORDER BY COALESCE(finished_at, created_at) DESC, id"
+                " INDEXED BY idx_jobs_finished WHERE state IN {FINISHED_STATES} \
+                 ORDER BY finished_at DESC, rowid DESC"
             ),
         }
     }
+}
+
+/// Queue order: highest priority, then oldest, then the order of creation.
+const QUEUE_ORDER: &str = "priority DESC, created_at ASC, rowid ASC";
+
+async fn list_page(
+    pool: &SqlitePool,
+    filter: JobFilter,
+    limit: u32,
+    offset: u32,
+) -> sqlx::Result<Vec<Job>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS} FROM jobs{} LIMIT ? OFFSET ?",
+        filter.clause()
+    ))
+    .bind(i64::from(limit))
+    .bind(i64::from(offset))
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(from_row).collect()
+}
+
+/// The query plan of a job page (for tests).
+#[cfg(test)]
+pub async fn explain_list(pool: &SqlitePool, filter: JobFilter) -> Vec<String> {
+    let rows = sqlx::query(&format!(
+        "EXPLAIN QUERY PLAN SELECT {COLUMNS} FROM jobs{} LIMIT 50 OFFSET 0",
+        filter.clause()
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    rows.iter()
+        .filter_map(|r| r.try_get::<String, _>("detail").ok())
+        .collect()
+}
+
+async fn count(pool: &SqlitePool, filter: JobFilter) -> sqlx::Result<u64> {
+    let clause = filter.clause();
+    let where_part = clause.split(" ORDER BY").next().unwrap_or_default();
+    let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM jobs{where_part}"))
+        .fetch_one(pool)
+        .await?;
+    Ok(u64::try_from(total).unwrap_or(0))
 }
 
 /// A page of jobs and the total count for the filter.
@@ -127,29 +178,33 @@ pub async fn list(
     limit: u32,
     offset: u32,
 ) -> sqlx::Result<(Vec<Job>, u64)> {
-    let clause = filter.clause();
-    let where_part = clause.split(" ORDER BY").next().unwrap_or_default();
-    let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM jobs{where_part}"))
-        .fetch_one(pool)
-        .await?;
-    let rows = sqlx::query(&format!(
-        "SELECT {COLUMNS} FROM jobs{clause} LIMIT ? OFFSET ?"
-    ))
-    .bind(i64::from(limit))
-    .bind(i64::from(offset))
-    .fetch_all(pool)
-    .await?;
-    let items = rows
-        .iter()
-        .map(from_row)
-        .collect::<sqlx::Result<Vec<_>>>()?;
-    Ok((items, u64::try_from(total).unwrap_or(0)))
+    if filter != JobFilter::Active {
+        let total = count(pool, filter).await?;
+        return Ok((list_page(pool, filter, limit, offset).await?, total));
+    }
+    // Running jobs first, then the queue. Paged as two index-ordered ranges
+    // so a queue of tens of thousands is never sorted as a whole.
+    let running = count(pool, JobFilter::Running).await?;
+    let queued = count(pool, JobFilter::Queued).await?;
+    let offset64 = u64::from(offset);
+    let mut items = if offset64 < running {
+        list_page(pool, JobFilter::Running, limit, offset).await?
+    } else {
+        Vec::new()
+    };
+    let remaining = limit.saturating_sub(u32::try_from(items.len()).unwrap_or(u32::MAX));
+    if remaining > 0 {
+        let queue_offset = u32::try_from(offset64.saturating_sub(running)).unwrap_or(u32::MAX);
+        items.extend(list_page(pool, JobFilter::Queued, remaining, queue_offset).await?);
+    }
+    Ok((items, running + queued))
 }
 
 /// The newest jobs of a file.
 pub async fn for_file(pool: &SqlitePool, file_id: Uuid, limit: u32) -> sqlx::Result<Vec<Job>> {
     let rows = sqlx::query(&format!(
-        "SELECT {COLUMNS} FROM jobs WHERE file_id = ? ORDER BY created_at DESC, id LIMIT ?"
+        "SELECT {COLUMNS} FROM jobs WHERE file_id = ? ORDER BY created_at DESC, rowid DESC \
+         LIMIT ?"
     ))
     .bind(file_id.to_string())
     .bind(i64::from(limit))
@@ -206,23 +261,117 @@ pub async fn create(conn: &mut SqliteConnection, new: &NewJob<'_>) -> sqlx::Resu
     Ok(Some(id))
 }
 
+/// Queue many files at once (one job each, in the given order), but only
+/// those whose status is one of `only_if` (which must not include `queued`
+/// or `processing`). Two statements for the whole list, so large selections
+/// stay fast; callers pass a few hundred files at a time. Returns how many
+/// were queued.
+pub async fn create_many(
+    conn: &mut SqliteConnection,
+    file_ids: &[Uuid],
+    only_if: &[FileStatus],
+) -> sqlx::Result<u64> {
+    let allowed: Vec<&str> = only_if
+        .iter()
+        .filter(|s| !matches!(s, FileStatus::Queued | FileStatus::Processing))
+        .map(|s| s.as_str())
+        .collect();
+    if file_ids.is_empty() || allowed.is_empty() {
+        return Ok(0);
+    }
+    let now = now_ts();
+    let new_rows = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push("WITH new(job_id, file_id, pos) AS (VALUES ");
+        let mut sep = qb.separated(", ");
+        for (pos, id) in file_ids.iter().enumerate() {
+            sep.push("(")
+                .push_bind_unseparated(Uuid::new_v4().to_string())
+                .push_unseparated(", ")
+                .push_bind_unseparated(id.to_string())
+                .push_unseparated(", ")
+                .push_bind_unseparated(i64::try_from(pos).unwrap_or(i64::MAX))
+                .push_unseparated(")");
+        }
+        qb.push(") ");
+    };
+    let status_filter = |qb: &mut QueryBuilder<'_, Sqlite>| {
+        qb.push("+f.status IN (");
+        let mut sep = qb.separated(", ");
+        for s in &allowed {
+            sep.push_bind(*s);
+        }
+        qb.push(")");
+    };
+
+    let mut qb = QueryBuilder::<Sqlite>::new("");
+    new_rows(&mut qb);
+    qb.push(
+        "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, stage, \
+         priority, progress, attempt, input_size, created_at) \
+         SELECT new.job_id, f.id, f.library_id, f.file_name, f.path, 'queued', 'waiting', \
+         0, 0, 0, f.size_bytes, ",
+    );
+    qb.push_bind(&now)
+        .push(" FROM new JOIN files f ON f.id = new.file_id WHERE ");
+    status_filter(&mut qb);
+    qb.push(" ORDER BY new.pos");
+    qb.build().execute(&mut *conn).await?;
+
+    // Point each file at the job just created for it.
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "UPDATE files AS f SET status = 'queued', skip_reason = NULL, error = NULL, updated_at = ",
+    );
+    qb.push_bind(&now).push(
+        ", job_id = (SELECT j.id FROM jobs j WHERE j.file_id = f.id AND j.state = 'queued' \
+         ORDER BY j.rowid DESC LIMIT 1) WHERE f.id IN (",
+    );
+    let mut sep = qb.separated(", ");
+    for id in file_ids {
+        sep.push_bind(id.to_string());
+    }
+    qb.push(") AND ");
+    status_filter(&mut qb);
+    Ok(qb.build().execute(conn).await?.rows_affected())
+}
+
 /// Claim the next queued job of an enabled library: mark it running and its
-/// file processing, atomically. Returns the claimed job.
-pub async fn claim_next(db: &Db) -> sqlx::Result<Option<Job>> {
+/// file processing, atomically. Jobs of `skip_libraries` (folders that are
+/// offline) and `skip_jobs` (waiting for a file to settle) are passed over.
+/// Returns the claimed job.
+pub async fn claim_next(
+    db: &Db,
+    skip_libraries: &[Uuid],
+    skip_jobs: &[Uuid],
+) -> sqlx::Result<Option<Job>> {
     let mut tx = db.write_tx().await?;
     let now = now_ts();
-    let claimed: Option<String> = sqlx::query_scalar(
+    let mut qb = QueryBuilder::<Sqlite>::new(
         "UPDATE jobs SET state = 'running', stage = 'preparing', progress = 0, fps = NULL, \
          speed = NULL, eta_secs = NULL, attempt = 1, error = NULL, skip_reason = NULL, \
-         started_at = ?, finished_at = NULL \
-         WHERE id = (SELECT j.id FROM jobs j JOIN libraries l ON l.id = j.library_id \
-                     WHERE j.state = 'queued' AND l.enabled = 1 \
-                     ORDER BY j.priority DESC, j.created_at ASC, j.id LIMIT 1) \
-         RETURNING id",
-    )
-    .bind(&now)
-    .fetch_optional(&mut *tx)
-    .await?;
+         finished_at = NULL, started_at = ",
+    );
+    qb.push_bind(now.clone()).push(
+        " WHERE id = (SELECT j.id FROM jobs j JOIN libraries l ON l.id = j.library_id \
+         WHERE j.state = 'queued' AND l.enabled = 1",
+    );
+    if !skip_libraries.is_empty() {
+        qb.push(" AND j.library_id NOT IN (");
+        let mut sep = qb.separated(", ");
+        for id in skip_libraries {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+    }
+    if !skip_jobs.is_empty() {
+        qb.push(" AND j.id NOT IN (");
+        let mut sep = qb.separated(", ");
+        for id in skip_jobs {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+    }
+    qb.push(" ORDER BY j.priority DESC, j.created_at ASC, j.rowid ASC LIMIT 1) RETURNING id");
+    let claimed: Option<String> = qb.build_query_scalar().fetch_optional(&mut *tx).await?;
     let Some(id) = claimed else {
         tx.rollback().await?;
         return Ok(None);
@@ -382,6 +531,53 @@ pub async fn max_queued_priority(pool: &SqlitePool) -> sqlx::Result<Option<i32>>
     Ok(v.map(|v| i32::try_from(v).unwrap_or(i32::MAX)))
 }
 
+/// Finished jobs kept by [`trim_history`], newest first.
+pub const HISTORY_KEEP_ROWS: i64 = 5_000;
+/// Finished jobs older than this many days are trimmed by [`trim_history`].
+pub const HISTORY_KEEP_DAYS: i64 = 90;
+/// Rows deleted per transaction while trimming.
+const TRIM_CHUNK: u64 = 500;
+
+/// Delete old finished jobs: those older than [`HISTORY_KEEP_DAYS`] and those
+/// beyond the newest [`HISTORY_KEEP_ROWS`]. The job each file points at is
+/// always kept (the file's detail page shows it). Works in small chunks so it
+/// never holds the write lock for long. Returns how many were deleted.
+pub async fn trim_history(db: &Db) -> sqlx::Result<u64> {
+    let cutoff = super::ts(chrono::Utc::now() - chrono::Duration::days(HISTORY_KEEP_DAYS));
+    let oldest_kept: Option<String> = sqlx::query_scalar(&format!(
+        "SELECT finished_at FROM jobs{} LIMIT 1 OFFSET ?",
+        JobFilter::History.clause()
+    ))
+    .bind(HISTORY_KEEP_ROWS - 1)
+    .fetch_optional(db.pool())
+    .await?;
+    // Whichever limit reaches further back in time wins.
+    let boundary = match oldest_kept {
+        Some(t) if t > cutoff => t,
+        _ => cutoff,
+    };
+    let mut deleted = 0;
+    loop {
+        let mut tx = db.write_tx().await?;
+        let n = sqlx::query(&format!(
+            "DELETE FROM jobs WHERE rowid IN (SELECT rowid FROM jobs \
+             WHERE state IN {FINISHED_STATES} AND finished_at < ? \
+             AND id NOT IN (SELECT job_id FROM files WHERE job_id IS NOT NULL) LIMIT ?)"
+        ))
+        .bind(&boundary)
+        .bind(i64_of(TRIM_CHUNK))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        deleted += n;
+        if n < TRIM_CHUNK {
+            return Ok(deleted);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Delete finished jobs. Files keep their status. Returns the count.
 pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
     let mut tx = db.write_tx().await?;
@@ -443,23 +639,4 @@ pub async fn counts(pool: &SqlitePool) -> sqlx::Result<(u32, u32)> {
         u32::try_from(running).unwrap_or(0),
         u32::try_from(queued).unwrap_or(0),
     ))
-}
-
-/// Ids of queued jobs whose file is in the selection.
-pub async fn queued_for_files(pool: &SqlitePool, file_ids: &[Uuid]) -> sqlx::Result<Vec<Uuid>> {
-    let mut out = Vec::new();
-    for chunk in file_ids.chunks(500) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id FROM jobs WHERE state = 'queued' AND file_id IN (",
-        );
-        let mut sep = qb.separated(", ");
-        for id in chunk {
-            sep.push_bind(id.to_string());
-        }
-        qb.push(")");
-        for row in qb.build().fetch_all(pool).await? {
-            out.push(uuid_col(&row, "id")?);
-        }
-    }
-    Ok(out)
 }

@@ -4,6 +4,7 @@ mod dispatcher;
 mod files;
 mod fs_browse;
 mod libraries;
+mod regressions;
 mod scan;
 mod settings;
 mod startup;

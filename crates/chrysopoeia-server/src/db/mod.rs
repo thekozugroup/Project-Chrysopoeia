@@ -34,6 +34,11 @@ pub const DB_FILE_NAME: &str = "chrysopoeia.db";
 /// A write transaction.
 pub type Tx = Transaction<'static, Sqlite>;
 
+/// How long a writer waits for another writer before giving up. Generous,
+/// because Unraid appdata often lives on spinning disks; long operations
+/// commit in chunks so no single write holds the lock for anywhere near this.
+pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Connection pool plus helpers.
 #[derive(Debug, Clone)]
 pub struct Db {
@@ -43,17 +48,22 @@ pub struct Db {
 impl Db {
     /// Open (creating if needed) the database at `path` and run migrations.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with(path, DEFAULT_BUSY_TIMEOUT).await
+    }
+
+    /// [`Db::open`] with a specific busy timeout (tests shorten it).
+    pub async fn open_with(path: &Path, busy_timeout: Duration) -> anyhow::Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(Duration::from_secs(5));
+            .busy_timeout(busy_timeout);
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .min_connections(1)
-            .acquire_timeout(Duration::from_secs(30))
+            .acquire_timeout(busy_timeout.max(Duration::from_secs(30)))
             .connect_with(options)
             .await
             .with_context(|| {
@@ -164,6 +174,20 @@ pub fn u64_col(row: &SqliteRow, column: &str) -> sqlx::Result<u64> {
 pub fn opt_u64_col(row: &SqliteRow, column: &str) -> sqlx::Result<Option<u64>> {
     let v: Option<i64> = row.try_get(column)?;
     Ok(v.map(|v| u64::try_from(v).unwrap_or(0)))
+}
+
+/// Whether a database error is temporary (another writer holds the lock, a
+/// full disk or an I/O hiccup), so the operation is worth retrying.
+pub fn is_transient(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) => true,
+        sqlx::Error::Database(d) => d
+            .code()
+            .and_then(|c| c.parse::<i32>().ok())
+            // Primary result codes: BUSY, LOCKED, IOERR, FULL.
+            .is_some_and(|c| matches!(c & 0xff, 5 | 6 | 10 | 13)),
+        _ => false,
+    }
 }
 
 /// Convert a byte count for storage.

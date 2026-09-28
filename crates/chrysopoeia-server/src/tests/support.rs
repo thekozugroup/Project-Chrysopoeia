@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use axum::Router;
@@ -53,8 +53,63 @@ pub enum Behavior {
     Panic,
 }
 
+/// Holds library walks after they have listed the files, so a test can
+/// change things while a scan is in progress.
+#[derive(Default)]
+pub struct WalkGate {
+    closed: AtomicBool,
+    reached: AtomicBool,
+    open: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl WalkGate {
+    /// Hold the next walks.
+    pub fn close(&self) {
+        *self.open.lock().unwrap() = false;
+        self.reached.store(false, Ordering::SeqCst);
+        self.closed.store(true, Ordering::SeqCst);
+    }
+
+    /// Let held and future walks through.
+    pub fn release(&self) {
+        self.closed.store(false, Ordering::SeqCst);
+        *self.open.lock().unwrap() = true;
+        self.cv.notify_all();
+    }
+
+    /// Whether a walk is being held.
+    pub fn reached(&self) -> bool {
+        self.reached.load(Ordering::SeqCst)
+    }
+
+    /// Wait until a walk is being held.
+    pub async fn wait_reached(self: &Arc<Self>) {
+        let me = Arc::clone(self);
+        wait_until("walk to be held", move || {
+            let me = Arc::clone(&me);
+            async move { me.reached() }
+        })
+        .await;
+    }
+
+    fn pass(&self) {
+        if !self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.reached.store(true, Ordering::SeqCst);
+        let open = self.open.lock().unwrap();
+        // Bounded, so a test that forgets to release can't hang forever.
+        let _ = self
+            .cv
+            .wait_timeout_while(open, Duration::from_secs(30), |open| !*open)
+            .unwrap();
+    }
+}
+
 /// Fake media tools with knobs for tests.
 pub struct FakeToolkit {
+    pub walk_gate: Arc<WalkGate>,
     pub behaviors: Mutex<HashMap<String, Behavior>>,
     pub default_behavior: Mutex<Behavior>,
     pub release: Arc<Semaphore>,
@@ -74,6 +129,7 @@ pub struct FakeToolkit {
 impl Default for FakeToolkit {
     fn default() -> Self {
         Self {
+            walk_gate: Arc::new(WalkGate::default()),
             behaviors: Mutex::new(HashMap::new()),
             default_behavior: Mutex::new(Behavior::Done { ratio: 0.5 }),
             release: Arc::new(Semaphore::new(0)),
@@ -427,7 +483,9 @@ impl MediaToolkit for Arc<FakeToolkit> {
 
     fn walk_library(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
         self.walks.lock().unwrap().push(root.to_path_buf());
-        walk(root, opts)
+        let result = walk(root, opts);
+        self.walk_gate.pass();
+        result
     }
 
     fn probe_file(
@@ -622,6 +680,8 @@ impl TestApp {
             data_dir: root.join("data"),
             web_dir: root.join("web"),
             browse_roots: vec![media.clone()],
+            // Test files are written right before they are scanned.
+            settle: Duration::ZERO,
             ..Config::default()
         };
         (opts.configure)(&mut config, &root);

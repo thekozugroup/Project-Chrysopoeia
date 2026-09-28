@@ -184,25 +184,14 @@ pub async fn get_conn(
     row.as_ref().map(|r| from_row(r, with_probe)).transpose()
 }
 
-/// Several files by id (without probes), in no particular order.
-pub async fn get_many(pool: &SqlitePool, ids: &[Uuid]) -> sqlx::Result<Vec<MediaFile>> {
-    let mut out = Vec::with_capacity(ids.len());
-    for chunk in ids.chunks(500) {
-        let mut qb =
-            QueryBuilder::<Sqlite>::new(format!("SELECT {COLUMNS} {FROM} WHERE f.id IN ("));
-        let mut sep = qb.separated(", ");
-        for id in chunk {
-            sep.push_bind(id.to_string());
-        }
-        qb.push(")");
-        for row in qb.build().fetch_all(pool).await? {
-            out.push(from_row(&row, false)?);
-        }
-    }
-    Ok(out)
-}
+/// Start of the error a job records when its input file is gone. Scans look
+/// at such files again when they reappear unchanged (a share that was briefly
+/// disconnected).
+pub const MISSING_INPUT_ERROR: &str = "The file is no longer at ";
 
-/// What a scan needs to know about a stored file.
+/// What a scan needs to know about a stored file. Also the guard for writing
+/// the scan's result: a row that changed since it was read (a job finished,
+/// a watch event, the user) is left alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
     pub id: Uuid,
@@ -211,7 +200,14 @@ pub struct IndexEntry {
     /// Stored timestamp string (compare with [`ts`] of the disk mtime).
     pub modified_at: String,
     pub status: FileStatus,
+    /// Stored `updated_at`, which every write changes.
+    pub updated_at: String,
+    /// The last job failed because the file was missing.
+    pub missing_input: bool,
 }
+
+const INDEX_COLUMNS: &str = "id, path, size_bytes, modified_at, status, updated_at, \
+    (status = 'failed' AND substr(COALESCE(error, ''), 1, length(?1)) = ?1) AS missing_input";
 
 fn index_from_row(row: &SqliteRow) -> sqlx::Result<IndexEntry> {
     let status: String = row.try_get("status")?;
@@ -222,14 +218,17 @@ fn index_from_row(row: &SqliteRow) -> sqlx::Result<IndexEntry> {
         modified_at: row.try_get("modified_at")?,
         status: FileStatus::parse(&status)
             .ok_or_else(|| super::decode_error(format!("bad file status {status:?}")))?,
+        updated_at: row.try_get("updated_at")?,
+        missing_input: row.try_get("missing_input")?,
     })
 }
 
 /// Index of every file in a library.
 pub async fn index(pool: &SqlitePool, library_id: Uuid) -> sqlx::Result<Vec<IndexEntry>> {
-    let rows = sqlx::query(
-        "SELECT id, path, size_bytes, modified_at, status FROM files WHERE library_id = ?",
-    )
+    let rows = sqlx::query(&format!(
+        "SELECT {INDEX_COLUMNS} FROM files WHERE library_id = ?2"
+    ))
+    .bind(MISSING_INPUT_ERROR)
     .bind(library_id.to_string())
     .fetch_all(pool)
     .await?;
@@ -246,11 +245,13 @@ pub async fn find_by_path_conn(
     conn: &mut SqliteConnection,
     path: &str,
 ) -> sqlx::Result<Option<IndexEntry>> {
-    let row =
-        sqlx::query("SELECT id, path, size_bytes, modified_at, status FROM files WHERE path = ?")
-            .bind(path)
-            .fetch_optional(conn)
-            .await?;
+    let row = sqlx::query(&format!(
+        "SELECT {INDEX_COLUMNS} FROM files WHERE path = ?2"
+    ))
+    .bind(MISSING_INPUT_ERROR)
+    .bind(path)
+    .fetch_optional(conn)
+    .await?;
     row.as_ref().map(index_from_row).transpose()
 }
 
@@ -347,11 +348,12 @@ pub async fn insert(conn: &mut SqliteConnection, f: &FileUpsert) -> sqlx::Result
 }
 
 /// Replace a changed file's row. Savings from an earlier conversion no longer
-/// apply to the new content, so they are cleared. Queued and processing rows
-/// are left alone; returns whether the row was updated.
+/// apply to the new content, so they are cleared. The row is only updated
+/// when it still matches `seen` (nothing wrote it since the scan read it) and
+/// is not queued or processing; returns whether it was updated.
 pub async fn update_scanned(
     conn: &mut SqliteConnection,
-    id: Uuid,
+    seen: &IndexEntry,
     f: &FileUpsert,
 ) -> sqlx::Result<bool> {
     let pc = ProbeColumns::from_probe(f.probe.as_ref())?;
@@ -361,7 +363,8 @@ pub async fn update_scanned(
          status = ?, probe = ?, container = ?, video_codec = ?, audio_codec = ?, \
          resolution = ?, hdr = ?, duration_secs = ?, bit_rate = ?, skip_reason = ?, error = ?, \
          original_size_bytes = NULL, saved_bytes = NULL, scanned_at = ?, updated_at = ? \
-         WHERE id = ? AND status NOT IN ('queued', 'processing')",
+         WHERE id = ? AND status NOT IN ('queued', 'processing') AND updated_at = ? \
+         AND size_bytes = ? AND modified_at = ?",
     )
     .bind(&f.relative_path)
     .bind(&f.file_name)
@@ -380,7 +383,10 @@ pub async fn update_scanned(
     .bind(&f.error)
     .bind(&now)
     .bind(&now)
-    .bind(id.to_string())
+    .bind(seen.id.to_string())
+    .bind(&seen.updated_at)
+    .bind(i64_of(seen.size_bytes))
+    .bind(&seen.modified_at)
     .execute(conn)
     .await?;
     Ok(done.rows_affected() > 0)
@@ -473,6 +479,32 @@ pub async fn apply_replacement(
     Ok(())
 }
 
+/// Set a file's status, reason and error, but only while its status is one
+/// of `only_if`. Returns whether the row changed.
+pub async fn set_status_where(
+    conn: &mut SqliteConnection,
+    id: Uuid,
+    status: FileStatus,
+    skip_reason: Option<&str>,
+    only_if: &[FileStatus],
+) -> sqlx::Result<bool> {
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = ");
+    qb.push_bind(status.as_str())
+        .push(", skip_reason = ")
+        .push_bind(skip_reason)
+        .push(", error = NULL, updated_at = ")
+        .push_bind(now_ts())
+        .push(" WHERE id = ")
+        .push_bind(id.to_string())
+        .push(" AND status IN (");
+    let mut sep = qb.separated(", ");
+    for s in only_if {
+        sep.push_bind(s.as_str());
+    }
+    qb.push(")");
+    Ok(qb.build().execute(conn).await?.rows_affected() > 0)
+}
+
 /// Set a file's status, reason and error (and optionally its job).
 pub async fn set_status(
     conn: &mut SqliteConnection,
@@ -494,17 +526,98 @@ pub async fn set_status(
     Ok(())
 }
 
-/// Delete files by id. Their jobs cascade.
-pub async fn delete_ids(conn: &mut SqliteConnection, ids: &[Uuid]) -> sqlx::Result<u64> {
+/// Mark files "skipped by the user" in one statement: those among `ids`
+/// whose status is still one of `statuses` (except `processing`, which needs
+/// its job cancelled first). Their queued jobs are cancelled. Returns how
+/// many files were skipped and the ids of those that are processing.
+pub async fn skip_many(
+    conn: &mut SqliteConnection,
+    ids: &[Uuid],
+    statuses: &[FileStatus],
+    reason: &str,
+) -> sqlx::Result<(u64, Vec<Uuid>)> {
+    let now = now_ts();
+    let mut qb =
+        QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE status = 'processing' AND id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.to_string());
+    }
+    qb.push(")");
+    let processing = qb
+        .build()
+        .fetch_all(&mut *conn)
+        .await?
+        .iter()
+        .map(|r| uuid_col(r, "id"))
+        .collect::<sqlx::Result<Vec<_>>>()?;
+
+    let skippable: Vec<&str> = statuses
+        .iter()
+        .filter(|s| **s != FileStatus::Processing)
+        .map(|s| s.as_str())
+        .collect();
+    if skippable.is_empty() {
+        return Ok((0, processing));
+    }
+    // The files to skip, looked up by id. (`+status` keeps SQLite from
+    // scanning the status index instead of the id lookups.)
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.to_string());
+    }
+    qb.push(") AND +status IN (");
+    let mut sep = qb.separated(", ");
+    for s in &skippable {
+        sep.push_bind(*s);
+    }
+    qb.push(")");
+    let targets: Vec<String> = qb.build_query_scalar().fetch_all(&mut *conn).await?;
+    if targets.is_empty() {
+        return Ok((0, processing));
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE jobs SET state = 'cancelled', finished_at = ");
+    qb.push_bind(&now).push(" WHERE file_id IN (");
+    let mut sep = qb.separated(", ");
+    for id in &targets {
+        sep.push_bind(id.as_str());
+    }
+    qb.push(") AND +state = 'queued'");
+    qb.build().execute(&mut *conn).await?;
+
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 'skipped', skip_reason = ");
+    qb.push_bind(reason)
+        .push(", error = NULL, updated_at = ")
+        .push_bind(&now)
+        .push(" WHERE id IN (");
+    let mut sep = qb.separated(", ");
+    for id in &targets {
+        sep.push_bind(id.as_str());
+    }
+    qb.push(")");
+    let skipped = qb.build().execute(&mut *conn).await?.rows_affected();
+    Ok((skipped, processing))
+}
+
+/// Delete the rows of files a scan no longer found, unless a row changed
+/// since the scan read it (a job moved it to a new name, a watch event) or
+/// is being processed. Their jobs cascade. Returns how many were deleted.
+pub async fn delete_unchanged(
+    conn: &mut SqliteConnection,
+    seen: &[IndexEntry],
+) -> sqlx::Result<u64> {
     let mut deleted = 0;
-    for chunk in ids.chunks(500) {
-        let mut qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
-        let mut sep = qb.separated(", ");
-        for id in chunk {
-            sep.push_bind(id.to_string());
-        }
-        qb.push(")");
-        deleted += qb.build().execute(&mut *conn).await?.rows_affected();
+    for e in seen {
+        deleted += sqlx::query(
+            "DELETE FROM files WHERE id = ? AND updated_at = ? AND status != 'processing'",
+        )
+        .bind(e.id.to_string())
+        .bind(&e.updated_at)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
     }
     Ok(deleted)
 }
@@ -537,36 +650,78 @@ pub struct RedecideCandidate {
     pub id: Uuid,
     pub status: FileStatus,
     pub probe: ProbeInfo,
+    pub skip_reason: Option<String>,
+    /// A finished job skipped it because the result was not small enough
+    /// (as opposed to a decision that needed no job at all).
+    pub size_rule_skip: bool,
 }
 
-/// `pending` and `skipped` files of a library that have a probe, except files
-/// the user skipped by hand.
-pub async fn redecide_candidates(
+/// Condition for files a profile change re-decides: `pending` and `skipped`
+/// files with a probe, except files the user skipped by hand (`?` is the
+/// user's skip reason).
+const REDECIDE_FILTER: &str = "f.status IN ('pending', 'skipped') AND f.probe IS NOT NULL \
+    AND (f.skip_reason IS NULL OR f.skip_reason != ?)";
+
+/// Ids of the files of a library a profile change re-decides.
+pub async fn redecide_candidate_ids(
     pool: &SqlitePool,
     library_id: Uuid,
     user_skip_reason: &str,
-) -> sqlx::Result<Vec<RedecideCandidate>> {
-    let rows = sqlx::query(
-        "SELECT id, status, probe FROM files WHERE library_id = ? \
-         AND status IN ('pending', 'skipped') AND probe IS NOT NULL \
-         AND (skip_reason IS NULL OR skip_reason != ?)",
-    )
+) -> sqlx::Result<Vec<Uuid>> {
+    let rows = sqlx::query(&format!(
+        "SELECT f.id FROM files f WHERE f.library_id = ? AND {REDECIDE_FILTER}"
+    ))
     .bind(library_id.to_string())
     .bind(user_skip_reason)
     .fetch_all(pool)
     .await?;
+    rows.iter().map(|r| uuid_col(r, "id")).collect()
+}
+
+/// The files among `ids` that still qualify for re-deciding, with their
+/// probes. Read inside the caller's write transaction so the rows can't
+/// change before they are written.
+pub async fn redecide_candidates(
+    conn: &mut SqliteConnection,
+    ids: &[Uuid],
+    user_skip_reason: &str,
+) -> sqlx::Result<Vec<RedecideCandidate>> {
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT f.id, f.status, f.probe, f.skip_reason, \
+         (f.status = 'skipped' AND j.state = 'skipped' AND j.output_size IS NOT NULL \
+          AND j.skip_reason IS f.skip_reason) AS size_rule_skip \
+         FROM files f LEFT JOIN jobs j ON j.id = f.job_id WHERE f.id IN (",
+    );
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.to_string());
+    }
+    // `REDECIDE_FILTER` with its one parameter bound in place.
+    let (before, after) = REDECIDE_FILTER
+        .split_once('?')
+        .unwrap_or((REDECIDE_FILTER, ""));
+    qb.push(") AND ")
+        .push(before)
+        .push_bind(user_skip_reason)
+        .push(after);
+    let rows = qb.build().fetch_all(conn).await?;
     let mut out = Vec::with_capacity(rows.len());
     for row in &rows {
+        let id = uuid_col(row, "id")?;
         let status: String = row.try_get("status")?;
         let probe: String = row.try_get("probe")?;
+        let size_rule_skip: Option<bool> = row.try_get("size_rule_skip")?;
+        let skip_reason: Option<String> = row.try_get("skip_reason")?;
         let Some(status) = FileStatus::parse(&status) else {
             continue;
         };
         match parse_json::<ProbeInfo>(&probe) {
             Ok(probe) => out.push(RedecideCandidate {
-                id: uuid_col(row, "id")?,
+                id,
                 status,
                 probe,
+                skip_reason,
+                size_rule_skip: size_rule_skip.unwrap_or(false),
             }),
             Err(e) => tracing::warn!("skipping a stored probe that no longer parses: {e}"),
         }

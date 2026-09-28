@@ -3,13 +3,14 @@
 //! Version 1 is the schema in `docs/ARCHITECTURE.md`. A database at version 0
 //! (the prototype's `media_files`/`library_paths`/`config` tables, or an
 //! interrupted first start) only ever held re-scannable data, so every table
-//! in it is dropped and the schema is created from scratch.
+//! in it is dropped and the schema is created from scratch. Later versions
+//! are applied step by step on top of version 1 and keep the data.
 
 use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -97,6 +98,22 @@ const SCHEMA_V1: &[&str] = &[
     )",
 ];
 
+/// Version 2: indexes for the job history, the job list and a file's jobs
+/// (so those pages don't sort the whole table), and `finished_at` on every
+/// finished job (the history is ordered by it).
+const MIGRATION_V2: &[&str] = &[
+    "UPDATE jobs SET finished_at = COALESCE(finished_at, started_at, created_at) \
+     WHERE state IN ('done', 'skipped', 'failed', 'cancelled') AND finished_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_finished ON jobs(finished_at) \
+     WHERE state IN ('done', 'skipped', 'failed', 'cancelled')",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)",
+    "DROP INDEX IF EXISTS idx_jobs_file",
+    "CREATE INDEX idx_jobs_file ON jobs(file_id, created_at)",
+];
+
+/// Steps applied on top of version 1, in order: (version reached, statements).
+const MIGRATIONS: &[(i64, &[&str])] = &[(2, MIGRATION_V2)];
+
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
@@ -112,7 +129,31 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
              Update Chrysopoeia, or move the database file away to start fresh."
         );
     }
+    if version < 1 {
+        create_v1(&mut conn).await?;
+    }
+    for (target, statements) in MIGRATIONS {
+        if *target <= version {
+            continue;
+        }
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        for statement in *statements {
+            sqlx::query(statement)
+                .execute(&mut *tx)
+                .await
+                .with_context(|| format!("could not update the database to version {target}"))?;
+        }
+        sqlx::query(&format!("PRAGMA user_version = {target}"))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        tracing::info!(version = target, "database updated");
+    }
+    Ok(())
+}
 
+/// Replace whatever a version-0 database holds with the version 1 schema.
+async fn create_v1(conn: &mut sqlx::SqliteConnection) -> anyhow::Result<()> {
     // Dropping tables that reference each other needs foreign keys off, and
     // the pragma cannot change inside a transaction.
     sqlx::query("PRAGMA foreign_keys = OFF")
@@ -136,7 +177,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         for statement in SCHEMA_V1 {
             sqlx::query(statement).execute(&mut *tx).await?;
         }
-        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+        sqlx::query("PRAGMA user_version = 1")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -147,7 +188,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         .execute(&mut *conn)
         .await?;
     result.context("could not create the database tables")?;
-    tracing::info!(version = SCHEMA_VERSION, "database schema created");
+    tracing::info!("database schema created");
     Ok(())
 }
 
@@ -167,7 +208,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_database_gets_v1() {
+    async fn fresh_database_gets_the_current_schema() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("t.db")).await.unwrap();
         let v: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -241,6 +282,68 @@ mod tests {
         assert!(!names.contains(&"library_paths".to_string()));
         assert!(!names.contains(&"config".to_string()));
         assert!(names.contains(&"files".to_string()));
+    }
+
+    #[tokio::test]
+    async fn version_1_is_upgraded_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            create_v1(&mut conn).await.unwrap();
+            for sql in [
+                "INSERT INTO libraries (id, name, path, profile, created_at) \
+                 VALUES ('l', 'Movies', '/m', '{}', '2026-01-01T00:00:00.000Z')",
+                "INSERT INTO files (id, library_id, path, relative_path, file_name, size_bytes, \
+                 modified_at, status, scanned_at, updated_at) VALUES ('f', 'l', '/m/a.mkv', \
+                 'a.mkv', 'a.mkv', 1, 'x', 'done', 'x', 'x')",
+                "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, stage, \
+                 created_at) VALUES ('j', 'f', 'l', 'a.mkv', '/m/a.mkv', 'failed', 'waiting', \
+                 '2026-01-02T00:00:00.000Z')",
+            ] {
+                sqlx::query(sql).execute(&mut *conn).await.unwrap();
+            }
+            drop(conn);
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let v: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let finished: Option<String> =
+            sqlx::query_scalar("SELECT finished_at FROM jobs WHERE id = 'j'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(finished.as_deref(), Some("2026-01-02T00:00:00.000Z"));
+        // The job pages read an index in order instead of sorting the table.
+        for filter in [
+            crate::db::jobs::JobFilter::History,
+            crate::db::jobs::JobFilter::Queued,
+            crate::db::jobs::JobFilter::All,
+        ] {
+            let plan = crate::db::jobs::explain_list(db.pool(), filter).await;
+            assert!(
+                !plan.iter().any(|d| d.contains("TEMP B-TREE")),
+                "{filter:?}: {plan:?}"
+            );
+        }
+        let plan: Vec<String> = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT id FROM jobs WHERE file_id = 'f' \
+             ORDER BY created_at DESC, rowid DESC LIMIT 10",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get::<String, _>("detail"))
+        .collect();
+        assert!(!plan.iter().any(|d| d.contains("TEMP B-TREE")), "{plan:?}");
     }
 
     #[tokio::test]

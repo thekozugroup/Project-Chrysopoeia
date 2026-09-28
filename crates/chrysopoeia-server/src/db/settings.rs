@@ -10,6 +10,8 @@ pub const SETTINGS_KEY: &str = "settings";
 pub const QUEUE_PAUSED_KEY: &str = "queue_paused";
 /// Key of the "last shutdown was clean" flag.
 pub const CLEAN_SHUTDOWN_KEY: &str = "clean_shutdown";
+/// Key of the `HW_ACCEL` value last applied to the settings.
+pub const HW_ACCEL_APPLIED_KEY: &str = "hw_accel_applied";
 
 /// Read a raw value.
 pub async fn get_raw(pool: &SqlitePool, key: &str) -> sqlx::Result<Option<String>> {

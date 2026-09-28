@@ -8,6 +8,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, bail};
 use chrysopoeia_core::HwPreference;
@@ -73,6 +74,11 @@ pub struct Cli {
         default_missing_value = "true"
     )]
     pub dev_cors: Option<String>,
+    /// Extra host names the server answers to (comma-separated in the env
+    /// var), e.g. the domain of a reverse proxy. IP addresses, localhost and
+    /// local names (tower, tower.local) always work. `*` allows any name.
+    #[arg(long = "allowed-host", env = "ALLOWED_HOSTS", value_delimiter = ',')]
+    pub allowed_hosts: Vec<String>,
 }
 
 /// Resolved server configuration.
@@ -92,6 +98,15 @@ pub struct Config {
     pub libraries: Vec<PathBuf>,
     pub log_level: String,
     pub dev_cors: bool,
+    /// Extra host names the API answers to (lowercase, without port).
+    /// Contains `*` to allow any.
+    pub allowed_hosts: Vec<String>,
+    /// How long a file must go unmodified before it is converted, so files
+    /// still being copied are left alone. Not a command-line option.
+    pub settle: Duration,
+    /// How long a database writer waits for another. Not a command-line
+    /// option.
+    pub db_busy_timeout: Duration,
 }
 
 impl Default for Config {
@@ -110,9 +125,17 @@ impl Default for Config {
             libraries: Vec::new(),
             log_level: "info".into(),
             dev_cors: false,
+            allowed_hosts: Vec::new(),
+            settle: DEFAULT_SETTLE,
+            db_busy_timeout: crate::db::DEFAULT_BUSY_TIMEOUT,
         }
     }
 }
+
+/// How long a file's size and modification time must stay unchanged before
+/// it is picked up, so files still being copied are not converted
+/// half-written.
+pub const DEFAULT_SETTLE: Duration = Duration::from_secs(20);
 
 /// Trimmed value, or `None` when empty.
 fn non_empty(value: &str) -> Option<&str> {
@@ -148,6 +171,15 @@ pub fn parse_hw_preference(value: &str) -> anyhow::Result<HwPreference> {
              or v4l2m2m (got \"{value}\")"
         )
     })
+}
+
+/// Lowercase a host name and drop a port or URL scheme someone pasted along
+/// with it (`https://media.example.com:443/` becomes `media.example.com`).
+fn normalize_host_name(value: &str) -> String {
+    let v = value.trim().to_ascii_lowercase();
+    let v = v.split_once("://").map_or(v.as_str(), |(_, rest)| rest);
+    let v = v.split('/').next().unwrap_or_default();
+    crate::guard::split_host_port(v).0.to_string()
 }
 
 fn parse_bool(value: &str) -> anyhow::Result<bool> {
@@ -212,6 +244,14 @@ impl Cli {
                 None => false,
                 Some(v) => parse_bool(v)?,
             },
+            allowed_hosts: self
+                .allowed_hosts
+                .iter()
+                .filter_map(|h| non_empty(h))
+                .map(normalize_host_name)
+                .collect(),
+            settle: defaults.settle,
+            db_busy_timeout: defaults.db_busy_timeout,
         })
     }
 }
@@ -267,6 +307,21 @@ mod tests {
         assert_eq!(c.libraries, vec![PathBuf::from("/media/Movies")]);
         assert!(c.dev_cors);
         assert!(c.temp_dir.is_none(), "an empty value means unset");
+    }
+
+    #[test]
+    fn allowed_hosts_are_normalized() {
+        let c = parse(&[
+            "--allowed-host",
+            "Media.Example.com",
+            "--allowed-host",
+            "https://x.example.org:8443/",
+            "--allowed-host",
+            " ",
+        ])
+        .unwrap();
+        assert_eq!(c.allowed_hosts, ["media.example.com", "x.example.org"]);
+        assert!(parse(&[]).unwrap().allowed_hosts.is_empty());
     }
 
     #[test]

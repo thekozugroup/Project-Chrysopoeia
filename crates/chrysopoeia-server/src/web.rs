@@ -1,5 +1,6 @@
 //! The HTTP application: `/api` plus the static web UI, with compression,
-//! security headers, cache headers and panic protection.
+//! security headers, cache headers, panic protection, and the checks that
+//! keep other websites from using the API (see [`crate::guard`]).
 //!
 //! The UI is the statically exported Next.js app in `--web-dir`. Any GET that
 //! is not under `/api` and has no matching file gets `index.html` (the UI
@@ -28,6 +29,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::error::INTERNAL_MESSAGE;
+use crate::guard::RequestGuard;
 use crate::state::AppState;
 
 /// Shown when `--web-dir` has no `index.html`.
@@ -139,8 +141,18 @@ pub async fn app(state: AppState) -> Router {
 pub fn router(state: AppState, ui: bool) -> Router {
     let web_dir = state.config.web_dir.clone();
     let dev_cors = state.config.dev_cors;
-    let api = crate::api::router().with_state(state);
-    let mut app = Router::new().nest("/api", api);
+    let guard = Arc::new(RequestGuard::new(&state.config));
+    let api = crate::api::router()
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            guard,
+            crate::guard::middleware,
+        ));
+    // `/api/` itself is not covered by the nested router; it must not fall
+    // through to the UI either.
+    let mut app = Router::new()
+        .nest("/api", api)
+        .route("/api/", any(crate::api::not_found));
     app = if ui {
         app.fallback_service(static_ui(&web_dir))
     } else {

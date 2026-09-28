@@ -5,7 +5,13 @@
 //! priority, then oldest) in a transaction and starts a task for it. Each task
 //! loads the file, library profile and settings, asks the toolkit for encoder
 //! candidates, runs the job, forwards progress, and applies the outcome to the
-//! job and file rows.
+//! job and file rows. A result is never dropped: when the database is busy,
+//! recording it is retried until it succeeds.
+//!
+//! Two kinds of jobs are passed over for a while instead of failing: jobs of
+//! a library whose folder is offline (an unmounted share or disk), until the
+//! folder is back, and jobs whose file is still being copied, until it has
+//! settled.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,15 +30,29 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
-use crate::db::files::ReplacedFile;
+use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile};
 use crate::db::jobs::JobFinish;
 use crate::db::{self};
 use crate::format;
-use crate::services::library::{PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message};
+use crate::services::library::{
+    self, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, still_settling,
+};
 use crate::state::{AppState, lock};
 
 /// Idle re-check interval.
 const TICK: Duration = Duration::from_secs(5);
+/// How often an offline library folder is checked again.
+const OFFLINE_RECHECK: Duration = Duration::from_secs(15);
+/// First wait before retrying to record a job result; doubles up to
+/// [`OUTCOME_RETRY_MAX`].
+const OUTCOME_RETRY_FIRST: Duration = Duration::from_millis(250);
+/// Longest wait between retries to record a job result.
+const OUTCOME_RETRY_MAX: Duration = Duration::from_secs(5);
+/// Attempts for errors that aren't about a busy database (bugs, corrupt
+/// rows) before the job is closed with a plain error instead.
+const OUTCOME_HARD_ATTEMPTS: u32 = 5;
+/// How long recording a result keeps retrying once shutdown has begun.
+const OUTCOME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Minimum time between progress writes to the database, per job.
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 /// Hard upper bound on concurrent jobs.
@@ -60,6 +80,12 @@ struct RunningJob {
     intent: Option<CancelIntent>,
 }
 
+/// A library whose folder can't be reached; its jobs wait.
+struct Offline {
+    reason: String,
+    next_check: Instant,
+}
+
 /// Shared queue state and the running jobs.
 pub struct DispatcherHandle {
     notify: Notify,
@@ -68,6 +94,10 @@ pub struct DispatcherHandle {
     /// Set once start-up recovery has finished; no job starts before.
     ready: AtomicBool,
     running: std::sync::Mutex<HashMap<Uuid, RunningJob>>,
+    /// Libraries whose folder is offline, by id.
+    offline: std::sync::Mutex<HashMap<Uuid, Offline>>,
+    /// Jobs whose file is still being written, with when to try again.
+    deferred: std::sync::Mutex<HashMap<Uuid, Instant>>,
 }
 
 impl DispatcherHandle {
@@ -79,7 +109,44 @@ impl DispatcherHandle {
             waiting_for_schedule: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             running: std::sync::Mutex::new(HashMap::new()),
+            offline: std::sync::Mutex::new(HashMap::new()),
+            deferred: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Why a library's jobs are waiting for its folder, if they are.
+    pub fn offline_reason(&self, library_id: Uuid) -> Option<String> {
+        lock(&self.offline)
+            .get(&library_id)
+            .map(|o| o.reason.clone())
+    }
+
+    /// Mark a library's folder offline. Returns true when it wasn't already.
+    fn mark_offline(&self, library_id: Uuid, reason: String) -> bool {
+        lock(&self.offline)
+            .insert(
+                library_id,
+                Offline {
+                    reason,
+                    next_check: Instant::now() + OFFLINE_RECHECK,
+                },
+            )
+            .is_none()
+    }
+
+    /// A library's folder answered again: its jobs may run. Returns true when
+    /// it was offline.
+    pub fn library_back(&self, library_id: Uuid) -> bool {
+        let was_offline = lock(&self.offline).remove(&library_id).is_some();
+        if was_offline {
+            self.wake();
+        }
+        was_offline
+    }
+
+    /// Keep a job in the queue without starting it until `until`.
+    fn defer(&self, job_id: Uuid, until: Instant) {
+        lock(&self.deferred).insert(job_id, until);
     }
 
     /// Ask the loop to look for work now.
@@ -196,12 +263,12 @@ impl Drop for RunningGuard {
 }
 
 /// Effective job limit and whether it is automatic: the saved setting, else
-/// the hardware recommendation. (`--max-jobs` seeds the setting on first
-/// run; after that the setting alone decides, so choosing "Automatic" in the
-/// UI really means automatic.)
+/// `--max-jobs` (`MAX_JOBS`), else the hardware recommendation. `MAX_JOBS`
+/// takes the place of the automatic count, so it applies whenever "Jobs at
+/// once" is Automatic in Settings, and a number chosen there wins.
 pub fn effective_max_jobs(state: &AppState) -> (u32, bool) {
     let settings = state.settings();
-    if let Some(n) = settings.max_jobs {
+    if let Some(n) = settings.max_jobs.or(state.config.max_jobs) {
         return (n.clamp(1, MAX_JOBS_LIMIT), false);
     }
     let total = match state.hardware.current() {
@@ -278,13 +345,70 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
         return Ok(());
     }
     let (max_jobs, _) = effective_max_jobs(state);
+    if d.running_count() >= max_jobs as usize {
+        return Ok(());
+    }
+    recheck_offline(state).await;
+    let skip_libraries: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
+    let skip_jobs: Vec<Uuid> = {
+        let now = Instant::now();
+        let mut deferred = lock(&d.deferred);
+        deferred.retain(|_, until| *until > now);
+        deferred.keys().copied().collect()
+    };
     while d.running_count() < max_jobs as usize && !state.shutdown.is_cancelled() {
-        let Some(job) = db::jobs::claim_next(&state.db).await? else {
+        let Some(job) = db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs).await? else {
             break;
         };
         start_job(state, job);
     }
     Ok(())
+}
+
+/// Check offline library folders that are due, and let the jobs of those
+/// that are back run again.
+async fn recheck_offline(state: &AppState) {
+    let due: Vec<Uuid> = {
+        let now = Instant::now();
+        lock(&state.dispatcher.offline)
+            .iter()
+            .filter(|(_, o)| o.next_check <= now)
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    for id in due {
+        let lib = match db::libraries::get(state.db.pool(), id).await {
+            Ok(Some(lib)) => lib,
+            Ok(None) => {
+                lock(&state.dispatcher.offline).remove(&id);
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!("could not load library {id}: {e}");
+                continue;
+            }
+        };
+        match library::root_unavailable(&lib.path).await {
+            Some(reason) => {
+                if let Some(o) = lock(&state.dispatcher.offline).get_mut(&id) {
+                    o.reason = reason;
+                    o.next_check = Instant::now() + OFFLINE_RECHECK;
+                }
+            }
+            None => {
+                if state.dispatcher.library_back(id) {
+                    state
+                        .library_activity(
+                            ActivityLevel::Info,
+                            format!("{} is reachable again; its conversions continue.", lib.name),
+                            id,
+                        )
+                        .await;
+                    state.broadcast_library(id).await;
+                }
+            }
+        }
+    }
 }
 
 fn start_job(state: &AppState, job: Job) {
@@ -309,11 +433,10 @@ fn start_job(state: &AppState, job: Job) {
         state.broadcast_queue_state().await;
         tracing::info!(job = %job.id, file = %job.file_path, "job started");
 
-        let (outcome, ctx) = execute(&state, &job, cancel).await;
+        let (disposition, ctx) = execute(&state, &job, cancel).await;
         let intent = guard.intent();
-        if let Err(e) = apply_outcome(&state, &job, outcome, intent, &ctx).await {
-            tracing::error!(job = %job.id, "could not record the job result: {e:#}");
-        }
+        // The slot stays taken until the result is recorded.
+        record(&state, &job, disposition, intent, &ctx).await;
         // Free the slot before announcing, so the queue state is current.
         drop(guard);
         state.broadcast_job(job.id).await;
@@ -329,7 +452,26 @@ fn start_job(state: &AppState, job: Job) {
 struct ExecContext {
     file: Option<MediaFile>,
     library_root: Option<PathBuf>,
+    library_name: Option<String>,
     output_mode: OutputMode,
+}
+
+/// Why a job goes back to the queue without running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Requeue {
+    /// The library folder can't be reached (the reason says why).
+    LibraryOffline(String),
+    /// The file changed moments ago and may still be being copied.
+    Settling,
+}
+
+/// How a job's run ended, as far as the queue is concerned.
+#[derive(Debug, Clone, PartialEq)]
+enum Disposition {
+    /// It ran (or could not run) and has a result.
+    Finished(JobOutcome),
+    /// It goes back to the queue for later.
+    Requeue(Requeue),
 }
 
 fn failed(error: impl Into<String>) -> JobOutcome {
@@ -379,39 +521,47 @@ async fn execute(
     state: &AppState,
     job: &Job,
     cancel: CancellationToken,
-) -> (JobOutcome, ExecContext) {
+) -> (Disposition, ExecContext) {
     let settings = state.settings();
     let mut ctx = ExecContext {
         file: None,
         library_root: None,
+        library_name: None,
         output_mode: settings.output_mode,
     };
+    let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
         Ok(Some(f)) => f,
-        Ok(None) => return (failed("This file is no longer in the library."), ctx),
+        Ok(None) => return done(failed("This file is no longer in the library."), ctx),
         Err(e) => {
             tracing::error!(job = %job.id, "could not load the file: {e}");
-            return (failed(crate::error::INTERNAL_MESSAGE), ctx);
+            return done(failed(crate::error::INTERNAL_MESSAGE), ctx);
         }
     };
     ctx.file = Some(file.clone());
     let lib = match db::libraries::get(state.db.pool(), file.library_id).await {
         Ok(Some(l)) => l,
-        Ok(None) => return (JobOutcome::Cancelled, ctx),
+        Ok(None) => return done(JobOutcome::Cancelled, ctx),
         Err(e) => {
             tracing::error!(job = %job.id, "could not load the library: {e}");
-            return (failed(crate::error::INTERNAL_MESSAGE), ctx);
+            return done(failed(crate::error::INTERNAL_MESSAGE), ctx);
         }
     };
     ctx.library_root = Some(PathBuf::from(&lib.path));
+    ctx.library_name = Some(lib.name.clone());
 
     let input = PathBuf::from(&file.path);
     let meta = match tokio::fs::metadata(&input).await {
         Ok(m) if m.is_file() => m,
         _ => {
-            return (
+            // A whole library missing is a disconnected drive or share, not
+            // a deleted file: wait for it instead of failing every job.
+            if let Some(reason) = library::root_unavailable(&lib.path).await {
+                return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
+            }
+            return done(
                 failed(format!(
-                    "The file is no longer at {}. It may have been moved or deleted.",
+                    "{MISSING_INPUT_ERROR}{}. It may have been moved or deleted.",
                     file.path
                 )),
                 ctx,
@@ -423,6 +573,9 @@ async fn execute(
         .map(DateTime::<Utc>::from)
         .unwrap_or_else(|_| Utc::now());
     let unchanged = meta.len() == file.size_bytes && db::ts(modified) == db::ts(file.modified_at);
+    if !unchanged && still_settling(modified, state.config.settle) {
+        return (Disposition::Requeue(Requeue::Settling), ctx);
+    }
     let probe = match file.probe.clone() {
         Some(p) if unchanged => p,
         _ => match state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT).await {
@@ -435,7 +588,7 @@ async fn execute(
                 }
                 p
             }
-            Err(e) => return (failed(probe_error_message(&e)), ctx),
+            Err(e) => return done(failed(probe_error_message(&e)), ctx),
         },
     };
 
@@ -488,7 +641,7 @@ async fn execute(
     {
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
     }
-    (outcome, ctx)
+    done(outcome, ctx)
 }
 
 /// Forward worker progress: every update to the WebSocket, and to the
@@ -514,6 +667,146 @@ fn relative_to(root: Option<&Path>, path: &Path) -> String {
     root.and_then(|r| path.strip_prefix(r).ok())
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Record how a job ended, retrying while the database is busy. The result
+/// must not be lost: after a replace the file on disk has already changed,
+/// and a job left `running` would hold its file forever. Gives up only at
+/// shutdown (start-up recovery re-queues the job) or, for errors that
+/// retrying can't fix, after closing the job with a plain error.
+async fn record(
+    state: &AppState,
+    job: &Job,
+    disposition: Disposition,
+    intent: Option<CancelIntent>,
+    ctx: &ExecContext,
+) {
+    let mut delay = OUTCOME_RETRY_FIRST;
+    let mut hard_failures = 0u32;
+    let mut attempts = 0u32;
+    let mut give_up_at: Option<Instant> = None;
+    loop {
+        let result = match &disposition {
+            Disposition::Finished(outcome) => {
+                apply_outcome(state, job, outcome.clone(), intent, ctx).await
+            }
+            Disposition::Requeue(why) => apply_requeue(state, job, why, ctx).await,
+        };
+        let Err(e) = result else {
+            if attempts > 0 {
+                tracing::info!(job = %job.id, attempts, "job result recorded after retrying");
+            }
+            return;
+        };
+        attempts += 1;
+        let transient = e
+            .chain()
+            .find_map(|c| c.downcast_ref::<sqlx::Error>())
+            .is_some_and(db::is_transient);
+        if !transient {
+            hard_failures += 1;
+            if hard_failures >= OUTCOME_HARD_ATTEMPTS {
+                tracing::error!(job = %job.id, "could not record the job result: {e:#}");
+                close_unrecorded(state, job).await;
+                return;
+            }
+        }
+        if attempts == 1 || attempts % 10 == 0 {
+            tracing::warn!(
+                job = %job.id,
+                attempts,
+                "could not record the job result yet, retrying: {e:#}"
+            );
+        }
+        if state.shutdown.is_cancelled() {
+            let deadline =
+                *give_up_at.get_or_insert_with(|| Instant::now() + OUTCOME_SHUTDOWN_GRACE);
+            if Instant::now() >= deadline {
+                tracing::error!(
+                    job = %job.id,
+                    "shutting down before the job result could be recorded; the job will be \
+                     checked again on the next start"
+                );
+                return;
+            }
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(OUTCOME_RETRY_MAX);
+    }
+}
+
+/// Last resort when a result can't be recorded: close the job and flag the
+/// file so nothing stays "running" and the user sees what happened.
+async fn close_unrecorded(state: &AppState, job: &Job) {
+    let error = "Chrysopoeia couldn't record how this conversion ended. Scan the library to \
+                 bring the file list up to date. The details are in the server log.";
+    let result = async {
+        let mut tx = state.db.write_tx().await?;
+        db::jobs::finish(
+            &mut tx,
+            job.id,
+            JobState::Failed,
+            &JobFinish {
+                error: Some(error.to_string()),
+                ..JobFinish::default()
+            },
+        )
+        .await?;
+        db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(error)).await?;
+        tx.commit().await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::error!(job = %job.id, "could not close the job either: {e}");
+    }
+}
+
+/// Put a job back in the queue without running it, and hold it (or its
+/// library) back for a while so it isn't picked again right away.
+async fn apply_requeue(
+    state: &AppState,
+    job: &Job,
+    why: &Requeue,
+    ctx: &ExecContext,
+) -> anyhow::Result<()> {
+    // Hold it back first, so the dispatcher can't pick it up again between
+    // the commit and here.
+    let newly_offline = match why {
+        Requeue::LibraryOffline(reason) => state
+            .dispatcher
+            .mark_offline(job.library_id, reason.clone()),
+        Requeue::Settling => {
+            state
+                .dispatcher
+                .defer(job.id, Instant::now() + state.config.settle);
+            false
+        }
+    };
+    let mut tx = state.db.write_tx().await?;
+    db::jobs::requeue(&mut tx, job.id).await?;
+    db::files::set_status(&mut tx, job.file_id, FileStatus::Queued, None, None).await?;
+    tx.commit().await?;
+    match why {
+        Requeue::LibraryOffline(reason) if newly_offline => {
+            let name = ctx.library_name.as_deref().unwrap_or("A library");
+            state
+                .library_activity(
+                    ActivityLevel::Warning,
+                    format!(
+                        "{name} can't be reached right now, so its conversions are waiting. \
+                         {reason}"
+                    ),
+                    job.library_id,
+                )
+                .await;
+            state.broadcast_library(job.library_id).await;
+        }
+        Requeue::LibraryOffline(_) => {}
+        Requeue::Settling => {
+            tracing::info!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
+        }
+    }
+    Ok(())
 }
 
 /// Record how a job ended on the job and file rows, and in the feed.

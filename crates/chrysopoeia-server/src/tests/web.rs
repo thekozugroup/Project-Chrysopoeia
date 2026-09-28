@@ -57,9 +57,11 @@ async fn serves_the_ui_with_spa_fallback_and_cache_headers() {
     assert_ne!(r.status, StatusCode::OK, "{}", r.text);
 
     // API paths never fall through to the UI.
-    let r = app.get("/api/unknown").await;
-    assert_eq!(r.status, StatusCode::NOT_FOUND);
-    assert_eq!(r.json["code"], "not_found");
+    for path in ["/api/unknown", "/api/", "/api"] {
+        let r = app.get(path).await;
+        assert_eq!(r.status, StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(r.json["code"], "not_found", "{path}");
+    }
     assert_eq!(r.headers["x-content-type-options"], "nosniff");
 }
 
@@ -150,11 +152,18 @@ async fn websocket_sends_initial_state_then_events() {
     assert_eq!(second["totals"]["file_count"], 0);
 
     // Events flow: pausing publishes queue.state; settings changes too.
+    // Other queue.state events (e.g. from start-up) may come first.
     let r = app.post_empty("/api/queue/pause").await;
     assert_eq!(r.status, StatusCode::OK);
-    let ev = next_json(&mut ws).await;
-    assert_eq!(ev["type"], "queue.state");
-    assert_eq!(ev["paused"], true);
+    let mut seen_pause = false;
+    for _ in 0..10 {
+        let ev = next_json(&mut ws).await;
+        if ev["type"] == "queue.state" && ev["paused"] == true {
+            seen_pause = true;
+            break;
+        }
+    }
+    assert!(seen_pause);
     app.patch("/api/settings", json!({ "onboarded": true }))
         .await;
     let mut seen_settings = false;

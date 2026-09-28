@@ -26,7 +26,20 @@ where
     }
 }
 
-/// Optional JSON body: an empty body means `T::default()`.
+/// Whether a request says its body is JSON (`application/json`, or a
+/// `+json` type).
+fn is_json(req: &Request) -> bool {
+    req.headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| v == "application/json" || v.ends_with("+json"))
+}
+
+/// Optional JSON body: an empty body means `T::default()`. A body that is
+/// present must be sent as JSON, which (with the origin check) keeps plain
+/// HTML forms on other sites from reaching the API.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OptionalJson<T>(pub T);
 
@@ -38,6 +51,7 @@ where
     type Rejection = ApiError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let json = is_json(&req);
         let bytes = axum::body::Bytes::from_request(req, state)
             .await
             .map_err(|e| {
@@ -53,6 +67,13 @@ where
             })?;
         if bytes.iter().all(u8::is_ascii_whitespace) {
             return Ok(Self(T::default()));
+        }
+        if !json {
+            return Err(ApiError::new(
+                axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_media_type",
+                "Send the request body as JSON (Content-Type: application/json).",
+            ));
         }
         serde_json::from_slice(&bytes).map(Self).map_err(|e| {
             ApiError::bad_request(

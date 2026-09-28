@@ -40,7 +40,8 @@ pub async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
 }
 
-async fn not_found(OriginalUri(uri): OriginalUri) -> ApiError {
+/// JSON 404 for unknown API paths.
+pub async fn not_found(OriginalUri(uri): OriginalUri) -> ApiError {
     ApiError::not_found(
         "not_found",
         format!("There's no API endpoint at {}.", uri.path()),

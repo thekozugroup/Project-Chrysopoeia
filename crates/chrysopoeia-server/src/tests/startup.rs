@@ -25,7 +25,11 @@ async fn first_run_applies_command_line_options() {
     .await;
     let s = app.get("/api/settings").await;
     assert_eq!(s.json["hardware"], "nvenc");
-    assert_eq!(s.json["max_jobs"], 3);
+    // MAX_JOBS takes the place of the automatic count; it isn't saved.
+    assert_eq!(s.json["max_jobs"], serde_json::Value::Null);
+    let q = app.get("/api/queue").await;
+    assert_eq!(q.json["max_jobs"], 3);
+    assert_eq!(q.json["max_jobs_auto"], false);
     let libs = app.get("/api/libraries").await;
     let libs = libs.json.as_array().unwrap();
     assert_eq!(
@@ -39,7 +43,9 @@ async fn first_run_applies_command_line_options() {
     app.wait_queue_idle().await;
     assert_eq!(app.get("/api/files?status=done").await.json["total"], 1);
 
-    // Later starts keep saved settings and don't re-add libraries.
+    // A later start with changed values: HW_ACCEL applies because it
+    // changed, MAX_JOBS applies because "Jobs at once" is still automatic,
+    // and libraries aren't added again.
     let dir = app.stop().await;
     let app = TestApp::start(TestOptions {
         dir: Some(dir),
@@ -52,8 +58,12 @@ async fn first_run_applies_command_line_options() {
     })
     .await;
     let s = app.get("/api/settings").await;
-    assert_eq!(s.json["hardware"], "nvenc");
-    assert_eq!(s.json["max_jobs"], 3);
+    assert_eq!(s.json["hardware"], "cpu");
+    let q = app.get("/api/queue").await;
+    assert_eq!(q.json["max_jobs"], 9);
+    assert_eq!(q.json["max_jobs_auto"], false);
+    let feed = app.get("/api/activity").await.json["items"].to_string();
+    assert!(feed.contains("HW_ACCEL=cpu"), "{feed}");
     assert_eq!(
         app.get("/api/libraries")
             .await
@@ -63,6 +73,31 @@ async fn first_run_applies_command_line_options() {
             .len(),
         1
     );
+
+    // Choices made in Settings win while the variables stay the same.
+    let r = app
+        .patch(
+            "/api/settings",
+            serde_json::json!({ "hardware": "auto", "max_jobs": 2 }),
+        )
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let dir = app.stop().await;
+    let app = TestApp::start(TestOptions {
+        dir: Some(dir),
+        configure: Box::new(|c, _| {
+            c.hw = chrysopoeia_core::HwPreference::Cpu;
+            c.max_jobs = Some(9);
+        }),
+        ..TestOptions::default()
+    })
+    .await;
+    let s = app.get("/api/settings").await;
+    assert_eq!(s.json["hardware"], "auto");
+    let q = app.get("/api/queue").await;
+    assert_eq!(q.json["max_jobs"], 2);
+    let feed = app.get("/api/activity").await.json["items"].to_string();
+    assert!(feed.contains("MAX_JOBS=9 is not used"), "{feed}");
 }
 
 #[tokio::test]

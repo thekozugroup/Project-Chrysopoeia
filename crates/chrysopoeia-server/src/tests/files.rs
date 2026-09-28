@@ -435,7 +435,12 @@ async fn scan_writes_never_touch_busy_rows() {
         error: None,
     };
     let mut tx = app.state.db.write_tx().await.unwrap();
-    assert!(!update_scanned(&mut tx, id, &upsert).await.unwrap());
+    let seen = crate::db::files::find_by_path_conn(&mut tx, &upsert.path)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.id, id);
+    assert!(!update_scanned(&mut tx, &seen, &upsert).await.unwrap());
     assert!(
         crate::db::files::insert(&mut tx, &upsert)
             .await
@@ -447,4 +452,46 @@ async fn scan_writes_never_touch_busy_rows() {
     let r = app.get(&format!("/api/files/{id}")).await;
     assert_eq!(r.json["file"]["status"], "queued");
     assert_eq!(r.json["file"]["file_name"], queued["file_name"]);
+}
+
+#[tokio::test]
+async fn scan_writes_never_touch_rows_changed_since_they_were_read() {
+    use crate::db::files::{FileUpsert, update_scanned};
+    let (app, lib) = fixture().await;
+    let failed = app.get("/api/files?status=failed&limit=1").await.json["items"][0].clone();
+    let path = failed["path"].as_str().unwrap().to_string();
+    let seen = crate::db::files::find_by_path(app.state.db.pool(), &path)
+        .await
+        .unwrap()
+        .unwrap();
+    // Something else writes the row after the scan read it.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let r = app
+        .post_empty(&format!("/api/files/{}/skip", seen.id))
+        .await;
+    assert_eq!(r.status, StatusCode::OK);
+    let upsert = FileUpsert {
+        library_id: uuid::Uuid::parse_str(&lib).unwrap(),
+        path: path.clone(),
+        relative_path: "x".into(),
+        file_name: "x".into(),
+        size_bytes: 1,
+        modified_at: chrono::Utc::now(),
+        status: chrysopoeia_core::FileStatus::Failed,
+        probe: None,
+        skip_reason: None,
+        error: Some("stale".into()),
+    };
+    let mut tx = app.state.db.write_tx().await.unwrap();
+    assert!(!update_scanned(&mut tx, &seen, &upsert).await.unwrap());
+    assert_eq!(
+        crate::db::files::delete_unchanged(&mut tx, std::slice::from_ref(&seen))
+            .await
+            .unwrap(),
+        0
+    );
+    tx.commit().await.unwrap();
+    let r = app.get(&format!("/api/files/{}", seen.id)).await;
+    assert_eq!(r.json["file"]["status"], "skipped");
+    assert_eq!(r.json["file"]["skip_reason"], "Skipped by you");
 }

@@ -239,17 +239,17 @@ pub async fn update(state: &AppState, id: Uuid, patch: LibraryPatch) -> ApiResul
         row.enabled = enabled;
     }
     let mut notes = Vec::new();
-    let mut profile_changed = false;
+    let previous_profile = row.profile.clone();
     if let Some(mut profile) = patch.profile {
         notes = profile.normalize();
-        profile_changed = profile != row.profile;
         row.profile = profile;
     }
+    let profile_changed = row.profile != previous_profile;
     db::libraries::update(state.db.pool(), &row).await?;
     note_adjustments(state, &row.name, &notes, id).await;
 
     if profile_changed {
-        let changed = library::redecide(state, &row).await?;
+        let changed = library::redecide(state, &row, Some(&previous_profile)).await?;
         if changed > 0 {
             state.emit(Event::FilesChanged {
                 library_id: Some(id),

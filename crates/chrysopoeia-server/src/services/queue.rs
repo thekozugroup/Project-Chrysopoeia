@@ -19,6 +19,8 @@ use crate::state::AppState;
 /// How long an API call waits for a running job to wind down after
 /// cancelling it (ffmpeg gets 5 s before it is killed).
 pub const CANCEL_WAIT: Duration = Duration::from_secs(8);
+/// Files changed per transaction by a bulk action.
+const BULK_CHUNK: usize = 500;
 
 fn file_not_found() -> ApiError {
     ApiError::not_found("file_not_found", "There's no file with that id.")
@@ -205,63 +207,30 @@ pub async fn bulk(state: &AppState, action: BulkAction, sel: BulkSelection) -> A
     if ids.is_empty() {
         return Ok(0);
     }
-    let files = db::files::get_many(state.db.pool(), &ids).await?;
+    // Work in chunks, each in its own short transaction, so a bulk action on
+    // a big library never keeps other writers (job results, scans) waiting.
     let mut affected = 0u64;
     let mut running_to_cancel = Vec::new();
-    let mut tx = state.db.write_tx().await?;
-    for file in &files {
+    for chunk in ids.chunks(BULK_CHUNK) {
         match action {
             BulkAction::Queue | BulkAction::RetryFailed => {
-                let created = db::jobs::create(
-                    &mut tx,
-                    &NewJob {
-                        file_id: file.id,
-                        library_id: file.library_id,
-                        file_name: &file.file_name,
-                        file_path: &file.path,
-                        input_size: file.size_bytes,
-                        priority: 0,
-                    },
-                )
-                .await?;
-                affected += u64::from(created.is_some());
+                let mut tx = state.db.write_tx().await?;
+                affected += db::jobs::create_many(&mut tx, chunk, &statuses).await?;
+                tx.commit().await?;
             }
-            BulkAction::Skip => match file.status {
-                Processing => running_to_cancel.push(file.id),
-                Queued => {
-                    let cancelled = match file.job_id {
-                        Some(job_id) => {
-                            db::jobs::cancel_queued(
-                                &mut tx,
-                                job_id,
-                                Skipped,
-                                Some(USER_SKIP_REASON),
-                            )
-                            .await?
-                        }
-                        None => false,
-                    };
-                    if !cancelled {
-                        db::files::set_status(
-                            &mut tx,
-                            file.id,
-                            Skipped,
-                            Some(USER_SKIP_REASON),
-                            None,
-                        )
-                        .await?;
-                    }
-                    affected += 1;
+            BulkAction::Skip => {
+                let mut tx = state.db.write_tx().await?;
+                let (skipped, processing) =
+                    db::files::skip_many(&mut tx, chunk, &statuses, USER_SKIP_REASON).await?;
+                tx.commit().await?;
+                affected += skipped;
+                if statuses.contains(&Processing) {
+                    running_to_cancel.extend(processing);
                 }
-                _ => {
-                    db::files::set_status(&mut tx, file.id, Skipped, Some(USER_SKIP_REASON), None)
-                        .await?;
-                    affected += 1;
-                }
-            },
+            }
         }
+        tokio::task::yield_now().await;
     }
-    tx.commit().await?;
     let mut cancelled_jobs = Vec::new();
     for file_id in running_to_cancel {
         let ids = state.dispatcher.cancel_file(file_id, CancelIntent::Skip);

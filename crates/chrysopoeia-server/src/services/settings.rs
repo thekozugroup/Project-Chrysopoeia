@@ -182,11 +182,12 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     Ok(new)
 }
 
-/// Build the settings to save on first run from the command line.
+/// Build the settings to save on first run from the command line. `MAX_JOBS`
+/// is not copied: it stands in for the automatic job count on every start
+/// (see `dispatcher::effective_max_jobs`), so changing it later still works.
 pub fn first_run_settings(config: &crate::config::Config) -> Settings {
     Settings {
         hardware: config.hw,
-        max_jobs: config.max_jobs,
         ..Settings::default()
     }
 }
