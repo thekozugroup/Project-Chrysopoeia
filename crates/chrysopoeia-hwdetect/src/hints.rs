@@ -1,13 +1,20 @@
 //! Setup hints: what's wrong or worth knowing about the hardware setup,
 //! written for people who are not video or Docker experts, each with a
 //! copy-paste fix where one exists.
+//!
+//! A GPU that can't be used is a warning only when nothing better is
+//! working: with another hardware encoder verified, the same hint becomes a
+//! tip that says which one Chrysopoeia uses instead.
 
 use std::collections::BTreeSet;
 
-use chrysopoeia_core::{FfmpegInfo, GpuVendor, HwApi, SetupHint, SetupHintLevel, VideoCodec};
+use chrysopoeia_core::{
+    EncoderStatus, FfmpegInfo, GpuVendor, HwApi, SetupHint, SetupHintLevel, VideoCodec,
+};
 
 use crate::devices::{DetectedGpu, Devices, NodeAccess, Platform, vendor_label};
 use crate::encoders::{EncoderCheck, FailureKind, VERIFICATION_FILTERS};
+use crate::recommend::{BYTES_PER_JOB, HW_API_ORDER, format_gb, memory_budget};
 
 /// Docker flags that give a container the NVIDIA driver.
 pub const NVIDIA_DOCKER_FIX: &str =
@@ -19,14 +26,21 @@ pub const ROCKCHIP_DOCKER_FIX: &str = "--device=/dev/mpp_service --device=/dev/d
 /// Docker flag that passes Intel and AMD GPUs into a container.
 pub const DRI_DOCKER_FIX: &str = "--device=/dev/dri";
 
+/// Docker flag that gives a container enough memory for a few encodes.
+pub const MEMORY_DOCKER_FIX: &str = "--memory=4g";
+
 /// Everything hints are derived from.
 #[derive(Debug, Clone, Copy)]
 pub struct HintInput<'a> {
+    /// Whether ffmpeg and ffprobe run.
     pub ffmpeg: &'a FfmpegInfo,
+    /// What the hardware scan found.
     pub devices: &'a Devices,
+    /// One result per registry encoder.
     pub checks: &'a [EncoderCheck],
     /// Verification filters this ffmpeg has.
     pub filters: &'a [String],
+    /// The platform Chrysopoeia runs on.
     pub platform: Platform,
 }
 
@@ -47,6 +61,44 @@ impl HintInput<'_> {
         self.checks
             .iter()
             .filter(move |c| c.status.api == api && c.status.available)
+    }
+
+    /// How a hint about an unusable GPU ends: the preferred hardware API
+    /// that works anyway, ignoring encoders `on_this_gpu` says belong to the
+    /// GPU in question.
+    fn fallback(&self, on_this_gpu: impl Fn(&EncoderStatus) -> bool) -> Fallback {
+        let working = HW_API_ORDER.iter().copied().find(|api| {
+            self.checks
+                .iter()
+                .any(|c| c.status.verified && c.status.api == *api && !on_this_gpu(&c.status))
+        });
+        Fallback { working }
+    }
+}
+
+/// What Chrysopoeia encodes with while a GPU can't be used.
+#[derive(Debug, Clone, Copy)]
+struct Fallback {
+    /// A hardware API that works, if any.
+    working: Option<HwApi>,
+}
+
+impl Fallback {
+    /// A warning when encoding falls back to the CPU; a tip otherwise.
+    fn level(self) -> SetupHintLevel {
+        match self.working {
+            Some(_) => SetupHintLevel::Info,
+            None => SetupHintLevel::Warning,
+        }
+    }
+
+    /// "so encoding runs on the CPU" or "so Chrysopoeia uses NVIDIA NVENC
+    /// instead".
+    fn clause(self) -> String {
+        match self.working {
+            Some(api) => format!("so Chrysopoeia uses {} instead", api.label()),
+            None => "so encoding runs on the CPU".to_string(),
+        }
     }
 }
 
@@ -72,6 +124,15 @@ fn tested_failure(kind: FailureKind) -> bool {
     )
 }
 
+/// Test failures that only show the GPU hung: every one timed out or,
+/// before that, found a codec the GPU can't do.
+fn only_hung(kinds: &[FailureKind]) -> bool {
+    kinds.contains(&FailureKind::TimedOut)
+        && kinds
+            .iter()
+            .all(|k| matches!(k, FailureKind::TimedOut | FailureKind::CodecUnsupported))
+}
+
 /// "a", "a and b", "a, b and c".
 fn join_list(items: &[String]) -> String {
     match items {
@@ -79,6 +140,11 @@ fn join_list(items: &[String]) -> String {
         [one] => one.clone(),
         [init @ .., last] => format!("{} and {last}", init.join(", ")),
     }
+}
+
+/// "isn't" or "aren't" for `n` things.
+fn isnt(n: usize) -> &'static str {
+    if n == 1 { "isn't" } else { "aren't" }
 }
 
 /// Build every hint that applies, errors first, then warnings, then tips.
@@ -93,6 +159,7 @@ pub fn build_hints(input: &HintInput<'_>) -> Vec<SetupHint> {
         rockchip_hint(input, &mut hints);
         missing_codec_hints(input, &mut hints);
         filter_hints(input, &mut hints);
+        memory_hint(input, &mut hints);
         av1_tip(input, &mut hints);
         cpu_only_hint(input, &mut hints);
     }
@@ -153,16 +220,22 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     if !devices.nvidia_visible() {
         return;
     }
-    let first = devices.gpus_from(GpuVendor::Nvidia).next();
+    // Name the GPU this container was given, if the host has several.
+    let first = devices
+        .gpus_from(GpuVendor::Nvidia)
+        .find(|g| !g.hidden)
+        .or_else(|| devices.gpus_from(GpuVendor::Nvidia).next());
     let name = first.map_or_else(|| "NVIDIA GPU".to_string(), DetectedGpu::display_name);
+    let fallback = input.fallback(|s| s.api == HwApi::Nvenc);
+    let clause = fallback.clause();
 
     let listed: Vec<&EncoderCheck> = input.listed(HwApi::Nvenc).collect();
     if listed.is_empty() {
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "This ffmpeg can't use NVIDIA GPUs",
             format!(
-                "Chrysopoeia found your {name}, but its ffmpeg was built without NVIDIA support (NVENC). \
+                "Chrysopoeia found your {name}, but its ffmpeg was built without NVIDIA support (NVENC), {clause}. \
                  The official Docker image includes an ffmpeg that has it."
             ),
             None,
@@ -185,20 +258,20 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
 
     if any(FailureKind::NvencSessionLimit) && !any(FailureKind::NvidiaDriverMissing) {
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "NVIDIA GPU is busy",
             format!(
-                "Your {name} has no free encoding sessions because other apps, such as Plex or Jellyfin, are using them. \
-                 Chrysopoeia uses the CPU for now; run detection again later."
+                "Your {name} has no free encoding sessions because other apps, such as Plex or Jellyfin, are using them all, \
+                 {clause} for now. Select Detect again in Settings once they finish."
             ),
             None,
         ));
     } else if any(FailureKind::NvidiaDriverTooOld) {
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "NVIDIA driver needs an update",
             format!(
-                "Your {name} was found, but its driver is too old for this ffmpeg. \
+                "Your {name} was found, but its driver is too old for this ffmpeg, {clause}. \
                  Update the NVIDIA driver on the host (on Unraid, in the Nvidia-Driver plugin), then restart the container."
             ),
             None,
@@ -207,17 +280,23 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
         out.push(hint(
             SetupHintLevel::Info,
             "Your NVIDIA GPU can't encode video",
-            format!("Your {name} has no hardware video encoder for these formats, so Chrysopoeia encodes on the CPU."),
+            format!("Your {name} has no hardware video encoder for these formats, {clause}."),
             None,
         ));
+    } else if only_hung(&kinds) {
+        out.push(hung_hint("NVIDIA", &name, fallback));
     } else if devices.in_container {
+        let next = if fallback.working.is_some() {
+            "To use it as well, install the Nvidia-Driver plugin on Unraid and add the settings below to the container"
+        } else {
+            "On Unraid, install the Nvidia-Driver plugin, then add the settings below to the container"
+        };
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "NVIDIA GPU found, but it can't be used",
             format!(
-                "Your {name} is in this server, but the container can't reach the NVIDIA driver, so encoding runs on the CPU. \
-                 On Unraid, install the Nvidia-Driver plugin, then add the settings below to the container \
-                 (--runtime=nvidia goes in Extra Parameters)."
+                "Your {name} is in this server, but the container can't reach the NVIDIA driver, {clause}. \
+                 {next} (--runtime=nvidia goes in Extra Parameters)."
             ),
             Some(NVIDIA_DOCKER_FIX.to_string()),
         ));
@@ -225,17 +304,17 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
         let nouveau = first.and_then(|g| g.driver.as_deref()) == Some("nouveau");
         let detail = if nouveau {
             format!(
-                "Your {name} uses the open-source nouveau driver, which can't encode video. \
+                "Your {name} uses the open-source nouveau driver, which can't encode video, {clause}. \
                  Install NVIDIA's own driver to use it."
             )
         } else {
             format!(
-                "Your {name} was found, but the NVIDIA driver isn't working, so encoding runs on the CPU. \
+                "Your {name} was found, but the NVIDIA driver isn't working, {clause}. \
                  Check that NVIDIA's driver is installed and that nvidia-smi works."
             )
         };
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "NVIDIA GPU found, but it can't be used",
             detail,
             None,
@@ -243,36 +322,95 @@ fn nvidia_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     }
 }
 
+/// A GPU whose test encodes hung.
+fn hung_hint(label: &str, name: &str, fallback: Fallback) -> SetupHint {
+    hint(
+        fallback.level(),
+        format!("{label} GPU didn't respond"),
+        format!(
+            "Your {name} didn't finish a one-second test encode in time, {}. \
+             Restart the container (or the server, if that doesn't help), then select Detect again in Settings.",
+            fallback.clause()
+        ),
+        None,
+    )
+}
+
 /// Render nodes of Intel/AMD GPUs this process may not open.
 fn permission_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
-    let denied: Vec<_> = input
-        .devices
-        .gpus
-        .iter()
-        .filter(|g| g.vendor != GpuVendor::Nvidia)
-        .filter_map(|g| g.render_node.as_ref())
-        .filter(|n| n.access == NodeAccess::PermissionDenied)
-        .filter(|n| {
-            // A verified encoder on the node means it works after all.
-            !input
-                .checks
-                .iter()
-                .any(|c| c.status.verified && c.status.device.as_deref() == Some(n.path.as_str()))
+    let refused = |access: NodeAccess| -> Vec<(String, Option<u32>)> {
+        input
+            .devices
+            .gpus
+            .iter()
+            .filter(|g| g.vendor != GpuVendor::Nvidia)
+            .filter_map(|g| g.render_node.as_ref())
+            .filter(|n| n.access == access)
+            .filter(|n| {
+                // A verified encoder on the node means it works after all.
+                !input.checks.iter().any(|c| {
+                    c.status.verified && c.status.device.as_deref() == Some(n.path.as_str())
+                })
+            })
+            .map(|n| (n.path.clone(), n.gid))
+            .collect()
+    };
+    let fallback_for = |nodes: &[(String, Option<u32>)]| {
+        input.fallback(|s| {
+            s.device
+                .as_deref()
+                .is_some_and(|d| nodes.iter().any(|(p, _)| p == d))
         })
-        .collect();
-    let Some(first) = denied.first() else {
+    };
+    let in_container = input.devices.in_container;
+
+    // Refused whatever the file permissions: a group won't help.
+    let blocked = refused(NodeAccess::Blocked);
+    if !blocked.is_empty() {
+        let fallback = fallback_for(&blocked);
+        let paths = join_list(&blocked.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+        let it = if blocked.len() == 1 { "it" } else { "them" };
+        let (title, detail, fix) = if in_container {
+            (
+                "The GPU isn't passed in as a device",
+                format!(
+                    "Chrysopoeia can see {paths} but isn't allowed to use {it}, {}. This happens when /dev/dri is added \
+                     as a folder (a Path) instead of a device: on Unraid, remove that Path from the template and add a \
+                     Device with the value /dev/dri.",
+                    fallback.clause()
+                ),
+                Some(DRI_DOCKER_FIX.to_string()),
+            )
+        } else {
+            (
+                "The system blocks the GPU",
+                format!(
+                    "Chrysopoeia isn't allowed to open {paths} even though the file permissions allow it, {}. \
+                     A security policy, such as SELinux or a systemd DevicePolicy setting, is probably blocking it.",
+                    fallback.clause()
+                ),
+                None,
+            )
+        };
+        out.push(hint(fallback.level(), title, detail, fix));
+    }
+
+    // Refused by the file permissions: a group problem.
+    let denied = refused(NodeAccess::PermissionDenied);
+    let Some((first_path, _)) = denied.first() else {
         return;
     };
-    let paths = join_list(&denied.iter().map(|n| n.path.clone()).collect::<Vec<_>>());
-    let gids: BTreeSet<u32> = denied.iter().filter_map(|n| n.gid).collect();
+    let fallback = fallback_for(&denied);
+    let paths = join_list(&denied.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>());
+    let gids: BTreeSet<u32> = denied.iter().filter_map(|(_, g)| *g).collect();
 
-    let (detail, fix) = if input.devices.in_container {
-        let group = match gids.iter().next() {
-            Some(gid) if gids.len() == 1 => format!(" (group {gid})"),
+    let (detail, fix) = if in_container {
+        let owner = match gids.iter().next() {
+            Some(gid) if gids.len() == 1 => format!(", which belongs to group {gid}"),
             _ => String::new(),
         };
         let fix = if gids.is_empty() {
-            format!("--group-add $(stat -c %g {})", first.path)
+            format!("--group-add $(stat -c %g {first_path})")
         } else {
             gids.iter()
                 .map(|g| format!("--group-add {g}"))
@@ -281,22 +419,24 @@ fn permission_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
         };
         (
             format!(
-                "Chrysopoeia isn't allowed to open {paths}. \
-                 Add the container to the group that owns it{group}, or set PGID to that group."
+                "Chrysopoeia isn't allowed to open {paths}{owner}, {}. \
+                 Add the container to that group with the setting below (on Unraid, it goes in Extra Parameters).",
+                fallback.clause()
             ),
             fix,
         )
     } else {
         (
             format!(
-                "Chrysopoeia isn't allowed to open {paths}. \
-                 Add the user that runs it to the render and video groups, then log in again."
+                "Chrysopoeia isn't allowed to open {paths}, {}. \
+                 Add the user that runs it to the render and video groups, then log in again.",
+                fallback.clause()
             ),
             "sudo usermod -aG render,video $USER".to_string(),
         )
     };
     out.push(hint(
-        SetupHintLevel::Warning,
+        fallback.level(),
         "No permission to use the GPU",
         detail,
         Some(fix),
@@ -322,28 +462,46 @@ fn passthrough_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     if missing.is_empty() {
         return;
     }
+    let paths: Vec<String> = missing
+        .iter()
+        .filter_map(|g| g.render_node.as_ref().map(|n| n.path.clone()))
+        .collect();
+    let fallback = input.fallback(|s| {
+        s.device
+            .as_deref()
+            .is_some_and(|d| paths.iter().any(|p| p == d))
+    });
     let names = join_list(&missing.iter().map(|g| g.display_name()).collect::<Vec<_>>());
+    let clause = fallback.clause();
     if input.devices.in_container {
+        let add = if fallback.working.is_some() {
+            "To use it as well, add the device below"
+        } else {
+            "Add the device below"
+        };
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "Your GPU isn't passed into the container",
             format!(
-                "This server has {names}, but /dev/dri isn't passed into the container, so encoding runs on the CPU. \
-                 Add the device below (on Unraid, add a Device with the value /dev/dri to the template)."
+                "Your {names} {} passed into the container, {clause}. \
+                 {add} (on Unraid, add a Device with the value /dev/dri to the template).",
+                isnt(missing.len())
             ),
             Some(DRI_DOCKER_FIX.to_string()),
         ));
     } else {
-        let paths = join_list(
-            &missing
-                .iter()
-                .filter_map(|g| g.render_node.as_ref().map(|n| n.path.clone()))
-                .collect::<Vec<_>>(),
-        );
+        let (has, are) = if paths.len() == 1 {
+            ("has", "is")
+        } else {
+            ("have", "are")
+        };
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             "Your GPU's device file is missing",
-            format!("This server has {names}, but {paths} doesn't exist, so it can't be used. Check that the GPU driver is loaded."),
+            format!(
+                "Your {names} {has} no device file ({} {are} missing), {clause}. Check that the GPU driver is loaded.",
+                join_list(&paths)
+            ),
             None,
         ));
     }
@@ -359,19 +517,23 @@ fn intel_amd_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
         };
         let label = vendor_label(vendor);
         let name = first.display_name();
+        let plugin = if vendor == GpuVendor::Intel {
+            "Intel GPU TOP"
+        } else {
+            "Radeon TOP"
+        };
 
         if gpus.iter().all(|g| g.render_node.is_none()) {
-            let plugin = if vendor == GpuVendor::Intel {
-                "Intel GPU TOP"
-            } else {
-                "Radeon TOP"
-            };
+            // Nothing can run on a GPU without a driver, so anything
+            // verified runs elsewhere.
+            let fallback = input.fallback(|_| false);
             out.push(hint(
-                SetupHintLevel::Warning,
+                fallback.level(),
                 format!("{label} GPU has no driver"),
                 format!(
-                    "Your {name} isn't set up on the host, so Chrysopoeia can't use it. \
-                     On Unraid, install the {plugin} plugin, then restart the container."
+                    "Your {name} has no driver loaded on the host, {}. \
+                     On Unraid, install the {plugin} plugin, then restart the container.",
+                    fallback.clause()
                 ),
                 None,
             ));
@@ -383,6 +545,11 @@ fn intel_amd_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
             // Missing or forbidden nodes have their own hints.
             continue;
         }
+        let fallback = input.fallback(|s| {
+            s.device.as_deref().is_some_and(|d| nodes.contains(&d))
+                || (vendor == GpuVendor::Amd && s.api == HwApi::Amf)
+        });
+        let clause = fallback.clause();
 
         let in_build: Vec<&EncoderCheck> = match vendor {
             GpuVendor::Intel => input
@@ -392,7 +559,7 @@ fn intel_amd_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
             _ => input.listed(HwApi::Vaapi).collect(),
         };
         if in_build.is_empty() {
-            if input.listed(HwApi::Amf).any(|c| c.status.verified) {
+            if vendor == GpuVendor::Amd && input.listed(HwApi::Amf).any(|c| c.status.verified) {
                 continue;
             }
             let what = if vendor == GpuVendor::Intel {
@@ -401,10 +568,10 @@ fn intel_amd_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
                 "VA-API support"
             };
             out.push(hint(
-                SetupHintLevel::Warning,
+                fallback.level(),
                 format!("This ffmpeg can't use {label} GPUs"),
                 format!(
-                    "Chrysopoeia found your {name}, but its ffmpeg was built without {what}. \
+                    "Chrysopoeia found your {name}, but its ffmpeg was built without {what}, {clause}. \
                      The official Docker image includes an ffmpeg that has it."
                 ),
                 None,
@@ -430,41 +597,52 @@ fn intel_amd_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
             .filter_map(|c| c.failure)
             .filter(|k| tested_failure(*k))
             .collect();
-        let all = |kind: FailureKind| kinds.iter().all(|k| *k == kind);
-        if kinds.is_empty() || all(FailureKind::Permission) || all(FailureKind::CodecUnsupported) {
+        let all_of = |allowed: &[FailureKind]| kinds.iter().all(|k| allowed.contains(k));
+        if kinds.is_empty()
+            || all_of(&[FailureKind::Permission, FailureKind::DeviceBlocked])
+            || all_of(&[FailureKind::CodecUnsupported])
+        {
+            continue;
+        }
+        if only_hung(&kinds) {
+            out.push(hung_hint(label, &name, fallback));
             continue;
         }
 
         let (detail, fix) = match (vendor, in_container) {
             (GpuVendor::Intel, true) => (
                 format!(
-                    "The test encode on your {name} failed, which usually means the Intel media driver is missing or too old for this GPU. \
-                     The official image includes a recent one; on Unraid, the Intel GPU TOP plugin also helps."
+                    "The test encode on your {name} failed, {clause}. Chrysopoeia's image already includes Intel's media \
+                     driver, so the host is the likely cause: on Unraid, install the {plugin} plugin and reboot; \
+                     elsewhere, update the kernel and the GPU firmware."
                 ),
                 None,
             ),
             (GpuVendor::Intel, false) => (
                 format!(
-                    "The test encode on your {name} failed, which usually means the Intel media driver (iHD) is missing or too old for this GPU."
+                    "The test encode on your {name} failed, {clause}. \
+                     This usually means the Intel media driver (iHD) is missing or too old for this GPU."
                 ),
                 Some("sudo apt install intel-media-va-driver-non-free".to_string()),
             ),
             (_, true) => (
                 format!(
-                    "The test encode on your {name} failed, which usually means the Mesa VA-API driver is missing or too old for this GPU. \
-                     The official image includes it."
+                    "The test encode on your {name} failed, {clause}. Chrysopoeia's image already includes the Mesa \
+                     VA-API driver, so the host is the likely cause: on Unraid, install the {plugin} plugin and reboot; \
+                     elsewhere, update the kernel and the GPU firmware."
                 ),
                 None,
             ),
             (_, false) => (
                 format!(
-                    "The test encode on your {name} failed, which usually means the Mesa VA-API driver is missing or too old for this GPU."
+                    "The test encode on your {name} failed, {clause}. \
+                     This usually means the Mesa VA-API driver is missing or too old for this GPU."
                 ),
                 Some("sudo apt install mesa-va-drivers".to_string()),
             ),
         };
         out.push(hint(
-            SetupHintLevel::Warning,
+            fallback.level(),
             format!("{label} GPU found, but encoding failed"),
             detail,
             fix,
@@ -481,11 +659,15 @@ fn rockchip_hint(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     if input.listed(HwApi::Rkmpp).next().is_none() {
         return;
     }
+    let fallback = input.fallback(|s| s.api == HwApi::Rkmpp);
     out.push(hint(
-        SetupHintLevel::Warning,
+        fallback.level(),
         "Your Rockchip video engine isn't passed into the container",
-        "This board can encode video in hardware, but /dev/mpp_service isn't passed into the container, \
-         so encoding runs on the CPU. Add the devices below (and /dev/rga and /dev/dma_heap if your board has them).",
+        format!(
+            "This board can encode video in hardware, but /dev/mpp_service isn't passed into the container, {}. \
+             Add the devices below (and /dev/rga and /dev/dma_heap if your board has them).",
+            fallback.clause()
+        ),
         Some(ROCKCHIP_DOCKER_FIX.to_string()),
     ));
 }
@@ -571,9 +753,60 @@ fn filter_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     }
 }
 
+/// Less memory than one encode needs.
+fn memory_hint(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
+    let memory = &input.devices.memory;
+    let Some(budget) = memory_budget(memory) else {
+        return;
+    };
+    if budget >= BYTES_PER_JOB {
+        return;
+    }
+    let amount = format_gb(budget);
+    let limited = memory.cgroup_limit_bytes == Some(budget);
+    let (detail, fix) = match (limited, input.devices.in_container) {
+        (true, true) => (
+            format!(
+                "The container is limited to {amount} of memory, but one encode can need about 1.5 GB, \
+                 so large or 4K files may be stopped partway. Raise the limit (on Unraid, --memory in Extra Parameters)."
+            ),
+            Some(MEMORY_DOCKER_FIX.to_string()),
+        ),
+        (true, false) => (
+            format!(
+                "Chrysopoeia is limited to {amount} of memory, but one encode can need about 1.5 GB, \
+                 so large or 4K files may be stopped partway. Raise the memory limit of its service."
+            ),
+            None,
+        ),
+        (false, _) => (
+            format!(
+                "This server has {amount} of memory, but one encode can need about 1.5 GB, \
+                 so large or 4K files may fail."
+            ),
+            None,
+        ),
+    };
+    out.push(hint(
+        SetupHintLevel::Warning,
+        "Not much memory for encoding",
+        detail,
+        fix,
+    ));
+}
+
 /// The GPU does HEVC but not AV1: point at the goal that stays fast.
 fn av1_tip(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
-    if input.hw_verified_for(VideoCodec::Hevc) && !input.hw_verified_for(VideoCodec::Av1) {
+    // A busy or hung GPU says nothing about what it can encode.
+    let unsure = input.checks.iter().any(|c| {
+        c.status.codec == VideoCodec::Av1
+            && matches!(
+                c.failure,
+                Some(FailureKind::TimedOut | FailureKind::NvencSessionLimit)
+            )
+    });
+    if input.hw_verified_for(VideoCodec::Hevc) && !input.hw_verified_for(VideoCodec::Av1) && !unsure
+    {
         out.push(hint(
             SetupHintLevel::Info,
             "Your GPU can't encode AV1",
@@ -589,11 +822,14 @@ fn cpu_only_hint(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     if input.any_hw_verified() || !input.devices.gpus.is_empty() || input.devices.nvidia_visible() {
         return;
     }
-    // Intel and AMD GPUs live in x86 machines; ARM boards have their own hints.
+    // Intel and AMD GPUs live in x86 machines; ARM boards have their own
+    // hints. The host's PCI bus is visible in a container, so when it lists
+    // devices but no GPU, there is no GPU to pass in.
     let pass_dri = input.platform.linux
         && !input.platform.arm
         && input.devices.in_container
-        && !input.devices.dri_present;
+        && !input.devices.dri_present
+        && !input.devices.pci_listed;
     let mut detail = "No GPU was found, so files are converted on the CPU. That works well; \
                       AV1 (the Save space goal) is the slowest to encode on a CPU, while Balanced (HEVC) finishes sooner."
         .to_string();
@@ -683,7 +919,19 @@ mod tests {
                 access,
                 gid: Some(44),
             }),
+            hidden: false,
         }
+    }
+
+    fn build(devices: &Devices, checks: &[EncoderCheck]) -> Vec<SetupHint> {
+        let filters = all_filters();
+        build_hints(&HintInput {
+            ffmpeg: &ffmpeg_ok(),
+            devices,
+            checks,
+            filters: &filters,
+            platform: LINUX,
+        })
     }
 
     fn titles(hints: &[SetupHint]) -> Vec<&str> {
@@ -814,9 +1062,12 @@ mod tests {
             platform: LINUX,
         });
         assert_eq!(titles(&hints), ["No permission to use the GPU"]);
+        assert_eq!(hints[0].level, SetupHintLevel::Warning);
         assert_eq!(hints[0].fix.as_deref(), Some("--group-add 44"));
         assert!(hints[0].detail.contains("/dev/dri/renderD128"));
-        assert!(hints[0].detail.contains("(group 44)"));
+        assert!(hints[0].detail.contains("belongs to group 44"));
+        assert!(hints[0].detail.contains("Extra Parameters"));
+        assert!(!hints[0].detail.contains("PGID"));
     }
 
     #[test]
@@ -878,7 +1129,9 @@ mod tests {
         };
         let hints = build_hints(&input);
         assert_eq!(titles(&hints), ["Intel GPU found, but encoding failed"]);
-        assert!(hints[0].detail.contains("Intel media driver"));
+        assert_eq!(hints[0].level, SetupHintLevel::Warning);
+        assert!(hints[0].detail.contains("Intel GPU TOP plugin"));
+        assert!(hints[0].detail.contains("encoding runs on the CPU"));
 
         // Working HEVC but no AV1 (e.g. an older iGPU): a tip about Balanced.
         let mut older = checks(
@@ -1022,6 +1275,234 @@ mod tests {
         assert_eq!(hints[0].fix.as_deref(), Some(ROCKCHIP_DOCKER_FIX));
         // No x86 GPU advice on an ARM board.
         assert_eq!(hints[1].fix, None);
+    }
+
+    /// Intel iGPU + NVIDIA card, the most common Unraid setup: when one GPU
+    /// works, problems with the other are tips, not warnings, and never
+    /// claim that encoding runs on the CPU.
+    #[test]
+    fn a_working_gpu_turns_the_other_gpus_problems_into_tips() {
+        let node = "/dev/dri/renderD128";
+        let nvenc_only = |fail: FailureKind| {
+            checks(
+                move |api| match api {
+                    HwApi::Nvenc => None,
+                    _ => Some(fail),
+                },
+                Some(node),
+            )
+        };
+        let mut unnamed_intel = gpu(GpuVendor::Intel, Some((node, NodeAccess::Missing)), "i915");
+        unnamed_intel.name = None;
+
+        // NVENC works; the iGPU isn't passed into the container.
+        let devices = Devices {
+            in_container: true,
+            nvidia_device_nodes: 1,
+            gpus: vec![unnamed_intel, gpu(GpuVendor::Nvidia, None, "nvidia")],
+            ..Devices::default()
+        };
+        let hints = build(&devices, &nvenc_only(FailureKind::DeviceMissing));
+        let pass = hints
+            .iter()
+            .find(|h| h.title == "Your GPU isn't passed into the container")
+            .expect("passthrough tip");
+        assert_eq!(pass.level, SetupHintLevel::Info);
+        assert_eq!(
+            pass.detail,
+            "Your Intel GPU (renderD128) isn't passed into the container, so Chrysopoeia uses NVIDIA NVENC instead. \
+             To use it as well, add the device below (on Unraid, add a Device with the value /dev/dri to the template)."
+        );
+        assert_eq!(pass.fix.as_deref(), Some(DRI_DOCKER_FIX));
+        assert!(
+            hints.iter().all(|h| h.level != SetupHintLevel::Warning),
+            "{hints:#?}"
+        );
+        assert!(
+            hints.iter().all(|h| !h.detail.contains("on the CPU")),
+            "{hints:#?}"
+        );
+
+        // NVENC works; the iGPU has no driver on the host.
+        let devices = Devices {
+            nvidia_device_nodes: 1,
+            gpus: vec![
+                gpu(GpuVendor::Intel, None, "i915"),
+                gpu(GpuVendor::Nvidia, None, "nvidia"),
+            ],
+            ..Devices::default()
+        };
+        let hints = build(&devices, &nvenc_only(FailureKind::DriverNotLoaded));
+        let driver = hints
+            .iter()
+            .find(|h| h.title == "Intel GPU has no driver")
+            .expect("driver tip");
+        assert_eq!(driver.level, SetupHintLevel::Info);
+        assert!(driver.detail.contains("uses NVIDIA NVENC instead"));
+
+        // The other way round: Quick Sync works; the NVIDIA card has no
+        // runtime.
+        let devices = Devices {
+            in_container: true,
+            dri_present: true,
+            gpus: vec![
+                gpu(GpuVendor::Intel, Some((node, NodeAccess::Ok)), "i915"),
+                gpu(GpuVendor::Nvidia, None, "nvidia"),
+            ],
+            ..Devices::default()
+        };
+        let list = checks(
+            |api| match api {
+                HwApi::Nvenc => Some(FailureKind::NvidiaDriverMissing),
+                HwApi::Qsv | HwApi::Vaapi => None,
+                _ => Some(FailureKind::NoDevice),
+            },
+            Some(node),
+        );
+        let hints = build(&devices, &list);
+        let nvidia = hints
+            .iter()
+            .find(|h| h.title == "NVIDIA GPU found, but it can't be used")
+            .expect("NVIDIA tip");
+        assert_eq!(nvidia.level, SetupHintLevel::Info);
+        assert!(
+            nvidia
+                .detail
+                .contains("so Chrysopoeia uses Intel Quick Sync instead. To use it as well"),
+            "{}",
+            nvidia.detail
+        );
+        assert_eq!(nvidia.fix.as_deref(), Some(NVIDIA_DOCKER_FIX));
+    }
+
+    #[test]
+    fn dri_mounted_as_a_folder_needs_a_device_not_a_group() {
+        let node = "/dev/dri/renderD128";
+        let devices = Devices {
+            in_container: true,
+            dri_present: true,
+            gpus: vec![gpu(
+                GpuVendor::Intel,
+                Some((node, NodeAccess::Blocked)),
+                "i915",
+            )],
+            ..Devices::default()
+        };
+        let list = checks(
+            |api| match api {
+                HwApi::Qsv | HwApi::Vaapi => Some(FailureKind::DeviceBlocked),
+                _ => Some(FailureKind::NoDevice),
+            },
+            Some(node),
+        );
+        let hints = build(&devices, &list);
+        assert_eq!(titles(&hints), ["The GPU isn't passed in as a device"]);
+        assert_eq!(hints[0].level, SetupHintLevel::Warning);
+        assert_eq!(hints[0].fix.as_deref(), Some(DRI_DOCKER_FIX));
+        assert!(hints[0].detail.contains("Path"));
+        assert!(!hints[0].detail.contains("group"));
+    }
+
+    #[test]
+    fn a_hung_gpu_gets_restart_advice_not_driver_advice() {
+        let node = "/dev/dri/renderD128";
+        let devices = Devices {
+            in_container: true,
+            dri_present: true,
+            nvidia_device_nodes: 1,
+            gpus: vec![
+                gpu(GpuVendor::Intel, Some((node, NodeAccess::Ok)), "i915"),
+                gpu(GpuVendor::Nvidia, None, "nvidia"),
+            ],
+            ..Devices::default()
+        };
+        let list = checks(
+            |api| match api {
+                HwApi::Nvenc | HwApi::Qsv | HwApi::Vaapi => Some(FailureKind::TimedOut),
+                _ => Some(FailureKind::NoDevice),
+            },
+            Some(node),
+        );
+        let hints = build(&devices, &list);
+        assert_eq!(
+            titles(&hints),
+            ["NVIDIA GPU didn't respond", "Intel GPU didn't respond"]
+        );
+        for h in &hints {
+            assert_eq!(h.fix, None);
+            assert!(h.detail.contains("Restart the container"), "{}", h.detail);
+        }
+    }
+
+    #[test]
+    fn busy_or_hung_av1_is_no_reason_for_the_av1_tip() {
+        let devices = Devices {
+            nvidia_device_nodes: 1,
+            gpus: vec![gpu(GpuVendor::Nvidia, None, "nvidia")],
+            ..Devices::default()
+        };
+        let mut list = checks(
+            |api| match api {
+                HwApi::Nvenc => None,
+                _ => Some(FailureKind::NoDevice),
+            },
+            None,
+        );
+        for c in list.iter_mut().filter(|c| c.status.name == "av1_nvenc") {
+            c.status.verified = false;
+            c.failure = Some(FailureKind::NvencSessionLimit);
+        }
+        assert!(build(&devices, &list).is_empty());
+    }
+
+    #[test]
+    fn low_memory_is_a_warning() {
+        let devices = Devices {
+            in_container: true,
+            memory: chrysopoeia_core::MemoryInfo {
+                total_bytes: 16 << 30,
+                available_bytes: 1 << 30,
+                cgroup_limit_bytes: Some(1 << 30),
+            },
+            pci_listed: true,
+            ..Devices::default()
+        };
+        let list = checks(|_| Some(FailureKind::NoDevice), None);
+        let hints = build(&devices, &list);
+        assert_eq!(
+            titles(&hints),
+            ["Not much memory for encoding", "Encoding on the CPU"]
+        );
+        assert_eq!(hints[0].level, SetupHintLevel::Warning);
+        assert!(hints[0].detail.contains("limited to 1 GB"));
+        assert_eq!(hints[0].fix.as_deref(), Some(MEMORY_DOCKER_FIX));
+
+        // Enough memory: no hint.
+        let roomy = Devices {
+            memory: chrysopoeia_core::MemoryInfo {
+                total_bytes: 16 << 30,
+                available_bytes: 8 << 30,
+                cgroup_limit_bytes: Some(4 << 30),
+            },
+            ..devices
+        };
+        assert_eq!(titles(&build(&roomy, &list)), ["Encoding on the CPU"]);
+    }
+
+    /// Docker shows the host's PCI bus; when it lists no GPU, there is
+    /// nothing to pass in (and `--device=/dev/dri` would stop the container
+    /// from starting).
+    #[test]
+    fn no_dri_advice_when_the_host_has_no_gpu() {
+        let devices = Devices {
+            in_container: true,
+            pci_listed: true,
+            ..Devices::default()
+        };
+        let hints = build(&devices, &checks(|_| Some(FailureKind::NoDevice), None));
+        assert_eq!(titles(&hints), ["Encoding on the CPU"]);
+        assert_eq!(hints[0].fix, None);
+        assert!(!hints[0].detail.contains("pass it"));
     }
 
     #[test]

@@ -4,6 +4,8 @@
 //! busy without thrashing) and memory (about 1.5 GB per encode). GPU encodes
 //! are limited by the GPU's encoder blocks and, for consumer NVIDIA cards,
 //! by the driver's session limit, so they get a small fixed number per GPU.
+//! They are capped by memory too: a job whose codec the GPU can't encode
+//! falls back to a software encoder and needs as much memory as a CPU job.
 
 use std::collections::BTreeSet;
 
@@ -17,7 +19,7 @@ const CORES_PER_CPU_JOB: u32 = 4;
 /// More CPU encodes than this rarely finish sooner.
 const MAX_CPU_JOBS: u32 = 8;
 /// Memory one encode needs (1.5 GiB), including decode buffers and headroom.
-const BYTES_PER_JOB: u64 = 3 * 512 * 1024 * 1024;
+pub(crate) const BYTES_PER_JOB: u64 = 3 * 512 * 1024 * 1024;
 /// Parallel encodes per NVIDIA GPU (consumer cards limit NVENC sessions).
 const NVENC_JOBS_PER_GPU: u32 = 3;
 /// Parallel encodes per Intel or AMD GPU.
@@ -74,7 +76,7 @@ pub fn memory_budget(memory: &MemoryInfo) -> Option<u64> {
 }
 
 /// "8 GB", "1.5 GB".
-fn format_gb(bytes: u64) -> String {
+pub(crate) fn format_gb(bytes: u64) -> String {
     let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
     if gb >= 10.0 || (gb - gb.round()).abs() < 0.05 {
         format!("{gb:.0} GB")
@@ -91,34 +93,69 @@ fn plural(n: u32, one: &str, many: &str) -> String {
     }
 }
 
-/// CPU job count and the reason for it (without the "N at once:" prefix).
-fn cpu_plan(hw: &HardwareInfo, cores: u32) -> (u32, String) {
-    let limited = hw
-        .cpu
-        .cgroup_limit
-        .is_some_and(|l| l.is_finite() && l > 0.0 && cores < hw.cpu.logical_cores.max(1));
-    let cores_n = plural(cores, "CPU core", "CPU cores");
-    let cores_text = if limited {
-        format!("the container is limited to {cores_n}")
+/// "1 CPU core", "2.5 CPU cores", "6 CPU cores".
+fn cpu_limit_text(limit: f64) -> String {
+    if (limit - 1.0).abs() < 0.05 {
+        "1 CPU core".to_string()
+    } else if (limit - limit.round()).abs() < 0.05 {
+        format!("{limit:.0} CPU cores")
     } else {
-        cores_n.clone()
-    };
+        format!("{limit:.1} CPU cores")
+    }
+}
 
-    let by_cores = (cores / CORES_PER_CPU_JOB).clamp(1, MAX_CPU_JOBS);
-    let budget = memory_budget(&hw.memory);
-    let by_memory = budget.map(|bytes| {
+/// Who a limit applies to: the container, or (a cgroup limit outside a
+/// container, e.g. a systemd service) Chrysopoeia.
+fn limited_subject(hw: &HardwareInfo) -> &'static str {
+    if hw.in_container {
+        "the container"
+    } else {
+        "Chrysopoeia"
+    }
+}
+
+/// Encodes that fit in memory, at least 1; `None` when memory is unknown.
+fn memory_jobs(memory: &MemoryInfo) -> Option<u32> {
+    memory_budget(memory).map(|bytes| {
         u32::try_from(bytes / BYTES_PER_JOB)
             .unwrap_or(u32::MAX)
             .max(1)
-    });
-    match (by_memory, budget) {
-        (Some(mem_jobs), Some(bytes)) if mem_jobs < by_cores => (
-            mem_jobs,
-            format!(
-                "{} of memory allows about 1.5 GB per encode",
-                format_gb(bytes)
-            ),
+    })
+}
+
+/// "the container is limited to 3 GB of memory, and each encode needs about
+/// 1.5 GB" or "this server has 4 GB of memory, ...".
+fn memory_reason(hw: &HardwareInfo) -> String {
+    let budget = memory_budget(&hw.memory).unwrap_or(0);
+    let amount = format_gb(budget);
+    let has = if hw.memory.cgroup_limit_bytes == Some(budget) {
+        format!("{} is limited to {amount} of memory", limited_subject(hw))
+    } else {
+        format!("this server has {amount} of memory")
+    };
+    format!("{has}, and each encode needs about 1.5 GB")
+}
+
+/// CPU job count and the reason for it (without the "N at once:" prefix).
+fn cpu_plan(hw: &HardwareInfo, cores: u32) -> (u32, String) {
+    let limit = hw
+        .cpu
+        .cgroup_limit
+        .filter(|l| l.is_finite() && *l > 0.0 && cores < hw.cpu.logical_cores.max(1));
+    let cores_n = plural(cores, "CPU core", "CPU cores");
+    let cores_text = match limit {
+        Some(limit) => format!(
+            "{} is limited to {}",
+            limited_subject(hw),
+            cpu_limit_text(limit)
         ),
+        None => cores_n.clone(),
+    };
+    let limited = limit.is_some();
+
+    let by_cores = (cores / CORES_PER_CPU_JOB).clamp(1, MAX_CPU_JOBS);
+    match memory_jobs(&hw.memory) {
+        Some(mem_jobs) if mem_jobs < by_cores => (mem_jobs, memory_reason(hw)),
         _ if cores < CORES_PER_CPU_JOB && limited => (by_cores, cores_text),
         _ if cores < CORES_PER_CPU_JOB => (
             by_cores,
@@ -254,11 +291,20 @@ pub fn recommend_jobs(hw: &HardwareInfo, preference: HwPreference) -> JobRecomme
     let cores = effective_cores(&hw.cpu);
     let (cpu_jobs, cpu_reason) = cpu_plan(hw, cores);
     let gpu = gpu_plan(hw, preference);
-    let gpu_jobs = gpu.as_ref().map_or(0, |g| g.jobs.min(cores).max(1));
+    let mem_cap = memory_jobs(&hw.memory).unwrap_or(u32::MAX);
+    let gpu_jobs = gpu
+        .as_ref()
+        .map_or(0, |g| g.jobs.min(cores).min(mem_cap).max(1));
 
     let (total, reason) = match (&gpu, preference) {
         (Some(plan), pref) if pref != HwPreference::Cpu => {
-            let reason = if plan.jobs > cores {
+            let reason = if mem_cap < plan.jobs && mem_cap <= cores {
+                format!(
+                    "{gpu_jobs} at once: {}, but {}.",
+                    plan.reason,
+                    memory_reason(hw)
+                )
+            } else if plan.jobs > cores {
                 let cores_text = plural(cores, "CPU core", "CPU cores");
                 let verb = if cores == 1 { "is" } else { "are" };
                 format!(
@@ -421,7 +467,8 @@ mod tests {
                 reason: String::new(),
             },
             hints: Vec::new(),
-            in_container: false,
+            // Limits come from a container runtime in these cases.
+            in_container: limit.is_some() || mem_limit_gb.is_some(),
             detected_at: Utc::now(),
         }
     }
@@ -487,7 +534,7 @@ mod tests {
                 cpu: 2,
                 gpu: 0,
                 total: 2,
-                reason: "2 at once: 4 GB of memory allows about 1.5 GB per encode.",
+                reason: "2 at once: the container is limited to 4 GB of memory, and each encode needs about 1.5 GB.",
             },
             Case {
                 name: "8 cores",
@@ -514,7 +561,54 @@ mod tests {
                 cpu: 1,
                 gpu: 0,
                 total: 1,
-                reason: "1 at once: the container is limited to 6 CPU cores, about 4 cores per encode.",
+                reason: "1 at once: the container is limited to 5.5 CPU cores, about 4 cores per encode.",
+            },
+            Case {
+                name: "2.5 CPUs on a 4-CPU machine",
+                hw: hw(4, Some(2.5), 16, None),
+                pref: HwPreference::Auto,
+                cpu: 1,
+                gpu: 0,
+                total: 1,
+                reason: "1 at once: the container is limited to 2.5 CPU cores.",
+            },
+            Case {
+                name: "3 GB container",
+                hw: hw(16, None, 32, Some(3)),
+                pref: HwPreference::Auto,
+                cpu: 2,
+                gpu: 0,
+                total: 2,
+                reason: "2 at once: the container is limited to 3 GB of memory, and each encode needs about 1.5 GB.",
+            },
+            Case {
+                name: "small server",
+                hw: hw(8, None, 1, None),
+                pref: HwPreference::Auto,
+                cpu: 1,
+                gpu: 0,
+                total: 1,
+                reason: "1 at once: this server has 1 GB of memory, and each encode needs about 1.5 GB.",
+            },
+            Case {
+                name: "NVIDIA in a 1 GB container",
+                hw: with_nvidia(hw(16, None, 32, Some(1)), 1),
+                pref: HwPreference::Auto,
+                cpu: 1,
+                gpu: 1,
+                total: 1,
+                reason: "1 at once: your NVIDIA GeForce RTX 3060 can run 3 encodes in parallel, but the container is \
+                         limited to 1 GB of memory, and each encode needs about 1.5 GB.",
+            },
+            Case {
+                name: "NVIDIA in a 4 GB container",
+                hw: with_nvidia(hw(16, None, 32, Some(4)), 1),
+                pref: HwPreference::Auto,
+                cpu: 2,
+                gpu: 2,
+                total: 2,
+                reason: "2 at once: your NVIDIA GeForce RTX 3060 can run 3 encodes in parallel, but the container is \
+                         limited to 4 GB of memory, and each encode needs about 1.5 GB.",
             },
             Case {
                 name: "one NVIDIA GPU",
@@ -706,6 +800,14 @@ mod tests {
         let c = encoder_candidates(&h, VideoCodec::Av1, HwPreference::Auto, false);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].name, "libsvtav1");
+    }
+
+    #[test]
+    fn formats_cpu_limits() {
+        assert_eq!(cpu_limit_text(1.0), "1 CPU core");
+        assert_eq!(cpu_limit_text(2.0), "2 CPU cores");
+        assert_eq!(cpu_limit_text(2.5), "2.5 CPU cores");
+        assert_eq!(cpu_limit_text(0.5), "0.5 CPU cores");
     }
 
     #[test]

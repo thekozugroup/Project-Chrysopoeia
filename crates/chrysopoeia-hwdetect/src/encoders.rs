@@ -5,9 +5,9 @@
 //! so a missing driver or a GPU that wasn't passed into the container shows
 //! up here, with a plain-language reason, instead of as failed jobs later.
 
-use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrysopoeia_core::{
@@ -25,6 +25,13 @@ pub const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Test encodes running at the same time.
 pub const TEST_CONCURRENCY: usize = 4;
 
+/// Longest all test encodes of one detection may take together. Healthy
+/// GPUs finish every test in a few seconds; this only bounds hung ones.
+pub const CHECK_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Pause before testing again an NVIDIA GPU whose sessions were all busy.
+pub const NVENC_BUSY_RETRY_DELAY: Duration = Duration::from_secs(3);
+
 /// Longest `ffmpeg -version`, `-encoders` or `-filters` may take.
 const INFO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -41,7 +48,9 @@ pub const VERIFICATION_FILTERS: [&str; 5] =
 /// Encoder names from `ffmpeg -encoders`, by media type.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ListedEncoders {
+    /// Video encoder names, e.g. `libx264`, `hevc_nvenc`.
     pub video: BTreeSet<String>,
+    /// Audio encoder names, e.g. `libopus`, `aac`.
     pub audio: BTreeSet<String>,
 }
 
@@ -115,8 +124,11 @@ pub fn available_filters(listed: &BTreeSet<String>) -> Vec<String> {
 /// What running ffmpeg and ffprobe revealed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FfmpegProbe {
+    /// Paths, whether the tools run, and the version.
     pub info: FfmpegInfo,
+    /// Encoders compiled in (empty when ffmpeg doesn't run).
     pub encoders: ListedEncoders,
+    /// Every filter name compiled in.
     pub filters: BTreeSet<String>,
 }
 
@@ -242,6 +254,9 @@ pub enum FailureKind {
     DriverNotLoaded,
     /// The render node exists in sysfs but not under `/dev`.
     DeviceMissing,
+    /// The render node exists, but the container's device rules forbid it
+    /// (`/dev/dri` mounted as a folder rather than passed as a device).
+    DeviceBlocked,
     /// libcuda / the NVIDIA driver isn't reachable.
     NvidiaDriverMissing,
     /// The NVIDIA driver is older than this ffmpeg needs.
@@ -262,15 +277,42 @@ pub enum FailureKind {
     CodecUnsupported,
     /// The device can't be opened by this process.
     Permission,
-    /// The test encode hung.
+    /// The test encode hung (or was skipped because the GPU hung before).
     TimedOut,
     /// Anything else.
     Other,
 }
 
+/// Facts about the machine that change how a failure is worded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailureContext {
+    /// Chrysopoeia runs inside a container.
+    pub in_container: bool,
+    /// Every NVIDIA GPU found uses the open-source nouveau driver.
+    pub nouveau: bool,
+}
+
+impl FailureContext {
+    /// The context for the machine `devices` describes.
+    pub fn from_devices(devices: &Devices) -> Self {
+        let mut nvidia = devices.gpus_from(GpuVendor::Nvidia).peekable();
+        let nouveau =
+            nvidia.peek().is_some() && nvidia.all(|g| g.driver.as_deref() == Some("nouveau"));
+        Self {
+            in_container: devices.in_container,
+            nouveau,
+        }
+    }
+}
+
 impl FailureKind {
     /// Plain-language sentence for this failure.
-    pub fn sentence(self, encoder: &EncoderInfo, device: Option<&str>) -> String {
+    pub fn sentence(
+        self,
+        encoder: &EncoderInfo,
+        device: Option<&str>,
+        context: FailureContext,
+    ) -> String {
         match self {
             Self::NotInBuild => "This ffmpeg build doesn't include it.".into(),
             Self::NotTested => "Not tested, because hardware checks are turned off.".into(),
@@ -295,8 +337,22 @@ impl FailureKind {
                     "The GPU's device file is missing, so it isn't available to Chrysopoeia.".into()
                 }
             },
-            Self::NvidiaDriverMissing => {
+            Self::DeviceBlocked if context.in_container => format!(
+                "The container isn't allowed to use {}; it has to be passed in as a device, not as a folder.",
+                device.unwrap_or("/dev/dri")
+            ),
+            Self::DeviceBlocked => format!(
+                "The system doesn't allow Chrysopoeia to use {}, even though its file permissions do.",
+                device.unwrap_or("/dev/dri")
+            ),
+            Self::NvidiaDriverMissing if context.nouveau => {
+                "The GPU uses the open-source nouveau driver, which can't encode video.".into()
+            }
+            Self::NvidiaDriverMissing if context.in_container => {
                 "The NVIDIA driver isn't available inside the container.".into()
+            }
+            Self::NvidiaDriverMissing => {
+                "The NVIDIA driver isn't installed or isn't working.".into()
             }
             Self::NvidiaDriverTooOld => "The NVIDIA driver is too old for this ffmpeg.".into(),
             Self::NvencSessionLimit => {
@@ -335,91 +391,120 @@ impl FailureKind {
                 }
                 _ => "Chrysopoeia doesn't have permission to use the GPU.".into(),
             },
-            Self::TimedOut => "The test encode timed out.".into(),
+            Self::TimedOut => "The test encode timed out; the GPU didn't respond.".into(),
             Self::Other => "The test encode failed.".into(),
         }
     }
+
+    /// Error text that identifies this failure in ffmpeg's output (compared
+    /// in lowercase). Empty for failures that aren't read from the output.
+    fn needles(self) -> &'static [&'static str] {
+        match self {
+            Self::NvidiaDriverTooOld => &[
+                "driver does not support the required nvenc api version",
+                "minimum required nvidia driver",
+            ],
+            Self::NvidiaDriverMissing => &[
+                "libcuda",
+                "cuda_error_no_device",
+                "no nvenc capable devices",
+                "no cuda capable devices",
+                "libnvidia-encode",
+                "cannot init cuda",
+                "cuinit(0) failed",
+            ],
+            Self::NvencSessionLimit => &["incompatible client key", "out of memory (10)"],
+            Self::Permission => &["permission denied"],
+            Self::QsvRuntimeMissing => &[
+                "mfx session",
+                "mfxinit",
+                "libmfx",
+                "libvpl",
+                "qsv=qs@va",
+                "failed to create a qsv device",
+                "error creating a qsv device",
+            ],
+            Self::VaapiUnavailable => &[
+                "failed to initialise vaapi",
+                "no va display",
+                "vainitialize failed",
+                "failed to create a vaapi device",
+            ],
+            Self::AmfRuntimeMissing => &[
+                "libamfrt",
+                "amf runtime",
+                "failed to load amf",
+                "amf failed to initialise",
+            ],
+            Self::RkmppUnavailable => &["mpp context", "mpp_service", "failed to init mpp"],
+            Self::NoEncoderDevice => &["could not find a valid device"],
+            Self::CodecUnsupported => &[
+                "no usable encoding profile",
+                "not supported",
+                "unsupported",
+                "no capable devices found",
+                "cannot create compression session",
+            ],
+            _ => &[],
+        }
+    }
+
+    /// Whether one lowercased line of ffmpeg output shows this failure.
+    fn matches(self, line: &str) -> bool {
+        // "Operation not permitted" is also ffmpeg's generic EPERM error
+        // code, so it only counts when it is about a device file.
+        (self == Self::Permission
+            && line.contains("operation not permitted")
+            && line.contains("/dev/"))
+            || self.needles().iter().any(|n| line.contains(n))
+    }
+}
+
+/// Failures read from ffmpeg's output, most specific first.
+const CLASSIFY_ORDER: [FailureKind; 10] = [
+    FailureKind::NvidiaDriverTooOld,
+    FailureKind::NvidiaDriverMissing,
+    FailureKind::NvencSessionLimit,
+    FailureKind::Permission,
+    FailureKind::QsvRuntimeMissing,
+    FailureKind::VaapiUnavailable,
+    FailureKind::AmfRuntimeMissing,
+    FailureKind::RkmppUnavailable,
+    FailureKind::NoEncoderDevice,
+    FailureKind::CodecUnsupported,
+];
+
+/// Non-empty, trimmed lines of ffmpeg's error output.
+fn stderr_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Classify a failed test encode, and find the line of `stderr` (an index
+/// into its non-empty lines) that shows why.
+pub fn find_cause(stderr: &str, timed_out: bool) -> (FailureKind, Option<usize>) {
+    if timed_out {
+        return (FailureKind::TimedOut, None);
+    }
+    let lines: Vec<String> = stderr_lines(stderr)
+        .iter()
+        .map(|l| l.to_ascii_lowercase())
+        .collect();
+    CLASSIFY_ORDER
+        .iter()
+        .find_map(|kind| {
+            let index = lines.iter().position(|l| kind.matches(l))?;
+            Some((*kind, Some(index)))
+        })
+        .unwrap_or((FailureKind::Other, None))
 }
 
 /// Classify a failed test encode from ffmpeg's error output.
 pub fn classify_failure(stderr: &str, timed_out: bool) -> FailureKind {
-    if timed_out {
-        return FailureKind::TimedOut;
-    }
-    let lower = stderr.to_ascii_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
-
-    if has(&[
-        "driver does not support the required nvenc api version",
-        "minimum required nvidia driver",
-    ]) {
-        return FailureKind::NvidiaDriverTooOld;
-    }
-    if has(&[
-        "libcuda",
-        "cuda_error_no_device",
-        "no nvenc capable devices",
-        "no cuda capable devices",
-        "libnvidia-encode",
-        "cannot init cuda",
-        "cuinit(0) failed",
-    ]) {
-        return FailureKind::NvidiaDriverMissing;
-    }
-    if has(&["incompatible client key", "out of memory (10)"]) {
-        return FailureKind::NvencSessionLimit;
-    }
-    // "Operation not permitted" is also ffmpeg's generic EPERM error code, so
-    // it only counts when it is about a device file.
-    let device_eperm = lower
-        .lines()
-        .any(|l| l.contains("operation not permitted") && l.contains("/dev/"));
-    if has(&["permission denied"]) || device_eperm {
-        return FailureKind::Permission;
-    }
-    if has(&[
-        "mfx session",
-        "mfxinit",
-        "libmfx",
-        "libvpl",
-        "qsv=qs@va",
-        "failed to create a qsv device",
-        "error creating a qsv device",
-    ]) {
-        return FailureKind::QsvRuntimeMissing;
-    }
-    if has(&[
-        "failed to initialise vaapi",
-        "no va display",
-        "vainitialize failed",
-        "failed to create a vaapi device",
-    ]) {
-        return FailureKind::VaapiUnavailable;
-    }
-    if has(&[
-        "libamfrt",
-        "amf runtime",
-        "failed to load amf",
-        "amf failed to initialise",
-    ]) {
-        return FailureKind::AmfRuntimeMissing;
-    }
-    if has(&["mpp context", "mpp_service", "failed to init mpp"]) {
-        return FailureKind::RkmppUnavailable;
-    }
-    if has(&["could not find a valid device"]) {
-        return FailureKind::NoEncoderDevice;
-    }
-    if has(&[
-        "no usable encoding profile",
-        "not supported",
-        "unsupported",
-        "no capable devices found",
-        "cannot create compression session",
-    ]) {
-        return FailureKind::CodecUnsupported;
-    }
-    FailureKind::Other
+    find_cause(stderr, timed_out).0
 }
 
 /// Strip the `[h264_nvenc @ 0x55d...] ` context prefix ffmpeg puts on lines.
@@ -434,19 +519,22 @@ fn strip_context(line: &str) -> &str {
     line
 }
 
-/// The last `n` non-empty stderr lines, without ffmpeg's context prefixes,
-/// each shortened to 200 characters, joined with " / ".
-pub fn stderr_tail(stderr: &str, n: usize) -> String {
-    let lines: Vec<&str> = stderr
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..]
-        .iter()
-        .map(|l| {
-            let l = strip_context(l);
+/// Up to three stderr lines, without ffmpeg's context prefixes, each
+/// shortened to 200 characters, joined with " / ": the line at `key` (the
+/// one that explains the failure) when there is one, then the last lines.
+pub fn stderr_summary(stderr: &str, key: Option<usize>) -> String {
+    const LINES: usize = 3;
+    let lines = stderr_lines(stderr);
+    let n = lines.len();
+    let picked: Vec<usize> = match key {
+        // The explaining line would be cut off by the tail: keep it first.
+        Some(k) if k + LINES < n => [k].into_iter().chain(n + 1 - LINES..n).collect(),
+        _ => (n.saturating_sub(LINES)..n).collect(),
+    };
+    picked
+        .into_iter()
+        .map(|i| {
+            let l = strip_context(lines[i]);
             match l.char_indices().nth(200) {
                 Some((cut, _)) => format!("{}...", &l[..cut]),
                 None => l.to_string(),
@@ -456,26 +544,31 @@ pub fn stderr_tail(stderr: &str, n: usize) -> String {
         .join(" / ")
 }
 
-/// Sentence for a failure plus the ffmpeg error tail, for `EncoderStatus::error`.
+/// Sentence for a failure plus the telling ffmpeg error lines, for
+/// `EncoderStatus::error`.
 pub fn describe_failure(
     kind: FailureKind,
     encoder: &EncoderInfo,
     device: Option<&str>,
     stderr: &str,
+    context: FailureContext,
 ) -> String {
-    let sentence = kind.sentence(encoder, device);
-    let tail = stderr_tail(stderr, 3);
-    if tail.is_empty() {
+    let sentence = kind.sentence(encoder, device, context);
+    let key = find_cause(stderr, false).1;
+    let details = stderr_summary(stderr, key);
+    if details.is_empty() {
         sentence
     } else {
-        format!("{sentence} Details: {tail}")
+        format!("{sentence} Details: {details}")
     }
 }
 
 /// A failed test encode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestFailure {
+    /// It was killed after the time limit.
     pub timed_out: bool,
+    /// ffmpeg's error output (or why it couldn't run).
     pub stderr: String,
 }
 
@@ -509,6 +602,7 @@ pub async fn run_test_encode(
 /// Result for one encoder, with the failure category hints are built from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderCheck {
+    /// The public result.
     pub status: EncoderStatus,
     /// Why it isn't verified; `None` when verified.
     pub failure: Option<FailureKind>,
@@ -556,8 +650,9 @@ impl EncoderCheck {
         available: bool,
         kind: FailureKind,
         device: Option<String>,
+        context: FailureContext,
     ) -> Self {
-        let error = kind.sentence(encoder, device.as_deref());
+        let error = kind.sentence(encoder, device.as_deref(), context);
         Self::failed(encoder, available, kind, device, error)
     }
 }
@@ -567,6 +662,7 @@ impl EncoderCheck {
 pub struct TestDevice {
     /// Render node for VA-API and Quick Sync; `None` otherwise.
     pub path: Option<String>,
+    /// What the scan found when opening it (`Ok` when there is no path).
     pub access: NodeAccess,
 }
 
@@ -586,7 +682,9 @@ pub enum CheckPlan {
     Known(EncoderCheck),
     /// Try a test encode on each device in turn; the first that works wins.
     Test {
+        /// The encoder to test.
         encoder: EncoderInfo,
+        /// Where to test it, in order of preference.
         devices: Vec<TestDevice>,
     },
 }
@@ -659,6 +757,7 @@ pub fn plan_checks(
     platform: Platform,
     verify: bool,
 ) -> Vec<CheckPlan> {
+    let context = FailureContext::from_devices(devices);
     VIDEO_ENCODERS
         .iter()
         .map(|encoder| {
@@ -668,6 +767,7 @@ pub fn plan_checks(
                     false,
                     FailureKind::NotInBuild,
                     None,
+                    context,
                 ));
             }
             if encoder.api == HwApi::Software {
@@ -679,6 +779,7 @@ pub fn plan_checks(
                     true,
                     FailureKind::NotTested,
                     None,
+                    context,
                 ));
             }
             match candidate_devices(encoder.api, devices, platform) {
@@ -686,70 +787,216 @@ pub fn plan_checks(
                     encoder: *encoder,
                     devices,
                 },
-                Err((kind, device)) => {
-                    CheckPlan::Known(EncoderCheck::known_failure(encoder, true, kind, device))
-                }
+                Err((kind, device)) => CheckPlan::Known(EncoderCheck::known_failure(
+                    encoder, true, kind, device, context,
+                )),
             }
         })
         .collect()
 }
 
-/// Test one encoder on each device until one works.
-async fn test_encoder(
-    ffmpeg: &Path,
-    encoder: EncoderInfo,
-    devices: Vec<TestDevice>,
-    timeout: Duration,
-) -> EncoderCheck {
-    let mut first_failure: Option<EncoderCheck> = None;
-    for device in &devices {
-        let args = test_encode_args(&encoder, device.path.as_deref());
-        match run_test_encode(ffmpeg, &args, timeout).await {
-            Ok(()) => {
-                tracing::debug!(encoder = encoder.name, device = ?device.path, "test encode succeeded");
-                return EncoderCheck::verified(&encoder, device.path.clone());
-            }
-            Err(failure) => {
-                let mut kind = classify_failure(&failure.stderr, failure.timed_out);
-                // VA-API reports an unopenable node only as "No VA display";
-                // the permission check made during the scan is more precise.
-                if device.access == NodeAccess::PermissionDenied
-                    && matches!(
-                        kind,
-                        FailureKind::VaapiUnavailable
-                            | FailureKind::QsvRuntimeMissing
-                            | FailureKind::Other
-                    )
-                {
-                    kind = FailureKind::Permission;
-                }
-                let error =
-                    describe_failure(kind, &encoder, device.path.as_deref(), &failure.stderr);
-                tracing::debug!(encoder = encoder.name, device = ?device.path, %error, "test encode failed");
-                if first_failure.is_none() {
-                    first_failure = Some(EncoderCheck::failed(
-                        &encoder,
-                        true,
-                        kind,
-                        device.path.clone(),
-                        error,
-                    ));
-                }
+/// Limits and wording for a batch of test encodes.
+#[derive(Debug, Clone)]
+pub struct CheckSettings {
+    /// Longest one test encode may take.
+    pub timeout: Duration,
+    /// Longest all test encodes together may take; unfinished ones are
+    /// stopped and reported as timed out.
+    pub deadline: Duration,
+    /// Pause before testing an NVIDIA GPU again whose sessions were all busy.
+    pub busy_retry_delay: Duration,
+    /// How failures are worded on this machine.
+    pub context: FailureContext,
+}
+
+impl CheckSettings {
+    /// The production limits ([`TEST_TIMEOUT`], [`CHECK_DEADLINE`],
+    /// [`NVENC_BUSY_RETRY_DELAY`]) with `context`.
+    pub fn new(context: FailureContext) -> Self {
+        Self {
+            timeout: TEST_TIMEOUT,
+            deadline: CHECK_DEADLINE,
+            busy_retry_delay: NVENC_BUSY_RETRY_DELAY,
+            context,
+        }
+    }
+}
+
+/// What earlier tests in the same run found out about a device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeviceTrouble {
+    /// A test encode hung: later tests on it are skipped.
+    Hung,
+    /// Its NVENC sessions stayed busy after a retry: later tests on it
+    /// run once, without waiting to retry.
+    Busy,
+}
+
+/// State shared by the tests of one run.
+#[derive(Debug)]
+struct TestRun {
+    ffmpeg: PathBuf,
+    settings: CheckSettings,
+    trouble: Mutex<HashMap<String, DeviceTrouble>>,
+}
+
+impl TestRun {
+    fn trouble(&self, key: &str) -> Option<DeviceTrouble> {
+        self.trouble
+            .lock()
+            .ok()
+            .and_then(|map| map.get(key).copied())
+    }
+
+    fn mark(&self, key: String, trouble: DeviceTrouble) {
+        if let Ok(mut map) = self.trouble.lock() {
+            // A hang outranks a busy GPU.
+            let entry = map.entry(key).or_insert(trouble);
+            if trouble == DeviceTrouble::Hung {
+                *entry = trouble;
             }
         }
     }
-    first_failure
-        .unwrap_or_else(|| EncoderCheck::known_failure(&encoder, true, FailureKind::Other, None))
+}
+
+/// The physical device a test runs on: the render node for VA-API and
+/// Quick Sync (both use the same GPU), else the API itself.
+fn device_key(api: HwApi, path: Option<&str>) -> String {
+    match (api, path) {
+        (HwApi::Vaapi | HwApi::Qsv, Some(path)) => path.to_string(),
+        _ => api.label().to_string(),
+    }
+}
+
+/// Test one encoder on each device until one works.
+async fn test_encoder(
+    run: &TestRun,
+    encoder: EncoderInfo,
+    devices: Vec<TestDevice>,
+) -> EncoderCheck {
+    let context = run.settings.context;
+    let mut first_failure: Option<EncoderCheck> = None;
+    for device in &devices {
+        let key = device_key(encoder.api, device.path.as_deref());
+        let check = test_on_device(run, &encoder, device, &key).await;
+        if check.status.verified {
+            return check;
+        }
+        if first_failure.is_none() {
+            first_failure = Some(check);
+        }
+    }
+    first_failure.unwrap_or_else(|| {
+        EncoderCheck::known_failure(&encoder, true, FailureKind::Other, None, context)
+    })
+}
+
+/// One test encode on one device, retrying once when NVENC is busy.
+async fn test_on_device(
+    run: &TestRun,
+    encoder: &EncoderInfo,
+    device: &TestDevice,
+    key: &str,
+) -> EncoderCheck {
+    let settings = &run.settings;
+    let path = device.path.clone();
+    let mut retried = false;
+    loop {
+        match run.trouble(key) {
+            Some(DeviceTrouble::Hung) => {
+                return EncoderCheck::failed(
+                    encoder,
+                    true,
+                    FailureKind::TimedOut,
+                    path,
+                    "Not tested, because the GPU didn't respond to an earlier test encode.".into(),
+                );
+            }
+            Some(DeviceTrouble::Busy) => retried = true,
+            None => {}
+        }
+        let args = test_encode_args(encoder, device.path.as_deref());
+        let failure = match run_test_encode(&run.ffmpeg, &args, settings.timeout).await {
+            Ok(()) => {
+                tracing::debug!(encoder = encoder.name, device = ?device.path, "test encode succeeded");
+                return EncoderCheck::verified(encoder, path);
+            }
+            Err(failure) => failure,
+        };
+        let mut kind = classify_failure(&failure.stderr, failure.timed_out);
+        match kind {
+            // Other apps may free a session in a moment; our own tests never
+            // hold more than one (see `run_checks`).
+            FailureKind::NvencSessionLimit if !retried => {
+                retried = true;
+                tracing::debug!(
+                    encoder = encoder.name,
+                    "NVIDIA GPU busy; testing again shortly"
+                );
+                tokio::time::sleep(settings.busy_retry_delay).await;
+                continue;
+            }
+            FailureKind::NvencSessionLimit => run.mark(key.to_string(), DeviceTrouble::Busy),
+            FailureKind::TimedOut => run.mark(key.to_string(), DeviceTrouble::Hung),
+            _ => {}
+        }
+        // VA-API reports an unopenable node only as "No VA display"; the
+        // access check made during the scan is more precise.
+        let vague = matches!(
+            kind,
+            FailureKind::VaapiUnavailable
+                | FailureKind::QsvRuntimeMissing
+                | FailureKind::Permission
+                | FailureKind::Other
+        );
+        match device.access {
+            NodeAccess::PermissionDenied if vague => kind = FailureKind::Permission,
+            NodeAccess::Blocked if vague => kind = FailureKind::DeviceBlocked,
+            _ => {}
+        }
+        let error = describe_failure(
+            kind,
+            encoder,
+            device.path.as_deref(),
+            &failure.stderr,
+            settings.context,
+        );
+        tracing::debug!(encoder = encoder.name, device = ?device.path, %error, "test encode failed");
+        return EncoderCheck::failed(encoder, true, kind, path, error);
+    }
+}
+
+/// Test encodes of `api` that may run at the same time. NVIDIA consumer
+/// cards allow only a few encoding sessions in total, shared with other apps
+/// such as Plex, so NVENC is tested one encoder at a time.
+fn api_concurrency(api: HwApi) -> usize {
+    match api {
+        HwApi::Nvenc => 1,
+        _ => TEST_CONCURRENCY,
+    }
 }
 
 /// Carry out the plans: known results are passed through, test encodes run
-/// with at most [`TEST_CONCURRENCY`] at a time. Results keep plan order.
+/// with at most [`TEST_CONCURRENCY`] at a time (NVENC one at a time).
+/// Results keep plan order.
+///
+/// A device whose test encode times out isn't tested again in this run, and
+/// everything stops after `settings.deadline`, so a hung GPU can't hold up
+/// detection for long.
 pub async fn run_checks(
     ffmpeg: &Path,
     plans: Vec<CheckPlan>,
-    timeout: Duration,
+    settings: CheckSettings,
 ) -> Vec<EncoderCheck> {
-    let semaphore = Arc::new(Semaphore::new(TEST_CONCURRENCY));
+    let context = settings.context;
+    let deadline = settings.deadline;
+    let run = Arc::new(TestRun {
+        ffmpeg: ffmpeg.to_path_buf(),
+        settings,
+        trouble: Mutex::new(HashMap::new()),
+    });
+    let global = Arc::new(Semaphore::new(TEST_CONCURRENCY));
+    let mut per_api: HashMap<HwApi, Arc<Semaphore>> = HashMap::new();
     let mut results: Vec<Option<EncoderCheck>> = vec![None; plans.len()];
     let mut order: Vec<Option<EncoderInfo>> = vec![None; plans.len()];
     let mut tasks = JoinSet::new();
@@ -759,31 +1006,60 @@ pub async fn run_checks(
             CheckPlan::Known(check) => results[index] = Some(check),
             CheckPlan::Test { encoder, devices } => {
                 order[index] = Some(encoder);
-                let semaphore = Arc::clone(&semaphore);
-                let ffmpeg = ffmpeg.to_path_buf();
+                let api_permits = Arc::clone(
+                    per_api
+                        .entry(encoder.api)
+                        .or_insert_with(|| Arc::new(Semaphore::new(api_concurrency(encoder.api)))),
+                );
+                let global = Arc::clone(&global);
+                let run = Arc::clone(&run);
                 tasks.spawn(async move {
-                    // The semaphore is never closed; if it were, run anyway.
-                    let _permit = semaphore.acquire_owned().await.ok();
-                    (
-                        index,
-                        test_encoder(&ffmpeg, encoder, devices, timeout).await,
-                    )
+                    // Take the API's permit before a shared one, so tests
+                    // waiting their turn on one API don't block the others.
+                    // The semaphores are never closed; if they were, run anyway.
+                    let _api = api_permits.acquire_owned().await.ok();
+                    let _slot = global.acquire_owned().await.ok();
+                    (index, test_encoder(&run, encoder, devices).await)
                 });
             }
         }
     }
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((index, check)) => results[index] = Some(check),
-            Err(err) => tracing::warn!(error = %err, "an encoder test stopped unexpectedly"),
+
+    let collect = async {
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok((index, check)) => results[index] = Some(check),
+                Err(err) => tracing::warn!(error = %err, "an encoder test stopped unexpectedly"),
+            }
         }
+    };
+    if tokio::time::timeout(deadline, collect).await.is_err() {
+        tracing::warn!(
+            unfinished = tasks.len(),
+            "hardware checks took too long; stopping the rest"
+        );
+        // Aborting drops each test, and with it its ffmpeg (kill_on_drop).
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }
+
     results
         .into_iter()
         .zip(order)
         .filter_map(|(result, encoder)| {
             result.or_else(|| {
-                encoder.map(|e| EncoderCheck::known_failure(&e, true, FailureKind::Other, None))
+                encoder.map(|e| {
+                    EncoderCheck::failed(
+                        &e,
+                        true,
+                        FailureKind::TimedOut,
+                        None,
+                        format!(
+                            "{} Detection stopped waiting for the GPU.",
+                            FailureKind::TimedOut.sentence(&e, None, context)
+                        ),
+                    )
+                })
             })
         })
         .collect()
@@ -869,6 +1145,30 @@ Filters:
                 access,
                 gid: Some(105),
             }),
+            hidden: false,
+        }
+    }
+
+    const IN_CONTAINER: FailureContext = FailureContext {
+        in_container: true,
+        nouveau: false,
+    };
+
+    /// Real ffmpeg 6.1 output for h264_nvenc without the NVIDIA driver.
+    const NVENC_NO_DRIVER: &str = "\
+[h264_nvenc @ 0x55ce44d5dec0] Cannot load libcuda.so.1
+[vost#0:0/h264_nvenc @ 0x55ce44d5db00] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+Error while filtering: Operation not permitted
+[out#0/null @ 0x55ce44d5c800] Nothing was written into output file, because at least one of its streams received no packets.
+";
+
+    /// Settings for tests: short limits.
+    fn quick(timeout_ms: u64, deadline_ms: u64) -> CheckSettings {
+        CheckSettings {
+            timeout: Duration::from_millis(timeout_ms),
+            deadline: Duration::from_millis(deadline_ms),
+            busy_retry_delay: Duration::from_millis(50),
+            context: IN_CONTAINER,
         }
     }
 
@@ -1063,30 +1363,244 @@ Filters:
 
     #[test]
     fn failure_messages_are_plain() {
+        // The line that explains the failure is kept even when it isn't
+        // among the last ones.
         let msg = describe_failure(
             FailureKind::NvidiaDriverMissing,
             &enc("h264_nvenc"),
             None,
-            "[h264_nvenc @ 0x562ae7bc1ec0] Cannot load libcuda.so.1\nline two\nline three\nline four\n",
+            NVENC_NO_DRIVER,
+            IN_CONTAINER,
         );
         assert_eq!(
             msg,
-            "The NVIDIA driver isn't available inside the container. Details: line two / line three / line four"
+            "The NVIDIA driver isn't available inside the container. Details: Cannot load libcuda.so.1 / \
+             Error while filtering: Operation not permitted / \
+             Nothing was written into output file, because at least one of its streams received no packets."
         );
         assert_eq!(
-            FailureKind::CodecUnsupported.sentence(&enc("av1_vaapi"), None),
+            find_cause(NVENC_NO_DRIVER, false),
+            (FailureKind::NvidiaDriverMissing, Some(0))
+        );
+        // Unrecognised output: the last three lines.
+        assert_eq!(
+            stderr_summary("one\ntwo\nthree\nfour\n", None),
+            "two / three / four"
+        );
+        assert_eq!(stderr_summary("a\nb\nkey\nc\n", Some(2)), "b / key / c");
+        assert_eq!(stderr_summary("[x @ 0xabc] only line\n", None), "only line");
+        assert_eq!(stderr_summary(&"x".repeat(300), None).chars().count(), 203);
+        assert_eq!(stderr_summary("", Some(0)), "");
+
+        // Worded for where Chrysopoeia runs.
+        let nvenc = enc("h264_nvenc");
+        let bare = FailureContext::default();
+        assert_eq!(
+            FailureKind::NvidiaDriverMissing.sentence(&nvenc, None, bare),
+            "The NVIDIA driver isn't installed or isn't working."
+        );
+        let nouveau = FailureContext {
+            nouveau: true,
+            ..bare
+        };
+        assert!(
+            FailureKind::NvidiaDriverMissing
+                .sentence(&nvenc, None, nouveau)
+                .contains("nouveau")
+        );
+        assert!(
+            FailureKind::DeviceBlocked
+                .sentence(
+                    &enc("hevc_vaapi"),
+                    Some("/dev/dri/renderD128"),
+                    IN_CONTAINER
+                )
+                .contains("passed in as a device")
+        );
+
+        assert_eq!(
+            FailureKind::CodecUnsupported.sentence(&enc("av1_vaapi"), None, bare),
             "This GPU can't encode AV1."
         );
         assert_eq!(
-            FailureKind::CodecUnsupported.sentence(&enc("hevc_qsv"), None),
+            FailureKind::CodecUnsupported.sentence(&enc("hevc_qsv"), None, bare),
             "This GPU can't encode HEVC."
         );
-        assert_eq!(stderr_tail("[x @ 0xabc] only line\n", 3), "only line");
-        assert_eq!(stderr_tail(&"x".repeat(300), 1).chars().count(), 203);
         assert_eq!(
-            FailureKind::TimedOut.sentence(&enc("h264_qsv"), None),
-            "The test encode timed out."
+            FailureKind::TimedOut.sentence(&enc("h264_qsv"), None, bare),
+            "The test encode timed out; the GPU didn't respond."
         );
+    }
+
+    /// A stand-in for ffmpeg: a shell script in `dir`.
+    #[cfg(unix)]
+    fn fake_ffmpeg(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("ffmpeg");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nd=\"$(dirname \"$0\")\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn test_plan(name: &str, nodes: &[&str]) -> CheckPlan {
+        CheckPlan::Test {
+            encoder: enc(name),
+            devices: if nodes.is_empty() {
+                vec![TestDevice::any()]
+            } else {
+                nodes
+                    .iter()
+                    .map(|n| TestDevice {
+                        path: Some((*n).to_string()),
+                        access: NodeAccess::Ok,
+                    })
+                    .collect()
+            },
+        }
+    }
+
+    /// NVENC tests never overlap (consumer cards have few sessions), and a
+    /// busy GPU is tested again after a pause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nvenc_tests_run_one_at_a_time_and_retry_when_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            r#"mkdir "$d/lock" 2>/dev/null || echo overlap >> "$d/overlap"
+sleep 0.2
+rmdir "$d/lock" 2>/dev/null
+echo run >> "$d/runs"
+if [ ! -e "$d/seen" ]; then
+  touch "$d/seen"
+  echo "[h264_nvenc @ 0x1] OpenEncodeSessionEx failed: incompatible client key (21): (no details)" >&2
+  exit 1
+fi
+exit 0"#,
+        );
+        let plans = ["h264_nvenc", "hevc_nvenc", "av1_nvenc"]
+            .iter()
+            .map(|n| test_plan(n, &[]))
+            .collect();
+        let checks = run_checks(&ffmpeg, plans, quick(5_000, 20_000)).await;
+        assert!(
+            !tmp.path().join("overlap").exists(),
+            "NVENC tests overlapped"
+        );
+        // The first test was busy, then passed on the retry.
+        assert!(checks.iter().all(|c| c.status.verified), "{checks:#?}");
+        let runs = std::fs::read_to_string(tmp.path().join("runs")).unwrap();
+        assert_eq!(runs.lines().count(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nvenc_that_stays_busy_is_reported_busy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            r#"echo run >> "$d/runs"
+echo "[hevc_nvenc @ 0x1] OpenEncodeSessionEx failed: out of memory (10): (no details)" >&2
+exit 1"#,
+        );
+        let plans = ["h264_nvenc", "hevc_nvenc"]
+            .iter()
+            .map(|n| test_plan(n, &[]))
+            .collect();
+        let checks = run_checks(&ffmpeg, plans, quick(5_000, 20_000)).await;
+        assert!(
+            checks
+                .iter()
+                .all(|c| c.failure == Some(FailureKind::NvencSessionLimit))
+        );
+        // Retried once for the first encoder only.
+        let runs = std::fs::read_to_string(tmp.path().join("runs")).unwrap();
+        assert_eq!(runs.lines().count(), 3);
+    }
+
+    /// A GPU that hangs is given up on after its first timeout, and other
+    /// devices are still used.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hung_devices_are_not_tested_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(
+            tmp.path(),
+            r#"case "$*" in
+  *renderD128*) echo hang >> "$d/hangs"; exec sleep 30 ;;
+esac
+exit 0"#,
+        );
+        let hung = "/dev/dri/renderD128";
+        let good = "/dev/dri/renderD129";
+        let mut plans: Vec<CheckPlan> = [
+            "h264_vaapi",
+            "hevc_vaapi",
+            "av1_vaapi",
+            "h264_qsv",
+            "hevc_qsv",
+        ]
+        .iter()
+        .map(|n| test_plan(n, &[hung]))
+        .collect();
+        // Falls back to the second GPU.
+        plans.push(test_plan("av1_qsv", &[hung, good]));
+        let started = std::time::Instant::now();
+        let checks = run_checks(&ffmpeg, plans, quick(400, 20_000)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // At most the first wave (4 at a time) actually ran on the hung GPU.
+        let hangs = std::fs::read_to_string(tmp.path().join("hangs")).unwrap();
+        assert!(hangs.lines().count() <= TEST_CONCURRENCY, "{hangs}");
+        for check in &checks[..5] {
+            assert_eq!(check.failure, Some(FailureKind::TimedOut), "{check:?}");
+        }
+        assert!(checks.iter().any(|c| {
+            c.status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.starts_with("Not tested, because the GPU didn't respond"))
+        }));
+        assert!(checks[5].status.verified);
+        assert_eq!(checks[5].status.device.as_deref(), Some(good));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detection_stops_at_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ffmpeg = fake_ffmpeg(tmp.path(), "exec sleep 30");
+        let plans = ["h264_nvenc", "hevc_nvenc", "h264_amf"]
+            .iter()
+            .map(|n| test_plan(n, &[]))
+            .collect();
+        let started = std::time::Instant::now();
+        let checks = run_checks(&ffmpeg, plans, quick(10_000, 300)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(checks.len(), 3);
+        for check in &checks {
+            assert_eq!(check.failure, Some(FailureKind::TimedOut));
+            assert!(
+                check
+                    .status
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .ends_with("Detection stopped waiting for the GPU.")
+            );
+        }
     }
 
     #[test]
@@ -1267,7 +1781,7 @@ Filters:
             expected.push(FailureKind::VaapiUnavailable);
         }
         let started = std::time::Instant::now();
-        let checks = run_checks(ffmpeg, plans, TEST_TIMEOUT).await;
+        let checks = run_checks(ffmpeg, plans, CheckSettings::new(IN_CONTAINER)).await;
         assert!(started.elapsed() < Duration::from_secs(10));
         assert_eq!(checks.len(), expected.len());
         for (check, kind) in checks.iter().zip(expected) {
@@ -1289,14 +1803,19 @@ Filters:
             eprintln!("ffmpeg lacks VA-API; skipping");
             return;
         }
+        let run = TestRun {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            settings: CheckSettings::new(IN_CONTAINER),
+            trouble: Mutex::new(HashMap::new()),
+        };
+        let device = |access| TestDevice {
+            path: Some("/nonexistent/renderD128".into()),
+            access,
+        };
         let check = test_encoder(
-            Path::new("ffmpeg"),
+            &run,
             enc("hevc_vaapi"),
-            vec![TestDevice {
-                path: Some("/nonexistent/renderD128".into()),
-                access: NodeAccess::PermissionDenied,
-            }],
-            TEST_TIMEOUT,
+            vec![device(NodeAccess::PermissionDenied)],
         )
         .await;
         assert_eq!(check.failure, Some(FailureKind::Permission));
@@ -1308,6 +1827,9 @@ Filters:
                 .unwrap()
                 .starts_with("Chrysopoeia doesn't have permission to use /nonexistent/renderD128.")
         );
+        // Refused by the container's device rules: a different fix.
+        let check = test_encoder(&run, enc("hevc_vaapi"), vec![device(NodeAccess::Blocked)]).await;
+        assert_eq!(check.failure, Some(FailureKind::DeviceBlocked));
     }
 
     #[tokio::test]
@@ -1327,7 +1849,7 @@ Filters:
     #[test]
     fn video_codec_label_used_for_h264() {
         assert_eq!(
-            FailureKind::CodecUnsupported.sentence(&enc("h264_vaapi"), None),
+            FailureKind::CodecUnsupported.sentence(&enc("h264_vaapi"), None, IN_CONTAINER),
             format!("This GPU can't encode {}.", VideoCodec::H264.label())
         );
     }

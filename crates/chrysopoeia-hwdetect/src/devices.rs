@@ -12,7 +12,9 @@
 //!    finds GPUs whose driver isn't loaded or that aren't passed into the
 //!    container, so the hints can say why.
 //! 3. NVIDIA's own reporting (`nvidia-smi`, `/proc/driver/nvidia/gpus`,
-//!    `/dev/nvidiaN`).
+//!    `/dev/nvidiaN`), which also says which NVIDIA GPUs the container may
+//!    use: the host's PCI bus is visible in every container, but the NVIDIA
+//!    runtime only exposes the GPUs picked by `NVIDIA_VISIBLE_DEVICES`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -41,13 +43,19 @@ const TOOL_TIMEOUT: Duration = Duration::from_secs(5);
 /// not usable by the host (or its containers) and are not reported.
 const VM_PASSTHROUGH_DRIVERS: &[&str] = &["vfio-pci", "pci-stub"];
 
+/// `EPERM`: returned by `open` when the container's device rules (the
+/// devices cgroup) forbid a device file, whatever its file permissions.
+const EPERM: i32 = 1;
+
 /// The operating system and CPU family Chrysopoeia runs on.
 ///
 /// A plain value rather than scattered `cfg!` checks, so tests can exercise
 /// the decisions made for every platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Platform {
+    /// Running on Linux.
     pub linux: bool,
+    /// Running on macOS.
     pub macos: bool,
     /// 32- or 64-bit ARM (Raspberry Pi, Rockchip boards, Apple silicon).
     pub arm: bool,
@@ -72,8 +80,14 @@ pub enum NodeAccess {
     /// The GPU is listed in sysfs but the device file doesn't exist, which in
     /// a container means `/dev/dri` wasn't passed in.
     Missing,
-    /// The device exists but this process isn't allowed to open it.
+    /// The device exists but its file permissions don't allow this process
+    /// to open it (`EACCES`): a group problem.
     PermissionDenied,
+    /// The device exists and its file permissions would allow it, but the
+    /// system still refuses to open it. In Docker this means `/dev/dri` was
+    /// mounted as a folder instead of being passed with `--device`, so the
+    /// container's device rules forbid it (`EPERM`).
+    Blocked,
     /// Any other error, with the system's message.
     Failed(String),
 }
@@ -84,6 +98,7 @@ pub struct RenderNode {
     /// Logical path such as `/dev/dri/renderD128`, never joined with the
     /// system root.
     pub path: String,
+    /// Whether this process can open it.
     pub access: NodeAccess,
     /// Group owning the device file, when it exists. Used for the
     /// `--group-add` hint.
@@ -93,6 +108,7 @@ pub struct RenderNode {
 /// A GPU found on this machine, with the details hints need.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedGpu {
+    /// Who made it.
     pub vendor: GpuVendor,
     /// Marketing name from `lspci`, `nvidia-smi` or the NVIDIA driver.
     pub name: Option<String>,
@@ -106,6 +122,10 @@ pub struct DetectedGpu {
     pub driver: Option<String>,
     /// DRM render node, when the kernel created one.
     pub render_node: Option<RenderNode>,
+    /// An NVIDIA GPU on the host that isn't given to this container (the
+    /// NVIDIA runtime exposes other GPUs, or it isn't bound to the NVIDIA
+    /// driver). Kept for hints; not reported or counted for jobs.
+    pub hidden: bool,
 }
 
 impl DetectedGpu {
@@ -118,6 +138,7 @@ impl DetectedGpu {
             device_id: None,
             driver: None,
             render_node: None,
+            hidden: false,
         }
     }
 
@@ -174,8 +195,11 @@ impl DetectedGpu {
 /// Everything found about the machine, before ffmpeg is consulted.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Devices {
+    /// CPU model, core counts and container CPU limit.
     pub cpu: CpuInfo,
+    /// Memory size and container memory limit.
     pub memory: MemoryInfo,
+    /// Running inside a container (Docker, Podman, LXC, Kubernetes).
     pub in_container: bool,
     /// `/dev/dri` exists.
     pub dri_present: bool,
@@ -187,13 +211,22 @@ pub struct Devices {
     pub rockchip_vpu: bool,
     /// `/dev/mpp_service` exists, so Rockchip MPP encoders can be tried.
     pub mpp_present: bool,
+    /// `/sys/bus/pci/devices` lists devices, so a machine without GPUs in
+    /// it really has none (rather than the PCI bus being hidden).
+    pub pci_listed: bool,
+    /// Every GPU found, in discovery order, including NVIDIA GPUs that are
+    /// [`DetectedGpu::hidden`] from this container.
     pub gpus: Vec<DetectedGpu>,
 }
 
 impl Devices {
-    /// The GPUs in their public form.
+    /// The GPUs this process can use, in their public form.
     pub fn gpu_devices(&self) -> Vec<GpuDevice> {
-        self.gpus.iter().map(DetectedGpu::to_device).collect()
+        self.gpus
+            .iter()
+            .filter(|g| !g.hidden)
+            .map(DetectedGpu::to_device)
+            .collect()
     }
 
     /// Any GPU from `vendor`.
@@ -260,14 +293,17 @@ pub fn is_real_root(root: &Path) -> bool {
 pub async fn scan(root: &Path, use_system_tools: bool, platform: Platform) -> Devices {
     let root_owned = root.to_path_buf();
     let scanned = tokio::task::spawn_blocking(move || {
-        let logical = if use_system_tools {
+        // Only a fallback for systems without `/proc` (macOS): on Linux it
+        // already rounds a container CPU limit down, which `recommend`
+        // applies itself (rounded up).
+        let fallback_logical = if use_system_tools {
             std::thread::available_parallelism()
                 .ok()
                 .and_then(|n| u32::try_from(n.get()).ok())
         } else {
             None
         };
-        scan_system(&root_owned, logical)
+        scan_system(&root_owned, fallback_logical)
     })
     .await;
     let mut devices = match scanned {
@@ -302,20 +338,26 @@ pub async fn scan(root: &Path, use_system_tools: bool, platform: Platform) -> De
 /// Read everything that comes from files under `root`. Blocking; call it
 /// from `spawn_blocking`.
 ///
-/// `logical_cores` is `available_parallelism` in production; `None` counts
-/// the processors listed in `proc/cpuinfo` (used by tests with a fake tree).
-pub fn scan_system(root: &Path, logical_cores: Option<u32>) -> Devices {
-    let mut gpus = scan_drm(root);
-    scan_pci(root, &mut gpus);
-    merge_nvidia_proc(root, &mut gpus);
+/// `fallback_logical` (`available_parallelism` in production) is only used
+/// when `root` doesn't say how many CPUs there are; see [`read_cpu`].
+pub fn scan_system(root: &Path, fallback_logical: Option<u32>) -> Devices {
+    let status = read_proc_status(root);
+    let mut gpus = scan_drm(root, &status);
+    let pci_listed = scan_pci(root, &mut gpus);
+    let proc_nvidia = merge_nvidia_proc(root, &mut gpus);
+    let minors = nvidia_minors(root);
+    if let Some(visible) = visible_nvidia_slots(&gpus, &proc_nvidia, &minors) {
+        apply_nvidia_visibility(&mut gpus, &visible);
+    }
     let mut devices = Devices {
-        cpu: read_cpu(root, logical_cores),
+        cpu: read_cpu(root, fallback_logical),
         memory: read_memory(root),
         in_container: detect_container(root),
         dri_present: root.join("dev/dri").is_dir(),
-        nvidia_device_nodes: count_nvidia_nodes(root),
+        nvidia_device_nodes: u32::try_from(minors.len()).unwrap_or(u32::MAX),
         rockchip_vpu: detect_rockchip_vpu(root),
         mpp_present: root.join("dev/mpp_service").exists(),
+        pci_listed,
         gpus,
     };
     devices.add_nvidia_placeholders();
@@ -391,8 +433,9 @@ pub struct CpuInfoText {
     pub hardware: Option<String>,
     /// `Processor` (old 32-bit ARM kernels).
     pub processor_name: Option<String>,
-    /// `CPU implementer` and `CPU part` of the first processor (ARM).
+    /// `CPU implementer` of the first processor (ARM).
     pub arm_implementer: Option<u32>,
+    /// `CPU part` of the first processor (ARM).
     pub arm_part: Option<u32>,
     /// Number of `processor` entries.
     pub processors: u32,
@@ -503,8 +546,67 @@ pub fn count_cpu_list(text: &str) -> Option<u32> {
     (count > 0).then_some(count)
 }
 
+/// Fields of interest from `/proc/self/status`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcStatus {
+    /// Effective user id.
+    pub uid: Option<u32>,
+    /// Effective group id followed by the supplementary groups.
+    pub gids: Vec<u32>,
+    /// CPUs this process may run on (`Cpus_allowed_list`), which reflects
+    /// `--cpuset-cpus` and CPU affinity but not a CPU quota.
+    pub cpus_allowed: Option<u32>,
+}
+
+/// Parse `/proc/self/status`. Pure, for tests.
+pub fn parse_proc_status(text: &str) -> ProcStatus {
+    let mut status = ProcStatus::default();
+    let mut groups = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        // `Uid:` and `Gid:` list real, effective, saved and filesystem ids.
+        let effective = || value.split_whitespace().nth(1)?.parse::<u32>().ok();
+        match key.trim() {
+            "Uid" => status.uid = effective(),
+            "Gid" => {
+                if let Some(gid) = effective() {
+                    status.gids.insert(0, gid);
+                }
+            }
+            "Groups" => {
+                groups = value
+                    .split_whitespace()
+                    .filter_map(|g| g.parse::<u32>().ok())
+                    .collect();
+            }
+            "Cpus_allowed_list" => status.cpus_allowed = count_cpu_list(value),
+            _ => {}
+        }
+    }
+    for gid in groups {
+        if !status.gids.contains(&gid) {
+            status.gids.push(gid);
+        }
+    }
+    status
+}
+
+fn read_proc_status(root: &Path) -> ProcStatus {
+    read_text(&root.join("proc/self/status"))
+        .as_deref()
+        .map(parse_proc_status)
+        .unwrap_or_default()
+}
+
 /// Read CPU details under `root`.
-pub fn read_cpu(root: &Path, logical_cores: Option<u32>) -> CpuInfo {
+///
+/// Logical cores are the CPUs this process may run on
+/// (`Cpus_allowed_list`), else the processors in `proc/cpuinfo`, else the
+/// online CPUs, else `fallback_logical`. A container CPU quota is reported
+/// separately in `cgroup_limit`, not subtracted here.
+pub fn read_cpu(root: &Path, fallback_logical: Option<u32>) -> CpuInfo {
     let parsed = read_text(&root.join("proc/cpuinfo"))
         .as_deref()
         .map(parse_cpuinfo)
@@ -528,20 +630,23 @@ pub fn read_cpu(root: &Path, logical_cores: Option<u32>) -> CpuInfo {
         })
         .unwrap_or_else(|| "Unknown CPU".to_string());
 
-    let logical = logical_cores
-        .filter(|n| *n > 0)
+    let logical = read_proc_status(root)
+        .cpus_allowed
         .or((parsed.processors > 0).then_some(parsed.processors))
         .or_else(|| {
             read_text(&root.join("sys/devices/system/cpu/online"))
                 .as_deref()
                 .and_then(count_cpu_list)
         })
+        .or(fallback_logical.filter(|n| *n > 0))
         .unwrap_or(1);
 
     CpuInfo {
         model,
         logical_cores: logical,
-        physical_cores: parsed.physical_cores,
+        // `cpuinfo` describes the whole host; with `--cpuset-cpus` fewer
+        // cores are usable, and never more physical than logical ones.
+        physical_cores: parsed.physical_cores.map(|p| p.min(logical)),
         cgroup_limit: cgroup_cpu_limit(root),
     }
 }
@@ -808,8 +913,9 @@ pub fn normalize_pci_slot(text: &str) -> Option<String> {
     Some(format!("{domain:04x}:{bus:02x}:{dev:02x}.{func:x}"))
 }
 
-/// Check whether a device file can be opened for reading and writing.
-fn check_node(path: &Path) -> (NodeAccess, Option<u32>) {
+/// Check whether a device file can be opened for reading and writing by a
+/// process with the ids in `status`.
+fn check_node(path: &Path, status: &ProcStatus) -> (NodeAccess, Option<u32>) {
     let meta = match fs::metadata(path) {
         Ok(meta) => meta,
         Err(err) => return (access_from_error(&err), None),
@@ -817,7 +923,12 @@ fn check_node(path: &Path) -> (NodeAccess, Option<u32>) {
     let gid = file_gid(&meta);
     let access = match fs::OpenOptions::new().read(true).write(true).open(path) {
         Ok(_) => NodeAccess::Ok,
-        Err(err) => access_from_error(&err),
+        // Refused although the file permissions allow it: adding a group
+        // won't help, so it isn't reported as a group problem.
+        Err(err) => match access_from_error(&err) {
+            NodeAccess::PermissionDenied if mode_allows_rw(&meta, status) => NodeAccess::Blocked,
+            other => other,
+        },
     };
     (access, gid)
 }
@@ -833,8 +944,40 @@ fn file_gid(_meta: &fs::Metadata) -> Option<u32> {
     None
 }
 
+/// Whether the file's owner, group and mode let a process with the ids in
+/// `status` read and write it. `false` when the ids are unknown.
+#[cfg(unix)]
+pub fn mode_allows_rw(meta: &fs::Metadata, status: &ProcStatus) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(uid) = status.uid else {
+        return false;
+    };
+    let bits = if uid == meta.uid() {
+        0o600
+    } else if status.gids.contains(&meta.gid()) {
+        0o060
+    } else {
+        0o006
+    };
+    meta.mode() & bits == bits
+}
+
+/// Whether the file's permissions allow reading and writing (unknown off
+/// Unix, so `false`).
+#[cfg(not(unix))]
+pub fn mode_allows_rw(_meta: &fs::Metadata, _status: &ProcStatus) -> bool {
+    false
+}
+
 /// Classify an error from opening a device file.
+///
+/// `EPERM` (the container's device rules) is [`NodeAccess::Blocked`];
+/// `EACCES` (file permissions) is [`NodeAccess::PermissionDenied`]. Rust maps
+/// both to [`io::ErrorKind::PermissionDenied`], so the raw code decides.
 pub fn access_from_error(err: &io::Error) -> NodeAccess {
+    if cfg!(unix) && err.raw_os_error() == Some(EPERM) {
+        return NodeAccess::Blocked;
+    }
     match err.kind() {
         io::ErrorKind::NotFound => NodeAccess::Missing,
         io::ErrorKind::PermissionDenied => NodeAccess::PermissionDenied,
@@ -858,8 +1001,9 @@ fn sysfs_gpu_name(device_dir: &Path) -> Option<String> {
     .then_some(label)
 }
 
-/// GPUs with a DRM render node.
-fn scan_drm(root: &Path) -> Vec<DetectedGpu> {
+/// GPUs with a DRM render node. `status` holds this process's ids, used to
+/// tell permission problems apart.
+fn scan_drm(root: &Path, status: &ProcStatus) -> Vec<DetectedGpu> {
     let mut gpus: Vec<DetectedGpu> = Vec::new();
     for (name, class_dir) in sorted_entries(&root.join("sys/class/drm")) {
         if !name.starts_with("renderD") {
@@ -881,7 +1025,7 @@ fn scan_drm(root: &Path) -> Vec<DetectedGpu> {
         if pci_slot.is_some() && gpus.iter().any(|g| g.pci_slot == pci_slot) {
             continue;
         }
-        let (access, gid) = check_node(&root.join("dev/dri").join(&name));
+        let (access, gid) = check_node(&root.join("dev/dri").join(&name), status);
         gpus.push(DetectedGpu {
             vendor,
             name: None,
@@ -894,15 +1038,19 @@ fn scan_drm(root: &Path) -> Vec<DetectedGpu> {
                 access,
                 gid,
             }),
+            hidden: false,
         });
     }
     gpus
 }
 
 /// Display controllers on the PCI bus that have no render node: GPUs whose
-/// driver isn't loaded, or NVIDIA GPUs without the DRM module.
-fn scan_pci(root: &Path, gpus: &mut Vec<DetectedGpu>) {
-    for (name, dir) in sorted_entries(&root.join("sys/bus/pci/devices")) {
+/// driver isn't loaded, or NVIDIA GPUs without the DRM module. Returns
+/// whether the PCI bus listed any device at all.
+fn scan_pci(root: &Path, gpus: &mut Vec<DetectedGpu>) -> bool {
+    let entries = sorted_entries(&root.join("sys/bus/pci/devices"));
+    let listed = !entries.is_empty();
+    for (name, dir) in entries {
         let Some(slot) = normalize_pci_slot(&name) else {
             continue;
         };
@@ -938,8 +1086,10 @@ fn scan_pci(root: &Path, gpus: &mut Vec<DetectedGpu>) {
             device_id: read_hex_u16(&dir.join("device")),
             driver,
             render_node: None,
+            hidden: false,
         });
     }
+    listed
 }
 
 /// The `Model:` line of `/proc/driver/nvidia/gpus/*/information`.
@@ -948,6 +1098,12 @@ pub fn parse_nvidia_information(text: &str) -> Option<String> {
         let model = line.strip_prefix("Model:")?.trim();
         (!model.is_empty()).then(|| model.to_string())
     })
+}
+
+/// The `Device Minor:` line of the same file: N in `/dev/nvidiaN`.
+pub fn parse_nvidia_minor(text: &str) -> Option<u32> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("Device Minor:")?.trim().parse().ok())
 }
 
 /// Prefix "NVIDIA " when a name from the driver lacks it.
@@ -985,14 +1141,85 @@ fn merge_nvidia_gpu(gpus: &mut Vec<DetectedGpu>, slot: Option<String>, name: Opt
     }
 }
 
+/// One GPU listed by the NVIDIA driver in `/proc/driver/nvidia/gpus`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcNvidiaGpu {
+    /// Normalized PCI address (the directory name).
+    slot: Option<String>,
+    /// N in `/dev/nvidiaN`.
+    minor: Option<u32>,
+}
+
 /// NVIDIA GPUs reported by the kernel driver in `/proc/driver/nvidia/gpus`.
-fn merge_nvidia_proc(root: &Path, gpus: &mut Vec<DetectedGpu>) {
+/// Inside a container the NVIDIA runtime lists only the GPUs it exposes.
+fn merge_nvidia_proc(root: &Path, gpus: &mut Vec<DetectedGpu>) -> Vec<ProcNvidiaGpu> {
+    let mut listed = Vec::new();
     for (name, dir) in sorted_entries(&root.join("proc/driver/nvidia/gpus")) {
-        let model = read_text(&dir.join("information"))
+        let information = read_text(&dir.join("information"));
+        let model = information
             .as_deref()
             .and_then(parse_nvidia_information)
             .map(|m| nvidia_name(&m));
-        merge_nvidia_gpu(gpus, normalize_pci_slot(&name), model);
+        let slot = normalize_pci_slot(&name);
+        merge_nvidia_gpu(gpus, slot.clone(), model);
+        listed.push(ProcNvidiaGpu {
+            slot,
+            minor: information.as_deref().and_then(parse_nvidia_minor),
+        });
+    }
+    listed
+}
+
+/// PCI slots of the NVIDIA GPUs this process can use, or `None` when that
+/// can't be told (then every NVIDIA GPU counts).
+///
+/// The driver's `/proc` listing is used first, keeping only GPUs whose
+/// `/dev/nvidiaN` exists when any do (a container given one device by hand
+/// still sees every GPU in `/proc`). Without it, `/dev/nvidiaN` numbers are
+/// matched to NVIDIA GPUs in PCI order, which is how the driver numbers them.
+fn visible_nvidia_slots(
+    gpus: &[DetectedGpu],
+    proc_listed: &[ProcNvidiaGpu],
+    minors: &[u32],
+) -> Option<BTreeSet<String>> {
+    let visible: BTreeSet<String> = if proc_listed.is_empty() {
+        if minors.is_empty() {
+            return None;
+        }
+        let mut slots: Vec<&str> = gpus
+            .iter()
+            .filter(|g| g.vendor == GpuVendor::Nvidia)
+            .filter_map(|g| g.pci_slot.as_deref())
+            .collect();
+        slots.sort_unstable();
+        let mut visible = BTreeSet::new();
+        for minor in minors {
+            let slot = usize::try_from(*minor).ok().and_then(|m| slots.get(m))?;
+            visible.insert((*slot).to_string());
+        }
+        visible
+    } else {
+        proc_listed
+            .iter()
+            .filter(|p| minors.is_empty() || p.minor.is_none_or(|m| minors.contains(&m)))
+            .filter_map(|p| p.slot.clone())
+            .collect()
+    };
+    // Hiding every GPU would only mean the numbering was misread.
+    (!visible.is_empty()).then_some(visible)
+}
+
+/// Hide NVIDIA GPUs outside `visible` (PCI slots): the host has them, but
+/// this container can't use them.
+fn apply_nvidia_visibility(gpus: &mut [DetectedGpu], visible: &BTreeSet<String>) {
+    for gpu in gpus.iter_mut().filter(|g| g.vendor == GpuVendor::Nvidia) {
+        gpu.hidden = gpu
+            .pci_slot
+            .as_ref()
+            .is_some_and(|slot| !visible.contains(slot));
+        if gpu.hidden {
+            tracing::debug!(slot = ?gpu.pci_slot, "NVIDIA GPU not available to this container");
+        }
     }
 }
 
@@ -1011,23 +1238,29 @@ fn detect_rockchip_vpu(root: &Path) -> bool {
     .any(|bytes| bytes.windows(8).any(|w| w == b"rockchip"))
 }
 
-/// Number of `/dev/nvidiaN` files (not `nvidiactl`, `nvidia-uvm`...).
-fn count_nvidia_nodes(root: &Path) -> u32 {
-    let count = sorted_entries(&root.join("dev"))
+/// N of every `/dev/nvidiaN` file (not `nvidiactl`, `nvidia-uvm`...), in
+/// ascending order.
+fn nvidia_minors(root: &Path) -> Vec<u32> {
+    sorted_entries(&root.join("dev"))
         .iter()
-        .filter(|(name, _)| {
-            name.strip_prefix("nvidia")
-                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .filter_map(|(name, _)| {
+            let n = name.strip_prefix("nvidia")?;
+            if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            n.parse().ok()
         })
-        .count();
-    u32::try_from(count).unwrap_or(u32::MAX)
+        .collect()
 }
 
 /// One row of `nvidia-smi --query-gpu=name,driver_version,pci.bus_id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NvidiaSmiGpu {
+    /// Marketing name, e.g. "NVIDIA GeForce RTX 3060".
     pub name: String,
+    /// Driver version, e.g. "550.54.14".
     pub driver_version: String,
+    /// PCI address with an 8-digit domain, e.g. "00000000:01:00.0".
     pub bus_id: String,
 }
 
@@ -1068,13 +1301,18 @@ async fn merge_nvidia_smi(devices: &mut Devices) {
                 return;
             }
             devices.gpus.retain(|g| !g.is_nvidia_placeholder());
+            let mut visible = BTreeSet::new();
             for gpu in listed {
                 tracing::debug!(name = %gpu.name, driver = %gpu.driver_version, bus = %gpu.bus_id, "nvidia-smi GPU");
-                merge_nvidia_gpu(
-                    &mut devices.gpus,
-                    normalize_pci_slot(&gpu.bus_id),
-                    Some(nvidia_name(&gpu.name)),
-                );
+                let slot = normalize_pci_slot(&gpu.bus_id);
+                if let Some(slot) = &slot {
+                    visible.insert(slot.clone());
+                }
+                merge_nvidia_gpu(&mut devices.gpus, slot, Some(nvidia_name(&gpu.name)));
+            }
+            // nvidia-smi lists exactly the GPUs this container may use.
+            if !visible.is_empty() {
+                apply_nvidia_visibility(&mut devices.gpus, &visible);
             }
         }
         Ok(out) => {
@@ -1352,6 +1590,7 @@ pub(crate) mod tests {
 
         assert_eq!(d.cpu.model, "Intel(R) Core(TM) i7-10700 CPU @ 2.90GHz");
         assert_eq!(d.cpu.logical_cores, 16);
+        assert!(d.pci_listed);
         assert_eq!(d.cpu.physical_cores, Some(8));
         assert_eq!(d.cpu.cgroup_limit, Some(4.0));
 
@@ -1485,8 +1724,11 @@ pub(crate) mod tests {
     fn permission_errors_are_classified() {
         let denied = io::Error::from(io::ErrorKind::PermissionDenied);
         assert_eq!(access_from_error(&denied), NodeAccess::PermissionDenied);
+        let eacces = io::Error::from_raw_os_error(13);
+        assert_eq!(access_from_error(&eacces), NodeAccess::PermissionDenied);
+        // EPERM comes from the container's device rules, not file modes.
         let eperm = io::Error::from_raw_os_error(1);
-        assert_eq!(access_from_error(&eperm), NodeAccess::PermissionDenied);
+        assert_eq!(access_from_error(&eperm), NodeAccess::Blocked);
         let missing = io::Error::from(io::ErrorKind::NotFound);
         assert_eq!(access_from_error(&missing), NodeAccess::Missing);
         let busy = io::Error::other("device busy");
@@ -1728,6 +1970,163 @@ pub(crate) mod tests {
                     Pages speculative:                        1000.\n";
         assert_eq!(parse_vm_stat(text), Some(16_000 * 16_384));
         assert_eq!(parse_vm_stat("nonsense"), None);
+    }
+
+    /// Two NVIDIA cards in the host (say one for Plex, one for
+    /// Chrysopoeia); the container was given one.
+    #[cfg(unix)]
+    fn two_nvidia_host(root: &Path) {
+        for slot in ["0000:01:00.0", "0000:02:00.0"] {
+            pci_device(
+                root,
+                "pci0000:00",
+                slot,
+                "0x10de",
+                "0x2504",
+                "0x030000",
+                Some("nvidia"),
+            );
+        }
+        put(root, ".dockerenv", "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nvidia_gpus_outside_the_container_are_hidden() {
+        // The NVIDIA runtime lists only the GPU it exposes in /proc.
+        let tmp = tempfile::tempdir().unwrap();
+        two_nvidia_host(tmp.path());
+        put(
+            tmp.path(),
+            "proc/driver/nvidia/gpus/0000:02:00.0/information",
+            "Model: \t\t NVIDIA GeForce RTX 3060\nDevice Minor: \t 1\n",
+        );
+        put(tmp.path(), "dev/nvidia1", "");
+        let d = scan_system(tmp.path(), Some(8));
+        assert_eq!(d.gpus.len(), 2);
+        assert!(d.gpus[0].hidden, "{:#?}", d.gpus);
+        assert!(!d.gpus[1].hidden);
+        let public = d.gpu_devices();
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].name, "NVIDIA GeForce RTX 3060");
+
+        // Only /dev/nvidia1: numbers follow PCI order, so the second card.
+        let tmp = tempfile::tempdir().unwrap();
+        two_nvidia_host(tmp.path());
+        put(tmp.path(), "dev/nvidia1", "");
+        put(tmp.path(), "dev/nvidiactl", "");
+        let d = scan_system(tmp.path(), Some(8));
+        assert_eq!(d.nvidia_device_nodes, 1);
+        assert_eq!(
+            d.gpus.iter().map(|g| g.hidden).collect::<Vec<_>>(),
+            [true, false]
+        );
+
+        // /proc lists both (a device passed by hand, without the runtime),
+        // but only /dev/nvidia0 exists.
+        let tmp = tempfile::tempdir().unwrap();
+        two_nvidia_host(tmp.path());
+        for (slot, minor) in [("0000:01:00.0", 0), ("0000:02:00.0", 1)] {
+            put(
+                tmp.path(),
+                &format!("proc/driver/nvidia/gpus/{slot}/information"),
+                &format!("Model: \t\t NVIDIA T400\nDevice Minor: \t {minor}\n"),
+            );
+        }
+        put(tmp.path(), "dev/nvidia0", "");
+        let d = scan_system(tmp.path(), Some(8));
+        assert_eq!(d.gpu_devices().len(), 1);
+        assert!(!d.gpus[0].hidden && d.gpus[1].hidden);
+
+        // No NVIDIA runtime at all: nothing is known, so nothing is hidden
+        // (the hints explain why NVENC fails).
+        let tmp = tempfile::tempdir().unwrap();
+        two_nvidia_host(tmp.path());
+        let d = scan_system(tmp.path(), Some(8));
+        assert_eq!(d.gpu_devices().len(), 2);
+
+        // Numbering that doesn't match hides nothing.
+        let tmp = tempfile::tempdir().unwrap();
+        two_nvidia_host(tmp.path());
+        put(tmp.path(), "dev/nvidia5", "");
+        let d = scan_system(tmp.path(), Some(8));
+        assert!(d.gpus.iter().all(|g| !g.hidden));
+    }
+
+    #[test]
+    fn cpu_count_follows_the_cpuset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cpuinfo = String::new();
+        for i in 0..16 {
+            cpuinfo.push_str(&format!(
+                "processor\t: {i}\nmodel name\t: Test CPU\nphysical id\t: 0\ncore id\t\t: {}\n\n",
+                i % 8
+            ));
+        }
+        put(tmp.path(), "proc/cpuinfo", &cpuinfo);
+        assert_eq!(read_cpu(tmp.path(), Some(2)).logical_cores, 16);
+        // `--cpuset-cpus=0-3`: 4 usable CPUs, however many the host has.
+        put(
+            tmp.path(),
+            "proc/self/status",
+            "Name:\tchrysopoeia\nUid:\t99\t99\t99\t99\nGid:\t100\t100\t100\t100\n\
+             Groups:\t44 100 105\nCpus_allowed:\tf\nCpus_allowed_list:\t0-3\n",
+        );
+        // A fractional quota is kept as is; `recommend` rounds it up.
+        put(tmp.path(), "sys/fs/cgroup/cpu.max", "250000 100000\n");
+        let cpu = read_cpu(tmp.path(), Some(2));
+        assert_eq!(cpu.logical_cores, 4);
+        assert_eq!(cpu.physical_cores, Some(4));
+        assert_eq!(cpu.cgroup_limit, Some(2.5));
+
+        let status = parse_proc_status(&read_text(&tmp.path().join("proc/self/status")).unwrap());
+        assert_eq!(status.uid, Some(99));
+        assert_eq!(status.gids, [100, 44, 105]);
+        assert_eq!(status.cpus_allowed, Some(4));
+        assert_eq!(parse_proc_status("garbage"), ProcStatus::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_modes_decide_whether_a_refusal_is_a_group_problem() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let node = tmp.path().join("renderD128");
+        fs::write(&node, "").unwrap();
+        let meta = |mode: u32| {
+            fs::set_permissions(&node, fs::Permissions::from_mode(mode)).unwrap();
+            fs::metadata(&node).unwrap()
+        };
+        let m = meta(0o660);
+        let (owner, group) = (m.uid(), m.gid());
+        let stranger = |gids: Vec<u32>| ProcStatus {
+            uid: Some(owner.wrapping_add(1)),
+            gids,
+            cpus_allowed: None,
+        };
+        // Owner: owner bits.
+        let me = ProcStatus {
+            uid: Some(owner),
+            gids: Vec::new(),
+            cpus_allowed: None,
+        };
+        assert!(mode_allows_rw(&meta(0o600), &me));
+        assert!(!mode_allows_rw(&meta(0o400), &me));
+        // In the owning group: group bits.
+        assert!(mode_allows_rw(&meta(0o660), &stranger(vec![group])));
+        assert!(!mode_allows_rw(&meta(0o600), &stranger(vec![group])));
+        // Anyone else: other bits (a 0666 node is open to everyone).
+        let outsider = stranger(vec![group.wrapping_add(1)]);
+        assert!(!mode_allows_rw(&meta(0o660), &outsider));
+        assert!(mode_allows_rw(&meta(0o666), &outsider));
+        // Unknown ids: never assume it is allowed.
+        assert!(!mode_allows_rw(&meta(0o666), &ProcStatus::default()));
+    }
+
+    #[test]
+    fn empty_pci_bus_is_noted() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!scan_system(tmp.path(), None).pci_listed);
     }
 
     #[test]

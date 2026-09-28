@@ -26,7 +26,9 @@ pub mod recommend;
 /// Inputs for [`detect`].
 #[derive(Debug, Clone)]
 pub struct DetectOptions {
+    /// ffmpeg to run (a name looked up on `PATH`, or a path).
     pub ffmpeg: PathBuf,
+    /// ffprobe to run (a name looked up on `PATH`, or a path).
     pub ffprobe: PathBuf,
     /// Run a short test encode per hardware encoder (recommended). When
     /// false, hardware encoders listed by ffmpeg are reported as unverified
@@ -56,6 +58,8 @@ impl Default for DetectOptions {
 ///
 /// Software encoders listed by ffmpeg are always `verified` (they need no
 /// device); `verify_encoders: false` only skips the hardware test encodes.
+/// Test encodes take at most 15 s each and 30 s together, NVENC is tested
+/// one encoder at a time, and a GPU that hangs isn't tested again.
 /// External tools (`lspci`, `nvidia-smi`) are only used when `system_root`
 /// is `/`, so a fake tree is never mixed with the real machine.
 pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
@@ -75,7 +79,8 @@ pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
             platform,
             opts.verify_encoders,
         );
-        encoders::run_checks(&opts.ffmpeg, plans, encoders::TEST_TIMEOUT).await
+        let context = encoders::FailureContext::from_devices(&found_devices);
+        encoders::run_checks(&opts.ffmpeg, plans, encoders::CheckSettings::new(context)).await
     } else {
         Vec::new()
     };
@@ -131,10 +136,12 @@ pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
 ///
 /// CPU jobs: one per four effective cores (container CPU limits honoured),
 /// between 1 and 8, and at most one per 1.5 GB of memory (container memory
-/// limit honoured). GPU jobs: 3 per NVIDIA GPU, 2 per Intel or AMD GPU, 2 on
-/// Apple, capped by effective cores. `total` is the GPU number when the
-/// preference isn't `Cpu` and a verified hardware encoder exists (for the
-/// pinned API, when one is pinned), else the CPU number.
+/// limit honoured). GPU jobs: 3 per NVIDIA GPU this container can use, 2 per
+/// Intel or AMD GPU, 2 on Apple, capped by effective cores and by memory
+/// (1.5 GB per job, since a job whose codec the GPU can't encode runs on the
+/// CPU). `total` is the GPU number when the preference isn't `Cpu` and a
+/// verified hardware encoder exists (for the pinned API, when one is
+/// pinned), else the CPU number.
 pub fn recommend_jobs(hw: &HardwareInfo, preference: HwPreference) -> JobRecommendation {
     recommend::recommend_jobs(hw, preference)
 }
