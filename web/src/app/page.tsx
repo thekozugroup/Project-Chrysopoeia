@@ -1,22 +1,6 @@
-"use client";
+import { App } from "@/components/app";
 
-import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
-import { AppSidebar } from "@/components/app-sidebar";
-import { Dashboard } from "@/components/dashboard";
-import { ErrorBoundary } from "@/components/error-boundary";
-import { StatusBar } from "@/components/status-bar";
-export default function Home() {
-  return (
-    <ErrorBoundary>
-      <SidebarProvider>
-        <AppSidebar />
-        <SidebarInset className="flex h-screen flex-col overflow-hidden min-w-0">
-          <div className="flex-1 min-h-0">
-            <Dashboard />
-          </div>
-          <StatusBar />
-        </SidebarInset>
-      </SidebarProvider>
-    </ErrorBoundary>
-  );
+/** The whole UI is one page; views live in the URL hash (see lib/router.ts). */
+export default function Page() {
+  return <App />;
 }

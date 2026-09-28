@@ -1,54 +1,37 @@
-import type { Metadata } from "next";
-import { Instrument_Serif, DM_Sans, JetBrains_Mono } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import "@fontsource/instrument-serif/400.css";
+import "@fontsource-variable/dm-sans/wght.css";
+import "@fontsource-variable/jetbrains-mono/wght.css";
 import "./globals.css";
 import { Providers } from "@/components/providers";
-
-const instrumentSerif = Instrument_Serif({
-  variable: "--font-display",
-  subsets: ["latin"],
-  weight: "400",
-});
-
-const dmSans = DM_Sans({
-  variable: "--font-sans",
-  subsets: ["latin"],
-});
-
-const jetbrainsMono = JetBrains_Mono({
-  variable: "--font-mono",
-  subsets: ["latin"],
-});
+import { THEME_BOOT_SCRIPT } from "@/lib/theme-script";
 
 export const metadata: Metadata = {
-  title: {
-    default: "Chrysopoeia",
-    template: "%s | Chrysopoeia",
-  },
+  title: "Chrysopoeia",
   description:
-    "Transmute your media library. Chrysopoeia is a conversational interface for intelligent media transcoding with hardware-accelerated encoding.",
-  openGraph: {
-    title: "Chrysopoeia",
-    description:
-      "Transmute your media library with intelligent, conversational transcoding.",
-    siteName: "Chrysopoeia",
-    type: "website",
-  },
-  other: {
-    "theme-color": "#0d0d0d",
-  },
+    "Chrysopoeia converts your media library to efficient formats in the background, verifies every file, and only then replaces the original.",
+  applicationName: "Chrysopoeia",
+  robots: { index: false, follow: false },
 };
 
-export default function RootLayout({
-  children,
-}: Readonly<{
-  children: React.ReactNode;
-}>) {
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+  themeColor: [
+    { media: "(prefers-color-scheme: dark)", color: "#1b1814" },
+    { media: "(prefers-color-scheme: light)", color: "#f7f4ee" },
+  ],
+};
+
+export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html
-      lang="en"
-      className={`${instrumentSerif.variable} ${dmSans.variable} ${jetbrainsMono.variable} dark h-full antialiased`}
-    >
-      <body className="h-full overflow-hidden bg-background text-foreground">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Apply the saved theme before first paint. */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOT_SCRIPT }} />
+      </head>
+      <body>
         <Providers>{children}</Providers>
       </body>
     </html>
