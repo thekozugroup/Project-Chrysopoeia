@@ -76,6 +76,9 @@ pub struct MediaFile {
     pub saved_bytes: Option<i64>,
     pub skip_reason: Option<String>,
     pub error: Option<String>,
+    /// Machine-readable cause of `error` (see `ProblemKind`).
+    #[serde(default)]
+    pub problem: Option<crate::job::ProblemKind>,
     /// Most recent job for this file.
     pub job_id: Option<Uuid>,
     /// Live progress (0..=100) while processing.

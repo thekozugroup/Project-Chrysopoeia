@@ -29,6 +29,32 @@ impl JobState {
     }
 }
 
+/// Why a file could not be converted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProblemKind {
+    /// The original is damaged, truncated or not really a video. Retrying
+    /// won't help; the user should check or replace the file.
+    UnreadableSource,
+    /// The work (temp) folder is missing, not writable or unusable.
+    WorkFolder,
+    /// The library or output folder can't be written (read-only mount,
+    /// permissions), so the result can't be put in place.
+    Destination,
+    /// Not enough free space for the work file or the result.
+    DiskFull,
+    /// The encoder failed on every attempt (including hardware errors).
+    Encoder,
+    /// The chosen hardware isn't available and CPU fallback is off.
+    HardwareUnavailable,
+    /// The new file failed verification on every attempt.
+    Verification,
+    /// The original changed or disappeared while it was being converted.
+    SourceChanged,
+    /// Anything else.
+    Other,
+}
+
 /// Where a running job is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -65,6 +91,10 @@ pub struct Job {
     pub input_size: u64,
     pub output_size: Option<u64>,
     pub error: Option<String>,
+    /// Machine-readable cause of `error`, so the UI can group problems and
+    /// offer the right fix without parsing sentences.
+    #[serde(default)]
+    pub problem: Option<ProblemKind>,
     pub skip_reason: Option<String>,
     pub validation: Option<ValidationReport>,
     /// The ffmpeg command line of the final attempt.

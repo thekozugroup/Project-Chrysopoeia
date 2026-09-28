@@ -33,6 +33,8 @@ fn from_row(row: &SqliteRow, with_probe: bool) -> sqlx::Result<MediaFile> {
     };
     let progress: Option<f64> = row.try_get("progress")?;
     Ok(MediaFile {
+        // Filled from the `problem` column once the backend records causes.
+        problem: None,
         id: uuid_col(row, "id")?,
         library_id: uuid_col(row, "library_id")?,
         path: row.try_get("path")?,

@@ -31,6 +31,8 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let notes: Option<String> = row.try_get("notes")?;
     let force: i64 = row.try_get("force")?;
     Ok(Job {
+        // Filled from the `problem` column once the backend records causes.
+        problem: None,
         force: force != 0,
         notes: notes
             .as_deref()

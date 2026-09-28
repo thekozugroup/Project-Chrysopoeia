@@ -618,3 +618,16 @@ secondary detail; every destructive action is reversible or confirmed.
 - `Overview.resolutions` has a "No video" bucket; `savings_history` and
   `totals.saved_bytes` cover the same libraries.
 - Workspace MSRV is Rust 1.88.
+
+## Contract additions, round 4 (normative)
+
+- `Job.problem` / `MediaFile.problem`: optional `ProblemKind` —
+  `unreadable_source`, `work_folder`, `destination`, `disk_full`, `encoder`,
+  `hardware_unavailable`, `verification`, `source_changed`, `other`. Set
+  whenever `error` is set; persisted (`jobs.problem`, `files.problem`). The UI
+  groups problems and picks the fix by code, never by parsing sentences.
+- `GET /api/fs/browse` also returns `media_count` and `media_count_capped`
+  for the browsed folder itself (same counting rules as entries).
+- A re-conversion of a `done` file that fails, is cancelled or is skipped
+  leaves the file `done` (the converted file is still on disk); only the job
+  row records the outcome.
