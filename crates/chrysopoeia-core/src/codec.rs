@@ -219,8 +219,23 @@ pub enum SubtitleAction {
 
 /// Text-based subtitle codecs (as reported by ffprobe).
 pub const TEXT_SUBTITLE_CODECS: &[&str] = &[
-    "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "microdvd", "subviewer",
-    "subviewer1", "jacosub", "realtext", "sami", "stl", "mpl2", "pjs", "vplayer",
+    "subrip",
+    "srt",
+    "ass",
+    "ssa",
+    "webvtt",
+    "mov_text",
+    "text",
+    "microdvd",
+    "subviewer",
+    "subviewer1",
+    "jacosub",
+    "realtext",
+    "sami",
+    "stl",
+    "mpl2",
+    "pjs",
+    "vplayer",
 ];
 
 /// Bitmap subtitle codecs; these cannot be converted to text formats.
@@ -384,7 +399,10 @@ mod tests {
 
     #[test]
     fn subtitle_actions() {
-        assert_eq!(Container::Mkv.subtitle_action("subrip"), SubtitleAction::Copy);
+        assert_eq!(
+            Container::Mkv.subtitle_action("subrip"),
+            SubtitleAction::Copy
+        );
         assert_eq!(
             Container::Mkv.subtitle_action("mov_text"),
             SubtitleAction::Convert("srt")
@@ -420,8 +438,14 @@ mod tests {
 
     #[test]
     fn serde_names() {
-        assert_eq!(serde_json::to_string(&VideoCodec::Hevc).unwrap(), "\"hevc\"");
-        assert_eq!(serde_json::to_string(&AudioCodec::Copy).unwrap(), "\"copy\"");
+        assert_eq!(
+            serde_json::to_string(&VideoCodec::Hevc).unwrap(),
+            "\"hevc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AudioCodec::Copy).unwrap(),
+            "\"copy\""
+        );
         assert_eq!(serde_json::to_string(&Container::Webm).unwrap(), "\"webm\"");
     }
 }
