@@ -22,6 +22,19 @@ env:
   PNPM_VERSION: "10.33.0"
 
 jobs:
+  lint-files:
+    name: Workflows and shell scripts (actionlint, shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        # The image bundles shellcheck, so `run:` blocks are checked too.
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+      - name: shellcheck
+        run: shellcheck docker/*.sh scripts/*.sh
+
   rust:
     name: Rust (fmt, clippy, tests)
     runs-on: ubuntu-latest
@@ -49,7 +62,7 @@ jobs:
         run: cargo test --workspace --locked
 
   web:
-    name: Web (lint, typecheck, build)
+    name: Web (lint, typecheck, tests, build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -80,12 +93,10 @@ jobs:
         run: pnpm lint
 
       - name: Typecheck
-        run: |
-          if node -e "process.exit(require('./package.json').scripts?.typecheck ? 0 : 1)"; then
-            pnpm typecheck
-          else
-            pnpm exec tsc --noEmit
-          fi
+        run: pnpm typecheck
+
+      - name: Unit tests
+        run: pnpm test
 
       - name: Build (static export)
         run: |

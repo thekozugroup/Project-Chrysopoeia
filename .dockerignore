@@ -1,11 +1,12 @@
-# Allowlist: the image needs only the Rust workspace, the web app and the
-# entrypoint. Everything else stays out of the build context.
+# Allowlist: the image needs only the Rust workspace, the web app, the
+# entrypoint and the license. Everything else stays out of the build context.
 *
 !Cargo.toml
 !Cargo.lock
 !crates/
 !web/
 !docker/
+!LICENSE
 
 # Build output and local state inside the allowed folders
 **/target

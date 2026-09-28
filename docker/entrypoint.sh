@@ -42,7 +42,7 @@ fi
 
 # Templates (Unraid in particular) pass optional settings as empty strings.
 # An empty value means "not set", never "set to nothing".
-for var in TEMP_DIR MAX_JOBS HW_ACCEL LIBRARIES BROWSE_ROOTS LOG_LEVEL RUST_LOG BIND DEV_CORS; do
+for var in TEMP_DIR MAX_JOBS HW_ACCEL LIBRARIES BROWSE_ROOTS ALLOWED_HOSTS LOG_LEVEL RUST_LOG BIND DEV_CORS; do
     eval "value=\${$var-}"
     if [ -z "$value" ]; then
         unset "$var"

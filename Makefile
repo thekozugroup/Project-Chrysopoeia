@@ -32,13 +32,15 @@ build: web/node_modules ## Build the static UI (web/out) and the release binary
 run: build ## Build, then serve UI + API from the release binary on :8080
 	./target/release/chrysopoeia --port $(API_PORT) --data-dir $(DATA_DIR) --web-dir web/out
 
-test: ## Run all Rust tests (tests that need ffmpeg skip without it)
+test: web/node_modules ## Run the Rust tests (those needing ffmpeg skip without it) and the web unit tests
 	cargo test --workspace
+	cd web && pnpm test
 
-lint: web/node_modules ## Check formatting, clippy, eslint and TypeScript
+lint: web/node_modules ## Check formatting, clippy, eslint, TypeScript and shell scripts
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
-	cd web && pnpm lint && pnpm exec tsc --noEmit
+	cd web && pnpm lint && pnpm typecheck
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck docker/*.sh scripts/*.sh; else echo "shellcheck not installed; skipping the shell script check"; fi
 
 fmt: ## Format Rust code
 	cargo fmt --all

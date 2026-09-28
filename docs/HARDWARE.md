@@ -4,7 +4,7 @@ Chrysopoeia works without a GPU. When one is available it can convert many
 times faster, at the cost of somewhat larger files than the CPU encoders give
 at the same visual quality.
 
-You do not pick encoders by hand. At startup (and whenever you click **Detect
+You do not pick encoders by hand. At startup (and whenever you click **Check
 again** in Settings > Hardware) Chrysopoeia lists the encoders its ffmpeg
 build has, runs a one-second test encode on each hardware encoder, and marks
 only the ones that succeed as *verified*. Jobs use the best verified encoder
@@ -17,6 +17,13 @@ which includes NVENC, Intel Quick Sync (oneVPL and the older Media SDK), VA-API
 with the Intel iHD/i965 and AMD radeonsi drivers bundled, and V4L2 and Rockchip
 encoders on ARM. No driver packages are needed inside the container; NVIDIA's
 driver libraries are injected by the NVIDIA runtime.
+
+For the curious: the VA-API drivers live in `/usr/lib/jellyfin-ffmpeg/lib/dri`
+(`iHD_drv_video.so`, `i965_drv_video.so`, `radeonsi_drv_video.so`) next to the
+oneVPL and Media SDK runtimes, and the bundled `libva` looks there first, so
+`LIBVA_DRIVERS_PATH` does not need to be set. The Hardware page names GPUs
+with `lspci`, which the image includes. `ffmpeg`, `ffprobe` and `vainfo` are
+on the `PATH` for checks with `docker exec`.
 
 ## Support matrix
 
@@ -40,7 +47,7 @@ Notes worth knowing:
 - **NVIDIA session limit.** GeForce cards limit how many encodes run at once
   (8 per system with Linux driver 550.54 or newer; 3 to 5 with older drivers).
   Chrysopoeia runs at most 3 jobs per NVIDIA GPU by default. Professional (RTX
-  A-series, Quadro) cards have no such limit; raise *Jobs at once* if you like.
+  A-series, Quadro) cards have no such limit; raise *Files at once* if you like.
 - **No NVENC at all.** The GeForce GT 1030 and most GeForce MX laptop chips
   have no video encoder, so Chrysopoeia encodes on the CPU with them. NVIDIA's
   [Video Encode and Decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new)

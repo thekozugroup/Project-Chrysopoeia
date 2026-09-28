@@ -175,8 +175,8 @@ expect "uses /temp when it is mounted" '^temp=/temp$'
 run -- sh -c 'echo "temp=${TEMP_DIR-unset}"'
 expect "leaves TEMP_DIR unset without a /temp mount" '^temp=unset$'
 
-run -e MAX_JOBS= -e HW_ACCEL= -e LIBRARIES= -- sh -c 'echo "jobs=${MAX_JOBS-unset} hw=${HW_ACCEL-unset} libs=${LIBRARIES-unset}"'
-expect "treats empty template values as unset" '^jobs=unset hw=unset libs=unset$'
+run -e MAX_JOBS= -e HW_ACCEL= -e LIBRARIES= -e ALLOWED_HOSTS= -- sh -c 'echo "jobs=${MAX_JOBS-unset} hw=${HW_ACCEL-unset} libs=${LIBRARIES-unset} hosts=${ALLOWED_HOSTS-unset}"'
+expect "treats empty template values as unset" '^jobs=unset hw=unset libs=unset hosts=unset$'
 
 # --- Ownership and privileges -----------------------------------------------------
 

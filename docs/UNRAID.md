@@ -85,8 +85,9 @@ Under **Show more settings**:
 |---|---|---|
 | PUID / PGID | `99` / `100` | Unraid's `nobody` / `users`. Keep them unless your media is owned by someone else. |
 | UMASK | `002` | New files are readable by everyone and editable by the `users` group. |
-| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU; `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) forces one. |
-| MAX_JOBS | empty | Empty = automatic. You can change it later in the app. |
+| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU; `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) forces one. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
+| MAX_JOBS | empty | Empty = automatic. A number here replaces the automatic count while *Files at once* is *Automatic* in the app (Settings › Processing); a number chosen in the app wins. |
+| ALLOWED_HOSTS | empty | Only behind a reverse proxy: the domain name you open Chrysopoeia at. See [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik). |
 | NVIDIA_VISIBLE_DEVICES | empty | NVIDIA: `all`, or one GPU UUID to use only that card. |
 
 **NVIDIA only:** switch the editor to **Advanced View** (toggle at the top
@@ -99,18 +100,26 @@ Click **Apply**. Unraid pulls the image and starts the container.
 
 ## 4. First run
 
-1. On the **Docker** tab, click the Chrysopoeia icon > **WebUI**.
-2. The setup screen asks for a folder: pick one under `/media` (for example
-   `/media/Movies`). You can add more libraries later.
+1. On the **Docker** tab, click the Chrysopoeia icon > **WebUI**. The welcome
+   page already says which GPU it found (or that your CPU will do the work).
+2. Click **Choose a folder**. The folder browser opens at `/media`, which is
+   the Media share you picked. Open the folder you want converted (for
+   example `Movies`) and click **Use this folder**. You can add more libraries
+   later.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
-   suits old devices.
+   suits old devices. The cards show how fast your hardware handles each one.
 4. Click **Start**. Chrysopoeia scans the folder, queues the files that need
-   work, and starts converting.
+   work, and starts converting. The **Overview** shows progress and space
+   saved; the **Queue** shows each running file with its speed and time left.
 
 Open **Settings > Hardware** to confirm your GPU was found: its encoders show as
 *verified*. If they do not, the page shows a hint with the fix; see
 [Troubleshooting](#troubleshooting).
+
+Files that are new or changed later are picked up on their own: folder
+watching sees changes made through `/mnt/user` shares, and every library is
+rescanned every 12 hours (Settings > Processing).
 
 ## Transcode cache on an SSD
 
@@ -129,6 +138,27 @@ copied into place once, after it passes verification.
 
 Never point it at `/tmp` or leave it inside the container: large files there
 end up in RAM or in `docker.img`, which can fill up and stop all containers.
+
+## Reverse proxy (SWAG, Nginx Proxy Manager, Traefik)
+
+Opening Chrysopoeia at `http://<server IP>:8080`, `http://tower:8080` or
+`http://tower.local:8080` needs no setup. To open it at a domain name through
+a reverse proxy:
+
+1. Point the proxy at `http://<server IP>:8080` (or the container name, when
+   both are on the same custom Docker network).
+2. Turn on WebSocket support (Nginx Proxy Manager: *Websockets Support*;
+   SWAG and Traefik pass WebSockets through already). Live progress uses
+   `/api/ws`.
+3. **Edit** the Chrysopoeia container, click **Show more settings**, set
+   **ALLOWED_HOSTS** to the domain, e.g. `transcode.example.com` (several:
+   separate with commas), and click **Apply**.
+
+Without step 3 the app shows *Chrysopoeia doesn't answer to the address
+"transcode.example.com"*. This check stops other websites from reaching
+Chrysopoeia through your browser. Chrysopoeia has no login of its own yet, so
+add authentication at the proxy (Authelia, Authentik or basic auth) before
+making it reachable from the internet.
 
 ## PUID, PGID and permissions
 
@@ -157,11 +187,36 @@ already efficient and skipped. Only history and statistics are lost.
 Your settings and libraries are kept. Jobs that were running are restarted
 from the beginning after the update; originals are never left half-replaced.
 
+## Trying a test build
+
+Builds that are not released yet (for example a branch before it is merged)
+are published as `ghcr.io/thekozugroup/chrysopoeia:edge` when someone runs the
+*Release* workflow on that branch. To use one, **Edit** the container, set
+**Repository** to `ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**.
+Set it back to `ghcr.io/thekozugroup/chrysopoeia:latest` to return to the
+released version; your settings and libraries are kept either way.
+
+Before the very first release there is no `latest` yet: install the template
+from the branch instead (replace `main` in the `wget` address of step 2 with
+the branch name, e.g. `.../Project-Chrysopoeia/my-branch/unraid/chrysopoeia.xml`)
+and set Repository to the `edge` image before clicking **Apply**.
+
 ## Troubleshooting
 
-Start with **Settings > Hardware** in the app and the container log (Docker
-tab > Chrysopoeia icon > **Logs**). The first lines of the log list the user it
-runs as and every GPU device it can see.
+Start with the app itself:
+
+- **Settings > Hardware** lists the CPU and every GPU the container can see,
+  each hardware encoder with the result of its test encode (and the error when
+  it failed), and a hint with the exact fix when something is missing, for
+  example a GPU visible on the host but not passed to the container. After
+  changing the template, click **Check again** on that page, or restart the
+  container.
+- Each failed file in the **Queue** says why in a sentence; open it for the
+  verification report, the ffmpeg command and the end of ffmpeg's log.
+
+Then the container log (Docker tab > Chrysopoeia icon > **Logs**). The first
+lines list the version, the user it runs as, the transcode folder and every
+GPU device it can see.
 
 | Problem | Fix |
 |---|---|
@@ -171,5 +226,9 @@ runs as and every GPU device it can see.
 | NVIDIA encoders fail on the Hardware page | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
 | Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). The Hardware page shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
 | Log says *cannot write to /media* | See [PUID, PGID and permissions](#puid-pgid-and-permissions). |
-| New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or click **Scan** on the library. |
-| The server feels slow while converting | Lower *Jobs at once* in Settings > Processing, or set *Active hours* so conversions run overnight. |
+| New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or click **Scan now** on the library. |
+| The server feels slow while converting | Lower *Files at once* in Settings > Processing, or turn on *When to convert* there so conversions run overnight. |
+| Nothing converts at night / during the day as expected | *When to convert* uses the server's time zone. Unraid passes it automatically; check **Settings > Date and Time**. |
+| The app says *Chrysopoeia doesn't answer to the address …* | You opened it through a domain name. Add that name to ALLOWED_HOSTS (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). |
+| MAX_JOBS or HW_ACCEL seem to be ignored | A number chosen in the app under *Files at once* wins over MAX_JOBS; choose *Automatic* there to use MAX_JOBS. HW_ACCEL is applied when its value changes, so a later choice in Settings > Hardware stays until you change HW_ACCEL again. |
+| A job's ffmpeg log says `set_mempolicy: Operation not permitted` | Harmless: the HEVC (x265) encoder asks for a memory placement that Docker does not allow, and carries on normally. To silence it, add `--cap-add=SYS_NICE` to Extra Parameters. |

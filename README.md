@@ -8,6 +8,19 @@ original before it is allowed to replace it.
 It runs as one Docker container with one web page, on Unraid or any Linux,
 Windows or macOS machine that runs Docker (or natively on a Mac).
 
+![The Chrysopoeia overview: space saved, library progress and the files being converted right now](docs/screenshots/overview.png)
+
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/queue.png" alt="The queue: a running conversion with its current step, progress, speed and time left, plus tabs for the files up next and the finished ones"></td>
+    <td width="50%"><img src="docs/screenshots/hardware.png" alt="Settings, Hardware: the detected processor, memory and graphics, a setup tip, and which formats each encoder can produce"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>The queue, with a conversion running</sub></td>
+    <td align="center"><sub>Settings › Hardware</sub></td>
+  </tr>
+</table>
+
 ## Why Chrysopoeia
 
 Tdarr is a powerful, flexible tool built around plugin stacks and separate
@@ -60,28 +73,30 @@ while asking far less of you:
 
 ### Unraid
 
-1. For hardware encoding, first install the driver plugin from Community
-   Applications: **Intel GPU TOP** (Intel), **Radeon TOP** (AMD) or
-   **Nvidia-Driver** (NVIDIA). CPU-only works without any plugin.
-2. Install **Chrysopoeia** from Community Applications. Until it is listed
-   there, add the template by hand from the Unraid terminal:
+1. For hardware encoding, first install the driver plugin from the **Apps**
+   tab: **Intel GPU TOP** (Intel), **Radeon TOP** (AMD) or **Nvidia-Driver**
+   (NVIDIA). CPU-only works without any plugin.
+2. Install **Chrysopoeia** from the **Apps** tab. Until it is listed there,
+   add the template by its URL from the Unraid terminal (the `>_` icon):
 
    ```sh
    wget -O /boot/config/plugins/dockerMan/templates-user/my-Chrysopoeia.xml \
      https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/chrysopoeia.xml
    ```
 
-   then open **Docker > Add Container** and pick *Chrysopoeia* from the
-   Template list.
+   then open **Docker › Add Container** and pick *Chrysopoeia* from the
+   *Template* list.
 3. Set **Media** (required) to the share that holds your videos, for
-   example `/mnt/user/media/`, rather than all of `/mnt/user/`. Intel or AMD:
-   click *Add another Path, Port, Variable, Label or Device*, choose *Device*
-   and enter `/dev/dri`. NVIDIA: add `--runtime=nvidia` to *Extra Parameters*
-   and set `NVIDIA_VISIBLE_DEVICES` (under *Show more settings*) to `all`.
-4. Click **Apply**, then open the web UI from the container's icon.
+   example `/mnt/user/media/`, rather than all of `/mnt/user/`. Optionally set
+   **Transcode cache** to a folder on your SSD pool. Intel or AMD: click *Add
+   another Path, Port, Variable, Label or Device*, choose *Device* and enter
+   `/dev/dri`. NVIDIA: add `--runtime=nvidia` to *Extra Parameters* and set
+   `NVIDIA_VISIBLE_DEVICES` (under *Show more settings*) to `all`.
+4. Click **Apply**, then open the web UI from the container's icon, choose a
+   folder under `/media` and a goal.
 
-The full walkthrough, including a transcode cache on your SSD and
-troubleshooting, is in [docs/UNRAID.md](docs/UNRAID.md).
+The full walkthrough, including GPU passthrough, the transcode cache, reverse
+proxies and troubleshooting, is in [docs/UNRAID.md](docs/UNRAID.md).
 
 ### docker run
 
@@ -94,7 +109,9 @@ docker run -d --name chrysopoeia --restart unless-stopped \
   ghcr.io/thekozugroup/chrysopoeia:latest
 ```
 
-Add a GPU with one extra flag:
+Use the owner of your media for `PUID`/`PGID` (`stat -c '%u %g' /srv/media`).
+Optional: `-v /fast/ssd/chrysopoeia-temp:/temp` keeps in-progress files on a
+fast disk. Add a GPU with one extra flag:
 
 ```sh
 # Intel or AMD
@@ -116,7 +133,7 @@ curl -o .env https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/
 docker compose up -d
 ```
 
-With a GPU, add the matching overlay file from this repository:
+With a GPU, download the matching overlay file too and name both files:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d      # NVIDIA
@@ -126,8 +143,9 @@ docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d   # I
 ## GPU setup
 
 Chrysopoeia uses whichever encoders pass its test encode, so the only job is
-making the GPU visible to the container. The **Hardware** section of Settings
-shows what was found and, if something is missing, the fix.
+making the GPU visible to the container. **Settings › Hardware** in the app
+shows what was found, which encoders passed, and, if something is missing, the
+exact fix.
 
 | Hardware | Host needs | Container needs | Encodes in hardware |
 |---|---|---|---|
@@ -144,20 +162,21 @@ detailed support matrix, including older GPUs and ARM boards, is in
 ## Configuration
 
 Almost everything is set in the web UI. The container reads these environment
-variables:
+variables; empty values count as not set.
 
 | Variable | Default | What it does |
 |---|---|---|
 | `PUID` / `PGID` | `1000` / `1000` | User and group Chrysopoeia runs as and writes files as. Use the owner of your media (Unraid: `99` / `100`). |
-| `UMASK` | `002` | Permissions for new files (`002`: group can edit). |
-| `TZ` | `UTC` | Time zone for logs and the active-hours schedule (Unraid sets it for you). |
-| `HW_ACCEL` | `auto` | Hardware preference on first start, changeable later in Settings: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). |
-| `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Leave unset for automatic; Settings overrides it. |
+| `UMASK` | `002` | Permissions for new files (`002`: the group can edit them; `022`: only the owner). |
+| `TZ` | `UTC` | Time zone (e.g. `Europe/London`) for the *When to convert* schedule in Settings › Processing. Unraid sets it for you. Log lines are always stamped in UTC. |
+| `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
+| `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Stands in for the automatic count while *Files at once* is *Automatic* in Settings › Processing; a number chosen there wins. |
 | `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. |
-| `TEMP_DIR` | `/temp` if mounted | Where in-progress files go. Unset and no `/temp` mount: next to each original. |
+| `ALLOWED_HOSTS` | none | Domain names the web UI may be opened at, comma-separated, e.g. `transcode.example.com`. Only needed behind a reverse proxy; see [below](#behind-a-reverse-proxy). |
+| `TEMP_DIR` | `/temp` if mounted | Where in-progress files go. Unset and no `/temp` mount: next to each original. Settings › Output can choose another folder. |
 | `BROWSE_ROOTS` | `/media,/` if `/media` is mounted | Folders the in-app folder picker starts from. |
 | `NVIDIA_VISIBLE_DEVICES` | unset | NVIDIA with `--runtime=nvidia` (Unraid): `all` or a GPU UUID. With `--gpus` or the compose overlay, Docker sets it from the GPUs chosen there. |
-| `NVIDIA_DRIVER_CAPABILITIES` | `compute,video,utility` | Already set in the image; needed for NVENC. |
+| `NVIDIA_DRIVER_CAPABILITIES` | `compute,video,utility` | Already set in the image; `video` is what enables NVENC. |
 | `PORT` | `8080` | Port inside the container. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |
 
@@ -166,6 +185,22 @@ variables:
 | `/config` | Database and settings. Small; back it up. |
 | `/media` | Your media. Needs write access so originals can be replaced. |
 | `/temp` | Optional scratch space on a fast disk (SSD or cache pool). |
+
+### Behind a reverse proxy
+
+Chrysopoeia answers on its IP address, `localhost` and local names (`tower`,
+`tower.local`, `nas.lan`, `*.home.arpa`, `*.ts.net` and similar) without any
+setup. So that a hostile website cannot reach it through a look-alike domain,
+any other name must be listed in `ALLOWED_HOSTS`; until it is, the app shows
+*Chrysopoeia doesn't answer to the address "…"*.
+
+- Set `ALLOWED_HOSTS=transcode.example.com` (several: separate with commas; a
+  leading dot, `.example.com`, allows every name under that domain).
+- Enable WebSocket support for the proxy host (Nginx Proxy Manager:
+  *Websockets Support*; nginx: forward `Upgrade` and `Connection` headers).
+  Live progress uses `/api/ws`.
+- There is no login yet: add authentication at the proxy (for example
+  Authelia, Authentik or basic auth) before exposing it outside your network.
 
 ## FAQ
 
@@ -201,8 +236,19 @@ goal is H.264 (tone mapping is not supported yet); or you skipped it.
 By default it is automatic. On the CPU: one job per four cores (1 to 8),
 limited so each job has about 1.5 GB of memory, and respecting any CPU or
 memory limit set on the container. With a GPU: 3 per NVIDIA GPU, 2 per Intel or
-AMD GPU, 2 on Apple Silicon. You can set a fixed number in Settings >
+AMD GPU, 2 on Apple Silicon. You can set a fixed number in Settings ›
 Processing, or with `MAX_JOBS`.
+
+**What happens if I restart or update the container mid-conversion?**
+Running jobs are stopped and their temporary files removed; the original is
+never left half-replaced. After the restart those files are back in the queue
+and start again from the beginning.
+
+**A job's ffmpeg log says `set_mempolicy: Operation not permitted`.**
+Harmless. The x265 (HEVC) encoder asks the kernel where to place its memory,
+which Docker's default security profile does not allow, and carries on
+normally. To silence it anyway, start the container with
+`--cap-add=SYS_NICE`.
 
 **Is there a login?**
 Not yet. Keep Chrysopoeia on your home network, or put it behind a reverse
@@ -218,5 +264,5 @@ end-to-end smoke test. The design contract is
 
 ## License
 
-Apache-2.0. Container images include
+[Apache License 2.0](LICENSE). Container images include
 [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) (GPL).

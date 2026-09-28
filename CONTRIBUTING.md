@@ -37,8 +37,8 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 |---|---|
 | `make dev-api` | Runs the backend on :8080 (`cargo run -p chrysopoeia-server -- --data-dir ./data --dev-cors`) |
 | `make dev-web` | Runs `next dev` on :3000 with `NEXT_PUBLIC_API_URL=http://localhost:8080` |
-| `make test` | `cargo test --workspace` |
-| `make lint` | `cargo fmt --check`, clippy with `-D warnings`, eslint and `tsc --noEmit` |
+| `make test` | `cargo test --workspace` and the web unit tests (`pnpm test`) |
+| `make lint` | `cargo fmt --check`, clippy with `-D warnings`, eslint, `tsc --noEmit` and shellcheck |
 | `make build` | Static UI in `web/out` plus the release binary |
 | `make run` | Builds, then serves UI and API together from `./target/release/chrysopoeia` on :8080 |
 | `make test-media` | Writes a synthetic library to `./media` |
@@ -113,27 +113,54 @@ E2E_URL=http://127.0.0.1:8080 scripts/e2e-smoke.sh   # against a running dev ser
 ```
 
 It generates the test library with the image's ffmpeg, starts the container,
-adds the library with the *Plays everywhere* goal, waits until the queue is
-idle, then checks that real videos ended up done or skipped (never failed),
-that done jobs carry a passing verification report, that outputs really are
-H.264, that no original was lost or temporary file left behind, and that the
-container reports healthy. `E2E_TIMEOUT`, `E2E_GOAL`, `E2E_MAX_JOBS` and
-`E2E_KEEP=1` (keep the container and files for inspection) tune it.
+adds the library with the *Plays everywhere* goal, waits until every file is
+in the library (brand-new files are first left alone for 20 seconds, as if
+still being copied) and the queue is idle, then checks that real videos ended
+up done or skipped (never failed), that done jobs carry a passing verification
+report, that outputs really are H.264, that no original was lost or temporary
+file left behind, and that the container reports healthy. It takes a few
+minutes on four cores. `E2E_TIMEOUT`, `E2E_GOAL`, `E2E_MAX_JOBS`, `E2E_PORT`
+(fixed host port instead of a random one) and `E2E_KEEP=1` (keep the container
+and files for inspection) tune it.
+
+### Screenshots
+
+`docs/screenshots/*.png` are real pages of a running container, taken at
+1440x900 in the light theme: start the image with a library made by
+`scripts/make-test-media.sh <dir> 40` (plus a few renamed copies) mounted at
+`/media`, go through the setup screen, and capture the Overview and Queue
+while a file is converting, and Settings > Hardware. Save them as 256-colour
+PNGs to keep the repository small.
 
 ## CI and releases
 
 - `.github/workflows/ci.yml` runs on pull requests and on pushes to `main`:
-  Rust (fmt, clippy, tests with ffmpeg installed), web (lint, typecheck,
-  static build) and Docker (amd64 image, entrypoint tests and the smoke test).
+  workflow and shell-script lint (actionlint via the `rhysd/actionlint` image,
+  shellcheck), Rust (fmt, clippy, tests with ffmpeg installed), web (lint,
+  typecheck, unit tests, static build) and Docker (amd64 image, entrypoint
+  tests and the end-to-end smoke test against the built image).
 - `.github/workflows/release.yml` runs on pushes to `main` and on `v*` tags.
   It builds the amd64 image, runs the entrypoint and smoke tests, and only
   then pushes a multi-arch (amd64 + arm64) image to
   `ghcr.io/<owner>/chrysopoeia` tagged `latest` (main), the version (`1.2.3`,
   `1.2`, `1`) for tags, and `sha-<short>`. The version shown in the app and the
   log is `1.2.3` for a tag and `main-<short sha>` for a build from `main`.
+- To publish an image from a branch before merging it (for example to try it
+  on an Unraid server), open **Actions > Release > Run workflow** and pick the
+  branch. The same tests run, and the image is pushed as `edge` and
+  `sha-<short>` (version `<branch>-<short sha>`); `latest` is not touched.
+  On Unraid, set the container's Repository to
+  `ghcr.io/<owner>/chrysopoeia:edge`.
 - After the first release, make the package public once on GitHub (Packages >
   chrysopoeia > Package settings > Change visibility), or Unraid and Docker
   will be refused when pulling it.
+
+Run the workflow checks locally before pushing a change to `.github/`:
+
+```sh
+docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+shellcheck docker/*.sh scripts/*.sh
+```
 
 ## Conventions
 
@@ -148,4 +175,4 @@ container reports healthy. `E2E_TIMEOUT`, `E2E_GOAL`, `E2E_MAX_JOBS` and
 ## License
 
 By contributing you agree that your contributions are licensed under the
-Apache License 2.0.
+[Apache License 2.0](LICENSE).

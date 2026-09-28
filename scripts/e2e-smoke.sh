@@ -6,8 +6,10 @@
 # Generates a small synthetic library (scripts/make-test-media.sh, run with the
 # image's own ffmpeg), starts the image with it mounted at /media and an empty
 # /config, adds /media as a library with the "Plays everywhere" goal (H.264 +
-# AAC in MP4: the quickest goal on a CPU), waits until nothing is queued or
-# running, then checks through the API and on disk that:
+# AAC in MP4: the quickest goal on a CPU), waits until every file is in the
+# library (freshly written files are first left alone for the server's settle
+# time, as if still being copied) and nothing is queued or running, then
+# checks through the API and on disk that:
 #   - the H.264 MP4, the AVI and every other real video ended done or skipped,
 #     never failed (only the deliberately broken files may fail),
 #   - the audio-only FLAC was skipped,
@@ -24,6 +26,8 @@
 #   E2E_GOAL           goal for the library (default compatible)
 #   E2E_HW_ACCEL       HW_ACCEL for the container (default auto)
 #   E2E_MAX_JOBS       MAX_JOBS for the container (default: automatic)
+#   E2E_PORT           host port (on 127.0.0.1) for the container's web UI
+#                      (default: a free port chosen by Docker)
 #   E2E_KEEP=1         keep the container and work folder for inspection
 #   E2E_URL            test a server that is already running at this base URL
 #                      (e.g. http://127.0.0.1:8080) instead of starting the
@@ -132,7 +136,8 @@ fi
 # Whatever uid the app runs as must be able to replace these files.
 chmod -R a+rwX "$MEDIA"
 (cd "$MEDIA" && find . -type f | sort) >"$WORK/inputs.txt"
-log "$(wc -l <"$WORK/inputs.txt" | tr -d ' ') input files"
+INPUT_COUNT=$(wc -l <"$WORK/inputs.txt" | tr -d ' ')
+log "$INPUT_COUNT input files"
 
 # --- 2. Start the server --------------------------------------------------------------
 
@@ -156,7 +161,7 @@ else
     fi
     log "Starting $IMAGE as uid $RUN_UID, gid $RUN_GID"
     docker run -d --name "$CONTAINER" \
-        -p 127.0.0.1::8080 \
+        -p "127.0.0.1:${E2E_PORT:-}:8080" \
         -v "$MEDIA:/media" -v "$CONFIG:/config" \
         "${env_args[@]}" \
         --health-interval 5s \
@@ -200,14 +205,19 @@ while :; do
     state=$(
         python3 -c '
 import json, sys
-lib, q = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+lib, q, expected = json.loads(sys.argv[1]), json.loads(sys.argv[2]), int(sys.argv[3])
 s = lib.get("stats") or {}
-idle = (not lib["scanning"]) and lib.get("last_scan_at") and q["running"] == 0 and q["queued"] == 0
+# New files join the library only once they have stopped changing (the
+# server treats them as still being copied until then).
+listed = s.get("file_count", 0)
+idle = (not lib["scanning"]) and lib.get("last_scan_at") and listed >= expected \
+    and q["running"] == 0 and q["queued"] == 0
 print("idle" if idle else "busy",
       "scanning" if lib["scanning"] else "scanned",
-      "running=%d queued=%d done=%d skipped=%d failed=%d" % (
-          q["running"], q["queued"], s.get("done", 0), s.get("skipped", 0), s.get("failed", 0)))
-' "$lib" "$queue"
+      "files=%d/%d running=%d queued=%d done=%d skipped=%d failed=%d" % (
+          listed, expected, q["running"], q["queued"], s.get("done", 0), s.get("skipped", 0),
+          s.get("failed", 0)))
+' "$lib" "$queue" "$INPUT_COUNT"
     )
     report=${state#* }
     if [ "$report" != "$last_report" ]; then
@@ -220,7 +230,7 @@ print("idle" if idle else "busy",
     else
         idle_polls=0
     fi
-    [ "$SECONDS" -lt "$deadline" ] || fail "Timed out after ${TIMEOUT}s with work still queued or running."
+    [ "$SECONDS" -lt "$deadline" ] || fail "Timed out after ${TIMEOUT}s with files missing from the library or work still queued or running ($report)."
     sleep 2
 done
 

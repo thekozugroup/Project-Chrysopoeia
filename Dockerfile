@@ -172,6 +172,7 @@ RUN set -eux; \
 COPY --from=rust /out/chrysopoeia /usr/local/bin/chrysopoeia
 COPY --from=web /src/web/out /app/web
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+COPY LICENSE /usr/share/doc/chrysopoeia/LICENSE
 
 ENV CHRYSOPOEIA_VERSION=${VERSION} \
     DATA_DIR=/config \
