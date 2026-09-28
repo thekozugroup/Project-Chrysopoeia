@@ -14,11 +14,12 @@
 //!   within the same timeout). [`crate::parse_ffprobe_json`] alone cannot see
 //!   it and reports such files as HDR10.
 //! - A Dolby Vision stream whose base layer is not a standard picture
-//!   (profile 5) is reported with no colour primaries, transfer or matrix:
-//!   `hdr == DolbyVision` without a `color_transfer` means the video cannot
-//!   be re-encoded without ruining its colours. The worker's skip decision
-//!   reads exactly this signal. Dolby Vision with a standard base layer keeps
-//!   its transfer: PQ (profiles 7, 8.1), HLG (8.4) or SDR (8.2, 9).
+//!   (profile 5) is flagged with `dolby_vision_without_base_layer` and
+//!   reported with no colour primaries, transfer or matrix, so it cannot be
+//!   re-encoded without ruining its colours. The worker skips it, and also
+//!   skips (with a more general reason) any Dolby Vision stream without a
+//!   `color_transfer`. Dolby Vision with a standard base layer keeps its
+//!   transfer: PQ (profiles 7, 8.1), HLG (8.4) or SDR (8.2, 9).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -128,7 +129,8 @@ pub(crate) struct FrameHdr {
 /// The HDR metadata on the first frames of stream `index`, or `None` when
 /// ffprobe could not tell.
 async fn read_frame_hdr(ffprobe: &Path, path: &Path, index: u32) -> Option<FrameHdr> {
-    let output = Command::new(ffprobe)
+    let mut command = Command::new(ffprobe);
+    command
         .args(["-v", "error", "-select_streams"])
         .arg(index.to_string())
         .arg("-read_intervals")
@@ -138,10 +140,9 @@ async fn read_frame_hdr(ffprobe: &Path, path: &Path, index: u32) -> Option<Frame
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await
-        .ok()?;
+        .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
+    let output = command.output().await.ok()?;
     if !output.status.success() {
         return None;
     }
@@ -269,7 +270,8 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
     }
 
     let input = input_argument(path);
-    let child = Command::new(ffprobe)
+    let mut command = Command::new(ffprobe);
+    command
         .args([
             "-v",
             "error",
@@ -284,7 +286,9 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
+    let child = command
         .spawn()
         .map_err(|error| ProbeError::Spawn(describe_spawn_error(ffprobe, &error)))?;
 
@@ -550,6 +554,7 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
             if dolby_vision_without_standard_base_layer(raw) {
                 // The picture is in Dolby's own IPT colour space; whatever
                 // the colour tags claim, it is not a standard picture.
+                stream.dolby_vision_without_base_layer = true;
                 stream.color_primaries = None;
                 stream.color_transfer = None;
                 stream.color_space = None;
@@ -616,9 +621,7 @@ fn detect_hdr(raw: &Value, transfer: Option<&str>, codec_tag: Option<&str>) -> O
 /// space and only looks right on a Dolby Vision display; re-encoding it
 /// without the Dolby Vision layer gives green and purple colours.
 ///
-/// The core types have no field for this, so it is signalled by leaving the
-/// colour tags empty: a [`HdrFormat::DolbyVision`] stream without a
-/// `color_transfer` has no usable base layer and must be left alone.
+/// Such streams get `dolby_vision_without_base_layer` and empty colour tags.
 fn dolby_vision_without_standard_base_layer(raw: &Value) -> bool {
     raw.get("side_data_list")
         .and_then(Value::as_array)
@@ -1003,8 +1006,9 @@ mod tests {
         assert_eq!(probe.hdr(), Some(HdrFormat::DolbyVision));
         let video = probe.primary_video().unwrap();
         assert_eq!(video.bit_depth, Some(10));
-        // The documented signal for "no standard base layer": Dolby Vision
-        // without a transfer.
+        // The documented signal for "no standard base layer": the flag, and
+        // no colour tags.
+        assert!(video.dolby_vision_without_base_layer);
         assert_eq!(video.color_transfer, None);
         assert_eq!(video.color_primaries, None);
         assert_eq!(video.color_space, None);

@@ -57,6 +57,11 @@ pub struct StreamInfo {
     pub color_space: Option<String>,
     pub color_range: Option<String>,
     pub hdr: Option<HdrFormat>,
+    /// Dolby Vision whose configuration record says the picture has no
+    /// standard base layer (profile 5, or compatibility id 0): it is in
+    /// Dolby's own colour space, so re-encoding it would ruin its colours.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dolby_vision_without_base_layer: bool,
     pub interlaced: bool,
     /// HDR10 static metadata: the mastering display (SMPTE ST 2086).
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -52,12 +52,14 @@ pub struct Cli {
     /// Scratch folder for in-progress encodes when the setting is unset.
     #[arg(long, env = "TEMP_DIR")]
     pub temp_dir: Option<String>,
-    /// Concurrent jobs instead of the automatic count, saved as the setting
-    /// on first run (the setting wins afterwards).
+    /// Jobs at once while "Jobs at once" in Settings is Automatic: 1-32, or
+    /// auto for the count recommended for this machine. A number chosen in
+    /// Settings wins.
     #[arg(long, env = "MAX_JOBS")]
     pub max_jobs: Option<String>,
-    /// Hardware preference on first run: auto, cpu, nvenc, qsv, vaapi, amf,
-    /// videotoolbox, rkmpp or v4l2m2m.
+    /// Hardware preference: auto, cpu, nvenc, qsv, vaapi, amf, videotoolbox,
+    /// rkmpp or v4l2m2m. Applied on the first run and whenever this value
+    /// changes; otherwise the choice made in Settings is kept.
     #[arg(long = "hw", env = "HW_ACCEL", default_value = "auto")]
     pub hw: String,
     /// Libraries to create on first run (comma-separated in the env var).

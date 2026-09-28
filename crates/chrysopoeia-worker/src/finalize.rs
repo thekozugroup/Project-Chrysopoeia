@@ -10,8 +10,9 @@
 //! - Replace mode, same path: the original is renamed to a hidden backup in
 //!   its own folder, the new file is renamed in, and the backup is deleted.
 //!   Any failure puts the backup back.
-//! - Replace mode, new extension: refuses to overwrite an unrelated file,
-//!   renames the new file in, then deletes the original.
+//! - Replace mode, new extension: refuses to overwrite an unrelated file;
+//!   the original is renamed to a hidden backup, the new file is renamed in
+//!   under its new name, and the backup is deleted.
 //! - Folder mode: creates the folders, refuses to overwrite anything and never
 //!   touches the original.
 //!
@@ -19,8 +20,9 @@
 //! job started (a Sonarr/Radarr upgrade replaced it mid-encode), nothing is
 //! replaced and [`OriginalChanged`] is returned. The new file gets the
 //! original's permission bits (and owner, where allowed) and, when asked, its
-//! modification/access times. [`recover_artifact`] cleans up whatever a crash
-//! left behind.
+//! modification/access times. After a crash, [`resume_replace`] finishes a
+//! replacement whose new file was already in place, and [`recover_artifact`]
+//! cleans up whatever else was left behind.
 
 use std::fs;
 use std::io;
@@ -203,8 +205,9 @@ pub struct Finalized {
 ///
 /// - Replace, same path: original → hidden backup, staged → final, backup
 ///   deleted. A failure puts the backup back.
-/// - Replace, new extension: staged → final (never over an unrelated file),
-///   then the original is deleted.
+/// - Replace, new extension: original → hidden backup, staged → final
+///   (never over an unrelated file), backup deleted. A failure puts the
+///   backup back.
 /// - Folder: staged → final (never over an existing file); the original is
 ///   left alone.
 ///
@@ -321,26 +324,42 @@ fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()>
     let staged = mover
         .stage(&req.temp, &req.final_path)
         .context("Could not put the new file in place, so the original was kept")?;
-    let result = swap_in(req, mover, &staged, &dir);
+    let result = swap_in(req, mover, &staged, &dir, None, &mut Vec::new());
     if result.is_err() {
         mover.discard(&staged, &req.temp);
     }
     result
 }
 
-fn swap_in(req: &OwnedRequest, mover: &Mover<'_>, staged: &Path, dir: &Path) -> anyhow::Result<()> {
+/// Original → hidden backup, staged → final, backup deleted. The backup is
+/// what makes a crash between the steps recoverable (see
+/// [`resume_replace`]): while it exists, the original is safe, and a backup
+/// next to a finished new file means the new file is complete.
+///
+/// `conflict` is set for a new file name: the final name must still be free
+/// when the new file moves in.
+fn swap_in(
+    req: &OwnedRequest,
+    mover: &Mover<'_>,
+    staged: &Path,
+    dir: &Path,
+    conflict: Option<&dyn Fn() -> anyhow::Error>,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let taken = || -> anyhow::Result<()> {
+        match conflict {
+            Some(conflict) if exists(&req.final_path)? => Err(conflict()),
+            _ => Ok(()),
+        }
+    };
     // A cross-device copy can take minutes; look again right before the swap.
     req.check_original()?;
+    taken()?;
     let file_name = file_name_lossy(&req.input);
     let backup_name = backup_file_name(&file_name, req.job_id);
     if backup_name.len() > MAX_FILE_NAME_BYTES {
-        // The backup name would be too long for the filesystem. A rename over
-        // the original is atomic, so the original is never missing either way.
-        mover
-            .commit(staged, &req.final_path, &req.temp)
-            .context("Could not put the new file in place, so the original was kept")?;
-        sync_dir(dir);
-        return Ok(());
+        // The backup name would be too long for the filesystem.
+        return commit_without_backup(req, mover, staged, dir, notes);
     }
     let backup = dir.join(backup_name);
 
@@ -359,20 +378,85 @@ fn swap_in(req: &OwnedRequest, mover: &Mover<'_>, staged: &Path, dir: &Path) -> 
         }
     }
 
-    if let Err(move_err) = mover.commit(staged, &req.final_path, &req.temp) {
+    let committed = match taken() {
+        Err(e) => Err((e, true)),
+        Ok(()) => mover
+            .commit(staged, &req.final_path, &req.temp)
+            .map_err(|e| (anyhow::Error::from(e), false)),
+    };
+    if let Err((move_err, is_conflict)) = committed {
         restore_backup(&backup, &req.input).map_err(|restore_err| {
             anyhow::anyhow!("Could not put the new file in place ({move_err}), and {restore_err:#}")
         })?;
+        if is_conflict {
+            return Err(move_err);
+        }
         return Err(anyhow::anyhow!(
             "Could not put the new file in place, so the original was kept: {move_err}"
         ));
     }
-
     sync_dir(dir);
+
+    // New name: a file that appeared under the original's name meanwhile
+    // (an upgrade landing at that very moment) is newer than what was
+    // converted, so the conversion is taken out again.
+    if conflict.is_some() && exists(&req.input).unwrap_or(false) {
+        remove_quietly(&req.final_path);
+        remove_quietly(&backup);
+        sync_dir(dir);
+        return Err(OriginalChanged.into());
+    }
+
     if let Err(e) = fs::remove_file(&backup) {
-        // Harmless: the new file is in place, and startup recovery deletes
-        // backups whose original exists.
+        // Harmless for a replacement under the same name: startup recovery
+        // deletes backups whose original exists.
         tracing::warn!(backup = %backup.display(), "could not delete the backup: {e}");
+        if conflict.is_some() {
+            notes.push(format!(
+                "The new file is in place, but the original \"{file_name}\" could not be \
+                 deleted ({e}). It is kept as the hidden file \"{}\"",
+                file_name_lossy(&backup)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Put the new file in place when the backup name would be too long for
+/// the filesystem. Same name: a rename over the original is atomic, so the
+/// original is never missing. New name: the new file goes in first, then
+/// the original is deleted.
+fn commit_without_backup(
+    req: &OwnedRequest,
+    mover: &Mover<'_>,
+    staged: &Path,
+    dir: &Path,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    mover
+        .commit(staged, &req.final_path, &req.temp)
+        .context("Could not put the new file in place, so the original was kept")?;
+    sync_dir(dir);
+    if req.input == req.final_path || is_same_file(&req.input, &req.final_path) {
+        return Ok(());
+    }
+    // The original changed after the new file went in: the new file is a
+    // conversion of the old version, so take it out again.
+    if let Err(e) = req.check_original() {
+        if e.is::<OriginalChanged>() {
+            remove_quietly(&req.final_path);
+            return Err(e);
+        }
+    }
+    if let Err(e) = fs::remove_file(&req.input) {
+        tracing::warn!(
+            input = %req.input.display(),
+            "the new file is in place, but the original could not be deleted: {e}"
+        );
+        notes.push(format!(
+            "The new file is in place, but the original \"{}\" could not be deleted ({e})",
+            file_name_lossy(&req.input)
+        ));
     }
     Ok(())
 }
@@ -389,7 +473,8 @@ fn restore_backup(backup: &Path, original: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// New extension: refuse to clobber, stage, move in, then delete the original.
+/// New extension: refuse to clobber, stage, then original → backup,
+/// staged → final, backup deleted (see [`swap_in`]).
 fn replace_with_new_name(
     req: &OwnedRequest,
     mover: &Mover<'_>,
@@ -404,45 +489,15 @@ fn replace_with_new_name(
     if exists(&req.final_path)? {
         return Err(conflict());
     }
+    let dir = parent_dir(&req.final_path);
     let staged = mover
         .stage(&req.temp, &req.final_path)
         .context("Could not put the new file in place")?;
-    let placed = (|| {
-        req.check_original()?;
-        if exists(&req.final_path)? {
-            return Err(conflict());
-        }
-        mover
-            .commit(&staged, &req.final_path, &req.temp)
-            .context("Could not put the new file in place")
-    })();
-    if let Err(e) = placed {
+    let result = swap_in(req, mover, &staged, &dir, Some(&conflict), notes);
+    if result.is_err() {
         mover.discard(&staged, &req.temp);
-        return Err(e);
     }
-    sync_dir(&parent_dir(&req.final_path));
-
-    // The original changed after the new file went in: the new file is a
-    // conversion of the old version, so take it out again.
-    if let Err(e) = req.check_original() {
-        if e.is::<OriginalChanged>() {
-            if let Err(remove) = fs::remove_file(&req.final_path) {
-                tracing::warn!(path = %req.final_path.display(), "could not remove an outdated conversion: {remove}");
-            }
-            return Err(e);
-        }
-    }
-    if let Err(e) = fs::remove_file(&req.input) {
-        tracing::warn!(
-            input = %req.input.display(),
-            "the new file is in place, but the original could not be deleted: {e}"
-        );
-        notes.push(format!(
-            "The new file is in place, but the original \"{}\" could not be deleted ({e})",
-            file_name_lossy(&req.input)
-        ));
-    }
-    Ok(())
+    result
 }
 
 /// Folder mode: create folders, refuse to clobber, never touch the input.
@@ -497,6 +552,8 @@ struct TestHooks<'a> {
     after_stage: Option<&'a dyn Fn(&Path)>,
     /// Make the final rename fail.
     fail_commit: bool,
+    /// Called right before the final rename, with the final path.
+    before_commit: Option<&'a dyn Fn(&Path)>,
 }
 
 impl Mover<'_> {
@@ -587,8 +644,13 @@ impl Mover<'_> {
     /// the temp file if the staged file was a copy of it.
     fn commit(&self, staged: &Path, dst: &Path, temp: &Path) -> io::Result<()> {
         #[cfg(test)]
-        if self.hooks.fail_commit {
-            return Err(io::Error::other("injected failure"));
+        {
+            if let Some(hook) = self.hooks.before_commit {
+                hook(dst);
+            }
+            if self.hooks.fail_commit {
+                return Err(io::Error::other("injected failure"));
+            }
         }
         fs::rename(staged, dst)?;
         if staged != temp {
@@ -826,6 +888,77 @@ fn recover_blocking(path: &Path) -> anyhow::Result<Recovery> {
     Ok(Recovery::Untouched)
 }
 
+/// Whether a replacement interrupted by a crash had already put the new
+/// file in place (see [`resume_replace`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Interrupted {
+    /// The new file was in place. The leftover backup of the original has
+    /// been deleted, so the replacement is complete.
+    Placed {
+        /// Size of the new file in bytes.
+        size: u64,
+        /// Size of the original (its backup) in bytes.
+        original_size: u64,
+    },
+    /// The new file was not in place: the original is where it was, or its
+    /// backup is still there for [`recover_artifact`] to put back.
+    NotPlaced,
+}
+
+/// After a crash, find out whether job `job_id`'s replacement of `input`
+/// by `final_path` (replace mode) had already put the new file in place,
+/// and if so finish it by deleting the backup of the original.
+///
+/// The backup is the evidence, because [`finalize`] moves the original
+/// aside before the new file takes its final name and deletes the backup
+/// last: a backup together with a file under the final name (the original's
+/// own name, or, for a new extension, the new name while the original's
+/// name is free) means the new file, flushed to disk before it was
+/// renamed, is complete. Without a backup nothing is claimed.
+///
+/// Call it before [`recover_artifact`], which would put such a backup back
+/// next to the new file.
+pub async fn resume_replace(
+    input: &Path,
+    final_path: &Path,
+    job_id: Uuid,
+) -> anyhow::Result<Interrupted> {
+    let input = input.to_path_buf();
+    let final_path = final_path.to_path_buf();
+    tokio::task::spawn_blocking(move || resume_blocking(&input, &final_path, job_id))
+        .await
+        .context("Checking an interrupted replacement was interrupted")?
+}
+
+fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Result<Interrupted> {
+    let backup = parent_dir(input).join(backup_file_name(&file_name_lossy(input), job_id));
+    let Ok(backup_meta) = fs::symlink_metadata(&backup) else {
+        return Ok(Interrupted::NotPlaced);
+    };
+    if !backup_meta.is_file() {
+        return Ok(Interrupted::NotPlaced);
+    }
+    let same_name = input == final_path || is_same_file(input, final_path);
+    let placed = if same_name {
+        exists(input)?
+    } else {
+        !exists(input)? && exists(final_path)?
+    };
+    if !placed {
+        return Ok(Interrupted::NotPlaced);
+    }
+    let size = fs::metadata(final_path)
+        .with_context(|| format!("Could not read {}", final_path.display()))?
+        .len();
+    fs::remove_file(&backup)
+        .with_context(|| format!("Could not delete the backup {}", backup.display()))?;
+    sync_dir(&parent_dir(input));
+    Ok(Interrupted::Placed {
+        size,
+        original_size: backup_meta.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -990,6 +1123,7 @@ mod tests {
         let hooks = TestHooks {
             after_stage: Some(&check),
             fail_commit: false,
+            before_commit: None,
         };
         replace_in_place(&req, &mover(&meta, hooks)).unwrap();
         assert!(seen.get());
@@ -1005,6 +1139,7 @@ mod tests {
         let hooks = TestHooks {
             after_stage: None,
             fail_commit: true,
+            before_commit: None,
         };
         let err = replace_in_place(&req, &mover(&meta, hooks)).unwrap_err();
         assert!(
@@ -1026,6 +1161,7 @@ mod tests {
         let hooks = TestHooks {
             after_stage: Some(&swap),
             fail_commit: false,
+            before_commit: None,
         };
         let err = replace_in_place(&req, &mover(&meta, hooks)).unwrap_err();
         assert!(err.is::<OriginalChanged>(), "{err:#}");
@@ -1058,6 +1194,7 @@ mod tests {
         let hooks = TestHooks {
             after_stage: Some(&swap),
             fail_commit: false,
+            before_commit: None,
         };
         let mut notes = Vec::new();
         let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
@@ -1081,5 +1218,135 @@ mod tests {
         assert_eq!(FileIdentity::of(&fs::metadata(&path).unwrap()), before);
         filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
         assert_ne!(FileIdentity::of(&fs::metadata(&path).unwrap()), before);
+    }
+
+    #[test]
+    fn a_new_extension_moves_the_original_aside_before_the_new_file_goes_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mp4");
+        let library = dir.path().join("library");
+        let backup = library.join(backup_file_name("Movie.mkv", id()));
+        let seen = std::cell::Cell::new(false);
+        let check = |dst: &Path| {
+            // A crash from here on leaves a backup, which recovery uses.
+            assert_eq!(dst, req.final_path);
+            assert!(!req.input.exists(), "the original is moved aside first");
+            assert_eq!(fs::read(&backup).unwrap(), OLD);
+            seen.set(true);
+        };
+        let hooks = TestHooks {
+            before_commit: Some(&check),
+            ..TestHooks::default()
+        };
+        let mut notes = Vec::new();
+        replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap();
+        assert!(seen.get());
+        assert!(notes.is_empty(), "{notes:?}");
+        assert_eq!(names(&library), ["Movie.mp4"]);
+        assert_eq!(fs::read(&req.final_path).unwrap(), NEW);
+    }
+
+    #[test]
+    fn a_failed_rename_to_a_new_extension_restores_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mp4");
+        let hooks = TestHooks {
+            fail_commit: true,
+            ..TestHooks::default()
+        };
+        let mut notes = Vec::new();
+        let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Could not put the new file in place, so the original was kept"),
+            "{err:#}"
+        );
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+        assert_eq!(fs::read(&req.input).unwrap(), OLD);
+    }
+
+    #[test]
+    fn a_file_taking_the_new_name_at_the_last_moment_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mp4");
+        let intruder = |_: &Path| fs::write(&req.final_path, NEWER).unwrap();
+        let hooks = TestHooks {
+            after_stage: Some(&intruder),
+            ..TestHooks::default()
+        };
+        let mut notes = Vec::new();
+        let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err:#}");
+        assert_eq!(fs::read(&req.input).unwrap(), OLD);
+        assert_eq!(fs::read(&req.final_path).unwrap(), NEWER);
+        assert_eq!(
+            names(&dir.path().join("library")),
+            ["Movie.mkv", "Movie.mp4"]
+        );
+    }
+
+    /// The files a crash can leave, and what [`resume_blocking`] makes of
+    /// them.
+    #[test]
+    fn resume_finishes_only_replacements_whose_new_file_was_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path();
+        let input = lib.join("Movie.mp4");
+        let new_name = lib.join("Movie.mkv");
+        let backup = lib.join(backup_file_name("Movie.mp4", id()));
+
+        // New extension, crash after the new file went in: complete.
+        fs::write(&backup, OLD).unwrap();
+        fs::write(&new_name, NEW).unwrap();
+        assert_eq!(
+            resume_blocking(&input, &new_name, id()).unwrap(),
+            Interrupted::Placed {
+                size: NEW.len() as u64,
+                original_size: OLD.len() as u64
+            }
+        );
+        assert_eq!(names(lib), ["Movie.mkv"]);
+
+        // New extension, crash before the new file went in: not placed, the
+        // backup stays for recover_artifact to put back.
+        fs::remove_file(&new_name).unwrap();
+        fs::write(&backup, OLD).unwrap();
+        assert_eq!(
+            resume_blocking(&input, &new_name, id()).unwrap(),
+            Interrupted::NotPlaced
+        );
+        assert!(backup.exists());
+        fs::remove_file(&backup).unwrap();
+
+        // No backup: a file under the new name next to the original is not
+        // ours to claim.
+        fs::write(&input, OLD).unwrap();
+        fs::write(&new_name, NEWER).unwrap();
+        assert_eq!(
+            resume_blocking(&input, &new_name, id()).unwrap(),
+            Interrupted::NotPlaced
+        );
+        assert_eq!(names(lib), ["Movie.mkv", "Movie.mp4"]);
+
+        // Same name, crash after the swap: complete.
+        fs::remove_file(&new_name).unwrap();
+        fs::write(&input, NEW).unwrap();
+        fs::write(&backup, OLD).unwrap();
+        assert_eq!(
+            resume_blocking(&input, &input, id()).unwrap(),
+            Interrupted::Placed {
+                size: NEW.len() as u64,
+                original_size: OLD.len() as u64
+            }
+        );
+        assert_eq!(names(lib), ["Movie.mp4"]);
+
+        // Same name, crash with the original moved aside: not placed.
+        fs::rename(&input, &backup).unwrap();
+        assert_eq!(
+            resume_blocking(&input, &input, id()).unwrap(),
+            Interrupted::NotPlaced
+        );
+        assert!(backup.exists());
     }
 }

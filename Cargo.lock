@@ -275,6 +275,7 @@ name = "chrysopoeia-core"
 version = "0.2.0"
 dependencies = [
  "chrono",
+ "rustix",
  "serde",
  "serde_json",
  "thiserror",
@@ -329,8 +330,10 @@ dependencies = [
  "clap",
  "futures",
  "globset",
+ "rustix",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "sqlx",
  "tempfile",
  "thiserror",

@@ -638,6 +638,7 @@ pub async fn run_ffmpeg(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
 
     let mut child = match command.spawn() {
         Ok(child) => child,

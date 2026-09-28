@@ -7,7 +7,7 @@ use chrysopoeia_scanner::validate_ignore_pattern;
 use serde_json::Value;
 
 use crate::db;
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, describe_value_error};
 use crate::services::dispatcher::MAX_JOBS_LIMIT;
 use crate::services::{hardware, watcher};
 use crate::state::AppState;
@@ -41,26 +41,19 @@ pub fn merge(current: &Settings, patch: Value) -> ApiResult<Settings> {
             .with_field(key.clone()));
         }
     }
-    let keys: Vec<String> = patch.keys().cloned().collect();
     for (k, v) in patch {
         merged.insert(k, v);
     }
-    serde_json::from_value::<Settings>(Value::Object(merged.clone())).map_err(|e| {
-        // Name the offending setting when a single key explains the error.
-        let culprit = keys.iter().find(|k| {
-            let Ok(Value::Object(mut probe)) = serde_json::to_value(current) else {
-                return false;
-            };
-            if let Some(v) = merged.get(*k) {
-                probe.insert((*k).clone(), v.clone());
-            }
-            serde_json::from_value::<Settings>(Value::Object(probe)).is_err()
-        });
-        match culprit {
-            Some(k) => {
-                invalid(format!("The value for \"{k}\" isn't valid: {e}")).with_field(k.clone())
-            }
-            None => invalid(format!("The settings aren't valid: {e}")),
+    // The path of the value at fault, down to nested fields such as
+    // `default_profile.quality`, so the UI can point at the control.
+    serde_path_to_error::deserialize::<_, Settings>(Value::Object(merged)).map_err(|e| {
+        let path = e.path().to_string();
+        let serde_message = e.inner().to_string();
+        let field = (!path.is_empty() && path != ".").then_some(path);
+        let error = invalid(describe_value_error(field.as_deref(), &serde_message));
+        match field {
+            Some(f) => error.with_field(f),
+            None => error,
         }
     })
 }
@@ -120,8 +113,10 @@ async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiRe
     }
 }
 
-/// Normalize and validate new settings.
-pub async fn validate(state: &AppState, s: &mut Settings) -> ApiResult<()> {
+/// Normalize and validate new settings. `old` are the settings they
+/// replace: an ignore pattern saved before patterns were checked this
+/// strictly doesn't block other changes (scans skip it and say so).
+pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> ApiResult<()> {
     blank_to_none(&mut s.temp_dir);
     blank_to_none(&mut s.output_folder);
     s.ignore_patterns = s
@@ -151,7 +146,11 @@ pub async fn validate(state: &AppState, s: &mut Settings) -> ApiResult<()> {
     }
     // The scanner's own check: it also refuses patterns that would silently
     // match nothing (backslashes, `!` exceptions).
-    for p in &s.ignore_patterns {
+    for p in s
+        .ignore_patterns
+        .iter()
+        .filter(|p| !old.ignore_patterns.contains(p))
+    {
         if let Err(e) = validate_ignore_pattern(p) {
             // The scanner words it for its log ("…, so it was not used").
             let reason = e.replace(", so it was not used", "");
@@ -196,7 +195,7 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     let _guard = state.settings_write.lock().await;
     let old = state.settings();
     let mut new = merge(&old, patch)?;
-    validate(state, &mut new).await?;
+    validate(state, &old, &mut new).await?;
     db::settings::save(state.db.pool(), &new).await?;
     state.replace_settings(new.clone());
     state.emit(Event::SettingsUpdated {
@@ -255,6 +254,18 @@ mod tests {
         assert!(e.message.contains("max_jobs"), "{}", e.message);
         let e = merge(&Settings::default(), json!([1, 2])).unwrap_err();
         assert_eq!(e.code, "invalid_settings");
+    }
+
+    #[test]
+    fn nested_mistakes_name_the_exact_field_in_plain_words() {
+        let e = merge(
+            &Settings::default(),
+            json!({"default_profile": {"quality": "ultra"}}),
+        )
+        .unwrap_err();
+        assert_eq!(e.field.as_deref(), Some("default_profile.quality"));
+        assert!(e.message.contains("Choose one of: "), "{}", e.message);
+        assert!(!e.message.contains('`'), "{}", e.message);
     }
 
     #[test]

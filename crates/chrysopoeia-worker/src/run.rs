@@ -575,19 +575,32 @@ impl Job<'_> {
             // a short but otherwise fine encode; say so plainly instead of
             // letting it fail verification (or, unverified, replace the
             // original). Checked before the size rule: a stub is always small.
+            // Only a CPU decode tells about the file itself: a GPU decoder
+            // that gives up early gets the next attempt (CPU decoding) first.
             let expected = self.spec.probe.duration_secs;
             let unverified = cfg.validation == ValidationLevel::Off;
+            let conclusive = !(candidate.api.is_hardware() && candidate.hw_decode) || is_last;
             if let Some(stop) = source_stops_early(
                 expected,
                 run.encoded_secs,
                 run.input_damage.is_some(),
                 unverified,
             ) {
-                return failure(
+                let f = failure(
                     damaged_source_message(stop),
                     exit.tail().map(str::to_string),
-                )
-                .into_outcome();
+                );
+                if conclusive {
+                    return f.into_outcome();
+                }
+                tracing::info!(
+                    job = %spec.job_id, attempt,
+                    "{} stopped early while decoding on the GPU; trying the next option",
+                    candidate.name
+                );
+                last_failure = Some(f);
+                guard.clear().await;
+                continue;
             }
 
             if let Some(reason) = size_rule(
@@ -650,7 +663,8 @@ impl Job<'_> {
             if let Some(report) = validation.as_ref().filter(|r| !r.passed) {
                 // Too short, and the encoder saw the input end early: the
                 // original is what's incomplete, not the new file.
-                let too_short = report.first_failure().is_some_and(|c| c.id == "duration");
+                let too_short =
+                    conclusive && report.first_failure().is_some_and(|c| c.id == "duration");
                 if let Some(stop) = too_short
                     .then(|| source_stops_early(expected, run.encoded_secs, true, false))
                     .flatten()
@@ -952,7 +966,7 @@ async fn folder_not_writable(dir: &Path) -> Option<String> {
         Some(format!(
             "Chrysopoeia doesn't have permission to write in {}, so the converted file can't be \
              put there. Check the folder's permissions (in Docker, the PUID/PGID user needs write \
-             access)",
+             access).",
             existing.display()
         ))
     })

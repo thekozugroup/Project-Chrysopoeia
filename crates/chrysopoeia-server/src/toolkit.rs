@@ -22,12 +22,13 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_hwdetect::DetectOptions;
 use chrysopoeia_scanner::{ProbeError, ScanOptions, WalkResult, WatchEvent};
-use chrysopoeia_worker::finalize::Recovery;
+use chrysopoeia_worker::finalize::{Interrupted, Recovery};
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// A running folder watcher. Dropping it stops watching. Its methods take
 /// `&self` and may block for seconds (they walk the folder tree), so the
@@ -94,6 +95,20 @@ pub trait MediaToolkit: Send + Sync + 'static {
 
     /// Clean up a temp or backup file left behind by a crash.
     fn recover_artifact(&self, path: PathBuf) -> BoxFuture<'static, anyhow::Result<Recovery>>;
+
+    /// After a crash, finish a replacement whose new file was already in
+    /// place (see `chrysopoeia_worker::finalize::resume_replace`). Only
+    /// touches the files a job of this id left, so fakes use it as is.
+    fn resume_replace(
+        &self,
+        input: PathBuf,
+        final_path: PathBuf,
+        job_id: Uuid,
+    ) -> BoxFuture<'static, anyhow::Result<Interrupted>> {
+        Box::pin(async move {
+            chrysopoeia_worker::finalize::resume_replace(&input, &final_path, job_id).await
+        })
+    }
 
     /// Start a debounced folder watcher.
     #[allow(clippy::type_complexity)]
@@ -361,6 +376,20 @@ impl Toolkit {
         let inner = Arc::clone(&self.inner);
         self.async_call("crash recovery", move || inner.recover_artifact(path))
             .await?
+    }
+
+    /// See [`MediaToolkit::resume_replace`].
+    pub async fn resume_replace(
+        &self,
+        input: PathBuf,
+        final_path: PathBuf,
+        job_id: Uuid,
+    ) -> anyhow::Result<Interrupted> {
+        let inner = Arc::clone(&self.inner);
+        self.async_call("crash recovery", move || {
+            inner.resume_replace(input, final_path, job_id)
+        })
+        .await?
     }
 
     /// See [`MediaToolkit::start_watcher`].

@@ -197,9 +197,9 @@ async fn interrupted_jobs_are_requeued_and_leftovers_recovered() {
 }
 
 #[tokio::test]
-async fn clean_shutdown_skips_the_library_walk() {
+async fn clean_shutdown_skips_the_leftover_search() {
     let app = TestApp::new().await;
-    app.add_library("Movies", json!({})).await;
+    let lib = app.add_library("Movies", json!({})).await;
     let dir = app.stop().await;
     let fake = std::sync::Arc::new(FakeToolkit::default());
     let app = TestApp::start(TestOptions {
@@ -209,16 +209,17 @@ async fn clean_shutdown_skips_the_library_walk() {
     })
     .await;
     assert!(app.startup.clean_shutdown);
-    let state = app.state.clone();
-    wait_until("dispatcher ready", move || {
-        let state = state.clone();
-        async move { state.dispatcher.is_ready() }
+    let fake_c = fake.clone();
+    wait_until("the catch-up scan", move || {
+        let fake = fake_c.clone();
+        async move { !fake.walks.lock().unwrap().is_empty() }
     })
     .await;
-    assert!(
-        fake.walks.lock().unwrap().is_empty(),
-        "no library walk after a clean stop"
-    );
+    app.wait_scan(lib["id"].as_str().unwrap()).await;
+    // The catch-up scan walks the library once; a clean stop leaves no
+    // leftovers, so recovery doesn't walk it again.
+    assert_eq!(fake.walks.lock().unwrap().len(), 1);
+    assert!(fake.recovered.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -813,6 +813,7 @@ fn parse_stream(s: &Value) -> StreamInfo {
         color_space: text(&s["color_space"]),
         color_range: text(&s["color_range"]),
         hdr,
+        dolby_vision_without_base_layer: false,
         interlaced: matches!(field_order, "tt" | "bb" | "tb" | "bt"),
         mastering_display: None,
         content_light: None,

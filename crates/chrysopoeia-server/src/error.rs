@@ -165,12 +165,69 @@ fn field_of(detail: &str) -> Option<String> {
     valid.then(|| path.to_string())
 }
 
+/// Say what is wrong with one value in plain words, from serde's message
+/// about it (`unknown variant `x`, expected one of `a`, `b``, `invalid type:
+/// string "x", expected u32`, …). `field` is the value's path, when known.
+pub fn describe_value_error(field: Option<&str>, serde_message: &str) -> String {
+    let lead = match field {
+        Some(f) => format!("The value for \"{f}\" isn't valid."),
+        None => "A value isn't valid.".to_string(),
+    };
+    let msg = serde_message.trim();
+    let quoted = |text: &str| -> Vec<String> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    };
+    let hint = if let Some(rest) = msg.strip_prefix("unknown variant ") {
+        let choices = rest
+            .split_once("expected")
+            .map(|(_, list)| quoted(list))
+            .unwrap_or_default();
+        if choices.is_empty() {
+            "Pick one of the listed choices.".to_string()
+        } else {
+            format!("Choose one of: {}.", choices.join(", "))
+        }
+    } else if let Some(rest) = msg.strip_prefix("unknown field ") {
+        let name = quoted(rest).into_iter().next().unwrap_or_default();
+        format!("There's no setting called \"{name}\" here.")
+    } else if msg.starts_with("missing field ") {
+        let name = quoted(msg).into_iter().next().unwrap_or_default();
+        format!("\"{name}\" is missing.")
+    } else if msg.starts_with("invalid type") || msg.starts_with("invalid value") {
+        let expected = msg.rsplit_once("expected ").map_or("", |(_, e)| e);
+        match expected {
+            e if e.starts_with('u') || e.starts_with('i') || e.contains("integer") => {
+                "It must be a whole number.".to_string()
+            }
+            e if e.starts_with('f') => "It must be a number.".to_string(),
+            "a boolean" => "It must be true or false.".to_string(),
+            e if e.contains("string") => "It must be text.".to_string(),
+            e if e.contains("sequence") => "It must be a list.".to_string(),
+            e if e.contains("map") || e.starts_with("struct") => {
+                "It must be an object with its own settings.".to_string()
+            }
+            _ => String::new(),
+        }
+    } else {
+        String::new()
+    };
+    if hint.is_empty() {
+        lead
+    } else {
+        format!("{lead} {hint}")
+    }
+}
+
 impl From<JsonRejection> for ApiError {
     fn from(rej: JsonRejection) -> Self {
         match rej {
             JsonRejection::MissingJsonContentType(_) => Self::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "invalid_json",
+                "unsupported_media_type",
                 "Send the request body as JSON (Content-Type: application/json).",
             ),
             JsonRejection::JsonSyntaxError(e) => Self::bad_request(
@@ -182,13 +239,20 @@ impl From<JsonRejection> for ApiError {
             ),
             JsonRejection::JsonDataError(e) => {
                 let detail = rejection_detail(&e.body_text());
-                let error = Self::bad_request(
-                    "invalid_request",
-                    format!("The request has a wrong or missing field ({detail})."),
-                );
                 match field_of(&detail) {
-                    Some(field) => error.with_field(field),
-                    None => error,
+                    Some(field) => {
+                        let serde_message =
+                            detail.split_once(": ").map_or(detail.as_str(), |(_, m)| m);
+                        Self::bad_request(
+                            "invalid_request",
+                            describe_value_error(Some(&field), serde_message),
+                        )
+                        .with_field(field)
+                    }
+                    None => Self::bad_request(
+                        "invalid_request",
+                        format!("The request has a wrong or missing field ({detail})."),
+                    ),
                 }
             }
             JsonRejection::BytesRejection(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -279,6 +343,52 @@ mod tests {
         assert_eq!(field_of("missing field `path`"), None);
         assert_eq!(field_of(".: invalid type: string"), None);
         assert_eq!(field_of("expected value: at position 3"), None);
+    }
+
+    #[tokio::test]
+    async fn a_body_that_is_not_json_is_refused_with_one_code() {
+        use axum::extract::FromRequest as _;
+        let req = axum::http::Request::builder()
+            .method("PATCH")
+            .header("content-type", "text/plain")
+            .body(axum::body::Body::from("{}"))
+            .unwrap();
+        let rej = Json::<serde_json::Value>::from_request(req, &())
+            .await
+            .unwrap_err();
+        let e = ApiError::from(rej);
+        assert_eq!(e.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(e.code, "unsupported_media_type");
+    }
+
+    #[test]
+    fn value_errors_are_plain() {
+        assert_eq!(
+            describe_value_error(
+                Some("default_profile.quality"),
+                "unknown variant `ultra`, expected one of `smallest`, `small`, `balanced`"
+            ),
+            "The value for \"default_profile.quality\" isn't valid. Choose one of: smallest, \
+             small, balanced."
+        );
+        assert_eq!(
+            describe_value_error(
+                Some("max_jobs"),
+                "invalid type: string \"lots\", expected u32"
+            ),
+            "The value for \"max_jobs\" isn't valid. It must be a whole number."
+        );
+        assert_eq!(
+            describe_value_error(
+                Some("auto_queue"),
+                "invalid type: integer `1`, expected a boolean"
+            ),
+            "The value for \"auto_queue\" isn't valid. It must be true or false."
+        );
+        assert_eq!(
+            describe_value_error(None, "something odd"),
+            "A value isn't valid."
+        );
     }
 
     #[test]

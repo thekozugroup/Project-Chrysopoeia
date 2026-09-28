@@ -49,6 +49,8 @@ pub enum Behavior {
     Fail(String),
     /// Wait until cancelled, or until released (then behave like `Done`).
     Hold,
+    /// Wait until cancelled, or until released (then fail with this error).
+    HoldFail(String),
     /// Panic inside the transcoder.
     Panic,
 }
@@ -209,6 +211,10 @@ fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
     let meta = std::fs::metadata(root)?;
     anyhow::ensure!(meta.is_dir(), "not a folder");
     let mut out = WalkResult::default();
+    // Like the real walker: unusable patterns are noted on the root.
+    for problem in chrysopoeia_scanner::IgnoreRules::new(&opts.ignore_patterns).invalid_patterns() {
+        out.notes.push((root.to_path_buf(), problem.clone()));
+    }
     let ignore = crate::services::library::compile_ignore(&opts.ignore_patterns);
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -631,6 +637,22 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     attempt: 2,
                     validation: None,
                 },
+                Behavior::HoldFail(error) => {
+                    tokio::select! {
+                        () = cancel.cancelled() => JobOutcome::Cancelled,
+                        permit = me.release.acquire() => {
+                            if let Ok(p) = permit { p.forget(); }
+                            JobOutcome::Failed {
+                                error,
+                                log_tail: None,
+                                command: None,
+                                encoder: None,
+                                attempt: 0,
+                                validation: None,
+                            }
+                        }
+                    }
+                }
                 Behavior::Hold => {
                     tokio::select! {
                         () = cancel.cancelled() => JobOutcome::Cancelled,

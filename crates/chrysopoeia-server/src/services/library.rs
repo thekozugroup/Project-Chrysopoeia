@@ -301,6 +301,18 @@ fn sentence(text: &str) -> String {
     out
 }
 
+/// Why a library folder couldn't be walked, as one or more sentences. The
+/// scanner's reasons are already sentences with advice; anything else gets
+/// the usual advice added.
+fn scan_failure(e: &anyhow::Error) -> String {
+    let text = sentence(&format!("{e:#}"));
+    if text.contains("Check ") || text.contains("check ") {
+        text
+    } else {
+        format!("{text} Check that the folder exists and its drive or share is connected.")
+    }
+}
+
 /// Plain-language message for a probe failure. The scanner's reasons for
 /// unreadable files are already sentences for users.
 pub fn probe_error_message(e: &ProbeError) -> String {
@@ -620,16 +632,18 @@ fn describe_problems(root: &Path, items: &[&(PathBuf, String)]) -> String {
         .iter()
         .take(NAMED_PROBLEMS)
         .map(|(path, reason)| {
+            let reason = reason.trim().trim_end_matches('.');
+            // A note on the library folder itself (an unusable ignore
+            // pattern) needs no path.
+            if path == root {
+                return reason.to_string();
+            }
             let shown = path
                 .strip_prefix(root)
                 .ok()
                 .filter(|r| !r.as_os_str().is_empty())
                 .unwrap_or(path);
-            format!(
-                "{}: {}",
-                shown.to_string_lossy(),
-                reason.trim().trim_end_matches('.')
-            )
+            format!("{}: {reason}", shown.to_string_lossy())
         })
         .collect();
     if items.len() > NAMED_PROBLEMS {
@@ -722,9 +736,18 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         .map(|e| (e.path.clone(), e))
         .collect();
 
+    // The minimum size only decides which files are added: the walk lists
+    // every size, so a file already in the list (typically a conversion
+    // that came out smaller than the minimum) is never taken for removed.
+    let opts = scan_options(state);
+    let min_size = opts.min_size_bytes;
+    let walk_opts = ScanOptions {
+        min_size_bytes: 0,
+        ..opts
+    };
     let walk = match state
         .toolkit
-        .walk_library(PathBuf::from(&lib.path), scan_options(state))
+        .walk_library(PathBuf::from(&lib.path), walk_opts)
         .await
     {
         Ok(Ok(walk)) => walk,
@@ -732,11 +755,7 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
             state
                 .library_activity(
                     ActivityLevel::Error,
-                    format!(
-                        "Couldn't scan {}: {e:#}. Check that the folder exists and its drive \
-                         or share is connected.",
-                        lib.name
-                    ),
+                    format!("Couldn't scan {}. {}", lib.name, scan_failure(&e)),
                     id,
                 )
                 .await;
@@ -762,7 +781,11 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     if !walk.files.is_empty() {
         state.dispatcher.library_back(id);
     }
-    let discovered = walk.files.len() as u64;
+    // Files below the minimum size that aren't listed yet are left out.
+    let small_new = |file: &DiscoveredFile| {
+        file.size < min_size && file.path.to_str().is_none_or(|p| !index.contains_key(p))
+    };
+    let discovered = walk.files.iter().filter(|f| !small_new(f)).count() as u64;
     state.emit(scan_progress(
         &lib,
         ScanPhase::Discovering,
@@ -783,6 +806,9 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         };
         seen.insert(path);
         let existing = index.get(path);
+        if existing.is_none() && file.size < min_size {
+            continue;
+        }
         match existing {
             Some(e) if matches!(e.status, FileStatus::Queued | FileStatus::Processing) => continue,
             Some(e)
@@ -810,11 +836,13 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     // Files that disappeared. An empty walk of a library that had files is
     // almost always an unmounted drive, so nothing is removed then. Nothing
     // below a folder that couldn't be read (or was left alone) was listed,
-    // so its files are kept too.
+    // so its files are kept too. Notes about the library folder itself (an
+    // ignore pattern that can't be used) don't hide anything.
+    let root = Path::new(&lib.path);
     let unreadable: Vec<PathBuf> = walk
         .errors
         .iter()
-        .chain(&walk.notes)
+        .chain(walk.notes.iter().filter(|(p, _)| p != root))
         .map(|(p, _)| p.clone())
         .collect();
     let removed: Vec<IndexEntry> = index
@@ -1092,7 +1120,7 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
     let Ok(meta) = tokio::fs::metadata(path).await else {
         return Ok(Single::Handled);
     };
-    if !meta.is_file() || meta.len() < opts.min_size_bytes {
+    if !meta.is_file() {
         return Ok(Single::Handled);
     }
     let modified: DateTime<Utc> = meta
@@ -1101,6 +1129,10 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
         .unwrap_or_else(|_| Utc::now());
     let read_at = db::now_ts();
     let existing = db::files::find_by_path(state.db.pool(), path_str).await?;
+    // The minimum size only decides which files are added (see `run_scan`).
+    if existing.is_none() && meta.len() < opts.min_size_bytes {
+        return Ok(Single::Handled);
+    }
     if let Some(e) = &existing {
         let busy = matches!(e.status, FileStatus::Queued | FileStatus::Processing);
         let unchanged =
@@ -1374,6 +1406,39 @@ mod tests {
         let dirs = vec![PathBuf::from("/m/Locked")];
         assert!(under_unreadable("/m/Locked/a.mkv", &dirs));
         assert!(!under_unreadable("/m/LockedOut/a.mkv", &dirs));
+    }
+
+    #[test]
+    fn notes_on_the_library_folder_itself_name_no_path() {
+        let root = Path::new("/m/Movies");
+        let pattern = (
+            root.to_path_buf(),
+            "The ignore pattern \"!x\" is not used.".to_string(),
+        );
+        let disc = (
+            root.join("Film/VIDEO_TS"),
+            "This folder is a DVD copy".to_string(),
+        );
+        assert_eq!(
+            describe_problems(root, &[&pattern, &disc]),
+            "The ignore pattern \"!x\" is not used; Film/VIDEO_TS: This folder is a DVD copy."
+        );
+    }
+
+    #[test]
+    fn scan_failures_read_as_sentences_with_advice_once() {
+        let scanner = anyhow::anyhow!(
+            "The folder /media/Movies does not exist. Check the path, and when running in \
+             Docker that the folder is mounted into the container."
+        );
+        let text = scan_failure(&scanner);
+        assert!(!text.contains(".."), "{text}");
+        assert_eq!(text.matches("Check").count(), 1, "{text}");
+        let other = anyhow::anyhow!("not a folder");
+        assert_eq!(
+            scan_failure(&other),
+            "Not a folder. Check that the folder exists and its drive or share is connected."
+        );
     }
 
     #[test]

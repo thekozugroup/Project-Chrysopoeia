@@ -199,9 +199,11 @@ fn hdr_to_h264_is_skipped() {
 
 #[test]
 fn dolby_vision_without_a_standard_layer_is_skipped() {
-    // Profile 5: no HDR10/HLG/SDR base layer, colour description unset.
+    // Profile 5: no HDR10/HLG/SDR base layer (the scanner flags it and
+    // clears the colour description).
     let mut dv5 = video_10bit(0, "hevc", 3840, 2160);
     dv5.hdr = Some(HdrFormat::DolbyVision);
+    dv5.dolby_vision_without_base_layer = true;
     let p = probe_of("matroska", vec![dv5.clone()]);
     let save = chrysopoeia_core::TranscodeProfile::from_goal(chrysopoeia_core::Goal::SaveSpace);
     let reason_text =
@@ -217,6 +219,16 @@ fn dolby_vision_without_a_standard_layer_is_skipped() {
     let mut small = save.clone();
     small.max_height = Some(1080);
     assert_eq!(reason(decide(&p, &small)), reason_text);
+
+    // Dolby Vision without a colour description but without the scanner's
+    // flag (seen only from its codec tag, or an older probe): skipped too,
+    // without claiming it is profile 5.
+    let mut unknown = video_10bit(0, "hevc", 3840, 2160);
+    unknown.hdr = Some(HdrFormat::DolbyVision);
+    let p = probe_of("matroska", vec![unknown]);
+    let why = reason(decide(&p, &save));
+    assert!(!why.contains("profile 5"), "{why}");
+    assert!(why.ends_with("left unchanged"), "{why}");
 
     // Profile 8.1 (HDR10 base layer) and 8.4 (HLG) are converted.
     let mut dv81 = hdr10(video_10bit(0, "hevc", 3840, 2160));

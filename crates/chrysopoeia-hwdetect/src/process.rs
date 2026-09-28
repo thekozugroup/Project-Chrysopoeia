@@ -48,17 +48,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|err| match err.kind() {
-            io::ErrorKind::NotFound => RunError::NotFound,
-            _ => RunError::Io(err),
-        })?;
+        .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
+    let child = command.spawn().map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => RunError::NotFound,
+        _ => RunError::Io(err),
+    })?;
 
     // Dropping the future on timeout drops the child, and kill_on_drop
     // sends SIGKILL; tokio reaps it in the background.

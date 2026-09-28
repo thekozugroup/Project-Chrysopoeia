@@ -610,6 +610,54 @@ pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
     Ok(done.rows_affected())
 }
 
+/// Remember where a running job will put its result (see
+/// [`interrupted`]).
+pub async fn set_final_path(pool: &SqlitePool, id: Uuid, path: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE jobs SET final_path = ? WHERE id = ? AND state = 'running'")
+        .bind(path)
+        .bind(id.to_string())
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A job that was running when the server stopped, with where it was going
+/// to put its result.
+#[derive(Debug, Clone)]
+pub struct InterruptedJob {
+    pub job: Job,
+    pub final_path: Option<String>,
+}
+
+/// Jobs left `running` by the previous run (before [`recover_interrupted`]).
+pub async fn interrupted(pool: &SqlitePool) -> sqlx::Result<Vec<InterruptedJob>> {
+    let rows = sqlx::query(&format!(
+        "SELECT {COLUMNS}, final_path FROM jobs WHERE state = 'running'"
+    ))
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(InterruptedJob {
+                job: from_row(row)?,
+                final_path: row.try_get("final_path")?,
+            })
+        })
+        .collect()
+}
+
+/// Whether a finished conversion other than `job` put its result at `path`.
+pub async fn other_done_at(pool: &SqlitePool, job: Uuid, path: &str) -> sqlx::Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM jobs WHERE final_path = ? AND id != ? AND state = 'done' LIMIT 1",
+    )
+    .bind(path)
+    .bind(job.to_string())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
 /// Startup recovery: jobs left `running` go back to the queue, and files left
 /// `processing` follow their job (or become `pending` without one).
 /// Returns the number of jobs re-queued.

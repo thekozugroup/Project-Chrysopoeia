@@ -39,10 +39,10 @@ shapes here are normative. The Rust source of truth for every shared type is
 
 | Crate | Owns | Public API |
 |---|---|---|
-| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming | Everything in `src/*.rs` |
+| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, tying child processes to the server's life | Everything in `src/*.rs` |
 | `chrysopoeia-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure` |
 | `chrysopoeia-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
-| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `build_plan`, `run_job`, `validate_output`, `finalize::*` |
+| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `recover_artifact`) |
 | `chrysopoeia-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `chrysopoeia` |
 
 Existing public signatures are fixed; new public items may be added.
@@ -73,6 +73,11 @@ Not configurable: a file must go 20 s without changes (size and mtime) before
 it is picked up or converted (the settle time); the database busy timeout is
 30 s. Active hours use the local time zone (`TZ`).
 
+Start order: exclusive lock on `$DATA_DIR/chrysopoeia.lock` (a second
+Chrysopoeia on the same data folder exits with "Another Chrysopoeia is already
+using the data folder …" and changes nothing; filesystems that can't lock
+only log a warning) → bind the port → open the database → recovery.
+
 ## Database (SQLite, WAL)
 
 Migrations are versioned with `PRAGMA user_version` and applied step by step,
@@ -95,7 +100,7 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      state TEXT, stage TEXT, priority INT, progress REAL, fps REAL, speed REAL, eta_secs INT,
      encoder, hw_api, attempt INT, input_size INT, output_size INT, error, skip_reason,
      validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
-     created_at, started_at, finished_at)
+     created_at, started_at, finished_at, final_path TEXT NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id)
@@ -103,7 +108,8 @@ savings(date TEXT PK 'YYYY-MM-DD', saved_bytes INT, files INT)
 ```
 
 Versions: 1 = base schema; 2 = job-list indexes and `finished_at` on every
-finished job; 3 = `jobs.notes`.
+finished job; 3 = `jobs.notes`; 4 = `jobs.final_path` (where a started job
+puts its result, written when it starts).
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -131,21 +137,36 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   profile read right before each batch of 50 is written. Files still settling
   are looked at again later. Removed files are deleted from the DB (their jobs
   cascade), except below folders the walk couldn't read or left alone, and
-  never when a library that had files walks empty (an unmounted share).
+  never when a library that had files walks empty (an unmounted share). A
+  file that is still on disk is never removed.
+- Scans at start (after recovery and once the watcher is armed): every
+  enabled library when `watch_folders` is on or `rescan_interval_hours` > 0
+  (catching what changed while the server was down), otherwise only
+  libraries never scanned. Periodic rescans follow `last_scan_at`.
 - Walk results carry `errors` (unreadable folders: a warning in the feed) and
   `notes` (DVD/Blu-ray disc folders, skipped links, names that aren't UTF-8,
   unusable ignore patterns: an informational "Left alone in …" entry). Each is
-  reported once per server run.
+  reported once per server run. Notes on the library folder itself (unusable
+  ignore patterns) don't keep removed files listed.
 - Filters (scan and watcher alike): ignore patterns (scanner glob rules,
   validated on save) and `min_file_size_mb` in decimal megabytes
-  (1 MB = 1 000 000 bytes).
+  (1 MB = 1 000 000 bytes). The minimum size only decides which files are
+  added: files already listed stay while they are on disk (a conversion often
+  ends up below the minimum).
 - Files `queued`/`processing` are not touched by scans or watch events. Files
   `done` whose size/mtime still match are left alone. A file in `failed` is
   not re-queued automatically; the user retries.
-- Startup recovery: jobs `running` → `queued` (attempt reset), files
-  `processing` → `queued`. Then every temp/backup artifact is passed to
-  `worker::finalize::recover_artifact`: in the temp folders always, and in the
-  library folders and the output folder after an unclean shutdown.
+- Startup recovery: first, jobs left `running` whose new file was already in
+  place are finished and recorded as `done` (note: "Chrysopoeia stopped just
+  as the new file was being put in place. The new file was already complete,
+  so it was kept"): in replace mode when `worker::finalize::resume_replace`
+  finds the job's backup of the original next to a file under
+  `jobs.final_path`; in folder mode when the job was `finalizing`, its output
+  file exists and no other finished job claims that path. Then jobs `running`
+  → `queued` (attempt reset), files `processing` → `queued`. Then every
+  temp/backup artifact is passed to `worker::finalize::recover_artifact`: in
+  the temp folders always, and in the library folders and the output folder
+  after an unclean shutdown.
 
 ## Folder watching
 
@@ -191,6 +212,12 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
   start (older versions didn't read it).
 - A failure is logged once, at WARN, through its activity entry.
+- Watch events for a file are ignored while it is `queued`/`processing`;
+  after its job ends the file is looked at again (as a watch event would).
+  A file moved or deleted during its job (gone while its library folder is
+  there) is taken off the list with watching on ("… was moved or deleted
+  while it was being converted, so it was taken off the list."), or marked
+  missing (`The file is no longer at …`) with watching off.
 
 ## Worker behaviour (normative)
 
@@ -200,12 +227,15 @@ and source codec efficiency rank ≥ target rank ("Already AV1…"); not
 `skip_efficient` and the file already is the target codec in the target
 container family, 4:2:0, ≤ 10-bit (8-bit for H.264), with audio the container
 holds ("Already H.264 in an MP4 or MOV file"). The efficiency rules don't apply
-when the picture exceeds `max_height`. Always skipped: Dolby Vision whose
-stream has no colour transfer (the scanner clears the colour tags of profile 5
-and other layers without a standard picture: "Dolby Vision profile 5 can't be
-converted without losing its colours — left unchanged"); HDR to H.264 ("HDR
-video would lose its colours as H.264 — left unchanged"); files whose audio
-can't be read. `run_job` repeats `decide` (a user may queue a skipped file).
+when the picture exceeds `max_height`. Always skipped: Dolby Vision without a
+standard base layer — the scanner sets `StreamInfo.dolby_vision_without_base_layer`
+(profile 5, compatibility id 0) and clears its colour tags: "Dolby Vision
+profile 5 can't be converted without losing its colours — left unchanged";
+any other Dolby Vision stream without a colour transfer: "This Dolby Vision
+video doesn't say which colours its picture uses, so converting it could ruin
+them — left unchanged"; HDR to H.264 ("HDR video would lose its colours as
+H.264 — left unchanged"); files whose audio can't be read. `run_job` repeats
+`decide` (a user may queue a skipped file).
 
 **build_plan**:
 - Explicit `-map 0:<index>` per kept stream. Primary video only (no cover art,
@@ -255,7 +285,9 @@ can't be read. `run_job` repeats `decide` (a user may queue a skipped file).
    the container claims (> max(2 s, 5 %)), the job fails with "The original
    file appears damaged or incomplete (it stops after 0.1 s). It was left
    unchanged." (With verification off, ending before half the length is
-   enough.)
+   enough.) Only an attempt that decoded on the CPU (or the last attempt)
+   concludes this; a GPU-decoding attempt that stops early moves on to the
+   next attempt like any other hardware failure.
 4. **Size rule**: if `profile.min_savings_pct = Some(p)` and the output is not
    at least `p`% smaller, it is discarded: `Skipped` ("Only 4% smaller — kept
    the original", "The new file was 7% larger — kept the original").
@@ -268,7 +300,9 @@ can't be read. `run_job` repeats `decide` (a user may queue a skipped file).
 
 stderr noise that means nothing (libnuma's `set_mempolicy: Operation not
 permitted` from libx265 under Docker's seccomp profile) is kept out of error
-reasons and log tails.
+reasons and log tails. Every ffmpeg/ffprobe child is started with
+`core::process::end_with_parent` (Linux `PR_SET_PDEATHSIG` = SIGKILL), so no
+encode outlives a killed server.
 
 **validate_output** by level (checks stop at the first failure):
 - `quick`: ffprobe opens the output; stream counts match the plan; video codec
@@ -287,26 +321,34 @@ reasons and log tails.
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to
 disk), so the original stays until the new file is completely there. The
-original's identity is checked again right before it is touched. Replace mode,
-same path: original → hidden backup (`paths::backup_file_name`), staged →
-final, backup deleted; the backup is checked to be the file the job read,
-and any failure puts it back. New extension: refuse to overwrite an unrelated
-file, staged → final, then delete the original. Folder mode: create folders,
-never overwrite, never touch the original. The new file gets the original's
-permission bits (and owner where allowed) and, with `keep_file_dates`, its
-times. `recover_artifact` after a crash: temp and staged files are deleted; a
-backup is renamed back when the original is missing, deleted otherwise.
+original's identity is checked again right before it is touched. Replace mode
+(same path or new extension): original → hidden backup
+(`paths::backup_file_name`), staged → final, backup deleted; the backup is
+checked to be the file the job read, a new name must still be free when the
+new file moves in, and any failure puts the backup back. (A backup name longer
+than 255 bytes: the new file is renamed in first, then a renamed original is
+deleted.) Folder mode: create folders, never overwrite, never touch the
+original. The new file gets the original's permission bits (and owner where
+allowed) and, with `keep_file_dates`, its times. After a crash,
+`resume_replace(input, final_path, job_id)` reports `Placed` (and deletes the
+backup) when the job's backup exists and the new file is in place — the
+original's name taken again (same path) or free with the new name present
+(new extension) — else `NotPlaced`. `recover_artifact`: temp and staged files
+are deleted; a backup is renamed back when the original is missing, deleted
+otherwise.
 
 ## REST API (`/api`)
 
 All responses are JSON. Errors: HTTP 4xx/5xx with
 `{"error": "<plain sentence>", "code": "<snake_case>"}`, plus
 `"field": "<name>"` when one setting or request field is at fault (a settings
-key such as `temp_dir`, or `path`, `name`, `profile.max_height`,
-`profile.quality`). 500s carry a generic sentence; details go to the log.
-List endpoints return `{"items": [...], "total": <n>}`. Bodies are limited to
-1 MB (413 `body_too_large`); write requests need `Content-Type:
-application/json` (415).
+key such as `temp_dir`, a nested one such as `default_profile.quality`, or
+`path`, `name`, `profile.max_height`, `profile.quality`). A value of the wrong
+kind is explained in plain words ("The value for "default_profile.quality"
+isn't valid. Choose one of: …"). 500s carry a generic sentence; details go to
+the log. List endpoints return `{"items": [...], "total": <n>}`. Bodies are
+limited to 1 MB (413 `body_too_large`); write requests with a body need
+`Content-Type: application/json` (415 `unsupported_media_type`).
 
 | Method & path | Body / query | Returns |
 |---|---|---|
@@ -334,7 +376,7 @@ application/json` (415).
 | `POST /queue/pause` / `POST /queue/resume` | | `QueueState` |
 | `POST /queue/stop` | | `QueueState` (cancel running, re-queue them, pause) |
 | `GET /settings` | | `Settings` |
-| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, invalid ignore pattern) |
+| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes) |
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}], "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |

@@ -1,14 +1,15 @@
 //! Start-up, background services and graceful shutdown.
 //!
-//! Order at start: data folder → database (migrated) → settings (first run
-//! applies `HW_ACCEL` and `LIBRARIES`; a changed `HW_ACCEL` is applied on
-//! later starts too) → recovery of interrupted jobs → HTTP server. In the
+//! Order at start: data folder lock → port → database (migrated) → settings
+//! (first run applies `HW_ACCEL` and `LIBRARIES`; a changed `HW_ACCEL` is
+//! applied on later starts too) → interrupted jobs (finished when their new
+//! file was already in place, else re-queued) → HTTP server. In the
 //! background: hardware detection, crash-artifact recovery (the dispatcher
-//! waits for both), the folder watcher, the dispatcher, periodic rescans and
-//! history trimming, and a first scan of never-scanned libraries.
+//! waits for both), then the folder watcher and catch-up scans; the
+//! dispatcher, periodic rescans and history trimming.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -38,6 +39,56 @@ pub struct Startup {
     pub clean_shutdown: bool,
     /// Jobs that were running when the previous run stopped.
     pub requeued_jobs: u64,
+}
+
+/// Name of the lock file in the data folder (see [`lock_data_dir`]).
+pub const LOCK_FILE_NAME: &str = "chrysopoeia.lock";
+
+/// Holds the data folder for this process; released when dropped (or when
+/// the process ends, however it ends).
+#[derive(Debug)]
+pub struct DataDirLock {
+    _file: std::fs::File,
+}
+
+/// Make sure no other Chrysopoeia uses the data folder: a second one would
+/// put the first one's running jobs back in the queue, start them twice and
+/// delete their temp files. Takes an exclusive lock on a file in the folder,
+/// creating the folder if needed. Where the filesystem can't lock (some
+/// network shares), a warning is logged and the server starts anyway.
+pub fn lock_data_dir(dir: &Path) -> anyhow::Result<DataDirLock> {
+    std::fs::create_dir_all(dir).with_context(|| {
+        format!(
+            "Could not create the data folder {}. Check that it exists and is writable",
+            dir.display()
+        )
+    })?;
+    let path = dir.join(LOCK_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| {
+            format!(
+                "Could not open {} in the data folder. Check that the folder is writable",
+                path.display()
+            )
+        })?;
+    #[cfg(unix)]
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => {}
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => anyhow::bail!(
+            "Another Chrysopoeia is already using the data folder {}. Stop it first, or give \
+             this one its own data folder (DATA_DIR)",
+            dir.display()
+        ),
+        Err(e) => tracing::warn!(
+            "Could not lock the data folder {} ({e}). Make sure only one Chrysopoeia uses it",
+            dir.display()
+        ),
+    }
+    Ok(DataDirLock { _file: file })
 }
 
 /// Open the database, load settings, apply first-run options and recover
@@ -94,6 +145,7 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             }
         }
     }
+    dispatcher::complete_interrupted(&state).await;
     let requeued_jobs = db::jobs::recover_interrupted(&state.db).await?;
     if requeued_jobs > 0 {
         state
@@ -256,34 +308,45 @@ pub fn start_background(state: &AppState, startup: Startup) {
         hardware::detect(&s).await;
     });
 
+    // Leftovers first (a backup put back must not look like a removed
+    // file), then the watcher, then the catch-up scans, so nothing that
+    // changes meanwhile falls between them.
     let s = state.clone();
     tokio::spawn(async move {
         recover_artifacts(&s, !startup.clean_shutdown).await;
         s.dispatcher.set_ready();
+        watcher::sync(&s).await;
+        startup_scans(&s).await;
     });
-
-    let s = state.clone();
-    tokio::spawn(async move { watcher::sync(&s).await });
 
     tokio::spawn(dispatcher::run(state.clone()));
     tokio::spawn(hardware::recheck_loop(state.clone()));
     tokio::spawn(rescan::run(state.clone()));
     tokio::spawn(rescan::trim_history_loop(state.clone()));
+}
 
-    let s = state.clone();
-    tokio::spawn(async move {
-        match db::libraries::list(s.db.pool()).await {
-            Ok(libs) => {
-                for lib in libs
-                    .into_iter()
-                    .filter(|l| l.enabled && l.last_scan_at.is_none())
-                {
-                    let _ = library::start_scan(&s, lib.id);
+/// Scans at start: libraries never scanned, and, when changes are meant to
+/// be found by themselves (folder watching or periodic rescans), every
+/// enabled library, since the watcher could not see what changed while the
+/// server was down. Scans only compare sizes and dates and probe new or
+/// changed files, so this is cheap.
+async fn startup_scans(state: &AppState) {
+    let settings = state.settings();
+    let catch_up = settings.watch_folders || settings.rescan_interval_hours > 0;
+    match db::libraries::list(state.db.pool()).await {
+        Ok(libs) => {
+            for lib in libs
+                .into_iter()
+                .filter(|l| l.enabled && (catch_up || l.last_scan_at.is_none()))
+            {
+                if state.shutdown.is_cancelled() {
+                    return;
                 }
+                let _ = library::start_scan(state, lib.id);
             }
-            Err(e) => tracing::error!("could not list libraries: {e}"),
         }
-    });
+        Err(e) => tracing::error!("could not list libraries: {e}"),
+    }
 }
 
 /// Bind the listening socket, with a plain explanation when that fails.
@@ -358,8 +421,11 @@ pub async fn shutdown_signal() {
 
 /// Run the server until SIGINT/SIGTERM.
 pub async fn run(config: Config, toolkit: Toolkit) -> anyhow::Result<()> {
+    // Nothing is written before this process owns the data folder and the
+    // port, so a second copy started by mistake changes nothing.
+    let _lock = lock_data_dir(&config.data_dir)?;
+    let listener = bind(&config).await?;
     let (state, startup) = build(config, toolkit).await?;
-    let listener = bind(&state.config).await?;
     let addr = listener
         .local_addr()
         .map_or_else(|_| "?".to_string(), |a| a.to_string());

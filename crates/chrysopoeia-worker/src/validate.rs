@@ -2430,6 +2430,7 @@ async fn probe_media(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    chrysopoeia_core::process::end_with_parent(command.as_std_mut());
     let child = command.spawn().map_err(|e| {
         ProbeError::Failed(if e.kind() == std::io::ErrorKind::NotFound {
             format!("ffprobe was not found at {}", ffprobe.display())
