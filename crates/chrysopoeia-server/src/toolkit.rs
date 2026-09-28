@@ -29,8 +29,9 @@ use futures::future::BoxFuture;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-/// A running folder watcher. Dropping it stops watching.
-pub trait FolderWatcher: Send + Sync {
+/// A running folder watcher. Dropping it stops watching. Only `Send` is
+/// required: the server keeps it behind a mutex.
+pub trait FolderWatcher: Send {
     /// Start watching a root recursively.
     fn watch(&self, root: &Path) -> anyhow::Result<()>;
     /// Stop watching a root.

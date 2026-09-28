@@ -77,6 +77,29 @@ async fn gzip_when_accepted() {
 }
 
 #[tokio::test]
+async fn cors_only_with_dev_cors() {
+    async fn allow_origin(app: &TestApp) -> Option<String> {
+        let req = Request::builder()
+            .uri("/api/health")
+            .header("origin", "http://localhost:3000")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.router.clone().oneshot(req).await.unwrap();
+        resp.headers()
+            .get("access-control-allow-origin")
+            .map(|v| v.to_str().unwrap().to_string())
+    }
+    let app = TestApp::new().await;
+    assert_eq!(allow_origin(&app).await, None);
+    let app = TestApp::start(TestOptions {
+        configure: Box::new(|c, _| c.dev_cors = true),
+        ..TestOptions::default()
+    })
+    .await;
+    assert_eq!(allow_origin(&app).await.as_deref(), Some("*"));
+}
+
+#[tokio::test]
 async fn missing_ui_explains_itself() {
     let app = TestApp::new().await;
     let r = app.get("/").await;

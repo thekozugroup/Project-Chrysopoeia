@@ -195,13 +195,13 @@ impl Drop for RunningGuard {
     }
 }
 
-/// Effective job limit and whether it is automatic.
+/// Effective job limit and whether it is automatic: the saved setting, else
+/// the hardware recommendation. (`--max-jobs` seeds the setting on first
+/// run; after that the setting alone decides, so choosing "Automatic" in the
+/// UI really means automatic.)
 pub fn effective_max_jobs(state: &AppState) -> (u32, bool) {
     let settings = state.settings();
     if let Some(n) = settings.max_jobs {
-        return (n.clamp(1, MAX_JOBS_LIMIT), false);
-    }
-    if let Some(n) = state.config.max_jobs {
         return (n.clamp(1, MAX_JOBS_LIMIT), false);
     }
     let total = match state.hardware.current() {

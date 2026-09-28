@@ -56,7 +56,13 @@ impl Db {
             .acquire_timeout(Duration::from_secs(30))
             .connect_with(options)
             .await
-            .with_context(|| format!("could not open the database at {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Could not open the database at {}. Check that the data folder is writable \
+                     (in Docker: the /config volume and PUID/PGID)",
+                    path.display()
+                )
+            })?;
         migrate::migrate(&pool).await?;
         Ok(Self { pool })
     }

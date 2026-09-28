@@ -51,7 +51,8 @@ pub struct Cli {
     /// Scratch folder for in-progress encodes when the setting is unset.
     #[arg(long, env = "TEMP_DIR")]
     pub temp_dir: Option<String>,
-    /// Concurrent jobs instead of the automatic count.
+    /// Concurrent jobs instead of the automatic count, saved as the setting
+    /// on first run (the setting wins afterwards).
     #[arg(long, env = "MAX_JOBS")]
     pub max_jobs: Option<String>,
     /// Hardware preference on first run: auto, cpu, nvenc, qsv, vaapi, amf,
