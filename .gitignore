@@ -36,3 +36,6 @@ media/
 # Build output and local data
 web/out/
 data/
+
+# Agent worktrees
+.claude/worktrees/
