@@ -221,6 +221,17 @@ pub fn vf(args: &[String]) -> Option<String> {
     value(args, "-vf")
 }
 
+/// The software downscale filter for a size limit of `long`x`short`
+/// (either orientation), written out independently of the planner.
+pub fn fit_filter(long: u32, short: u32) -> String {
+    let (l, s) = (long, short);
+    format!(
+        "scale=w='if(gte(iw,ih),if(gte(iw*{s},ih*{l}),{l},-2),if(gte(ih*{s},iw*{l}),-2,{s}))'\
+         :h='if(gte(iw,ih),if(gte(iw*{s},ih*{l}),-2,{s}),if(gte(ih*{s},iw*{l}),{l},-2))'\
+         :flags=lanczos"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 
@@ -459,6 +470,233 @@ fn extra_samples(dir: &Path) -> Result<(), &'static str> {
     if !cover {
         return Err("cover art");
     }
+    review_samples(dir, &ffmpeg)
+}
+
+/// Channel layouts of the tracks in `Layouts.mov`, in order, with their
+/// channel counts. ffmpeg names `5.0(side)` what AC-3/DTS decoders report
+/// for DVD 3/2 audio.
+pub const LAYOUT_SAMPLE: &[(&str, u32)] = &[
+    ("5.0(side)", 5),
+    ("4.0", 4),
+    ("quad", 4),
+    ("6.1", 7),
+    ("7.1(wide)", 8),
+    ("2.1", 3),
+];
+
+/// Samples for the cases QA reviews found. Returns the name of the one that
+/// failed.
+fn review_samples(dir: &Path, ffmpeg: &dyn Fn(&[&str]) -> bool) -> Result<(), &'static str> {
+    // A transport stream whose only audio starts 8 s in: a plain ffprobe
+    // (like the scanner's) reports it as 0 channels at 0 Hz.
+    let late = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=10:duration=10",
+        "-itsoffset",
+        "8",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440:duration=2:sample_rate=48000",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-c:v",
+        "mpeg2video",
+        "-b:v",
+        "500k",
+        "-c:a",
+        "ac3",
+        "-f",
+        "mpegts",
+        "Late Audio.ts",
+    ]);
+    if !late {
+        return Err("late audio");
+    }
+
+    // One PCM track per awkward channel layout (MOV keeps PCM layouts).
+    let mut args: Vec<String> = [
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x120:rate=10:duration=3",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    for (n, (layout, channels)) in LAYOUT_SAMPLE.iter().enumerate() {
+        let tones: Vec<String> = (0..*channels)
+            .map(|c| format!("sin({}*2*PI*t)", 220 + 55 * (c + n as u32)))
+            .collect();
+        args.extend([
+            "-f".to_string(),
+            "lavfi".to_string(),
+            "-i".to_string(),
+            format!("aevalsrc={}:c={layout}:s=44100:d=3", tones.join("|")),
+        ]);
+    }
+    args.extend(["-map".to_string(), "0:v".to_string()]);
+    for n in 1..=LAYOUT_SAMPLE.len() {
+        args.extend(["-map".to_string(), format!("{n}:a")]);
+    }
+    args.extend(
+        [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "pcm_s16le",
+            "Layouts.mov",
+        ]
+        .iter()
+        .map(|s| (*s).to_string()),
+    );
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if !ffmpeg(&refs) {
+        return Err("channel layouts");
+    }
+
+    // Camera-style MOV: H.264, PCM sound and a timecode track.
+    let camera = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=25:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=300:duration=3:sample_rate=48000",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "pcm_s16le",
+        "-timecode",
+        "01:00:00:00",
+        "Camera.mov",
+    ]);
+    if !camera {
+        return Err("camera");
+    }
+
+    // A phone clip stored 1280x720 and shown rotated to portrait.
+    let phone = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=1280x720:rate=10:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=350:duration=3",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        ".phone.mp4",
+    ]) && ffmpeg(&[
+        "-display_rotation",
+        "90",
+        "-i",
+        ".phone.mp4",
+        "-c",
+        "copy",
+        "Phone.mp4",
+    ]);
+    if !phone {
+        return Err("rotated phone");
+    }
+
+    // Matroska written to a pipe: no duration anywhere.
+    let piped = std::fs::File::create(dir.join("Piped.mkv")).is_ok_and(|file| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=320x240:rate=25:duration=3",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=450:duration=3",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-f",
+                "matroska",
+                "-",
+            ])
+            .stdout(file)
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !piped {
+        return Err("piped Matroska");
+    }
+
+    // English audio description (original + visual impaired) and a German
+    // default track.
+    let dispositions = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=160x120:rate=10:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=300:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=500:duration=3",
+        "-map",
+        "0",
+        "-map",
+        "1",
+        "-map",
+        "2",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-metadata:s:a:0",
+        "language=eng",
+        "-metadata:s:a:1",
+        "language=ger",
+        "-disposition:a:0",
+        "original+visual_impaired",
+        "-disposition:a:1",
+        "default",
+        "Dispositions.mkv",
+    ]);
+    if !dispositions {
+        return Err("dispositions");
+    }
     Ok(())
 }
 
@@ -582,18 +820,19 @@ fn parse_stream(s: &Value) -> StreamInfo {
     }
 }
 
-/// Run ffmpeg with `args`; returns stderr on failure.
-pub fn run_ffmpeg(args: &[String]) -> Result<(), String> {
+/// Run ffmpeg with `args`. Returns its warnings (stderr) on success and the
+/// exit status plus stderr on failure.
+pub fn run_ffmpeg(args: &[String]) -> Result<String, String> {
     let out = Command::new("ffmpeg")
         .args(args)
         .output()
         .map_err(|e| format!("could not start ffmpeg: {e}"))?;
     if out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
         if std::env::var_os("PLAN_SHOW_STDERR").is_some() && !stderr.trim().is_empty() {
             eprintln!("---- ffmpeg stderr for {:?}\n{stderr}", args.last());
         }
-        Ok(())
+        Ok(stderr)
     } else {
         Err(format!(
             "ffmpeg exited with {}\n{}",

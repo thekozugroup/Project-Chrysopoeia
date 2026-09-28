@@ -25,6 +25,18 @@ const WEBM_ODD: &str = "Odd Size.webm";
 const MKV_HDR10: &str = "HDR10.mkv";
 const MKV_STYLED_FONT: &str = "Styled.mkv";
 const MP4_COVER_ART: &str = "Cover.mp4";
+const TS_LATE_AUDIO: &str = "Late Audio.ts";
+const MOV_LAYOUTS: &str = "Layouts.mov";
+const MOV_CAMERA: &str = "Camera.mov";
+const MP4_ROTATED: &str = "Phone.mp4";
+const MKV_PIPED: &str = "Piped.mkv";
+const MKV_DISPOSITIONS: &str = "Dispositions.mkv";
+
+/// Channels each `Layouts.mov` track must keep, per target codec (see
+/// `LAYOUT_SAMPLE`): Opus and Vorbis have a layout for every count, 2.1
+/// becomes 5.1 to keep its bass channel, and AAC turns 6.1 into 5.1.
+const LAYOUT_CHANNELS_VORBIS_ORDER: &[u32] = &[5, 4, 4, 7, 8, 6];
+const LAYOUT_CHANNELS_AAC: &[u32] = &[5, 4, 4, 6, 8, 6];
 
 /// One conversion and what its output must look like.
 struct Case {
@@ -122,7 +134,7 @@ fn run_case(media: &Path, out_dir: &Path, i: usize, case: &Case) -> Result<(), S
         encoder: &encoder,
     })
     .map_err(|e| format!("build_plan: {e:#}"))?;
-    run_ffmpeg(&plan.args).map_err(|e| format!("{e}\nargs: {:?}", plan.args))?;
+    let warnings = run_ffmpeg(&plan.args).map_err(|e| format!("{e}\nargs: {:?}", plan.args))?;
 
     let out = probe_file(&output);
     let fail = |what: String| {
@@ -131,6 +143,11 @@ fn run_case(media: &Path, out_dir: &Path, i: usize, case: &Case) -> Result<(), S
             plan.args, plan.notes
         ))
     };
+    // Encoders relabel layouts they don't support ("output stream will have
+    // incorrect channel layout"); the plan must never rely on that.
+    if warnings.contains("channel layout") {
+        return fail(format!("ffmpeg warned about channel layouts:\n{warnings}"));
+    }
 
     // Stream counts match what the plan promised verification.
     let videos: Vec<_> = out
@@ -184,6 +201,27 @@ fn run_case(media: &Path, out_dir: &Path, i: usize, case: &Case) -> Result<(), S
         return fail(format!(
             "{all_video} video streams (cover art must be dropped)"
         ));
+    }
+    // No data or timecode streams (MP4 turns a copied timecode tag into one
+    // unless told not to).
+    let others: Vec<&str> = out
+        .streams
+        .iter()
+        .filter(|s| {
+            !matches!(
+                s.kind,
+                Some(
+                    chrysopoeia_core::StreamKind::Video
+                        | chrysopoeia_core::StreamKind::Audio
+                        | chrysopoeia_core::StreamKind::Subtitle
+                        | chrysopoeia_core::StreamKind::Attachment
+                )
+            )
+        })
+        .map(|s| s.codec.as_str())
+        .collect();
+    if !others.is_empty() {
+        return fail(format!("unexpected extra streams: {others:?}"));
     }
     let attachments = out
         .streams
@@ -351,6 +389,17 @@ fn svt_av1() {
                 expect_colour: Some(("bt2020", "smpte2084", "bt2020nc")),
                 ..Case::new(MKV_HDR10, "libsvtav1", Container::Mkv, AudioCodec::Copy)
             },
+            // Every awkward layout to Opus keeps its channels (no padding).
+            Case {
+                expect_audio: &["opus"; 6],
+                expect_channels: Some(LAYOUT_CHANNELS_VORBIS_ORDER),
+                ..Case::new(MOV_LAYOUTS, "libsvtav1", Container::Mkv, AudioCodec::Opus)
+            },
+            // Matroska without a duration converts normally.
+            Case {
+                expect_audio: &["aac"],
+                ..Case::new(MKV_PIPED, "libsvtav1", Container::Mkv, AudioCodec::Copy)
+            },
         ],
     );
 }
@@ -471,6 +520,31 @@ fn x264() {
                 expect_audio: &["opus"],
                 ..Case::new(MP4_COVER_ART, "libx264", Container::Mkv, AudioCodec::Opus)
             },
+            // The only audio starts late: the quick probe can't read it, but
+            // it must not be dropped (a silent file would pass verification).
+            Case {
+                expect_audio: &["opus"],
+                expect_channels: Some(&[1]),
+                ..Case::new(TS_LATE_AUDIO, "libx264", Container::Mkv, AudioCodec::Opus)
+            },
+            // Camera MOV to MP4: PCM becomes AAC and no timecode track appears.
+            Case {
+                expect_audio: &["aac"],
+                ..Case::new(MOV_CAMERA, "libx264", Container::Mp4, AudioCodec::Aac)
+            },
+            // A rotated phone clip is limited as the portrait picture it is.
+            Case {
+                max_height: Some(480),
+                expect_audio: &["aac"],
+                expect_size: Some((480, 854)),
+                ..Case::new(MP4_ROTATED, "libx264", Container::Mkv, AudioCodec::Copy)
+            },
+            // Awkward layouts to AAC: standard configurations only.
+            Case {
+                expect_audio: &["aac"; 6],
+                expect_channels: Some(LAYOUT_CHANNELS_AAC),
+                ..Case::new(MOV_LAYOUTS, "libx264", Container::Mp4, AudioCodec::Aac)
+            },
         ],
     );
 }
@@ -514,8 +588,107 @@ fn vpx_vp9() {
                     AudioCodec::Opus,
                 )
             },
+            // Every awkward layout to Vorbis (which relabels what it doesn't
+            // know instead of failing).
+            Case {
+                expect_audio: &["vorbis"; 6],
+                expect_channels: Some(LAYOUT_CHANNELS_VORBIS_ORDER),
+                ..Case::new(
+                    MOV_LAYOUTS,
+                    "libvpx-vp9",
+                    Container::Webm,
+                    AudioCodec::Vorbis,
+                )
+            },
         ],
     );
+}
+
+/// Disposition flags of each audio stream, e.g. `["default", "original"]`.
+fn audio_dispositions(path: &Path) -> Vec<Vec<String>> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream_disposition",
+            "-of",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffprobe runs");
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).expect("ffprobe JSON");
+    json["streams"]
+        .as_array()
+        .map(|streams| {
+            streams
+                .iter()
+                .map(|s| {
+                    s["disposition"]
+                        .as_object()
+                        .map(|d| {
+                            d.iter()
+                                .filter(|(_, v)| v.as_i64() == Some(1))
+                                .map(|(k, _)| k.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_promoted_default_track_keeps_its_other_flags() {
+    if !media_tools_available() || !has_encoder("libx264") {
+        return;
+    }
+    let Some(media) = media_dir() else {
+        return;
+    };
+    let input = media.join(MKV_DISPOSITIONS);
+    let out_dir = tempfile::tempdir().expect("temp dir");
+    let output = out_dir.path().join("out.mkv");
+    let mut prof = profile(VideoCodec::H264, AudioCodec::Copy, Container::Mkv);
+    prof.audio_languages = vec!["eng".into()];
+    let source = probe_file(&input);
+    let plan = build_plan(&PlanRequest {
+        input: &input,
+        output: &output,
+        probe: &source,
+        profile: &prof,
+        encoder: &software(VideoCodec::H264),
+    })
+    .expect("plan");
+    run_ffmpeg(&plan.args).expect("ffmpeg runs");
+    let flags = audio_dispositions(&output);
+    assert_eq!(flags.len(), 1, "{flags:?}");
+    for flag in ["default", "original", "visual_impaired"] {
+        assert!(
+            flags[0].iter().any(|f| f == flag),
+            "{flag} missing: {flags:?}"
+        );
+    }
+}
+
+#[test]
+fn the_late_audio_sample_really_fools_a_quick_probe() {
+    if !media_tools_available() {
+        return;
+    }
+    let Some(media) = media_dir() else {
+        return;
+    };
+    // If ffprobe ever reads this track fully, the x264 case above no longer
+    // covers the "unconfirmed only" path; keep the sample honest.
+    let probe = probe_file(&media.join(TS_LATE_AUDIO));
+    let audio: Vec<_> = probe.audio_streams().collect();
+    assert_eq!(audio.len(), 1);
+    assert_eq!(audio[0].channels, Some(0), "{:?}", audio[0]);
 }
 
 #[test]
@@ -549,10 +722,27 @@ fn decide_agrees_with_the_sample_library() {
         MKV_HDR10,
         MKV_STYLED_FONT,
         MP4_COVER_ART,
+        TS_LATE_AUDIO,
+        MOV_CAMERA,
+        MP4_ROTATED,
+        MKV_PIPED,
     ] {
         let probe = probe_file(&media.join(input));
         assert_eq!(decide(&probe, &save), Decision::Transcode, "{input}");
     }
+    // Matroska from a pipe has no duration, and is converted anyway.
+    assert_eq!(probe_file(&media.join(MKV_PIPED)).duration_secs, None);
+    // "Plays everywhere": a camera MOV with PCM sound is not already done.
+    let compatible = TranscodeProfile::from_goal(Goal::Compatible);
+    let camera = probe_file(&media.join(MOV_CAMERA));
+    assert_eq!(decide(&camera, &compatible), Decision::Transcode);
+    // The rotated 720p clip is within a 720 limit in either orientation.
+    let mut hd = balanced.clone();
+    hd.max_height = Some(720);
+    hd.skip_efficient = true;
+    hd.video_codec = VideoCodec::H264;
+    let phone = probe_file(&media.join(MP4_ROTATED));
+    assert!(matches!(decide(&phone, &hd), Decision::Skip { .. }));
     // The 10-bit HEVC sample has no bits_per_raw_sample; the pixel format
     // alone must mark it as 10-bit.
     let v = hevc.primary_video().expect("video");

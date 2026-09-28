@@ -19,9 +19,17 @@
 //!   a 0–51 QP. libaom maps its 0–63 CRF onto that range at roughly ×4, so the
 //!   hardware ladder is the CPU CRF ladder (shifted two steps towards quality)
 //!   multiplied by four.
-//! - `quality_override` is interpreted in the encoder's own scale and clamped
-//!   into the range the encoder accepts, so a bad value can never make ffmpeg
-//!   refuse to start.
+//! - `quality_override` is a quantizer-style number (CRF, CQ, QP; lower is
+//!   better), as the core profile documents it. It is used in the encoder's
+//!   own scale when that scale is quantizer-style too. It is ignored (the
+//!   level ladder is used, and the plan says so) when the scale is of another
+//!   kind (VideoToolbox's 1–100 quality and V4L2's bitrate, where 24 would
+//!   mean a terrible picture) or when the value is above the encoder's
+//!   maximum. One profile drives a whole fallback chain (for example NVENC,
+//!   then libx265), so an out-of-range value was almost certainly meant for
+//!   another encoder, and clamping it would pick the worst possible picture.
+//!   Values below the minimum are raised to it. Either way a bad value can
+//!   never make ffmpeg refuse to start.
 //!
 //! Encoder-wide options that audio encoders also read (`global_quality`,
 //! `b`, `profile`) always carry a `:v` stream specifier: an unscoped
@@ -50,12 +58,19 @@ pub struct QualityScale {
 }
 
 impl QualityScale {
-    /// The value for `quality`, or `quality_override` clamped into
-    /// `min..=max` when set.
+    /// Whether a quantizer-style `quality_override` applies to this scale
+    /// (see the module docs): the scale is quantizer-style and the value is
+    /// not above its maximum.
+    pub fn accepts_override(&self, value: u32) -> bool {
+        !self.higher_is_better && value <= self.max
+    }
+
+    /// The value for `quality`, or `quality_override` (raised to `min` if
+    /// needed) when [`Self::accepts_override`] allows it.
     pub fn value(&self, quality: QualityLevel, quality_override: Option<u32>) -> u32 {
         match quality_override {
-            Some(v) => v.clamp(self.min, self.max),
-            None => self.levels[usize::from(quality.step()).min(self.levels.len() - 1)],
+            Some(v) if self.accepts_override(v) => v.max(self.min),
+            _ => self.levels[usize::from(quality.step()).min(self.levels.len() - 1)],
         }
     }
 }
@@ -73,7 +88,8 @@ pub struct VideoQuality<'a> {
     pub quality: QualityLevel,
     /// The profile's effort setting.
     pub speed: SpeedPreset,
-    /// Raw value in the encoder's own scale; wins over `quality`.
+    /// Quantizer-style value in the encoder's own scale; wins over
+    /// `quality` where [`QualityScale::accepts_override`] allows it.
     pub quality_override: Option<u32>,
     /// Whether the output is 10-bit (selects the Main 10 / Profile 2 profile).
     pub ten_bit: bool,
@@ -218,6 +234,28 @@ pub fn quality_scale(encoder: &str, api: HwApi, codec: VideoCodec) -> Option<Qua
         Family::OtherSoftware => return None,
     };
     Some(scale)
+}
+
+/// Whether `q.quality_override` is set but not used for this encoder (its
+/// scale is of another kind, the value is out of range, or the encoder has
+/// no quality table). The planner turns this into a note.
+pub fn override_ignored(q: &VideoQuality<'_>) -> bool {
+    match (q.quality_override, quality_scale(q.encoder, q.api, q.codec)) {
+        (Some(value), Some(scale)) => !scale.accepts_override(value),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The name of a quality level as the UI shows it.
+pub fn quality_label(level: QualityLevel) -> &'static str {
+    match level {
+        QualityLevel::Smallest => "Smallest files",
+        QualityLevel::Small => "Small files",
+        QualityLevel::Balanced => "Balanced",
+        QualityLevel::High => "High quality",
+        QualityLevel::Best => "Best quality",
+    }
 }
 
 /// Encoder options for quality, speed and (for 10-bit output) profile.
@@ -379,11 +417,9 @@ pub fn video_quality_args(q: &VideoQuality<'_>) -> Vec<String> {
             push(&mut args, &["-rc_mode", "CQP", "-qp_init", &v]);
         }
         Family::V4l2m2m => {
-            let kbps = match q.quality_override {
-                // An override is an absolute bitrate.
-                Some(_) => value.unwrap_or(4_000),
-                None => scaled_bitrate(value.unwrap_or(4_000), q.width, q.height),
-            };
+            // The ladder is kbit/s at 1080p, scaled to the output size. A
+            // quantizer-style override never applies here (see module docs).
+            let kbps = scaled_bitrate(value.unwrap_or(4_000), q.width, q.height);
             push(&mut args, &["-b:v", &format!("{kbps}k")]);
         }
         Family::OtherSoftware => {}
@@ -547,29 +583,59 @@ mod tests {
     }
 
     #[test]
-    fn override_replaces_the_value_and_is_clamped() {
+    fn override_replaces_the_value_within_the_scale() {
         let mut req = q("libx265", HwApi::Software, VideoCodec::Hevc);
         req.quality_override = Some(19);
         assert_eq!(
             value_after(&video_quality_args(&req), "-crf").unwrap(),
             "19"
         );
-        req.quality_override = Some(90);
+        assert!(!override_ignored(&req));
+        // Above the maximum: meant for another encoder, so the ladder is
+        // used instead of the worst possible CRF.
+        req.quality_override = Some(60);
         assert_eq!(
             value_after(&video_quality_args(&req), "-crf").unwrap(),
-            "51"
+            "24"
+        );
+        assert!(override_ignored(&req));
+        // The same value is fine for a 0-63 encoder.
+        let mut svt = q("libsvtav1", HwApi::Software, VideoCodec::Av1);
+        svt.quality_override = Some(60);
+        assert_eq!(
+            value_after(&video_quality_args(&svt), "-crf").unwrap(),
+            "60"
         );
 
+        // Below the minimum: raised to it.
         let mut nv = q("hevc_nvenc", HwApi::Nvenc, VideoCodec::Hevc);
         nv.quality_override = Some(0);
         assert_eq!(value_after(&video_quality_args(&nv), "-cq").unwrap(), "1");
+        assert!(!override_ignored(&nv));
+    }
 
+    #[test]
+    fn override_is_ignored_by_scales_of_another_kind() {
+        // A CRF-style 24 would be a terrible VideoToolbox quality (higher is
+        // better there) and a 24 kbit/s V4L2 bitrate.
         let mut vt = q("hevc_videotoolbox", HwApi::VideoToolbox, VideoCodec::Hevc);
-        vt.quality_override = Some(500);
+        vt.quality_override = Some(24);
+        assert_eq!(value_after(&video_quality_args(&vt), "-q:v").unwrap(), "60");
+        assert!(override_ignored(&vt));
+
+        let mut v4l2 = q("h264_v4l2m2m", HwApi::V4l2m2m, VideoCodec::H264);
+        v4l2.quality_override = Some(24);
         assert_eq!(
-            value_after(&video_quality_args(&vt), "-q:v").unwrap(),
-            "100"
+            value_after(&video_quality_args(&v4l2), "-b:v").as_deref(),
+            Some("6500k")
         );
+        assert!(override_ignored(&v4l2));
+
+        let plain = q("libx264", HwApi::Software, VideoCodec::H264);
+        assert!(!override_ignored(&plain));
+        let mut unknown = q("librav1e", HwApi::Software, VideoCodec::Av1);
+        unknown.quality_override = Some(30);
+        assert!(override_ignored(&unknown));
     }
 
     #[test]
@@ -634,11 +700,6 @@ mod tests {
             .parse()
             .unwrap();
         assert!((3_000..4_000).contains(&small), "720p bitrate {small}");
-        req.quality_override = Some(2_500);
-        assert_eq!(
-            value_after(&video_quality_args(&req), "-b:v").as_deref(),
-            Some("2500k")
-        );
     }
 
     #[test]

@@ -36,6 +36,7 @@ const NOT_ENCODER: &[&str] = &[
     "disposition",
     "max_muxing_queue_size",
     "movflags",
+    "write_tmcd",
 ];
 
 /// Options every filter accepts (not listed per filter).
@@ -71,6 +72,25 @@ fn help_options(kind: &str, name: &str) -> HashMap<String, Vec<String>> {
         }
     }
     options
+}
+
+/// Split a filtergraph string on `sep`, ignoring separators inside single
+/// quotes (ffmpeg's quoting for expressions that contain commas).
+fn split_unquoted(text: &str, sep: char) -> Vec<String> {
+    let mut parts = vec![String::new()];
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                parts.last_mut().expect("never empty").push(c);
+            }
+            c if c == sep && !quoted => parts.push(String::new()),
+            c => parts.last_mut().expect("never empty").push(c),
+        }
+    }
+    assert!(!quoted, "unbalanced quotes in {text}");
+    parts
 }
 
 /// The value must be one of the option's named constants, unless it is a
@@ -155,6 +175,7 @@ fn filter_options_exist_in_ffmpeg() {
     v.interlaced = true;
     let interlaced = probe_of("mpegts", vec![v]);
     let tall = probe_of("matroska", vec![video(0, "h264", 3840, 2160)]);
+    let scope = probe_of("matroska", vec![video(0, "h264", 1920, 804)]);
     let odd = probe_of("matroska", vec![video(0, "vp9", 639, 359)]);
     let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
     prof.max_height = Some(1080);
@@ -168,7 +189,7 @@ fn filter_options_exist_in_ffmpeg() {
         ("hevc_qsv", true),
         ("hevc_qsv", false),
     ] {
-        for source in [&interlaced, &tall, &odd] {
+        for source in [&interlaced, &tall, &odd, &scope] {
             if let Some(chain) = vf(&plan(source, &prof, &candidate(name, hw)).args) {
                 chains.push(chain);
             }
@@ -186,17 +207,45 @@ fn filter_options_exist_in_ffmpeg() {
         &software(VideoCodec::Av1),
     );
     chains.push(value(&opus.args, "-filter:a:0").expect("opus layout filter"));
+    // Every CPU chain must also run as a real filtergraph (quoting, commas
+    // in expressions, option names and values). GPU chains need hardware.
+    for chain in &chains {
+        let gpu = ["hwupload", "_cuda", "_vaapi", "_qsv"]
+            .iter()
+            .any(|marker| chain.contains(marker));
+        if gpu {
+            continue;
+        }
+        let (source, flag) = if chain.starts_with("aformat") {
+            ("sine=duration=0.2", "-af")
+        } else {
+            ("testsrc2=size=1280x720:duration=0.2", "-vf")
+        };
+        let out = Command::new("ffmpeg")
+            .args(["-hide_banner", "-v", "error", "-f", "lavfi", "-i", source])
+            .args([flag, chain.as_str(), "-f", "null", "-"])
+            .output()
+            .expect("ffmpeg runs");
+        assert!(
+            out.status.success(),
+            "{chain}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 
     let mut problems = Vec::new();
     for chain in &chains {
-        for filter in chain.split(',') {
-            let (name, params) = filter.split_once('=').unwrap_or((filter, ""));
+        for filter in split_unquoted(chain, ',') {
+            let (name, params) = filter.split_once('=').unwrap_or((&filter, ""));
             let help = help_options("filter", name);
             if help.is_empty() {
                 problems.push(format!("filter {name} is not in this ffmpeg"));
                 continue;
             }
-            for param in params.split(':').filter(|p| p.contains('=')) {
+            for param in split_unquoted(params, ':')
+                .iter()
+                .filter(|p| p.contains('='))
+            {
                 let (key, value) = param.split_once('=').unwrap_or((param, ""));
                 match help.get(key) {
                     None if GENERIC_FILTER.contains(&key) => {}

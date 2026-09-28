@@ -614,37 +614,42 @@ fn downscale_per_frame_location() {
     let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
     prof.max_height = Some(1080);
 
+    // CPU frames: an orientation-free fit into 1920x1080 (or 1080x1920).
+    let fit = fit_filter(1920, 1080);
+    assert_eq!(
+        fit,
+        "scale=w='if(gte(iw,ih),if(gte(iw*1080,ih*1920),1920,-2),if(gte(ih*1080,iw*1920),-2,1080))'\
+         :h='if(gte(iw,ih),if(gte(iw*1080,ih*1920),-2,1080),if(gte(ih*1080,iw*1920),1920,-2))'\
+         :flags=lanczos"
+    );
     let cases = [
-        (software(VideoCodec::Hevc), "scale=-2:1080:flags=lanczos"),
+        (software(VideoCodec::Hevc), fit.clone()),
         (
             candidate("hevc_nvenc", true),
-            "scale_cuda=w=-2:h=1080:format=nv12",
+            "scale_cuda=w=1920:h=1080:format=nv12".into(),
         ),
-        (
-            candidate("hevc_nvenc", false),
-            "scale=-2:1080:flags=lanczos",
-        ),
+        (candidate("hevc_nvenc", false), fit.clone()),
         (
             candidate("hevc_vaapi", true),
-            "scale_vaapi=w=-2:h=1080:format=nv12",
+            "scale_vaapi=w=1920:h=1080:format=nv12".into(),
         ),
         (
             candidate("hevc_vaapi", false),
-            "scale=-2:1080:flags=lanczos,format=nv12,hwupload",
+            format!("{fit},format=nv12,hwupload"),
         ),
         (
             candidate("hevc_qsv", true),
-            "scale_qsv=w=-1:h=1080:format=nv12",
+            "scale_qsv=w=1920:h=1080:format=nv12".into(),
         ),
         (
             candidate("hevc_qsv", false),
-            "scale=-2:1080:flags=lanczos,format=nv12,hwupload=extra_hw_frames=64,format=qsv",
+            format!("{fit},format=nv12,hwupload=extra_hw_frames=64,format=qsv"),
         ),
     ];
     for (enc, expected) in cases {
         let plan = plan(&p, &prof, &enc);
         assert_eq!(
-            vf(&plan.args).as_deref(),
+            vf(&plan.args),
             Some(expected),
             "{} hw_decode={}",
             enc.name,
@@ -657,19 +662,68 @@ fn downscale_per_frame_location() {
     let plan = plan(&p10, &prof, &candidate("hevc_nvenc", true));
     assert_eq!(
         vf(&plan.args).as_deref(),
-        Some("scale_cuda=w=-2:h=1080:format=p010le")
+        Some("scale_cuda=w=1920:h=1080:format=p010le")
     );
 
     // Odd limits round down to even; shorter sources are left alone.
     prof.max_height = Some(719);
     let plan = common::plan(&p, &prof, &software(VideoCodec::Hevc));
+    assert_eq!(vf(&plan.args), Some(fit_filter(1278, 718)));
+    let plan = common::plan(&p, &prof, &candidate("hevc_vaapi", true));
     assert_eq!(
         vf(&plan.args).as_deref(),
-        Some("scale=-2:718:flags=lanczos")
+        Some("scale_vaapi=w=1276:h=718:format=nv12")
     );
     prof.max_height = Some(2160);
     let plan = common::plan(&p, &prof, &software(VideoCodec::Hevc));
     assert_absent(&plan.args, "-vf");
+}
+
+#[test]
+fn size_limit_is_a_resolution_class() {
+    let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    prof.max_height = Some(1080);
+    let plan_for = |w, h, enc: &chrysopoeia_core::EncoderCandidate| {
+        common::plan(
+            &probe_of("matroska", vec![video(0, "h264", w, h)]),
+            &prof,
+            enc,
+        )
+    };
+    // Scope 4K is limited by its width: 1920x800, not 2592x1080.
+    let plan = plan_for(3840, 1600, &candidate("hevc_vaapi", true));
+    assert_eq!(
+        vf(&plan.args).as_deref(),
+        Some("scale_vaapi=w=1920:h=800:format=nv12")
+    );
+    // Portrait video stored upright is limited on its short side.
+    let plan = plan_for(2160, 3840, &candidate("hevc_nvenc", true));
+    assert_eq!(
+        vf(&plan.args).as_deref(),
+        Some("scale_cuda=w=1080:h=1920:format=nv12")
+    );
+    // Portrait 1080p and 4:3 1080p are within the limit.
+    assert_absent(
+        &plan_for(1080, 1920, &software(VideoCodec::Hevc)).args,
+        "-vf",
+    );
+    assert_absent(
+        &plan_for(1440, 1080, &software(VideoCodec::Hevc)).args,
+        "-vf",
+    );
+}
+
+#[test]
+fn qsv_scaling_uses_explicit_even_widths() {
+    // scale_qsv's own -1 would compute 1719 for 1920x804 at 720 lines.
+    let p = probe_of("matroska", vec![video(0, "h264", 1920, 804)]);
+    let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    prof.max_height = Some(720);
+    let plan = plan(&p, &prof, &candidate("hevc_qsv", true));
+    assert_eq!(
+        vf(&plan.args).as_deref(),
+        Some("scale_qsv=w=1280:h=536:format=nv12")
+    );
 }
 
 #[test]
@@ -696,10 +750,7 @@ fn odd_dimensions_are_made_even() {
     let mut small = prof.clone();
     small.max_height = Some(240);
     let plan = plan(&p, &small, &software(VideoCodec::Av1));
-    assert_eq!(
-        vf(&plan.args).as_deref(),
-        Some("scale=-2:240:flags=lanczos")
-    );
+    assert_eq!(vf(&plan.args), Some(fit_filter(428, 240)));
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +776,8 @@ fn audio_language_filter_keeps_untagged_and_restores_default() {
     let plan = plan(&p, &prof, &software(VideoCodec::Av1));
     assert_eq!(values(&plan.args, "-map"), ["0:0", "0:2", "0:4", "0:5"]);
     assert_eq!(plan.expected.audio, 3);
-    assert!(has_pair(&plan.args, "-disposition:a:0", "default"));
+    // `+default` adds the flag without wiping the track's other flags.
+    assert!(has_pair(&plan.args, "-disposition:a:0", "+default"));
     assert!(plan.notes.is_empty(), "{:?}", plan.notes);
 }
 
@@ -788,11 +840,11 @@ fn opus_from_side_surround_gets_a_normalised_layout() {
     assert!(has_pair(a, "-b:a:0", "320k"));
     assert!(has_pair(a, "-ar:a:0", "48000"));
     assert!(has_pair(a, "-mapping_family:a:0", "1"));
-    let filter = value(a, "-filter:a:0").unwrap();
-    assert!(filter.starts_with("aformat=channel_layouts="), "{filter}");
-    assert!(
-        filter.contains("5.1|") && !filter.contains("5.1(side)"),
-        "{filter}"
+    // Exactly one layout: a list lets ffmpeg pad the track with silent
+    // channels.
+    assert_eq!(
+        value(a, "-filter:a:0").as_deref(),
+        Some("aformat=channel_layouts=5.1")
     );
     assert_absent(a, "-ac:a:0");
 }
@@ -1270,6 +1322,9 @@ fn mp4_tags_only_hevc() {
         &software(VideoCodec::Av1),
     );
     assert!(has_pair(&plan.args, "-movflags", "+faststart"));
+    // A copied camera timecode must not become an extra data track.
+    assert!(has_pair(&plan.args, "-write_tmcd", "0"));
+    assert!(pos(&plan.args, "-write_tmcd").unwrap() < pos(&plan.args, "-f").unwrap());
     assert_absent(&plan.args, "-tag:v");
     let mkv = common::plan(
         &movie(),
@@ -1278,4 +1333,321 @@ fn mp4_tags_only_hevc() {
     );
     assert_absent(&mkv.args, "-tag:v");
     assert_absent(&mkv.args, "-movflags");
+    assert_absent(&mkv.args, "-write_tmcd");
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for review findings
+
+#[test]
+fn audio_the_quick_probe_could_not_read_is_kept_when_it_is_all_there_is() {
+    // A plain ffprobe reports a track that starts late in a TS as 0 channels
+    // at 0 Hz. Dropping it would write a silent file that verification
+    // accepts (expected.audio would be 0).
+    let late = audio(1, "ac3", 0, 0, None);
+    let p = probe_of("mpegts", vec![video(0, "mpeg2video", 720, 576), late]);
+    let prof = profile(VideoCodec::Hevc, AudioCodec::Opus, Container::Mkv);
+    let plan = plan(&p, &prof, &software(VideoCodec::Hevc));
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:1"]);
+    assert_eq!(plan.expected.audio, 1);
+    assert!(has_pair(&plan.args, "-c:a:0", "libopus"));
+    // Unknown channel count: the encoder picks the bitrate and layout.
+    assert_absent(&plan.args, "-b:a:0");
+    assert!(has_pair(&plan.args, "-ar:a:0", "48000"));
+    assert!(
+        plan.notes.iter().all(|n| !n.contains("no readable sound")),
+        "{:?}",
+        plan.notes
+    );
+
+    // Copy keeps it as it is.
+    let copy = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let plan = common::plan(&p, &copy, &software(VideoCodec::Hevc));
+    assert!(has_pair(&plan.args, "-c:a:0", "copy"));
+    assert_eq!(plan.expected.audio, 1);
+
+    // The language filter still applies among such tracks, and still never
+    // drops them all.
+    let p = probe_of(
+        "mpegts",
+        vec![
+            video(0, "mpeg2video", 720, 576),
+            audio(1, "ac3", 0, 0, Some("deu")),
+            audio(2, "mp2", 0, 0, Some("eng")),
+        ],
+    );
+    let mut eng = copy.clone();
+    eng.audio_languages = vec!["eng".into()];
+    let plan = common::plan(&p, &eng, &software(VideoCodec::Hevc));
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:2"]);
+    eng.audio_languages = vec!["fra".into()];
+    let plan = common::plan(&p, &eng, &software(VideoCodec::Hevc));
+    assert_eq!(plan.expected.audio, 1);
+}
+
+#[test]
+fn unconfirmed_tracks_are_dropped_next_to_readable_ones() {
+    // An empty PID beside a real track (common in DVB recordings) is removed,
+    // even when it is the one in the chosen language.
+    let p = probe_of(
+        "mpegts",
+        vec![
+            video(0, "h264", 1280, 720),
+            audio(1, "ac3", 2, 48_000, Some("deu")),
+            audio(2, "ac3", 0, 0, Some("eng")),
+        ],
+    );
+    let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    prof.audio_languages = vec!["eng".into()];
+    let plan = plan(&p, &prof, &software(VideoCodec::Hevc));
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:1"]);
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n == "Removed 1 audio track that contains no readable sound"),
+        "{:?}",
+        plan.notes
+    );
+    assert!(
+        plan.notes.iter().any(|n| n.contains("(eng)")),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn audio_nobody_can_read_fails_the_plan_instead_of_going_silent() {
+    let mut unknown = audio(1, "unknown", 2, 48_000, None);
+    unknown.channels = None;
+    let p = probe_of("avi", vec![video(0, "mpeg4", 640, 480), unknown]);
+    let prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let err = build_plan(&PlanRequest {
+        input: Path::new("/media/in.avi"),
+        output: Path::new("/tmp/out.mkv"),
+        probe: &p,
+        profile: &prof,
+        encoder: &software(VideoCodec::Hevc),
+    })
+    .expect_err("silent output must be refused");
+    assert!(err.to_string().contains("silent"), "{err}");
+}
+
+#[test]
+fn a_new_default_track_keeps_its_other_flags_and_skips_commentary() {
+    let mut commentary = audio(1, "aac", 2, 48_000, Some("eng"));
+    commentary.title = Some("Director's Commentary".into());
+    let mut main = audio(2, "aac", 2, 48_000, Some("eng"));
+    main.title = Some("English".into());
+    let mut ger = audio(3, "aac", 2, 48_000, Some("ger"));
+    ger.is_default = true;
+    let p = probe_of(
+        "matroska",
+        vec![video(0, "h264", 1920, 1080), commentary, main, ger],
+    );
+    let mut prof = profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mkv);
+    prof.audio_languages = vec!["eng".into()];
+    let plan = plan(&p, &prof, &software(VideoCodec::Av1));
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:1", "0:2"]);
+    assert!(
+        has_pair(&plan.args, "-disposition:a:1", "+default"),
+        "{:?}",
+        plan.args
+    );
+    assert_absent(&plan.args, "-disposition:a:0");
+
+    // The never-drop-all fallback also passes over commentary.
+    let mut first = audio(1, "aac", 2, 48_000, Some("eng"));
+    first.title = Some("Audio Description".into());
+    let p = probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            first,
+            audio(2, "aac", 2, 48_000, Some("eng")),
+        ],
+    );
+    prof.audio_languages = vec!["jpn".into()];
+    let plan = common::plan(&p, &prof, &software(VideoCodec::Av1));
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:2"]);
+    assert!(
+        plan.notes.iter().any(|n| n.contains("first main track")),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn surround_layouts_keep_their_channel_count() {
+    let with_layout = |channels, layout: &str| {
+        let mut a = audio(1, "ac3", channels, 48_000, None);
+        a.channel_layout = Some(layout.into());
+        probe_of("matroska", vec![video(0, "mpeg2video", 720, 576), a])
+    };
+    // DVD 3/2 AC-3 without LFE.
+    let dvd = with_layout(5, "5.0(side)");
+    for (codec, container, encoder, kbps) in [
+        (AudioCodec::Aac, Container::Mp4, "aac", "384k"),
+        (AudioCodec::Opus, Container::Mkv, "libopus", "320k"),
+        (AudioCodec::Vorbis, Container::Webm, "libvorbis", "320k"),
+    ] {
+        let video_codec = if container == Container::Webm {
+            VideoCodec::Vp9
+        } else {
+            VideoCodec::Hevc
+        };
+        let plan = plan(
+            &dvd,
+            &profile(video_codec, codec, container),
+            &software(video_codec),
+        );
+        assert!(has_pair(&plan.args, "-c:a:0", encoder));
+        assert_eq!(
+            value(&plan.args, "-filter:a:0").as_deref(),
+            Some("aformat=channel_layouts=5.0"),
+            "{encoder}"
+        );
+        assert!(has_pair(&plan.args, "-b:a:0", kbps), "{encoder}");
+    }
+    // Quad and 4.0 map to the layout each format has for four channels.
+    let aac = profile(VideoCodec::Hevc, AudioCodec::Aac, Container::Mp4);
+    let opus = profile(VideoCodec::Hevc, AudioCodec::Opus, Container::Mkv);
+    let enc = software(VideoCodec::Hevc);
+    let filter = |p: &chrysopoeia_core::ProbeInfo, prof| {
+        value(&common::plan(p, prof, &enc).args, "-filter:a:0")
+    };
+    assert_eq!(
+        filter(&with_layout(4, "quad"), &aac).as_deref(),
+        Some("aformat=channel_layouts=4.0")
+    );
+    assert_eq!(
+        filter(&with_layout(4, "4.0"), &opus).as_deref(),
+        Some("aformat=channel_layouts=quad")
+    );
+    assert_eq!(
+        filter(&with_layout(8, "7.1(wide)"), &opus).as_deref(),
+        Some("aformat=channel_layouts=7.1")
+    );
+    // 6.1 has no standard AAC layout: 5.1, with the bitrate for 5.1.
+    let plan = common::plan(&with_layout(7, "6.1"), &aac, &enc);
+    assert_eq!(
+        value(&plan.args, "-filter:a:0").as_deref(),
+        Some("aformat=channel_layouts=5.1")
+    );
+    assert!(has_pair(&plan.args, "-b:a:0", "384k"));
+    // Vorbis gets a layout too (libvorbis relabels others silently).
+    let vorbis = profile(VideoCodec::Hevc, AudioCodec::Vorbis, Container::Mkv);
+    assert_eq!(
+        filter(&with_layout(3, "2.1"), &vorbis).as_deref(),
+        Some("aformat=channel_layouts=5.1")
+    );
+}
+
+#[test]
+fn subtitles_matroska_cannot_store_are_converted_or_dropped() {
+    let p = probe_of(
+        "avi",
+        vec![
+            video(0, "mpeg4", 720, 480),
+            audio(1, "mp3", 2, 48_000, None),
+            subtitle(2, "xsub", Some("eng")),
+            subtitle(3, "microdvd", Some("eng")),
+            subtitle(4, "subrip", Some("eng")),
+        ],
+    );
+    let plan = plan(
+        &p,
+        &profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv),
+        &software(VideoCodec::Hevc),
+    );
+    assert_eq!(values(&plan.args, "-map"), ["0:0", "0:1", "0:3", "0:4"]);
+    assert!(has_pair(&plan.args, "-c:s:0", "srt"));
+    assert!(has_pair(&plan.args, "-c:s:1", "copy"));
+    assert_eq!(plan.expected.subtitle, 2);
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n == "Removed 1 picture-based subtitle because MKV can't hold it"),
+        "{:?}",
+        plan.notes
+    );
+}
+
+#[test]
+fn dolby_vision_notes_name_the_picture_that_is_kept() {
+    let prof = profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mkv);
+    let enc = software(VideoCodec::Av1);
+    let note_for = |v: StreamInfo| {
+        let plan = common::plan(&probe_of("matroska", vec![v]), &prof, &enc);
+        plan.notes
+            .into_iter()
+            .find(|n| n.contains("Dolby Vision"))
+            .expect("a note")
+    };
+    let mut hdr10_base = hdr10(video_10bit(0, "hevc", 3840, 2160));
+    hdr10_base.hdr = Some(chrysopoeia_core::HdrFormat::DolbyVision);
+    assert!(note_for(hdr10_base.clone()).ends_with("standard HDR10 picture"));
+    let mut hlg = video_10bit(0, "hevc", 3840, 2160);
+    hlg.hdr = Some(chrysopoeia_core::HdrFormat::DolbyVision);
+    hlg.color_transfer = Some("arib-std-b67".into());
+    assert!(note_for(hlg).ends_with("standard HLG picture"));
+    let mut sdr = video(0, "h264", 1920, 1080);
+    sdr.hdr = Some(chrysopoeia_core::HdrFormat::DolbyVision);
+    sdr.color_transfer = Some("bt709".into());
+    assert!(!note_for(sdr).contains("HDR10"));
+
+    // x265's HDR10 options follow the PQ transfer, not the Dolby Vision flag.
+    let hevc = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let plan = common::plan(
+        &probe_of("matroska", vec![hdr10_base]),
+        &hevc,
+        &software(VideoCodec::Hevc),
+    );
+    assert!(
+        value(&plan.args, "-x265-params")
+            .unwrap()
+            .contains("hdr-opt=1")
+    );
+
+    // Profile 5 (no standard layer) is refused even when queued by hand.
+    let mut dv5 = video_10bit(0, "hevc", 3840, 2160);
+    dv5.hdr = Some(chrysopoeia_core::HdrFormat::DolbyVision);
+    let p = probe_of("matroska", vec![dv5]);
+    let err = build_plan(&PlanRequest {
+        input: Path::new("/media/in.mkv"),
+        output: Path::new("/tmp/out.mkv"),
+        probe: &p,
+        profile: &prof,
+        encoder: &enc,
+    })
+    .expect_err("profile 5 must be refused");
+    assert!(err.to_string().contains("Dolby Vision"), "{err}");
+}
+
+#[test]
+fn quality_override_of_another_scale_is_ignored_with_a_note() {
+    let mut prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    prof.quality_override = Some(24);
+    // A CRF-style 24 fits libx265 ...
+    let plan = plan(&movie(), &prof, &software(VideoCodec::Hevc));
+    assert!(has_pair(&plan.args, "-crf", "24"));
+    assert!(plan.notes.is_empty(), "{:?}", plan.notes);
+    // ... but not VideoToolbox's 1-100 (higher is better) scale.
+    let plan = common::plan(&movie(), &prof, &candidate("hevc_videotoolbox", false));
+    assert!(has_pair(&plan.args, "-q:v", "60"));
+    assert!(
+        plan.notes.iter().any(|n| n.contains("(24)")
+            && n.contains("hevc_videotoolbox")
+            && n.contains("Balanced")),
+        "{:?}",
+        plan.notes
+    );
+    // A value above libx265's maximum was meant for another encoder.
+    prof.quality_override = Some(60);
+    let plan = common::plan(&movie(), &prof, &software(VideoCodec::Hevc));
+    assert!(has_pair(&plan.args, "-crf", "24"));
+    assert!(
+        plan.notes.iter().any(|n| n.contains("(60)")),
+        "{:?}",
+        plan.notes
+    );
 }

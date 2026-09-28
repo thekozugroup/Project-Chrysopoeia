@@ -20,7 +20,7 @@ use chrysopoeia_core::{
     SubtitleAction, SubtitlePolicy, TranscodeProfile, VideoCodec,
 };
 
-use crate::quality::{VideoQuality, video_quality_args};
+use crate::quality::{VideoQuality, override_ignored, quality_label, video_quality_args};
 
 /// Files shorter than this are not worth converting (and too short to verify).
 const MIN_DURATION_SECS: f64 = 1.0;
@@ -51,23 +51,35 @@ fn skip(reason: impl Into<String>) -> Decision {
 ///
 /// Rules, in order:
 /// 1. No real video stream (audio only, or cover art only): skip.
-/// 2. Unknown or zero picture size, unknown duration, or shorter than one
-///    second: skip (such files cannot be converted and verified reliably).
+/// 2. Unknown or zero picture size, or a known duration under one second:
+///    skip (such files cannot be converted and verified reliably). An
+///    unknown duration is not a reason to skip: Matroska written to a pipe
+///    or by a live capture has none, and the converted file gets one.
 /// 3. With `skip_efficient`: skip when the source codec's efficiency rank is
 ///    at least the target's ("Already AV1, which is more efficient than
-///    HEVC"). Without it: skip only when the video is already the target
-///    codec in the target container.
+///    HEVC"). Without it: skip only when the file is already what the
+///    profile would write: the target codec in the target container, with a
+///    picture every player of that codec handles (4:2:0 chroma; 8-bit for
+///    H.264, at most 10-bit otherwise) and audio the container can hold
+///    without conversion. Camera footage (4:2:2 10-bit H.264, PCM audio in
+///    MOV) is therefore converted under "Plays everywhere".
 ///
 ///    Container matching uses ffprobe's demuxer name, which cannot tell MKV
 ///    from WebM (both report `matroska`) or MP4 from MOV/M4V (all report
 ///    `mov`). So an MKV or WebM target matches any Matroska-family file, and
-///    an MP4 target matches any QuickTime-family file.
+///    an MP4 target matches any QuickTime-family file; the skip reason names
+///    the family rather than claiming one exact container.
 ///
-///    Neither rule applies when the video is taller than the profile's
-///    `max_height`: the user asked for smaller pictures, so the file is
-///    converted even if its codec is already efficient.
-/// 4. H.264 target with an HDR source: skip. There is no tone mapping, and
+///    Neither rule applies when the picture is larger than the profile's
+///    `max_height` allows (see [`SizeLimit`]): the user asked for smaller
+///    pictures, so the file is converted even if its codec is efficient.
+/// 4. Dolby Vision without a standard base layer (profile 5): skip. Without
+///    Dolby Vision reshaping its picture decodes with wrong colours, and
+///    verification would compare two equally wrong pictures.
+/// 5. H.264 target with an HDR source: skip. There is no tone mapping, and
 ///    8-bit H.264 cannot carry HDR, so the colours would be wrong.
+/// 6. Audio tracks exist but none of them can be read: skip rather than
+///    write a silent file.
 pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
     let Some(video) = probe.primary_video() else {
         return if probe.audio_streams().next().is_some() {
@@ -76,21 +88,20 @@ pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
             skip("No video in this file — nothing to convert")
         };
     };
-    let height = match (video.width, video.height) {
-        (Some(w), Some(h)) if w > 0 && h > 0 => h,
+    let (width, height) = match (video.width, video.height) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
         _ => return skip("Couldn't read this video's picture size — left unchanged"),
     };
-    match probe.duration_secs {
-        Some(d) if d.is_finite() && d >= MIN_DURATION_SECS => {}
-        Some(d) if d.is_finite() && d >= 0.0 => {
-            return skip("Shorter than a second — nothing worth converting");
-        }
-        _ => return skip("Couldn't tell how long this video is — left unchanged"),
+    if let Some(d) = probe.duration_secs
+        && d.is_finite()
+        && (0.0..MIN_DURATION_SECS).contains(&d)
+    {
+        return skip("Shorter than a second — nothing worth converting");
     }
 
     let target = profile.video_codec;
-    let too_tall = max_output_height(profile).is_some_and(|max| height > max);
-    if !too_tall {
+    let too_big = size_limit(profile).is_some_and(|limit| !limit.fits(width, height));
+    if !too_big {
         if profile.skip_efficient {
             let rank = source_efficiency_rank(&video.codec);
             if rank >= target.efficiency_rank() {
@@ -98,19 +109,71 @@ pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
             }
         } else if VideoCodec::from_probe_name(&video.codec) == Some(target)
             && container_matches(&probe.container, profile.container)
+            && plays_as_target(video, target)
+            && audio_fits_container(probe, profile)
         {
             return skip(format!(
                 "Already {} in {}",
                 codec_short_name(target),
-                profile.container.label()
+                container_family_label(profile.container)
             ));
         }
     }
 
+    if video.hdr == Some(HdrFormat::DolbyVision) && !has_standard_base_layer(video) {
+        return skip("Dolby Vision video without a standard HDR layer — left unchanged");
+    }
     if target == VideoCodec::H264 && is_hdr(video) {
         return skip("HDR video would lose its colours as H.264 — left unchanged");
     }
+    if select_audio(probe, profile).all_unreadable {
+        return skip("Couldn't read this file's audio — left unchanged");
+    }
     Decision::Transcode
+}
+
+/// Whether the source picture is one every decoder of `target` plays and
+/// the planner would write as-is: 4:2:0, 8-bit for H.264 (see
+/// [`VideoCodec::supports_10bit`]) and at most 10-bit for the others.
+fn plays_as_target(video: &StreamInfo, target: VideoCodec) -> bool {
+    let max_depth = if target.supports_10bit() { 10 } else { 8 };
+    is_420(video) && source_bit_depth(video) <= max_depth
+}
+
+/// Whether every audio track the plan would keep can be copied into the
+/// profile's container (so a same-format file needs no audio conversion).
+fn audio_fits_container(probe: &ProbeInfo, profile: &TranscodeProfile) -> bool {
+    select_audio(probe, profile)
+        .kept
+        .iter()
+        .all(|s| can_copy_audio(profile.container, &s.codec.to_ascii_lowercase()))
+}
+
+/// The container family a same-format skip matched (see [`decide`]).
+fn container_family_label(target: Container) -> &'static str {
+    match target {
+        Container::Mp4 => "an MP4 or MOV file",
+        Container::Mkv => "an MKV file",
+        Container::Webm => "a WebM or MKV file",
+    }
+}
+
+/// Dolby Vision streams carry a base layer other players can show when the
+/// stream is tagged with a standard transfer (PQ for profiles 7 and 8.1, HLG
+/// for 8.4, SDR for 8.2 and 9). Profile 5 has no such layer and leaves the
+/// colour description unset. `StreamInfo` has no Dolby Vision profile or
+/// compatibility id, so the transfer tag is the signal used.
+fn has_standard_base_layer(video: &StreamInfo) -> bool {
+    video
+        .color_transfer
+        .as_deref()
+        .is_some_and(|t| !is_placeholder_colour(t))
+}
+
+/// Colour description values that mean "not specified".
+fn is_placeholder_colour(value: &str) -> bool {
+    let lower = value.trim().to_ascii_lowercase();
+    lower.is_empty() || matches!(lower.as_str(), "unknown" | "reserved" | "unspecified")
 }
 
 /// Skip reason for the `skip_efficient` rule.
@@ -147,18 +210,89 @@ fn is_hdr(video: &StreamInfo) -> bool {
     video.hdr.is_some() || is_pq(video) || video.color_transfer.as_deref() == Some("arib-std-b67")
 }
 
-/// PQ (SMPTE 2084) transfer, i.e. HDR10-style video.
+/// PQ (SMPTE 2084) transfer, i.e. HDR10-style video. Dolby Vision alone does
+/// not imply PQ: its base layer may be HLG, SDR or (profile 5) none at all.
 fn is_pq(video: &StreamInfo) -> bool {
-    matches!(
-        video.hdr,
-        Some(HdrFormat::Hdr10 | HdrFormat::Hdr10Plus | HdrFormat::DolbyVision)
-    ) || video.color_transfer.as_deref() == Some("smpte2084")
+    matches!(video.hdr, Some(HdrFormat::Hdr10 | HdrFormat::Hdr10Plus))
+        || video.color_transfer.as_deref() == Some("smpte2084")
 }
 
-/// The profile's height limit, rounded down to an even number. Values below
-/// 2 mean "no limit".
-fn max_output_height(profile: &TranscodeProfile) -> Option<u32> {
-    profile.max_height.filter(|&h| h >= 2).map(|h| h & !1)
+/// HLG (ARIB STD-B67) transfer.
+fn is_hlg(video: &StreamInfo) -> bool {
+    video.hdr == Some(HdrFormat::Hlg) || video.color_transfer.as_deref() == Some("arib-std-b67")
+}
+
+/// The picture size a profile's `max_height` allows.
+///
+/// `max_height` names a resolution class ("1080p"), so like
+/// [`chrysopoeia_core::media::resolution_label`] it looks at both sides: the
+/// short side may be at most `max_height`, and the long side at most the
+/// 16:9 width of that class (1080 → 1920) plus a fifth. The allowance keeps
+/// near-16:9 pictures such as DCI 2K (2048×1080) or 1998×1080 flat, which
+/// `resolution_label` also calls 1080p, from being re-encoded for a few
+/// pixels. Pictures over the limit are scaled into the exact 16:9 frame: a
+/// 3840×1600 scope film at 1080 becomes 1920×800 (not 2592×1080), and a
+/// portrait 4K phone clip becomes 1080×1920 (not 608×1080).
+///
+/// The rule depends only on the short and long side, so a rotated file
+/// (whose stored and displayed sizes are swapped) is judged the same before
+/// and after conversion, and a converted file is never selected again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeLimit {
+    /// Most lines on the short side (even).
+    pub short: u32,
+    /// Long side of the frame pictures are scaled into (even): the 16:9
+    /// width for `short`.
+    pub long: u32,
+}
+
+impl SizeLimit {
+    /// Whether a `width`×`height` picture is within the limit, in either
+    /// orientation (see the type docs for the long-side allowance).
+    pub fn fits(self, width: u32, height: u32) -> bool {
+        let long_allowed = u64::from(self.long) * 6 / 5;
+        width.min(height) <= self.short && u64::from(width.max(height)) <= long_allowed
+    }
+
+    /// Output size for a `width`×`height` picture scaled down to fit, in the
+    /// same orientation, with even sides. Matches [`Self::scale_filter`]
+    /// (ffmpeg's `-2` rounding) for unrotated frames.
+    pub fn fit(self, width: u32, height: u32) -> (u32, u32) {
+        let (box_w, box_h) = if width >= height {
+            (self.long, self.short)
+        } else {
+            (self.short, self.long)
+        };
+        if u64::from(width) * u64::from(box_h) >= u64::from(height) * u64::from(box_w) {
+            (box_w, scaled_even(height, width, box_w))
+        } else {
+            (scaled_even(width, height, box_h), box_h)
+        }
+    }
+
+    /// Software `scale` filter that fits frames of either orientation into
+    /// the limit. ffmpeg rotates phone video upright before user filters and
+    /// `StreamInfo` carries no rotation, so the orientation is decided from
+    /// the frames themselves (`iw`/`ih`) rather than the probed size. The
+    /// expressions are quoted because they contain commas, which would
+    /// otherwise split the filter chain.
+    pub fn scale_filter(self) -> String {
+        let (l, s) = (self.long, self.short);
+        let w =
+            format!("if(gte(iw,ih),if(gte(iw*{s},ih*{l}),{l},-2),if(gte(ih*{s},iw*{l}),-2,{s}))");
+        let h =
+            format!("if(gte(iw,ih),if(gte(iw*{s},ih*{l}),-2,{s}),if(gte(ih*{s},iw*{l}),{l},-2))");
+        format!("scale=w='{w}':h='{h}':flags=lanczos")
+    }
+}
+
+/// The profile's size limit. `max_height` is rounded down to an even
+/// number; values below 2 mean "no limit".
+pub fn size_limit(profile: &TranscodeProfile) -> Option<SizeLimit> {
+    let short = profile.max_height.filter(|&h| h >= 2).map(|h| h & !1)?;
+    let long = (u64::from(short) * 16).div_ceil(9);
+    let long = u32::try_from(long + (long & 1)).unwrap_or(u32::MAX - 1);
+    Some(SizeLimit { short, long })
 }
 
 /// Inputs for [`build_plan`].
@@ -208,7 +342,10 @@ pub struct FfmpegPlan {
 ///
 /// Fails (with a plain sentence) when the file has no video, when the
 /// encoder does not produce the profile's codec, when the container cannot
-/// hold that codec, or when a path cannot be passed to ffmpeg.
+/// hold that codec, when a path cannot be passed to ffmpeg, and for files
+/// [`decide`] skips because converting them would damage them (Dolby Vision
+/// without a standard layer, audio that can't be read). Those checks repeat
+/// here because a user can queue a skipped file by hand.
 pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     let profile = req.profile;
     let encoder = req.encoder;
@@ -218,6 +355,11 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
         .probe
         .primary_video()
         .ok_or_else(|| anyhow!("This file has no video stream to convert."))?;
+    if video.hdr == Some(HdrFormat::DolbyVision) && !has_standard_base_layer(video) {
+        bail!(
+            "This Dolby Vision video has no standard HDR layer, so converting it would ruin its colours."
+        );
+    }
     if encoder.codec != profile.video_codec {
         bail!(
             "The {} encoder makes {} video, but this library is set to {}.",
@@ -238,7 +380,7 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
 
     let mut notes = Vec::new();
     let video_plan = plan_video(video, profile, encoder, &mut notes);
-    let audio = plan_audio(req.probe, profile, &mut notes);
+    let audio = plan_audio(req.probe, profile, &mut notes)?;
     let subtitles = plan_subtitles(req.probe, profile, &mut notes);
     let attachments: Vec<u32> = if container.supports_attachments() {
         req.probe
@@ -297,7 +439,10 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     }
     push(&mut args, &["-max_muxing_queue_size", "9999"]);
     if container == Container::Mp4 {
-        push(&mut args, &["-movflags", "+faststart"]);
+        // faststart puts the index first so playback can start while the
+        // file downloads. write_tmcd 0 stops the muxer from turning a copied
+        // `timecode` tag (camera footage) into an extra timecode data track.
+        push(&mut args, &["-movflags", "+faststart", "-write_tmcd", "0"]);
     }
     push(&mut args, &["-f", container.ffmpeg_format()]);
     args.push(output);
@@ -401,10 +546,20 @@ fn plan_video(
         ));
     }
     match video.hdr {
-        Some(HdrFormat::DolbyVision) => notes.push(
-            "Dolby Vision layers can't be kept, so the video keeps its standard HDR10 picture"
-                .into(),
-        ),
+        Some(HdrFormat::DolbyVision) => {
+            // Only reached with a standard base layer (see `decide`); name
+            // the picture that layer actually carries.
+            let base = if is_pq(video) {
+                "standard HDR10 picture"
+            } else if is_hlg(video) {
+                "standard HLG picture"
+            } else {
+                "standard (non-HDR) picture"
+            };
+            notes.push(format!(
+                "Dolby Vision layers can't be kept, so the video keeps its {base}"
+            ));
+        }
         Some(HdrFormat::Hdr10Plus) => notes.push(
             "HDR10+ scene data can't be kept, so the video keeps its standard HDR10 picture".into(),
         ),
@@ -414,7 +569,10 @@ fn plan_video(
     let width = video.width.unwrap_or(0);
     let height = video.height.unwrap_or(0);
     let odd = width % 2 == 1 || height % 2 == 1;
-    let target_height = max_output_height(profile).filter(|&max| height > max);
+    let limit = size_limit(profile).filter(|limit| !limit.fits(width, height));
+    // Output size in the stored orientation (GPU scalers and bitrate-driven
+    // encoders need numbers; CPU frames use the orientation-free filter).
+    let target_size = limit.map(|limit| limit.fit(width, height));
 
     // GPU decoding is kept only when the frames can stay on the GPU all the
     // way to the encoder; otherwise this attempt decodes on the CPU.
@@ -452,8 +610,8 @@ fn plan_video(
                 // One frame per frame (not per field) keeps the frame rate.
                 filters.push("bwdif=mode=send_frame".into());
             }
-            if let Some(h) = target_height {
-                filters.push(format!("scale=-2:{h}:flags=lanczos"));
+            if let Some(limit) = limit {
+                filters.push(limit.scale_filter());
             } else if odd {
                 // 4:2:0 encoders need even sizes. Scaling by one pixel (rather
                 // than cropping) keeps the picture aligned with the source,
@@ -477,18 +635,16 @@ fn plan_video(
             // Frames arrive in the decoder's surface format. Convert on the
             // GPU when resizing or when the bit depth must drop (e.g. 10-bit
             // HEVC to 8-bit H.264); otherwise pass them straight through.
-            if target_height.is_some() || (depth > 8 && !ten_bit) {
-                filters.push(gpu_scale_filter(gpu, target_height, hw_format));
+            if target_size.is_some() || (depth > 8 && !ten_bit) {
+                filters.push(gpu_scale_filter(gpu, target_size, hw_format));
             }
         }
     }
-    if let Some(h) = target_height {
-        out_width = even_width_for(width, height, h);
-        out_height = h;
+    if let Some((w, h)) = target_size {
+        (out_width, out_height) = (w, h);
     }
 
-    let mut out = strings(&["-c:v", &encoder.name]);
-    out.extend(video_quality_args(&VideoQuality {
+    let quality = VideoQuality {
         encoder: &encoder.name,
         api,
         codec,
@@ -498,7 +654,18 @@ fn plan_video(
         ten_bit,
         width: out_width,
         height: out_height,
-    }));
+    };
+    if let Some(value) = profile.quality_override
+        && override_ignored(&quality)
+    {
+        notes.push(format!(
+            "Your custom quality value ({value}) doesn't fit the {} encoder's quality scale, so the “{}” quality setting was used",
+            encoder.name,
+            quality_label(profile.quality)
+        ));
+    }
+    let mut out = strings(&["-c:v", &encoder.name]);
+    out.extend(video_quality_args(&quality));
     if let Some(fmt) = pix_fmt {
         push(&mut out, &["-pix_fmt", fmt]);
     }
@@ -633,29 +800,34 @@ fn qsv_decoder(codec: &str) -> Option<&'static str> {
 }
 
 /// Resize and/or convert frames that are already on the GPU.
-fn gpu_scale_filter(gpu: GpuFrames, height: Option<u32>, format: &str) -> String {
-    let (name, auto_width) = match gpu {
-        GpuFrames::Cuda => ("scale_cuda", "-2"),
-        GpuFrames::Vaapi => ("scale_vaapi", "-2"),
-        // scale_qsv only understands -1 ("keep aspect"); QSV aligns the
-        // surface itself.
-        GpuFrames::Qsv => ("scale_qsv", "-1"),
+///
+/// The size is given explicitly (from [`SizeLimit::fit`]) rather than as
+/// `-2`/`-1`: `scale_qsv` computes `-1` without even rounding (1920×804 at
+/// 720 lines would be 1719 wide, which 4:2:0 encoders reject). GPU frames
+/// are never auto-rotated (ffmpeg's rotation filters work on CPU frames), so
+/// the stored orientation is the one the filter sees.
+fn gpu_scale_filter(gpu: GpuFrames, size: Option<(u32, u32)>, format: &str) -> String {
+    let name = match gpu {
+        GpuFrames::Cuda => "scale_cuda",
+        GpuFrames::Vaapi => "scale_vaapi",
+        GpuFrames::Qsv => "scale_qsv",
     };
-    match height {
-        Some(h) => format!("{name}=w={auto_width}:h={h}:format={format}"),
+    match size {
+        Some((w, h)) => format!("{name}=w={w}:h={h}:format={format}"),
         None => format!("{name}=format={format}"),
     }
 }
 
-/// Output width for a downscale to `target` lines, computed exactly like
-/// ffmpeg's `scale=-2:H`: `round(H * width / (height * 2)) * 2`.
-fn even_width_for(width: u32, height: u32, target: u32) -> u32 {
-    if width == 0 || height == 0 {
-        return 0;
+/// Length of `side` after the picture is scaled so that `other` becomes
+/// `target`, rounded to an even number exactly like ffmpeg's `-2`:
+/// `round(target * side / (other * 2)) * 2`. Never less than 2.
+fn scaled_even(side: u32, other: u32, target: u32) -> u32 {
+    if side == 0 || other == 0 {
+        return 2;
     }
-    let (w, h, t) = (u64::from(width), u64::from(height), u64::from(target));
-    let halves = (t * w + h) / (2 * h);
-    u32::try_from(halves * 2).unwrap_or(u32::MAX - 1)
+    let (s, o, t) = (u64::from(side), u64::from(other), u64::from(target));
+    let halves = (t * s + o) / (2 * o);
+    u32::try_from(halves * 2).unwrap_or(u32::MAX - 1).max(2)
 }
 
 /// Bit depth of the source picture: the larger of ffprobe's
@@ -738,8 +910,7 @@ fn color_args(video: &StreamInfo) -> Vec<String> {
             continue;
         };
         let lower = value.to_ascii_lowercase();
-        let placeholder =
-            lower.is_empty() || matches!(lower.as_str(), "unknown" | "reserved" | "unspecified");
+        let placeholder = is_placeholder_colour(&lower);
         let rgb_matrix = flag == "-colorspace" && lower == "gbr";
         let well_formed = lower
             .chars()
@@ -768,14 +939,42 @@ struct AudioTrack {
     index: u32,
 }
 
-/// Opus channel layouts libopus accepts with mapping family 1 (the Vorbis
-/// channel order). `5.1` here is ffmpeg's back-surround 5.1; the common
-/// `5.1(side)` from Blu-ray/AC-3 sources is rejected by libopus as-is.
-const OPUS_LAYOUTS: &str = "aformat=channel_layouts=7.1|6.1|5.1|5.0|quad|3.0|stereo|mono";
-/// AAC layouts with a standard channel configuration; anything else (such as
-/// `5.1(side)`) would be written with a program config element that many
-/// players ignore.
-const AAC_LAYOUTS: &str = "aformat=channel_layouts=7.1|5.1|5.0|4.0|3.0|stereo|mono";
+/// Channel layouts in the Vorbis channel order, by channel count − 1. Opus
+/// (mapping family 1) and Vorbis only accept these; `5.0`/`5.1` are ffmpeg's
+/// back-surround layouts and `quad` is FL+FR+BL+BR. The common `5.1(side)`
+/// and `5.0(side)` from Blu-ray/DVD sources must be converted to them.
+const VORBIS_ORDER_LAYOUTS: [Option<&str>; 8] = [
+    Some("mono"),
+    Some("stereo"),
+    Some("3.0"),
+    Some("quad"),
+    Some("5.0"),
+    Some("5.1"),
+    Some("6.1"),
+    Some("7.1"),
+];
+
+/// AAC's standard channel configurations, by channel count − 1. Anything
+/// else is written with a program config element that many TVs and
+/// streamers ignore. There is no standard 7-channel configuration, so 6.1
+/// becomes 5.1 (which plays everywhere) rather than a padded 7.1.
+const AAC_STANDARD_LAYOUTS: [Option<&str>; 8] = [
+    Some("mono"),
+    Some("stereo"),
+    Some("3.0"),
+    Some("4.0"),
+    Some("5.0"),
+    Some("5.1"),
+    None,
+    Some("7.1"),
+];
+
+/// Layout lists for tracks whose channel count the probe could not read
+/// (kept only when no track could be read fully, see [`select_audio`]).
+/// Format negotiation then picks a layout the encoder accepts. It may pad
+/// with a silent channel, which beats failing on an unknown layout.
+const VORBIS_ORDER_ANY: &str = "aformat=channel_layouts=7.1|6.1|5.1|5.0|quad|3.0|stereo|mono";
+const AAC_ANY: &str = "aformat=channel_layouts=7.1|5.1|5.0|4.0|3.0|stereo|mono";
 
 /// Matroska muxer cannot store these even though `Container::can_copy_audio`
 /// allows everything for MKV (Blu-ray/DVD PCM and SMPTE 302M from TS).
@@ -785,40 +984,141 @@ const MKV_UNCOPYABLE_AUDIO: &[&str] = &["pcm_bluray", "pcm_dvd", "s302m", "pcm_s
 /// players, which only decode Layer III, play it silently. It is re-encoded.
 const MP4_UNCOPYABLE_AUDIO: &[&str] = &["mp2"];
 
-fn plan_audio(probe: &ProbeInfo, profile: &TranscodeProfile, notes: &mut Vec<String>) -> AudioPlan {
-    let container = profile.container;
-    let all: Vec<&StreamInfo> = probe.audio_streams().collect();
-    let (usable, broken): (Vec<&StreamInfo>, Vec<&StreamInfo>) =
-        all.iter().copied().partition(|s| is_usable_audio(s));
-    if !broken.is_empty() {
-        notes.push(format!(
-            "Removed {} that contain{} no readable sound",
-            plural(broken.len(), "audio track", "audio tracks"),
-            if broken.len() == 1 { "s" } else { "" }
-        ));
+/// How well the probe could read an audio track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioHealth {
+    /// Codec known, and channels and sample rate known or not reported.
+    Readable,
+    /// Codec known but zero channels or sample rate. A plain ffprobe reports
+    /// this for empty PIDs in broadcast recordings, but also for tracks that
+    /// start late in a transport stream, which ffmpeg's deeper probe during
+    /// the conversion (`-analyzeduration 100M`) reads fine.
+    Unconfirmed,
+    /// No codec ffmpeg knows: the track can be neither decoded nor copied.
+    Unreadable,
+}
+
+fn audio_health(stream: &StreamInfo) -> AudioHealth {
+    let codec = stream.codec.trim().to_ascii_lowercase();
+    if codec.is_empty() || codec == "none" || codec == "unknown" {
+        AudioHealth::Unreadable
+    } else if stream.channels == Some(0) || stream.sample_rate == Some(0) {
+        AudioHealth::Unconfirmed
+    } else {
+        AudioHealth::Readable
     }
+}
+
+/// The audio tracks an output keeps, before any codec decisions.
+struct AudioSelection<'a> {
+    /// Kept tracks, in source (and output) order.
+    kept: Vec<&'a StreamInfo>,
+    /// Tracks removed because they hold no readable sound.
+    dropped_broken: usize,
+    /// The file has audio, but not one track can be read.
+    all_unreadable: bool,
+    /// When the language filter matched nothing: which track was kept
+    /// instead ("default", "first" or "first main").
+    fallback: Option<&'static str>,
+}
+
+/// Choose the audio tracks to keep.
+///
+/// 1. Readable tracks are the candidates. Only when there are none do
+///    unconfirmed tracks become the candidates: dropping them would leave
+///    the video silent, and verification (which trusts `expected`) would
+///    accept that. If such a track really is empty, ffmpeg fails and the
+///    original stays untouched. Unreadable tracks are never kept.
+/// 2. The language filter applies to the candidates. Untagged and
+///    undetermined tracks always pass.
+/// 3. If nothing passes, one track is kept anyway: the default one, else the
+///    first that is not commentary or audio description, else the first.
+fn select_audio<'a>(probe: &'a ProbeInfo, profile: &TranscodeProfile) -> AudioSelection<'a> {
+    let all: Vec<&StreamInfo> = probe.audio_streams().collect();
+    let with_health = |health: AudioHealth| -> Vec<&'a StreamInfo> {
+        all.iter()
+            .copied()
+            .filter(|s| audio_health(s) == health)
+            .collect()
+    };
+    let readable = with_health(AudioHealth::Readable);
+    let candidates = if readable.is_empty() {
+        with_health(AudioHealth::Unconfirmed)
+    } else {
+        readable
+    };
 
     let wanted = wanted_languages(&profile.audio_languages);
-    let mut kept: Vec<&StreamInfo> = usable
+    let mut kept: Vec<&StreamInfo> = candidates
         .iter()
         .copied()
         .filter(|s| language_allowed(s.language.as_deref(), &wanted))
         .collect();
+    let mut fallback = None;
     if kept.is_empty() {
-        let fallback = usable.iter().copied().find(|s| s.is_default);
-        let which = if fallback.is_some() {
-            "default"
-        } else {
-            "first"
+        let default = candidates.iter().copied().find(|s| s.is_default);
+        let main = candidates.iter().copied().find(|s| !is_secondary_audio(s));
+        let (pick, which) = match (default, main) {
+            (Some(track), _) => (Some(track), "default"),
+            (None, Some(track)) if candidates.first().is_some_and(|f| f.index != track.index) => {
+                (Some(track), "first main")
+            }
+            (None, _) => (candidates.first().copied(), "first"),
         };
-        if let Some(track) = fallback.or_else(|| usable.first().copied()) {
+        if let Some(track) = pick {
             kept.push(track);
-            notes.push(format!(
-                "None of the audio tracks is in your chosen languages ({}), so the {which} track was kept",
-                language_list(&profile.audio_languages)
-            ));
+            fallback = Some(which);
         }
     }
+
+    AudioSelection {
+        dropped_broken: all.len() - candidates.len(),
+        all_unreadable: !all.is_empty() && candidates.is_empty(),
+        kept,
+        fallback,
+    }
+}
+
+/// Commentary and audio-description tracks, recognised by their title
+/// (`StreamInfo` carries no `comment` or `visual_impaired` disposition).
+/// They are never promoted to the default track.
+fn is_secondary_audio(stream: &StreamInfo) -> bool {
+    stream.title.as_deref().is_some_and(|title| {
+        let title = title.to_ascii_lowercase();
+        title.contains("comment") || title.contains("descri")
+    })
+}
+
+fn plan_audio(
+    probe: &ProbeInfo,
+    profile: &TranscodeProfile,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<AudioPlan> {
+    let container = profile.container;
+    let selection = select_audio(probe, profile);
+    if selection.all_unreadable {
+        bail!(
+            "None of this file's audio tracks can be read, so converting it would leave the video silent."
+        );
+    }
+    if selection.dropped_broken > 0 {
+        notes.push(format!(
+            "Removed {} that contain{} no readable sound",
+            plural(selection.dropped_broken, "audio track", "audio tracks"),
+            if selection.dropped_broken == 1 {
+                "s"
+            } else {
+                ""
+            }
+        ));
+    }
+    if let Some(which) = selection.fallback {
+        notes.push(format!(
+            "None of the audio tracks is in your chosen languages ({}), so the {which} track was kept",
+            language_list(&profile.audio_languages)
+        ));
+    }
+    let kept = selection.kept;
 
     let requested = profile.audio_codec;
     let encode_target = if requested == AudioCodec::Copy || container.supports_audio(requested) {
@@ -872,26 +1172,23 @@ fn plan_audio(probe: &ProbeInfo, profile: &TranscodeProfile, notes: &mut Vec<Str
     }
     push_forced_notes(&forced, container, notes);
 
-    let had_default = all.iter().any(|s| s.is_default);
+    // Keep a default track when the original default was filtered out.
+    // `+default` adds the flag without wiping the track's other flags (such
+    // as `original`), and commentary is never the one promoted.
+    let had_default = probe.audio_streams().any(|s| s.is_default);
     if had_default && !kept.is_empty() && !kept.iter().any(|s| s.is_default) {
-        push(&mut args, &["-disposition:a:0", "default"]);
+        let n = kept
+            .iter()
+            .position(|s| !is_secondary_audio(s))
+            .unwrap_or(0);
+        args.push(format!("-disposition:a:{n}"));
+        args.push("+default".into());
     }
 
-    AudioPlan {
+    Ok(AudioPlan {
         tracks: kept.iter().map(|s| AudioTrack { index: s.index }).collect(),
         args,
-    }
-}
-
-/// A track ffmpeg can actually decode: it has a codec and, where known,
-/// channels and a sample rate. Empty PIDs in broadcast recordings fail these.
-fn is_usable_audio(stream: &StreamInfo) -> bool {
-    let codec = stream.codec.trim().to_ascii_lowercase();
-    !codec.is_empty()
-        && codec != "none"
-        && codec != "unknown"
-        && stream.channels != Some(0)
-        && stream.sample_rate != Some(0)
+    })
 }
 
 /// `Container::can_copy_audio` plus the muxers' real limits.
@@ -954,6 +1251,48 @@ fn max_output_channels(codec: AudioCodec) -> u32 {
     }
 }
 
+/// The one layout an Opus, Vorbis or AAC encoder must receive for a source
+/// with `channels` channels, and its channel count. `None` for other codecs
+/// and for mono/stereo, which need no conversion.
+///
+/// Exactly one layout is passed to `aformat`: given a list, ffmpeg's format
+/// negotiation prefers a layout containing every source channel and pads
+/// with silent channels (DVD `5.0(side)` became 7.1 AAC or 6.1 Opus). The
+/// count is kept wherever the format has a layout for it, with two
+/// exceptions: sources with an LFE channel but fewer than six channels (2.1,
+/// 3.1, 4.1) become 5.1 so the bass channel survives, and 7-channel AAC
+/// becomes 5.1 (see [`AAC_STANDARD_LAYOUTS`]). ffmpeg's resampler maps side
+/// to back surrounds one to one, so `5.1(side)` → `5.1` loses nothing.
+fn standard_layout(
+    codec: AudioCodec,
+    channels: u32,
+    source_layout: Option<&str>,
+) -> Option<(&'static str, u32)> {
+    let table = match codec {
+        AudioCodec::Opus | AudioCodec::Vorbis => &VORBIS_ORDER_LAYOUTS,
+        AudioCodec::Aac => &AAC_STANDARD_LAYOUTS,
+        _ => return None,
+    };
+    let mut count = channels.min(max_output_channels(codec)).min(8);
+    if count <= 2 {
+        return None;
+    }
+    if count < 6 && source_layout.is_some_and(layout_has_lfe) {
+        count = 6;
+    }
+    (1..=count).rev().find_map(|c| {
+        let slot = usize::try_from(c - 1).ok()?;
+        table.get(slot).copied().flatten().map(|name| (name, c))
+    })
+}
+
+/// Whether an ffprobe channel layout name includes a low-frequency channel
+/// (`2.1`, `5.1(side)`, `7.1(wide)`, `22.2`, or a custom `FL+FR+LFE`).
+fn layout_has_lfe(layout: &str) -> bool {
+    let lower = layout.to_ascii_lowercase();
+    lower.contains(".1") || lower.contains(".2") || lower.contains("lfe")
+}
+
 /// Options for one encoded output audio stream `n`.
 fn encode_audio_args(
     n: usize,
@@ -962,50 +1301,75 @@ fn encode_audio_args(
     notes: &mut Vec<String>,
 ) -> Vec<String> {
     let mut args = vec![format!("-c:a:{n}"), codec.ffmpeg_encoder().to_string()];
-    let channels_in = stream.channels.filter(|&c| c > 0).unwrap_or(2);
+    let name = audio_short_name(codec);
     let max = max_output_channels(codec);
-    let channels = channels_in.min(max);
-    if let Some(kbps) = codec.default_bitrate_kbps(channels) {
+    // Zero means the probe could not read the count (see `AudioHealth`).
+    let channels_in = stream.channels.filter(|&c| c > 0);
+    let layout =
+        channels_in.and_then(|c| standard_layout(codec, c, stream.channel_layout.as_deref()));
+    let channels_out = match (layout, channels_in) {
+        (Some((_, count)), _) => Some(count),
+        (None, Some(count)) => Some(count.min(max)),
+        (None, None) => None,
+    };
+
+    // With an unknown channel count the encoder picks its own per-channel
+    // default bitrate, which beats guessing.
+    if let Some(kbps) = channels_out.and_then(|c| codec.default_bitrate_kbps(c)) {
         args.push(format!("-b:a:{n}"));
         args.push(format!("{kbps}k"));
     }
-    if channels_in > max {
-        args.push(format!("-ac:a:{n}"));
-        args.push(max.to_string());
-        notes.push(format!(
-            "Downmixed {} audio to {} because {} holds at most {max} channels",
-            channel_label(channels_in),
-            channel_label(max),
-            audio_short_name(codec)
-        ));
+    if let (Some(cin), Some(cout)) = (channels_in, channels_out) {
+        let from = source_channel_label(stream, cin);
+        let to = layout.map_or_else(|| channel_label(cout), |(l, _)| friendly_layout(l));
+        if cout < cin {
+            let why = if cin > max {
+                format!("{name} holds at most {max} channels")
+            } else {
+                format!("{name} has no standard {from} layout")
+            };
+            notes.push(format!("Downmixed {from} audio to {to} because {why}"));
+        } else if cout > cin {
+            notes.push(format!(
+                "Wrote {from} audio as {to} so its bass channel is kept, because {name} has no {from} layout (the added channels are silent)"
+            ));
+        }
+        if layout.is_none() && cin > max {
+            args.push(format!("-ac:a:{n}"));
+            args.push(max.to_string());
+        }
     }
-    if let Some(rate) = output_sample_rate(codec, stream.sample_rate) {
+    if let Some(rate) = output_sample_rate(codec, stream.sample_rate.filter(|&r| r > 0)) {
         args.push(format!("-ar:a:{n}"));
         args.push(rate.to_string());
     }
-    match codec {
-        AudioCodec::Opus if channels > 2 => {
-            args.push(format!("-mapping_family:a:{n}"));
-            args.push("1".into());
-            args.push(format!("-filter:a:{n}"));
-            args.push(OPUS_LAYOUTS.into());
-        }
-        AudioCodec::Aac if channels > 2 => {
-            args.push(format!("-filter:a:{n}"));
-            args.push(AAC_LAYOUTS.into());
-        }
-        AudioCodec::Flac => {
-            args.push(format!("-sample_fmt:a:{n}"));
-            args.push(
-                if is_high_resolution_audio(stream) {
-                    "s32"
-                } else {
-                    "s16"
-                }
-                .into(),
-            );
-        }
-        _ => {}
+
+    let layout_filter = match (codec, layout, channels_out) {
+        (_, Some((name, _)), _) => Some(format!("aformat=channel_layouts={name}")),
+        (AudioCodec::Opus | AudioCodec::Vorbis, None, None) => Some(VORBIS_ORDER_ANY.to_string()),
+        (AudioCodec::Aac, None, None) => Some(AAC_ANY.to_string()),
+        _ => None,
+    };
+    if codec == AudioCodec::Opus && channels_out.is_some_and(|c| c > 2) {
+        // Surround Opus needs the Vorbis-order mapping family. With an
+        // unknown count libopus chooses the family itself.
+        args.push(format!("-mapping_family:a:{n}"));
+        args.push("1".into());
+    }
+    if let Some(filter) = layout_filter {
+        args.push(format!("-filter:a:{n}"));
+        args.push(filter);
+    }
+    if codec == AudioCodec::Flac {
+        args.push(format!("-sample_fmt:a:{n}"));
+        args.push(
+            if is_high_resolution_audio(stream) {
+                "s32"
+            } else {
+                "s16"
+            }
+            .into(),
+        );
     }
     args
 }
@@ -1082,15 +1446,57 @@ fn push_forced_notes(
     }
 }
 
+/// Plain name for a channel count, e.g. `5.1` for six channels.
 fn channel_label(channels: u32) -> String {
     match channels {
         1 => "mono".into(),
         2 => "stereo".into(),
+        5 => "5.0".into(),
         6 => "5.1".into(),
         7 => "6.1".into(),
         8 => "7.1".into(),
         n => format!("{n}-channel"),
     }
+}
+
+/// Plain name for a source track's layout: ffprobe's layout name without
+/// its speaker-position detail (`5.1(side)` → `5.1`) when it is a familiar
+/// one, otherwise the channel count's name.
+fn source_channel_label(stream: &StreamInfo, channels: u32) -> String {
+    stream
+        .channel_layout
+        .as_deref()
+        .map(friendly_layout)
+        .filter(|name| {
+            matches!(
+                name.as_str(),
+                "mono"
+                    | "stereo"
+                    | "2.1"
+                    | "3.0"
+                    | "3.1"
+                    | "4.0"
+                    | "4.1"
+                    | "quad"
+                    | "5.0"
+                    | "5.1"
+                    | "6.0"
+                    | "6.1"
+                    | "7.0"
+                    | "7.1"
+            )
+        })
+        .unwrap_or_else(|| channel_label(channels))
+}
+
+/// An ffmpeg layout name without its parenthesised variant.
+fn friendly_layout(layout: &str) -> String {
+    layout
+        .split('(')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn audio_short_name(codec: AudioCodec) -> &'static str {
@@ -1138,6 +1544,43 @@ struct SubtitleTrack {
     codec: &'static str,
 }
 
+/// Subtitle codecs the Matroska muxer can store (its codec tag table in
+/// ffmpeg 6.1). `Container::subtitle_action` copies every text and picture
+/// codec into MKV, but the muxer refuses the rest with "Subtitle codec is
+/// not supported", which would fail every attempt.
+const MATROSKA_SUBTITLES: &[&str] = &[
+    "subrip",
+    "ass",
+    "webvtt",
+    "text",
+    "dvd_subtitle",
+    "dvb_subtitle",
+    "hdmv_pgs_subtitle",
+    "hdmv_text_subtitle",
+    "arib_caption",
+];
+
+/// `Container::subtitle_action` plus the Matroska muxer's real limits: text
+/// formats it can't store (MicroDVD, SAMI, old `ssa`, ...) are converted
+/// (to ASS for `ssa`, which keeps the styling, otherwise to SubRip) and
+/// picture formats it can't store (DivX XSUB) are dropped.
+fn subtitle_action(container: Container, codec: &str) -> SubtitleAction {
+    let action = container.subtitle_action(codec);
+    if !is_matroska(container)
+        || action != SubtitleAction::Copy
+        || MATROSKA_SUBTITLES.contains(&codec)
+    {
+        return action;
+    }
+    if is_image_subtitle(codec) {
+        SubtitleAction::Drop
+    } else if codec == "ssa" {
+        SubtitleAction::Convert("ass")
+    } else {
+        SubtitleAction::Convert("srt")
+    }
+}
+
 fn plan_subtitles(
     probe: &ProbeInfo,
     profile: &TranscodeProfile,
@@ -1159,7 +1602,7 @@ fn plan_subtitles(
             continue;
         }
         let codec = stream.codec.to_ascii_lowercase();
-        match container.subtitle_action(&codec) {
+        match subtitle_action(container, &codec) {
             SubtitleAction::Copy => kept.push(SubtitleTrack {
                 index: stream.index,
                 codec: "copy",
@@ -1571,12 +2014,266 @@ mod tests {
     }
 
     #[test]
-    fn even_widths() {
-        assert_eq!(even_width_for(3840, 2160, 1080), 1920);
-        assert_eq!(even_width_for(1920, 800, 720), 1728);
-        assert_eq!(even_width_for(1998, 1080, 720), 1332);
-        assert_eq!(even_width_for(639, 359, 240), 428);
-        assert_eq!(even_width_for(0, 0, 720), 0);
+    fn even_scaling_matches_ffmpeg_minus_two() {
+        assert_eq!(scaled_even(3840, 2160, 1080), 1920);
+        assert_eq!(scaled_even(1920, 800, 720), 1728);
+        assert_eq!(scaled_even(1998, 1080, 720), 1332);
+        assert_eq!(scaled_even(639, 359, 240), 428);
+        // scale_qsv's -1 would give 1719 here.
+        assert_eq!(scaled_even(1920, 804, 720), 1720);
+        assert_eq!(scaled_even(0, 0, 720), 2);
+    }
+
+    #[test]
+    fn size_limits_are_resolution_classes() {
+        let limit = |h| {
+            size_limit(&TranscodeProfile {
+                max_height: Some(h),
+                ..TranscodeProfile::default()
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            limit(1080),
+            SizeLimit {
+                short: 1080,
+                long: 1920
+            }
+        );
+        assert_eq!(
+            limit(720),
+            SizeLimit {
+                short: 720,
+                long: 1280
+            }
+        );
+        assert_eq!(
+            limit(480),
+            SizeLimit {
+                short: 480,
+                long: 854
+            }
+        );
+        assert_eq!(
+            limit(2160),
+            SizeLimit {
+                short: 2160,
+                long: 3840
+            }
+        );
+        assert_eq!(
+            limit(719),
+            SizeLimit {
+                short: 718,
+                long: 1278
+            }
+        );
+        assert!(
+            size_limit(&TranscodeProfile {
+                max_height: Some(1),
+                ..TranscodeProfile::default()
+            })
+            .is_none()
+        );
+        // Huge values do not overflow.
+        assert!(limit(u32::MAX).long >= limit(u32::MAX).short);
+
+        let hd = limit(1080);
+        assert!(hd.fits(1920, 1080));
+        assert!(hd.fits(1080, 1920), "portrait 1080p");
+        assert!(hd.fits(1440, 1080));
+        assert!(!hd.fits(3840, 2160));
+        assert!(!hd.fits(2160, 3840));
+        assert!(!hd.fits(3840, 1600), "scope 4K is a 4K file");
+        assert!(
+            !hd.fits(2560, 1080),
+            "ultra-wide 1080 is a 1440p-class file"
+        );
+        assert!(hd.fits(1998, 1080), "flat 1080p is not worth a re-encode");
+        assert!(hd.fits(2048, 1080), "DCI 2K");
+        assert!(hd.fits(2304, 1080));
+        assert!(!hd.fits(2306, 1080));
+        assert_eq!(hd.fit(3840, 2160), (1920, 1080));
+        assert_eq!(hd.fit(2160, 3840), (1080, 1920));
+        assert_eq!(hd.fit(3840, 1600), (1920, 800));
+        assert_eq!(hd.fit(1998, 1080), (1920, 1038));
+        assert_eq!(hd.fit(2880, 2160), (1440, 1080));
+        // A converted file always fits the limit it was made for.
+        for (w, h) in [
+            (3840, 2160),
+            (2160, 3840),
+            (3840, 1600),
+            (4096, 2160),
+            (1998, 1080),
+        ] {
+            let (ow, oh) = hd.fit(w, h);
+            assert!(hd.fits(ow, oh), "{w}x{h} -> {ow}x{oh}");
+            assert_eq!((ow % 2, oh % 2), (0, 0));
+        }
+        assert_eq!(limit(720).fit(1920, 804), (1280, 536));
+        assert_eq!(limit(480).fit(1920, 1080), (854, 480));
+    }
+
+    fn surround(codec: &str, channels: u32, layout: &str) -> StreamInfo {
+        StreamInfo {
+            kind: Some(StreamKind::Audio),
+            codec: codec.into(),
+            channels: Some(channels),
+            channel_layout: Some(layout.into()),
+            sample_rate: Some(48_000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn one_layout_per_channel_count() {
+        use AudioCodec::*;
+        type Case = (AudioCodec, u32, &'static str, Option<(&'static str, u32)>);
+        let cases: &[Case] = &[
+            (Opus, 6, "5.1(side)", Some(("5.1", 6))),
+            (Opus, 5, "5.0(side)", Some(("5.0", 5))),
+            (Aac, 5, "5.0(side)", Some(("5.0", 5))),
+            (Vorbis, 5, "5.0(side)", Some(("5.0", 5))),
+            (Opus, 4, "4.0", Some(("quad", 4))),
+            (Aac, 4, "quad", Some(("4.0", 4))),
+            (Opus, 7, "6.1", Some(("6.1", 7))),
+            (Aac, 7, "6.1", Some(("5.1", 6))),
+            (Opus, 8, "7.1(wide)", Some(("7.1", 8))),
+            (Aac, 8, "7.1(wide)", Some(("7.1", 8))),
+            (Opus, 6, "hexagonal", Some(("5.1", 6))),
+            (Opus, 3, "2.1", Some(("5.1", 6))),
+            (Vorbis, 3, "2.1", Some(("5.1", 6))),
+            (Opus, 3, "3.0(back)", Some(("3.0", 3))),
+            (Opus, 10, "unknown", Some(("7.1", 8))),
+            (Opus, 2, "stereo", None),
+            (Aac, 1, "mono", None),
+            (Ac3, 6, "5.1(side)", None),
+            (Flac, 6, "5.1(side)", None),
+        ];
+        for &(codec, channels, layout, want) in cases {
+            assert_eq!(
+                standard_layout(codec, channels, Some(layout)),
+                want,
+                "{codec:?} {layout}"
+            );
+        }
+    }
+
+    #[test]
+    fn dvd_five_channel_audio_stays_five_channels() {
+        let mut notes = Vec::new();
+        let args = encode_audio_args(
+            0,
+            &surround("ac3", 5, "5.0(side)"),
+            AudioCodec::Aac,
+            &mut notes,
+        );
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("-filter:a:0 aformat=channel_layouts=5.0"),
+            "{joined}"
+        );
+        assert!(!joined.contains('|'), "a single layout: {joined}");
+        assert!(joined.contains("-b:a:0 384k"), "{joined}");
+        assert!(notes.is_empty(), "{notes:?}");
+
+        let args = encode_audio_args(1, &surround("dts", 7, "6.1"), AudioCodec::Aac, &mut notes);
+        assert!(
+            args.join(" ")
+                .contains("-filter:a:1 aformat=channel_layouts=5.1")
+        );
+        assert_eq!(
+            notes,
+            ["Downmixed 6.1 audio to 5.1 because AAC has no standard 6.1 layout"]
+        );
+
+        notes.clear();
+        let args = encode_audio_args(0, &surround("flac", 3, "2.1"), AudioCodec::Opus, &mut notes);
+        let joined = args.join(" ");
+        assert!(
+            joined.contains("-b:a:0 320k"),
+            "bitrate for 6 channels: {joined}"
+        );
+        assert!(joined.contains("-mapping_family:a:0 1"), "{joined}");
+        assert!(notes[0].starts_with("Wrote 2.1 audio as 5.1"), "{notes:?}");
+    }
+
+    #[test]
+    fn unknown_channel_counts_let_the_encoder_choose() {
+        let mut notes = Vec::new();
+        let mut late = surround("ac3", 0, "unknown");
+        late.sample_rate = Some(0);
+        let args = encode_audio_args(0, &late, AudioCodec::Opus, &mut notes);
+        let joined = args.join(" ");
+        assert!(!joined.contains("-b:a:0"), "{joined}");
+        assert!(!joined.contains("-mapping_family"), "{joined}");
+        assert!(joined.contains("-ar:a:0 48000"), "{joined}");
+        assert!(
+            joined.contains("-filter:a:0 aformat=channel_layouts=7.1|"),
+            "{joined}"
+        );
+        let args = encode_audio_args(0, &late, AudioCodec::Ac3, &mut notes);
+        assert!(!args.join(" ").contains("-ac:a:0"));
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn matroska_subtitle_guard() {
+        assert_eq!(
+            subtitle_action(Container::Mkv, "subrip"),
+            SubtitleAction::Copy
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "hdmv_pgs_subtitle"),
+            SubtitleAction::Copy
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "xsub"),
+            SubtitleAction::Drop
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "microdvd"),
+            SubtitleAction::Convert("srt")
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "sami"),
+            SubtitleAction::Convert("srt")
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "ssa"),
+            SubtitleAction::Convert("ass")
+        );
+        assert_eq!(
+            subtitle_action(Container::Mkv, "mov_text"),
+            SubtitleAction::Convert("srt")
+        );
+        // Other containers keep the core rules.
+        assert_eq!(
+            subtitle_action(Container::Mp4, "microdvd"),
+            SubtitleAction::Convert("mov_text")
+        );
+        assert_eq!(
+            subtitle_action(Container::Webm, "webvtt"),
+            SubtitleAction::Copy
+        );
+        // Every text codec the core knows ends up somewhere Matroska can store.
+        for codec in chrysopoeia_core::codec::TEXT_SUBTITLE_CODECS {
+            match subtitle_action(Container::Mkv, codec) {
+                SubtitleAction::Copy => assert!(MATROSKA_SUBTITLES.contains(codec), "{codec}"),
+                SubtitleAction::Convert(to) => assert!(matches!(to, "srt" | "ass"), "{codec}"),
+                SubtitleAction::Drop => panic!("{codec} dropped"),
+            }
+        }
+    }
+
+    #[test]
+    fn lfe_detection() {
+        assert!(layout_has_lfe("2.1"));
+        assert!(layout_has_lfe("5.1(side)"));
+        assert!(layout_has_lfe("FL+FR+LFE"));
+        assert!(!layout_has_lfe("5.0(side)"));
+        assert!(!layout_has_lfe("hexagonal"));
+        assert!(!layout_has_lfe("quad"));
     }
 
     #[test]
