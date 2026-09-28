@@ -5,7 +5,7 @@
 #   1. moves the "chrysopoeia" user and group to PUID/PGID (default 1000/1000;
 #      Unraid uses 99/100) and applies UMASK (default 002),
 #   2. adds the user to the groups that own the GPU device nodes it can see
-#      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes),
+#      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes), except root,
 #   3. makes /config (and the top of /temp) owned by that user,
 #   4. prints a short banner and drops privileges with setpriv.
 # Started as any other user (docker run --user ...), it only applies UMASK
@@ -189,7 +189,9 @@ fi
 # --- GPU device access -----------------------------------------------------------
 
 # Give the app user every group that owns a GPU or codec device node it could
-# not otherwise open. Groups missing from the image are created by gid.
+# not otherwise open. Groups missing from the image are created by gid. The
+# root group (gid 0) is never joined: it would also grant write access to
+# every root-group-writable file in the container and in mounted folders.
 for dev in $DEVICE_NODES; do
     [ -c "$dev" ] || continue
     dev_gid=$(stat -c %g "$dev")
@@ -198,16 +200,20 @@ for dev in $DEVICE_NODES; do
     other_bits=$((dev_mode % 10))
     dev_group=$(getent group "$dev_gid" | cut -d: -f1)
     if [ "$PUID" -ne 0 ] && [ $((other_bits & 6)) -ne 6 ]; then
-        if [ $((group_bits & 6)) -ne 6 ]; then
-            warn "$dev is not readable and writable by its group, so Chrysopoeia may not be able to use it. On the host, run: chmod g+rw $dev"
-        fi
-        if [ "$dev_gid" != "$PGID" ]; then
-            if [ -z "$dev_group" ]; then
-                dev_group="gpu$dev_gid"
-                groupadd -g "$dev_gid" "$dev_group" || die "$readonly_hint"
+        if [ "$dev_gid" -eq 0 ] && [ "$PGID" -ne 0 ]; then
+            warn "$dev belongs to the root group, which Chrysopoeia does not join, so it may not be able to use this device. On the host, give it a group of its own, for example: chgrp video $dev && chmod g+rw $dev (a udev rule makes this permanent)."
+        else
+            if [ $((group_bits & 6)) -ne 6 ]; then
+                warn "$dev is not readable and writable by its group, so Chrysopoeia may not be able to use it. On the host, run: chmod g+rw $dev"
             fi
-            if ! id -nG "$APP_USER" | tr ' ' '\n' | grep -qx "$dev_group"; then
-                usermod -a -G "$dev_group" "$APP_USER" || die "$readonly_hint"
+            if [ "$dev_gid" != "$PGID" ]; then
+                if [ -z "$dev_group" ]; then
+                    dev_group="gpu$dev_gid"
+                    groupadd -g "$dev_gid" "$dev_group" || die "$readonly_hint"
+                fi
+                if ! id -nG "$APP_USER" | tr ' ' '\n' | grep -qx "$dev_group"; then
+                    usermod -a -G "$dev_group" "$APP_USER" || die "$readonly_hint"
+                fi
             fi
         fi
     fi

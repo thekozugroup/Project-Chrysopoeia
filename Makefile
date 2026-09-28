@@ -8,7 +8,7 @@ IMAGE ?= chrysopoeia:dev
 PLATFORM ?= linux/amd64
 
 .DEFAULT_GOAL := help
-.PHONY: help dev-api dev-web web-install build run test lint fmt docker e2e test-media clean
+.PHONY: help dev-api dev-web web-install build run test lint fmt docker test-docker e2e test-media clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -45,6 +45,9 @@ fmt: ## Format Rust code
 
 docker: ## Build the Docker image (IMAGE=chrysopoeia:dev, PLATFORM=linux/amd64)
 	docker build --platform $(PLATFORM) -t $(IMAGE) .
+
+test-docker: docker ## Build the image, then test its entrypoint (PUID/PGID, GPU groups)
+	docker/test-entrypoint.sh $(IMAGE)
 
 e2e: docker ## Build the image, then run the end-to-end smoke test against it
 	scripts/e2e-smoke.sh $(IMAGE)

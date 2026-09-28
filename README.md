@@ -73,10 +73,11 @@ while asking far less of you:
 
    then open **Docker > Add Container** and pick *Chrysopoeia* from the
    Template list.
-3. Set **Media** to the share you want converted (for example
-   `/mnt/user/media/`). NVIDIA: add `--runtime=nvidia` to *Extra Parameters* and
-   set `NVIDIA_VISIBLE_DEVICES` (under *Show more settings*) to `all`. No
-   Intel/AMD graphics: remove the *Intel/AMD GPU* entry.
+3. Set **Media** (required) to the share that holds your videos, for
+   example `/mnt/user/media/`, rather than all of `/mnt/user/`. Intel or AMD:
+   click *Add another Path, Port, Variable, Label or Device*, choose *Device*
+   and enter `/dev/dri`. NVIDIA: add `--runtime=nvidia` to *Extra Parameters*
+   and set `NVIDIA_VISIBLE_DEVICES` (under *Show more settings*) to `all`.
 4. Click **Apply**, then open the web UI from the container's icon.
 
 The full walkthrough, including a transcode cache on your SSD and
@@ -99,7 +100,9 @@ Add a GPU with one extra flag:
 # Intel or AMD
 --device /dev/dri:/dev/dri
 # NVIDIA (needs the NVIDIA Container Toolkit on the host)
---runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all      # or: --gpus all
+--gpus all                                    # one card: --gpus device=GPU-<uuid>
+# NVIDIA through the runtime instead (what Unraid uses)
+--runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=all   # one card: its UUID instead of all
 ```
 
 Then open `http://<server>:8080`.
@@ -128,9 +131,9 @@ shows what was found and, if something is missing, the fix.
 
 | Hardware | Host needs | Container needs | Encodes in hardware |
 |---|---|---|---|
-| NVIDIA GeForce / RTX / Quadro | NVIDIA driver + NVIDIA Container Toolkit (Unraid: Nvidia-Driver plugin) | `--runtime=nvidia` and `NVIDIA_VISIBLE_DEVICES=all` (or `--gpus all`) | H.264 (Kepler+), HEVC (GTX 950 and newer), AV1 (RTX 40 and newer) |
-| Intel iGPU or Arc | `i915` or `xe` driver loaded, `/dev/dri` present (Unraid: Intel GPU TOP plugin) | `--device /dev/dri` | H.264, HEVC (6th gen+), AV1 (Arc, Core Ultra) |
-| AMD Radeon / Ryzen APU | `amdgpu` driver, `/dev/dri` present (Unraid: Radeon TOP plugin) | `--device /dev/dri` | H.264, HEVC (RX 400 and newer), AV1 (RX 7000 and newer) |
+| NVIDIA GeForce / RTX / Quadro | NVIDIA driver + NVIDIA Container Toolkit (Unraid: Nvidia-Driver plugin) | `--gpus all`, or `--runtime=nvidia` and `NVIDIA_VISIBLE_DEVICES=all` | H.264 (Kepler+), HEVC (GTX 950 and newer), AV1 (RTX 40 and newer); the GT 1030 and most MX laptop chips have no encoder |
+| Intel iGPU or Arc | `i915` or `xe` driver loaded, `/dev/dri` present (Unraid: Intel GPU TOP plugin) | `--device /dev/dri` (Unraid: a Device `/dev/dri`) | H.264, HEVC (6th gen+), AV1 (Arc, Core Ultra) |
+| AMD Radeon / Ryzen APU | `amdgpu` driver, `/dev/dri` present (Unraid: Radeon TOP plugin) | `--device /dev/dri` (Unraid: a Device `/dev/dri`) | H.264, HEVC (RX 400 and newer), AV1 (RX 7000 and newer) |
 | Apple Silicon Mac | nothing: run Chrysopoeia natively, not in Docker (Docker on macOS cannot reach the GPU) | n/a | H.264, HEVC |
 | Raspberry Pi 4 | 64-bit OS | `--device /dev/video11` (encoder) | H.264 only; the Pi 5 has no hardware encoder |
 
@@ -148,12 +151,12 @@ variables:
 | `PUID` / `PGID` | `1000` / `1000` | User and group Chrysopoeia runs as and writes files as. Use the owner of your media (Unraid: `99` / `100`). |
 | `UMASK` | `002` | Permissions for new files (`002`: group can edit). |
 | `TZ` | `UTC` | Time zone for logs and the active-hours schedule (Unraid sets it for you). |
-| `HW_ACCEL` | `auto` | Hardware preference on first start: `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`, `amf`. Changeable later in Settings. |
-| `MAX_JOBS` | automatic | Files converted at once. Leave unset for automatic; Settings overrides it. |
+| `HW_ACCEL` | `auto` | Hardware preference on first start, changeable later in Settings: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). |
+| `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Leave unset for automatic; Settings overrides it. |
 | `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. |
 | `TEMP_DIR` | `/temp` if mounted | Where in-progress files go. Unset and no `/temp` mount: next to each original. |
 | `BROWSE_ROOTS` | `/media,/` if `/media` is mounted | Folders the in-app folder picker starts from. |
-| `NVIDIA_VISIBLE_DEVICES` | unset | NVIDIA only: `all` or a GPU UUID. |
+| `NVIDIA_VISIBLE_DEVICES` | unset | NVIDIA with `--runtime=nvidia` (Unraid): `all` or a GPU UUID. With `--gpus` or the compose overlay, Docker sets it from the GPUs chosen there. |
 | `NVIDIA_DRIVER_CAPABILITIES` | `compute,video,utility` | Already set in the image; needed for NVENC. |
 | `PORT` | `8080` | Port inside the container. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |

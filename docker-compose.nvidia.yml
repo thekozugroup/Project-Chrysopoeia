@@ -5,17 +5,21 @@
 #
 # Check it worked: the Hardware page in the app lists NVENC encoders as
 # verified, and `docker exec chrysopoeia nvidia-smi` shows your GPU.
+#
+# Docker itself sets NVIDIA_VISIBLE_DEVICES (and NVIDIA_DRIVER_CAPABILITIES)
+# from the reservation below, overriding any value in `environment:`, so
+# choose GPUs here rather than with that variable. "video" is the capability
+# that enables NVENC.
 services:
   chrysopoeia:
-    environment:
-      # "all", or one GPU's UUID from `nvidia-smi -L` to pin a single card.
-      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
-      # The image already sets this; repeated here so it survives overrides.
-      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
+              # Every NVIDIA GPU. To use only one card, replace this line with
+              # its UUID from `nvidia-smi -L` (count and device_ids cannot be
+              # combined):
+              #   device_ids: ["GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"]
               count: all
               capabilities: [gpu, video, compute, utility]

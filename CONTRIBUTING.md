@@ -43,6 +43,7 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 | `make run` | Builds, then serves UI and API together from `./target/release/chrysopoeia` on :8080 |
 | `make test-media` | Writes a synthetic library to `./media` |
 | `make docker` | Builds the image `chrysopoeia:dev` |
+| `make test-docker` | Builds the image and runs the entrypoint tests |
 | `make e2e` | Builds the image and runs the end-to-end smoke test |
 
 ### Backend and UI during development
@@ -95,6 +96,13 @@ emulation only for the final `apt-get` step. Useful build arguments:
 The entrypoint (`docker/entrypoint.sh`) handles PUID/PGID/UMASK, GPU device
 groups and dropping privileges; `docker run --rm chrysopoeia:dev id` shows the
 result, and `docker run --rm chrysopoeia:dev --help` reaches the binary.
+`make test-docker` (or `docker/test-entrypoint.sh <image>`) runs its
+regression tests against an image, with fake GPU device nodes, in about 30
+seconds.
+
+The Rust stage compiles dependencies in a separate cargo-chef layer that only
+changes with `Cargo.toml`/`Cargo.lock`, so after the first build a source
+change recompiles just the workspace crates.
 
 ## End-to-end smoke test
 
@@ -114,13 +122,15 @@ container reports healthy. `E2E_TIMEOUT`, `E2E_GOAL`, `E2E_MAX_JOBS` and
 
 ## CI and releases
 
-- `.github/workflows/ci.yml` runs on every push and pull request: Rust
-  (fmt, clippy, tests with ffmpeg installed), web (lint, typecheck, static
-  build) and Docker (amd64 image plus the smoke test).
+- `.github/workflows/ci.yml` runs on pull requests and on pushes to `main`:
+  Rust (fmt, clippy, tests with ffmpeg installed), web (lint, typecheck,
+  static build) and Docker (amd64 image, entrypoint tests and the smoke test).
 - `.github/workflows/release.yml` runs on pushes to `main` and on `v*` tags.
-  It builds the amd64 image, runs the smoke test, and only then pushes a
-  multi-arch (amd64 + arm64) image to `ghcr.io/<owner>/chrysopoeia` tagged
-  `latest` (main), the version (`1.2.3`, `1.2`, `1`) for tags, and `sha-<short>`.
+  It builds the amd64 image, runs the entrypoint and smoke tests, and only
+  then pushes a multi-arch (amd64 + arm64) image to
+  `ghcr.io/<owner>/chrysopoeia` tagged `latest` (main), the version (`1.2.3`,
+  `1.2`, `1`) for tags, and `sha-<short>`. The version shown in the app and the
+  log is `1.2.3` for a tag and `main-<short sha>` for a build from `main`.
 - After the first release, make the package public once on GitHub (Packages >
   chrysopoeia > Package settings > Change visibility), or Unraid and Docker
   will be refused when pulling it.

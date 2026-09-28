@@ -12,6 +12,7 @@
 #
 # Build arguments:
 #   CARGO_BUILD_JOBS          limit parallel rustc jobs (default: all cores)
+#   CARGO_CHEF_VERSION        cargo-chef used to cache compiled dependencies
 #   JELLYFIN_FFMPEG_VERSION   pin jellyfin-ffmpeg7 (e.g. 7.1.4-3-bookworm); default: newest
 #   VERSION, REVISION, CREATED  image metadata, set by CI
 
@@ -42,8 +43,31 @@ RUN pnpm build \
 
 # ---------------------------------------------------------------------------
 # Server binary: cross-compiled for the target platform -> /out/chrysopoeia
+#
+# Dependencies are compiled in a layer of their own (cargo-chef) that depends
+# only on the Cargo manifests and Cargo.lock, so a source change recompiles
+# just Chrysopoeia's crates. Unlike RUN cache mounts, layers are kept by CI's
+# GitHub Actions cache (type=gha).
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS rust
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS rust-chef
+ARG CARGO_CHEF_VERSION=0.1.78
+ARG CARGO_BUILD_JOBS
+ENV CARGO_TERM_COLOR=never
+RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
+    set -eu; \
+    jobs="${CARGO_BUILD_JOBS:-}"; \
+    unset CARGO_BUILD_JOBS; \
+    cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}" ${jobs:+--jobs "$jobs"}
+WORKDIR /src
+
+# The recipe: the workspace's manifests and lockfile, with the sources removed.
+FROM rust-chef AS rust-plan
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
+    cargo chef prepare --recipe-path /recipe.json
+
+FROM rust-chef AS rust
 ARG TARGETARCH
 ARG BUILDARCH
 # Cross linkers and C compilers (sqlx bundles SQLite's C sources). On a native
@@ -55,8 +79,7 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
     AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar \
-    SQLX_OFFLINE=true \
-    CARGO_TERM_COLOR=never
+    SQLX_OFFLINE=true
 RUN set -eu; \
     case "$TARGETARCH" in \
       amd64) triple=x86_64-unknown-linux-gnu;  cross="gcc-x86-64-linux-gnu libc6-dev-amd64-cross" ;; \
@@ -70,13 +93,22 @@ RUN set -eu; \
     fi; \
     rustup target add "$triple"; \
     echo "$triple" > /rust-target
-WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
-COPY crates ./crates
 ARG CARGO_BUILD_JOBS
+# 1. Dependencies only (cached until Cargo.toml or Cargo.lock change).
+COPY --from=rust-plan /recipe.json /recipe.json
 RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=chrysopoeia-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=chrysopoeia-target-${TARGETARCH},target=/src/target,sharing=locked \
+    set -eu; \
+    triple="$(cat /rust-target)"; \
+    jobs="${CARGO_BUILD_JOBS:-}"; \
+    unset CARGO_BUILD_JOBS; \
+    cargo chef cook --release --locked --target "$triple" --recipe-path /recipe.json \
+        -p chrysopoeia-server --bin chrysopoeia ${jobs:+--jobs "$jobs"}
+# 2. Chrysopoeia itself.
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=chrysopoeia-cargo-git,target=/usr/local/cargo/git \
     set -eu; \
     triple="$(cat /rust-target)"; \
     jobs="${CARGO_BUILD_JOBS:-}"; \

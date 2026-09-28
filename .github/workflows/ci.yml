@@ -1,8 +1,10 @@
 name: CI
 
+# Pull requests cover branches; pushes run only for main, so a branch with an
+# open pull request is not built twice.
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -113,6 +115,9 @@ jobs:
 
       - name: Image size
         run: docker image ls chrysopoeia:ci
+
+      - name: Entrypoint tests (PUID/PGID, GPU groups, privilege drop)
+        run: docker/test-entrypoint.sh chrysopoeia:ci
 
       - name: End-to-end smoke test
         run: scripts/e2e-smoke.sh chrysopoeia:ci

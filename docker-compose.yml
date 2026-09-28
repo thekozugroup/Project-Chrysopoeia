@@ -32,8 +32,9 @@ services:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
       TZ: ${TZ:-Etc/UTC}
-      # auto picks the best verified hardware encoder, else the CPU.
-      # Other values: cpu, nvenc, qsv, vaapi, amf
+      # auto picks the best verified hardware encoder, else the CPU. Other
+      # values: cpu, nvenc (NVIDIA), qsv (Intel), vaapi (Intel or AMD), amf,
+      # rkmpp (Rockchip), v4l2m2m (Raspberry Pi 4); see .env.example.
       HW_ACCEL: ${HW_ACCEL:-auto}
       # Jobs at once. Leave empty for automatic (based on CPU, memory and GPU).
       MAX_JOBS: ${MAX_JOBS:-}

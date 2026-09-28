@@ -35,11 +35,15 @@ In the template (step 3) you will add `--runtime=nvidia` and set
 3. Open the Unraid terminal (the `>_` icon) and run `ls -l /dev/dri`. You
    should see `renderD128`. If not, reboot once.
 
+In the template (step 3) you will add `/dev/dri` as a device.
+
 ### AMD
 
 1. **Apps** > search **Radeon TOP** (by ich777) > **Install**. It loads the
    `amdgpu` driver.
 2. In the terminal, `ls -l /dev/dri` should list `renderD128`.
+
+In the template (step 3) you will add `/dev/dri` as a device.
 
 ## 2. Install Chrysopoeia
 
@@ -61,9 +65,19 @@ list.
 |---|---|
 | Web UI port | `8080`, or any free port. |
 | Config | `/mnt/user/appdata/chrysopoeia` (the default). Holds the database; it stays small. |
-| Media | The share to convert, e.g. `/mnt/user/media/`. The default `/mnt/user/` exposes every share; narrowing it is safer. Inside the app this folder is `/media`. |
+| Media | **Required.** The share that holds your videos, e.g. `/mnt/user/media/` (click the field to browse). Choose only what you want converted, never all of `/mnt/user/`: Chrysopoeia replaces files in this folder, so other apps' folders (appdata, photo libraries, camera recordings) must stay out of it. Inside the app this folder is `/media`. |
 | Transcode cache | Optional. A folder on an SSD pool for in-progress files, e.g. `/mnt/cache/chrysopoeia-temp/`. See [Transcode cache](#transcode-cache-on-an-ssd). |
-| Intel/AMD GPU | Keep `/dev/dri` if you did the Intel or AMD step. **Remove this entry** (the *Remove* button next to it) if your server has no `/dev/dri` (NVIDIA-only or no GPU): Docker refuses to start a container with a device that does not exist. |
+
+**Intel or AMD graphics:** add the GPU as a device. Do this only if
+`ls -l /dev/dri` listed `renderD128` in step 1: Docker will not start a
+container whose device does not exist, which is why the template does not
+include it by default.
+
+1. At the bottom of the template, click **Add another Path, Port, Variable,
+   Label or Device**.
+2. Set **Config Type** to *Device*, **Name** to `Intel/AMD GPU` and **Value**
+   to `/dev/dri`.
+3. Click **Add**.
 
 Under **Show more settings**:
 
@@ -71,9 +85,9 @@ Under **Show more settings**:
 |---|---|---|
 | PUID / PGID | `99` / `100` | Unraid's `nobody` / `users`. Keep them unless your media is owned by someone else. |
 | UMASK | `002` | New files are readable by everyone and editable by the `users` group. |
-| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` forces CPU encoding. |
+| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU; `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) forces one. |
 | MAX_JOBS | empty | Empty = automatic. You can change it later in the app. |
-| NVIDIA_VISIBLE_DEVICES | empty | NVIDIA: your GPU UUID or `all`. |
+| NVIDIA_VISIBLE_DEVICES | empty | NVIDIA: `all`, or one GPU UUID to use only that card. |
 
 **NVIDIA only:** switch the editor to **Advanced View** (toggle at the top
 right), and put `--runtime=nvidia` in **Extra Parameters**.
@@ -151,7 +165,8 @@ runs as and every GPU device it can see.
 
 | Problem | Fix |
 |---|---|
-| Container will not start: *error gathering device information while adding custom device "/dev/dri"* | Your server has no `/dev/dri`. Remove the *Intel/AMD GPU* entry from the template, or install Intel GPU TOP / Radeon TOP first. |
+| Container will not start: *error gathering device information while adding custom device "/dev/dri"* | The template has a `/dev/dri` device, but the server has no `/dev/dri`. Install Intel GPU TOP or Radeon TOP and reboot, or remove the device: **Edit** the container and click **Remove** next to it. |
+| Log warns that a device *belongs to the root group* | Chrysopoeia does not join the root group, for safety. In the Unraid terminal run `chgrp video /dev/dri/renderD128 && chmod g+rw /dev/dri/renderD128` (with the device named in the warning), then restart the container. To keep it after a reboot, add the same line to `/boot/config/go`. |
 | NVIDIA card not used; log says *NVIDIA_VISIBLE_DEVICES is set but no NVIDIA GPU is visible* | Add `--runtime=nvidia` to Extra Parameters (Advanced View). After installing the Nvidia-Driver plugin, restart Docker once. |
 | NVIDIA encoders fail on the Hardware page | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
 | Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). The Hardware page shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
