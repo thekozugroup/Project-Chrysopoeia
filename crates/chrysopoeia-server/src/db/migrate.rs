@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -119,29 +119,73 @@ const MIGRATION_V3: &[&str] = &["ALTER TABLE jobs ADD COLUMN notes TEXT"];
 /// start-up recovery can finish a replacement a crash interrupted.
 const MIGRATION_V4: &[&str] = &["ALTER TABLE jobs ADD COLUMN final_path TEXT"];
 
+/// Version 5:
+/// - `jobs.force`: the job converts the file anyway ("Convert anyway").
+/// - `libraries.settling`: files the last scan left for later because they
+///   were still being copied.
+/// - `savings` keyed by day and library, so removing a library removes its
+///   share of the history (the chart then describes the same files as the
+///   total above it). With one library, the old daily rows are all its own;
+///   with several, the history is rebuilt from the conversions still on
+///   record, which cover the 30 days the chart shows.
+const MIGRATION_V5: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN force INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE libraries ADD COLUMN settling INTEGER NOT NULL DEFAULT 0",
+    "CREATE TABLE savings_by_library (
+        date        TEXT NOT NULL,
+        library_id  TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        saved_bytes INTEGER NOT NULL DEFAULT 0,
+        files       INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (date, library_id)
+    )",
+    "INSERT INTO savings_by_library (date, library_id, saved_bytes, files) \
+     SELECT s.date, l.id, s.saved_bytes, s.files FROM savings s, libraries l \
+     WHERE (SELECT COUNT(*) FROM libraries) = 1",
+    "INSERT INTO savings_by_library (date, library_id, saved_bytes, files) \
+     SELECT substr(j.finished_at, 1, 10), j.library_id, \
+            SUM(j.input_size - j.output_size), COUNT(*) \
+     FROM jobs j JOIN libraries l ON l.id = j.library_id \
+     WHERE j.state = 'done' AND j.output_size IS NOT NULL AND j.finished_at IS NOT NULL \
+       AND (SELECT COUNT(*) FROM libraries) > 1 \
+     GROUP BY substr(j.finished_at, 1, 10), j.library_id",
+    "DROP TABLE savings",
+    "ALTER TABLE savings_by_library RENAME TO savings",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
-const MIGRATIONS: &[(i64, &[&str])] = &[(2, MIGRATION_V2), (3, MIGRATION_V3), (4, MIGRATION_V4)];
+const MIGRATIONS: &[(i64, &[&str])] = &[
+    (2, MIGRATION_V2),
+    (3, MIGRATION_V3),
+    (4, MIGRATION_V4),
+    (5, MIGRATION_V5),
+];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
+    migrate_to(pool, SCHEMA_VERSION).await
+}
+
+/// Bring the database towards [`SCHEMA_VERSION`] step by step, stopping at
+/// version `last` (tests build older databases with it).
+async fn migrate_to(pool: &SqlitePool, last: i64) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?;
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
         .fetch_one(&mut *conn)
         .await?;
-    if version == SCHEMA_VERSION {
-        return Ok(());
-    }
     if version > SCHEMA_VERSION {
         bail!(
             "This database was created by a newer version of Chrysopoeia (schema {version}). \
              Update Chrysopoeia, or move the database file away to start fresh."
         );
     }
+    if version >= last {
+        return Ok(());
+    }
     if version < 1 {
         create_v1(&mut conn).await?;
     }
     for (target, statements) in MIGRATIONS {
-        if *target <= version {
+        if *target <= version || *target > last {
             continue;
         }
         let mut tx = sqlx::Connection::begin(&mut *conn).await?;
@@ -362,6 +406,88 @@ mod tests {
         .map(|r| r.get::<String, _>("detail"))
         .collect();
         assert!(!plan.iter().any(|d| d.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    /// A version 4 database with `libraries` and `jobs` rows, and daily
+    /// savings of `saved` bytes on 2026-09-01.
+    async fn version_4_db(path: &std::path::Path, libraries: &[&str], saved: i64) {
+        let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+            .await
+            .unwrap();
+        migrate_to(&pool, 4).await.unwrap();
+        for (i, lib) in libraries.iter().enumerate() {
+            for sql in [
+                format!(
+                    "INSERT INTO libraries (id, name, path, profile, created_at) \
+                     VALUES ('{lib}', '{lib}', '/m/{lib}', '{{}}', '2026-01-01T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, saved_bytes, scanned_at, updated_at) \
+                     VALUES ('f{i}', '{lib}', '/m/{lib}/a.mkv', 'a.mkv', 'a.mkv', 60, 'x', \
+                     'done', 40, 'x', 'x')"
+                ),
+                format!(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, input_size, output_size, created_at, finished_at) VALUES ('j{i}', \
+                     'f{i}', '{lib}', 'a.mkv', '/m/{lib}/a.mkv', 'done', 'finalizing', 100, 60, \
+                     '2026-09-01T10:00:00.000Z', '2026-09-01T11:00:00.000Z')"
+                ),
+            ] {
+                sqlx::query(&sql).execute(&pool).await.unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO savings (date, saved_bytes, files) VALUES ('2026-09-01', ?, 3)")
+            .bind(saved)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+    }
+
+    async fn savings_rows(pool: &SqlitePool) -> Vec<(String, String, i64, i64)> {
+        sqlx::query_as(
+            "SELECT date, library_id, saved_bytes, files FROM savings ORDER BY library_id",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn version_5_keys_savings_by_library() {
+        // One library: the old history is all its own, kept as it was.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.db");
+        version_4_db(&path, &["a"], 1234).await;
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(
+            savings_rows(db.pool()).await,
+            [("2026-09-01".to_string(), "a".to_string(), 1234, 3)]
+        );
+        let force: i64 = sqlx::query_scalar("SELECT force FROM jobs WHERE id = 'j0'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(force, 0);
+
+        // Several: rebuilt per library from the finished conversions.
+        let path = dir.path().join("two.db");
+        version_4_db(&path, &["a", "b"], 999).await;
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(
+            savings_rows(db.pool()).await,
+            [
+                ("2026-09-01".to_string(), "a".to_string(), 40, 1),
+                ("2026-09-01".to_string(), "b".to_string(), 40, 1),
+            ]
+        );
+        // Removing a library removes its share.
+        sqlx::query("DELETE FROM libraries WHERE id = 'b'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(savings_rows(db.pool()).await.len(), 1);
     }
 
     #[tokio::test]

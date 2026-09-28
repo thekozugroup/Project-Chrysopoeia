@@ -227,6 +227,7 @@ async fn run_detection(state: &AppState) -> Arc<HardwareInfo> {
             }
         }
     }
+    apply_preference_hint(&mut info, settings.hardware, settings.cpu_fallback);
     let busy = info
         .encoders
         .iter()
@@ -327,8 +328,33 @@ pub async fn recheck_loop(state: AppState) {
     }
 }
 
-/// Recompute `recommended_jobs` after the hardware preference changed.
-pub async fn apply_preference(state: &AppState, preference: HwPreference) {
+/// Show, in the hardware hints, when the hardware chosen in Settings has no
+/// working encoder here (files then convert on the CPU, or not at all with
+/// CPU fallback off). Replaces the hint an earlier choice left.
+pub fn apply_preference_hint(
+    info: &mut HardwareInfo,
+    preference: HwPreference,
+    cpu_fallback: bool,
+) {
+    info.hints
+        .retain(|h| h.title != chrysopoeia_hwdetect::PREFERENCE_UNAVAILABLE_TITLE);
+    if info.detecting {
+        return;
+    }
+    if let Some(hint) = chrysopoeia_hwdetect::preference_hint(info, preference, cpu_fallback) {
+        info.hints.push(hint);
+        // Errors first, then warnings, then tips (as detection orders them).
+        info.hints.sort_by_key(|h| match h.level {
+            SetupHintLevel::Error => 0,
+            SetupHintLevel::Warning => 1,
+            SetupHintLevel::Info => 2,
+        });
+    }
+}
+
+/// Recompute `recommended_jobs` and the hint about the chosen hardware
+/// after the hardware preference or CPU fallback changed.
+pub async fn apply_preference(state: &AppState, preference: HwPreference, cpu_fallback: bool) {
     let Some(current) = state.hardware.current() else {
         return;
     };
@@ -338,6 +364,7 @@ pub async fn apply_preference(state: &AppState, preference: HwPreference) {
     };
     let mut info = (*current).clone();
     info.recommended_jobs = recommendation;
+    apply_preference_hint(&mut info, preference, cpu_fallback);
     let info = state.hardware.set(info);
     state.emit(Event::HardwareUpdated {
         hardware: Box::new((*info).clone()),

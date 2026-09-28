@@ -84,6 +84,11 @@ pub struct JobSpec {
     pub profile: TranscodeProfile,
     /// Encoders to try in order (from `chrysopoeia_hwdetect::encoder_candidates`).
     pub candidates: Vec<EncoderCandidate>,
+    /// "Convert anyway": convert even when the file is already efficient or
+    /// already in the target format ([`crate::plan::decide_forced`]), and
+    /// keep the result whatever its size (`min_savings_pct` is not applied).
+    /// Verification still applies.
+    pub force: bool,
 }
 
 /// How a job ended.
@@ -200,6 +205,9 @@ pub async fn run_job_with(
     outcome
 }
 
+/// The worker's own record of how a job ended, at debug level: the server
+/// writes the one plain line per finished job that the log shows by default
+/// (its activity entry), so an info line here would only repeat it.
 fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
     let file = spec.input.display();
     match outcome {
@@ -209,19 +217,17 @@ fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
             original_size,
             output_size,
             ..
-        } => tracing::info!(
+        } => tracing::debug!(
             job = %spec.job_id, %file, %encoder, attempt,
             "done: {} → {}", human_bytes(*original_size), human_bytes(*output_size)
         ),
         JobOutcome::Skipped { reason, .. } => {
-            tracing::info!(job = %spec.job_id, %file, "skipped: {reason}");
+            tracing::debug!(job = %spec.job_id, %file, "skipped: {reason}");
         }
-        // The caller reports failures to the user (and the log); a second
-        // warning here would only repeat it.
         JobOutcome::Failed { error, .. } => {
             tracing::debug!(job = %spec.job_id, %file, "failed: {error}");
         }
-        JobOutcome::Cancelled => tracing::info!(job = %spec.job_id, %file, "cancelled"),
+        JobOutcome::Cancelled => tracing::debug!(job = %spec.job_id, %file, "cancelled"),
     }
 }
 
@@ -290,6 +296,16 @@ struct Job<'a> {
 }
 
 impl Job<'_> {
+    /// The size rule for this job: the profile's, except when converting
+    /// anyway (the user wants the new file whatever its size).
+    fn min_savings_pct(&self) -> Option<u8> {
+        if self.spec.force {
+            None
+        } else {
+            self.spec.profile.min_savings_pct
+        }
+    }
+
     async fn run(&self) -> JobOutcome {
         if self.cancel.is_cancelled() {
             return JobOutcome::Cancelled;
@@ -324,7 +340,15 @@ impl Job<'_> {
             Err(e) => return Err(failed(format!("Could not read the file: {e}"))),
         };
 
-        if let Decision::Skip { reason } = (self.decider)(&spec.probe, &spec.profile) {
+        let decision = match (self.decider)(&spec.probe, &spec.profile) {
+            // Converting anyway sets aside the rules about files that are
+            // already efficient, not those that protect the file.
+            Decision::Skip { .. } if spec.force => {
+                crate::plan::decide_forced(&spec.probe, &spec.profile)
+            }
+            decision => decision,
+        };
+        if let Decision::Skip { reason } = decision {
             return Err(JobOutcome::Skipped {
                 reason,
                 encoder: None,
@@ -423,7 +447,7 @@ impl Job<'_> {
         final_path: &Path,
     ) -> Result<SpaceGuard, JobOutcome> {
         let needed = input_size.saturating_add(input_size / 10);
-        let largest_kept = match self.spec.profile.min_savings_pct {
+        let largest_kept = match self.min_savings_pct() {
             Some(p) => input_size / 100 * u64::from(100u8.saturating_sub(p)),
             None => input_size,
         };
@@ -547,11 +571,14 @@ impl Job<'_> {
                     let error = other
                         .describe_failure(&candidate.name)
                         .unwrap_or_else(|| format!("{} failed", candidate.name));
-                    if is_last {
-                        tracing::debug!(job = %spec.job_id, attempt, "{error}");
+                    // The job's notes (or its error) tell the user; the log
+                    // keeps the attempt-by-attempt detail at debug level.
+                    let next = if is_last {
+                        ""
                     } else {
-                        tracing::info!(job = %spec.job_id, attempt, "{error}; trying the next option");
-                    }
+                        "; trying the next option"
+                    };
+                    tracing::debug!(job = %spec.job_id, attempt, "{error}{next}");
                     last_failure = Some(failure(error, other.tail().map(str::to_string)));
                     guard.clear().await;
                     continue;
@@ -593,7 +620,7 @@ impl Job<'_> {
                 if conclusive {
                     return f.into_outcome();
                 }
-                tracing::info!(
+                tracing::debug!(
                     job = %spec.job_id, attempt,
                     "{} stopped early while decoding on the GPU; trying the next option",
                     candidate.name
@@ -603,11 +630,9 @@ impl Job<'_> {
                 continue;
             }
 
-            if let Some(reason) = size_rule(
-                spec.profile.min_savings_pct,
-                prepared.original_size,
-                output_size,
-            ) {
+            if let Some(reason) =
+                size_rule(self.min_savings_pct(), prepared.original_size, output_size)
+            {
                 return JobOutcome::Skipped {
                     reason,
                     encoder: Some(candidate.name.clone()),
@@ -676,7 +701,7 @@ impl Job<'_> {
                 let mut f = failure(verification_error(report), None);
                 f.validation = Some(report.clone());
                 if candidate.api.is_hardware() && !is_last {
-                    tracing::info!(
+                    tracing::debug!(
                         job = %spec.job_id, attempt,
                         "{} output failed verification; trying the next option", candidate.name
                     );
@@ -1018,11 +1043,46 @@ async fn remove_empty_dirs(created: &[PathBuf]) {
     }
 }
 
-/// "Verification failed: <label> — <detail>".
-fn verification_error(report: &ValidationReport) -> String {
-    match report.first_failure() {
-        Some(check) => format!("Verification failed: {} — {}", check.label, check.detail),
-        None => "Verification failed".to_string(),
+/// Why a result failed verification, for the job's error and the activity
+/// feed. A check's label says what passing means ("Same length as the
+/// original"), so it is never used here: the failure is phrased per check,
+/// e.g. "The new file is shorter than the original (0.1 s instead of 8.0 s)".
+pub(crate) fn verification_error(report: &ValidationReport) -> String {
+    let Some(check) = report.first_failure() else {
+        return "The new file didn't pass verification, so the original was kept".to_string();
+    };
+    let detail = check.detail.trim().trim_end_matches('.');
+    // Checks whose detail names a measurement rather than the problem get a
+    // plain statement of the problem first.
+    let lead = match check.id.as_str() {
+        "streams" => Some("The new file doesn't have the tracks it should"),
+        "decode" => Some("The new file doesn't play start to finish"),
+        "visual" => Some("The new file doesn't look like the original"),
+        "black_frames" | "frozen_frames" if !detail.starts_with("The new file") => {
+            Some("The new file has more black or frozen video than the original")
+        }
+        // probe, duration and the rest describe the problem themselves:
+        // "The new file could not be opened: …", "The new file is shorter
+        // than the original (0.1 s instead of 8.0 s)".
+        "probe" | "duration" if detail.is_empty() => {
+            Some("The new file isn't a complete copy of the original")
+        }
+        _ if detail.is_empty() => Some("The new file didn't pass verification"),
+        _ => None,
+    };
+    match (lead, detail.is_empty()) {
+        (Some(lead), true) => lead.to_string(),
+        (Some(lead), false) => format!("{lead}. {}", capitalize_first(detail)),
+        (None, _) => capitalize_first(detail),
+    }
+}
+
+/// `text` with its first letter in upper case.
+fn capitalize_first(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
     }
 }
 
@@ -1617,8 +1677,74 @@ mod tests {
         };
         assert_eq!(
             verification_error(&report),
-            "Verification failed: Plays start to finish — Found a playback error"
+            "The new file doesn't play start to finish. Found a playback error"
         );
+    }
+
+    /// The error never repeats a check's pass-form label, which reads as if
+    /// the check passed ("Same length as the original — The new file is …").
+    #[test]
+    fn verification_errors_use_failure_phrasing_per_check() {
+        let failing = |id: &str, label: &str, detail: &str| ValidationReport {
+            passed: false,
+            level: ValidationLevel::Standard,
+            checks: vec![ValidationCheck {
+                id: id.into(),
+                label: label.into(),
+                status: CheckStatus::Fail,
+                detail: detail.into(),
+                value: None,
+            }],
+            ssim_min: None,
+            ssim_avg: None,
+            psnr_avg: None,
+            elapsed_secs: 1.0,
+        };
+        let cases = [
+            (
+                "duration",
+                "Same length as the original",
+                "The new file is shorter than the original (0.1 s instead of 8.0 s)",
+                "The new file is shorter than the original (0.1 s instead of 8.0 s)",
+            ),
+            (
+                "probe",
+                "Opens correctly",
+                "The new file could not be opened: Invalid data found",
+                "The new file could not be opened: Invalid data found",
+            ),
+            (
+                "streams",
+                "All tracks present",
+                "Expected 1 video and 2 audio tracks but found 1 video track",
+                "The new file doesn't have the tracks it should. Expected 1 video and 2 audio \
+                 tracks but found 1 video track",
+            ),
+            (
+                "visual",
+                "Looks like the original",
+                "A frame near 0:10 looks very different from the original (similarity 0.40)",
+                "The new file doesn't look like the original. A frame near 0:10 looks very \
+                 different from the original (similarity 0.40)",
+            ),
+            (
+                "black_frames",
+                "No extra black frames",
+                "The new file has 3.0 s more black video than the original",
+                "The new file has 3.0 s more black video than the original",
+            ),
+            (
+                "decode",
+                "Plays start to finish",
+                "",
+                "The new file doesn't play start to finish",
+            ),
+        ];
+        for (id, label, detail, expected) in cases {
+            let error = verification_error(&failing(id, label, detail));
+            assert_eq!(error, expected, "{id}");
+            assert!(!error.contains(label), "{id}: {error}");
+        }
     }
 
     #[test]
@@ -1695,6 +1821,7 @@ mod tests {
             probe: ProbeInfo::default(),
             profile: TranscodeProfile::default(),
             candidates: Vec::new(),
+            force: false,
         };
         let (tx, _rx) = mpsc::channel(1);
         let job = run_job(&cfg, &spec, tx, CancellationToken::new());

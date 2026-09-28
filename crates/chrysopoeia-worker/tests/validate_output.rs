@@ -374,6 +374,10 @@ async fn truncated_output_fails_the_duration_check() {
         describe(&report)
     );
     assert!(detail.contains("2.0 s"), "{detail}");
+    assert!(
+        detail.starts_with("The new file is shorter than the original ("),
+        "{detail}"
+    );
 }
 
 #[tokio::test]
@@ -462,7 +466,10 @@ async fn wrong_video_codec_fails_opens_correctly() {
     let report = validate_output(&req, &CancellationToken::new(), &|_| {}).await;
     let (label, detail) = first_failure(&report);
     assert_eq!(label, "Opens correctly");
-    assert_eq!(detail, "The video is H.264 instead of HEVC (H.265)");
+    assert_eq!(
+        detail,
+        "The new file's video is H.264 instead of HEVC (H.265)"
+    );
 }
 
 #[tokio::test]

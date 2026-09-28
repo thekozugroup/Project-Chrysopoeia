@@ -125,6 +125,8 @@ pub struct FakeToolkit {
     pub running: AtomicUsize,
     pub max_running: AtomicUsize,
     pub run_configs: Mutex<Vec<RunConfig>>,
+    /// Every job the fake ran, as the dispatcher described it.
+    pub run_specs: Mutex<Vec<JobSpec>>,
     pub recovered: Mutex<Vec<PathBuf>>,
     pub walks: Mutex<Vec<PathBuf>>,
     pub watch_tx: Mutex<Option<mpsc::Sender<WatchEvent>>>,
@@ -153,6 +155,7 @@ impl Default for FakeToolkit {
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
             run_configs: Mutex::new(Vec::new()),
+            run_specs: Mutex::new(Vec::new()),
             recovered: Mutex::new(Vec::new()),
             walks: Mutex::new(Vec::new()),
             watch_tx: Mutex::new(None),
@@ -580,6 +583,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                 .unwrap_or_default();
             me.started.lock().unwrap().push(name.clone());
             me.run_configs.lock().unwrap().push(cfg.clone());
+            me.run_specs.lock().unwrap().push(spec.clone());
             let now = me.running.fetch_add(1, Ordering::SeqCst) + 1;
             me.max_running.fetch_max(now, Ordering::SeqCst);
             let _count = RunningCount(&me);

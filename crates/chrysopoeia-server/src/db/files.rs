@@ -505,6 +505,23 @@ pub async fn set_status_where(
     Ok(qb.build().execute(conn).await?.rows_affected() > 0)
 }
 
+/// After a job for a file Chrysopoeia converted before ended without a new
+/// result (skipped): the file on disk is still the converted one, so it
+/// stays `done` with its savings. Only files with `original_size_bytes`
+/// qualify (set when a conversion replaced the file, cleared when its
+/// content changes). Returns whether the file was kept done.
+pub async fn keep_converted(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<bool> {
+    let done = sqlx::query(
+        "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ? \
+         WHERE id = ? AND original_size_bytes IS NOT NULL",
+    )
+    .bind(now_ts())
+    .bind(id.to_string())
+    .execute(conn)
+    .await?;
+    Ok(done.rows_affected() > 0)
+}
+
 /// Set a file's status, reason and error (and optionally its job).
 pub async fn set_status(
     conn: &mut SqliteConnection,
@@ -791,6 +808,50 @@ pub async fn redecide_candidates(
             }),
             Err(e) => tracing::warn!("skipping a stored probe that no longer parses: {e}"),
         }
+    }
+    Ok(out)
+}
+
+/// What deciding whether a selected file is worth queueing needs.
+#[derive(Debug, Clone)]
+pub struct QueueCandidate {
+    pub id: Uuid,
+    pub library_id: Uuid,
+    pub status: FileStatus,
+    /// `None` when the file was never probed (or its probe no longer parses).
+    pub probe: Option<ProbeInfo>,
+}
+
+/// The files among `ids` (at most a few hundred), with their probes.
+pub async fn queue_candidates(
+    pool: &SqlitePool,
+    ids: &[Uuid],
+) -> sqlx::Result<Vec<QueueCandidate>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, library_id, status, probe FROM files WHERE id IN (",
+    );
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id.to_string());
+    }
+    qb.push(")");
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let status: String = row.try_get("status")?;
+        let Some(status) = FileStatus::parse(&status) else {
+            continue;
+        };
+        let probe: Option<String> = row.try_get("probe")?;
+        out.push(QueueCandidate {
+            id: uuid_col(row, "id")?,
+            library_id: uuid_col(row, "library_id")?,
+            status,
+            probe: probe.and_then(|p| parse_json::<ProbeInfo>(&p).ok()),
+        });
     }
     Ok(out)
 }

@@ -71,6 +71,12 @@ pub trait MediaToolkit: Send + Sync + 'static {
     /// Whether a path has a media extension. Blocking-safe, pure.
     fn is_media_path(&self, path: &Path) -> bool;
 
+    /// Whether a path is a video file (media, but not audio only).
+    /// Blocking-safe, pure.
+    fn is_video_path(&self, path: &Path) -> bool {
+        chrysopoeia_scanner::is_video_path(path)
+    }
+
     /// Walk a library root. Blocking.
     fn walk_library(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult>;
 
@@ -308,6 +314,11 @@ impl Toolkit {
     /// See [`MediaToolkit::is_media_path`]. Call from a blocking thread.
     pub fn is_media_path_blocking(&self, path: &Path) -> Result<bool, ToolPanic> {
         self.sync_call("media file check", || self.inner.is_media_path(path))
+    }
+
+    /// See [`MediaToolkit::is_video_path`]. Call from a blocking thread.
+    pub fn is_video_path_blocking(&self, path: &Path) -> Result<bool, ToolPanic> {
+        self.sync_call("video file check", || self.inner.is_video_path(path))
     }
 
     /// Walk a library root on a blocking thread.

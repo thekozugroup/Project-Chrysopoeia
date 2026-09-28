@@ -64,6 +64,10 @@ pub struct LibraryHandle {
     /// another name (see [`remember_removed`]).
     removed: std::sync::Mutex<RecentlyRemoved>,
     probes: Arc<Semaphore>,
+    /// Per library, the number of the scan whose files still being copied
+    /// are being looked at again (see [`recheck_settling`]); a newer scan
+    /// takes over from an older one.
+    settle_scans: std::sync::Mutex<HashMap<Uuid, u64>>,
 }
 
 /// How long a removed file's row is remembered for a rename or move.
@@ -88,6 +92,7 @@ impl Default for LibraryHandle {
             reported_walk_problems: std::sync::Mutex::new(HashMap::new()),
             removed: std::sync::Mutex::new(RecentlyRemoved::default()),
             probes: Arc::new(Semaphore::new(PROBE_CONCURRENCY)),
+            settle_scans: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -476,6 +481,7 @@ async fn write_batch(
                     file_path: &row.path,
                     input_size: row.size_bytes,
                     priority: 0,
+                    force: false,
                 },
             )
             .await?;
@@ -524,6 +530,29 @@ const SETTLE_ROUNDS: u32 = 180;
 /// Look at files that were still being written again once they had time to
 /// settle, so they don't wait for the next scan.
 fn recheck_settling(state: &AppState, paths: Vec<PathBuf>) {
+    recheck_settling_for(state, paths, None);
+}
+
+/// Record how many files a finished scan of `library_id` left for later
+/// because they were still being copied (`LibraryStats::settling`), and
+/// look at them again as they settle, lowering the count as they are
+/// added. A later scan of the library takes over the count.
+async fn track_settling(state: &AppState, library_id: Uuid, paths: Vec<PathBuf>) {
+    let scan = {
+        let mut scans = lock(&state.library.settle_scans);
+        let n = scans.entry(library_id).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if let Err(e) = db::stats::set_settling(state.db.pool(), library_id, paths.len() as u64).await {
+        tracing::warn!(library = %library_id, "could not record the files still being copied: {e}");
+    }
+    recheck_settling_for(state, paths, Some((library_id, scan)));
+}
+
+/// [`recheck_settling`], keeping the settling count of the scan `owner`
+/// (library, scan number) up to date while that scan is the library's last.
+fn recheck_settling_for(state: &AppState, paths: Vec<PathBuf>, owner: Option<(Uuid, u64)>) {
     if paths.is_empty() {
         return;
     }
@@ -544,6 +573,24 @@ fn recheck_settling(state: &AppState, paths: Vec<PathBuf>) {
                     Err(e) => {
                         tracing::warn!(path = %path.display(), "could not check a new file: {e:#}");
                     }
+                }
+            }
+            if let Some((library_id, scan)) = owner {
+                let current = lock(&state.library.settle_scans).get(&library_id).copied();
+                if current != Some(scan) {
+                    // A newer scan found these files again and looks after them.
+                    return;
+                }
+                let count = still.len() as u64;
+                match db::stats::set_settling(state.db.pool(), library_id, count).await {
+                    Ok(()) => {
+                        state.broadcast_library(library_id).await;
+                        state.broadcast_stats().await;
+                    }
+                    Err(e) => tracing::warn!(
+                        library = %library_id,
+                        "could not record the files still being copied: {e}"
+                    ),
                 }
             }
             if still.is_empty() {
@@ -1014,7 +1061,7 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "scan finished"
     );
-    recheck_settling(state, settling);
+    track_settling(state, id, settling).await;
     state.emit(scan_progress(
         &lib,
         ScanPhase::Done,

@@ -75,6 +75,11 @@ pub struct Job {
     /// "Removed 2 picture-based subtitles because MP4 can't hold them".
     #[serde(default)]
     pub notes: Vec<String>,
+    /// "Convert anyway": queued with `force`, so the file is converted even
+    /// when it is already efficient or in the target format, and kept
+    /// whatever its size. Verification still applies.
+    #[serde(default)]
+    pub force: bool,
     pub created_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,

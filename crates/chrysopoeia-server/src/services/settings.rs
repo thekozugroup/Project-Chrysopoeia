@@ -113,6 +113,20 @@ async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiRe
     }
 }
 
+/// The scanner's reason an ignore pattern can't be used, as a settings
+/// error: it is worded for the scan log ("…, so it was not used"), and any
+/// glob library detail ("error parsing glob '…': …") is dropped so only a
+/// plain reason naming the pattern is left.
+fn ignore_pattern_error(reason: &str) -> String {
+    let mut reason = reason.replace(", so it was not used", "");
+    if let Some(start) = reason.find("error parsing glob '")
+        && let Some(end) = reason[start..].find("': ")
+    {
+        reason.replace_range(start..start + end + 3, "");
+    }
+    format!("{}.", reason.trim().trim_end_matches('.'))
+}
+
 /// Normalize and validate new settings. `old` are the settings they
 /// replace: an ignore pattern saved before patterns were checked this
 /// strictly doesn't block other changes (scans skip it and say so).
@@ -133,7 +147,7 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
     {
         return Err(invalid_field(
             "max_jobs",
-            format!("Jobs at once must be between 1 and {MAX_JOBS_LIMIT}."),
+            format!("Files at once must be between 1 and {MAX_JOBS_LIMIT}."),
         ));
     }
     if let Some(h) = s.active_hours
@@ -152,12 +166,7 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
         .filter(|p| !old.ignore_patterns.contains(p))
     {
         if let Err(e) = validate_ignore_pattern(p) {
-            // The scanner words it for its log ("…, so it was not used").
-            let reason = e.replace(", so it was not used", "");
-            return Err(invalid_field(
-                "ignore_patterns",
-                format!("{}.", reason.trim_end_matches('.')),
-            ));
+            return Err(invalid_field("ignore_patterns", ignore_pattern_error(&e)));
         }
     }
     if let Some(dir) = s.temp_dir.clone() {
@@ -202,8 +211,8 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
         settings: Box::new(new.clone()),
     });
 
-    if old.hardware != new.hardware {
-        hardware::apply_preference(state, new.hardware).await;
+    if old.hardware != new.hardware || old.cpu_fallback != new.cpu_fallback {
+        hardware::apply_preference(state, new.hardware, new.cpu_fallback).await;
     }
     // The watcher filters events like a scan does, so it follows the ignore
     // patterns and minimum size too.
@@ -266,6 +275,23 @@ mod tests {
         assert_eq!(e.field.as_deref(), Some("default_profile.quality"));
         assert!(e.message.contains("Choose one of: "), "{}", e.message);
         assert!(!e.message.contains('`'), "{}", e.message);
+    }
+
+    #[test]
+    fn ignore_pattern_errors_are_plain_and_name_the_pattern() {
+        let e = validate_ignore_pattern("Movies/[abc").unwrap_err();
+        assert_eq!(
+            ignore_pattern_error(&e),
+            "The ignore pattern \"Movies/[abc\" has a [ without a closing ]."
+        );
+        // Whatever the glob library says is reduced to the plain reason.
+        assert_eq!(
+            ignore_pattern_error(
+                "The ignore pattern \"[\" is not valid (error parsing glob '**/[': unclosed \
+                 character class; missing ']'), so it was not used"
+            ),
+            "The ignore pattern \"[\" is not valid (unclosed character class; missing ']')."
+        );
     }
 
     #[test]

@@ -1,9 +1,13 @@
 //! User actions on files and jobs: queue, skip, bulk changes, cancel,
 //! priority, clearing history, and "Stop now".
 
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
-use chrysopoeia_core::{ActivityLevel, Event, FileStatus, Job, JobState, MediaFile, QueueState};
+use chrysopoeia_core::{
+    ActivityLevel, Event, FileStatus, Job, JobState, MediaFile, QueueState, TranscodeProfile,
+};
+use chrysopoeia_worker::Decision;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -17,8 +21,14 @@ use crate::services::library::USER_SKIP_REASON;
 use crate::state::AppState;
 
 /// How long an API call waits for a running job to wind down after
-/// cancelling it (ffmpeg gets 5 s before it is killed).
+/// cancelling it. ffmpeg is killed at once (its output is thrown away), so
+/// a cancelled job normally ends within a moment; only a job that is
+/// already putting its result in place, which isn't interrupted, takes
+/// longer.
 pub const CANCEL_WAIT: Duration = Duration::from_secs(8);
+/// How long a cancel looks for the task of a job the queue has just marked
+/// running (the task starts a moment after the row changes).
+const STARTING_WAIT: Duration = Duration::from_millis(500);
 /// Files changed per transaction by a bulk action.
 const BULK_CHUNK: usize = 500;
 
@@ -38,8 +48,15 @@ async fn announce_file_change(state: &AppState, file: &MediaFile) {
 }
 
 /// Queue a file (pending, failed, skipped or done). 409 when it is already
-/// queued or processing.
-pub async fn queue_file(state: &AppState, file_id: Uuid, priority: Option<i32>) -> ApiResult<Job> {
+/// queued or processing. With `force` ("Convert anyway") the job converts
+/// the file even when the goal would leave it as it is, and keeps the
+/// result whatever its size; verification still applies.
+pub async fn queue_file(
+    state: &AppState,
+    file_id: Uuid,
+    priority: Option<i32>,
+    force: bool,
+) -> ApiResult<Job> {
     let file = db::files::get(state.db.pool(), file_id, false)
         .await?
         .ok_or_else(file_not_found)?;
@@ -59,6 +76,7 @@ pub async fn queue_file(state: &AppState, file_id: Uuid, priority: Option<i32>) 
             file_path: &file.path,
             input_size: file.size_bytes,
             priority: priority.unwrap_or(0),
+            force,
         },
     )
     .await?;
@@ -179,10 +197,71 @@ fn intersect(requested: &[FileStatus], allowed: &[FileStatus]) -> Vec<FileStatus
     }
 }
 
+/// What a bulk action did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BulkOutcome {
+    /// Files changed (queued, skipped).
+    pub affected: u64,
+    /// Selected files that were not queued because the library's goal
+    /// would leave them as they are (already efficient, already in the
+    /// target format, nothing to convert).
+    pub left_out: u64,
+}
+
+/// The files among `ids` worth a job: failed files (a retry), and files the
+/// library's goal would convert. Returns them in the given order, and how
+/// many were left out.
+async fn worth_queueing(state: &AppState, ids: Vec<Uuid>) -> ApiResult<(Vec<Uuid>, u64)> {
+    let pool = state.db.pool();
+    let profiles: HashMap<Uuid, TranscodeProfile> = db::libraries::list(pool)
+        .await?
+        .into_iter()
+        .map(|l| (l.id, l.profile))
+        .collect();
+    let mut keep = Vec::with_capacity(ids.len());
+    let mut left_out = 0u64;
+    for chunk in ids.chunks(BULK_CHUNK) {
+        let found: HashMap<Uuid, db::files::QueueCandidate> =
+            db::files::queue_candidates(pool, chunk)
+                .await?
+                .into_iter()
+                .map(|c| (c.id, c))
+                .collect();
+        for id in chunk {
+            let Some(c) = found.get(id) else {
+                continue;
+            };
+            let convert = c.status == FileStatus::Failed
+                || match (&c.probe, profiles.get(&c.library_id)) {
+                    (Some(probe), Some(profile)) => {
+                        matches!(
+                            state.toolkit.decide(probe, profile),
+                            Ok(Decision::Transcode)
+                        )
+                    }
+                    _ => false,
+                };
+            if convert {
+                keep.push(*id);
+            } else {
+                left_out += 1;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    Ok((keep, left_out))
+}
+
 /// Apply a bulk action. Without ids or a status filter, `queue` only takes
 /// pending files and `skip` pending and queued files, so a bare request can
-/// never re-convert finished files. Returns how many files changed.
-pub async fn bulk(state: &AppState, action: BulkAction, sel: BulkSelection) -> ApiResult<u64> {
+/// never re-convert finished files. `queue` with explicit ids only queues
+/// the files worth a job (see [`worth_queueing`]); the rest are counted as
+/// left out. Returns how many files changed and how many were left out.
+pub async fn bulk(
+    state: &AppState,
+    action: BulkAction,
+    sel: BulkSelection,
+) -> ApiResult<BulkOutcome> {
     use FileStatus::{Done, Failed, Pending, Processing, Queued, Skipped};
     let explicit = sel.ids.is_some();
     let statuses = match action {
@@ -200,12 +279,20 @@ pub async fn bulk(state: &AppState, action: BulkAction, sel: BulkSelection) -> A
         BulkAction::RetryFailed => vec![Failed],
     };
     if statuses.is_empty() {
-        return Ok(0);
+        return Ok(BulkOutcome::default());
     }
     let ids =
         db::files::select_ids(state.db.pool(), sel.ids.as_deref(), sel.library, &statuses).await?;
+    let (ids, left_out) = if action == BulkAction::Queue && explicit {
+        worth_queueing(state, ids).await?
+    } else {
+        (ids, 0)
+    };
     if ids.is_empty() {
-        return Ok(0);
+        return Ok(BulkOutcome {
+            affected: 0,
+            left_out,
+        });
     }
     // Work in chunks, each in its own short transaction, so a bulk action on
     // a big library never keeps other writers (job results, scans) waiting.
@@ -259,7 +346,23 @@ pub async fn bulk(state: &AppState, action: BulkAction, sel: BulkSelection) -> A
         state.broadcast_stats().await;
         state.broadcast_queue_state().await;
     }
-    Ok(affected)
+    Ok(BulkOutcome { affected, left_out })
+}
+
+/// Cancel a job the database says is running. The queue marks a job
+/// running a moment before its task starts, so a job without a task is
+/// looked for again briefly. Returns false when it has no task.
+async fn cancel_running(state: &AppState, id: Uuid) -> bool {
+    let deadline = Instant::now() + STARTING_WAIT;
+    loop {
+        if state.dispatcher.cancel_job(id, CancelIntent::User) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Cancel a queued or running job.
@@ -288,7 +391,7 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
             }
         }
         JobState::Running => {
-            if state.dispatcher.cancel_job(id, CancelIntent::User) {
+            if cancel_running(state, id).await {
                 state.dispatcher.wait_finished(&[id], CANCEL_WAIT).await;
             } else {
                 // A row marked running without a task (should not happen

@@ -24,7 +24,9 @@ mod process;
 pub mod recommend;
 
 pub use encoders::{NVENC_BUSY_SENTENCE, is_busy_failure};
-pub use hints::NVIDIA_BUSY_TITLE;
+pub use hints::{
+    NVIDIA_BUSY_TITLE, PREFERENCE_UNAVAILABLE_TITLE, preference_hint, preference_problem,
+};
 
 /// Inputs for [`detect`].
 #[derive(Debug, Clone)]

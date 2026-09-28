@@ -44,7 +44,7 @@ async fn first_run_applies_command_line_options() {
     assert_eq!(app.get("/api/files?status=done").await.json["total"], 1);
 
     // A later start with changed values: HW_ACCEL applies because it
-    // changed, MAX_JOBS applies because "Jobs at once" is still automatic,
+    // changed, MAX_JOBS applies because "Files at once" is still automatic,
     // and libraries aren't added again.
     let dir = app.stop().await;
     let app = TestApp::start(TestOptions {
@@ -62,6 +62,7 @@ async fn first_run_applies_command_line_options() {
     let q = app.get("/api/queue").await;
     assert_eq!(q.json["max_jobs"], 9);
     assert_eq!(q.json["max_jobs_auto"], false);
+    assert_eq!(q.json["max_jobs_source"], "env");
     let feed = app.get("/api/activity").await.json["items"].to_string();
     assert!(feed.contains("HW_ACCEL=cpu"), "{feed}");
     assert_eq!(
@@ -96,8 +97,16 @@ async fn first_run_applies_command_line_options() {
     assert_eq!(s.json["hardware"], "auto");
     let q = app.get("/api/queue").await;
     assert_eq!(q.json["max_jobs"], 2);
+    assert_eq!(q.json["max_jobs_source"], "settings");
     let feed = app.get("/api/activity").await.json["items"].to_string();
-    assert!(feed.contains("MAX_JOBS=9 is not used"), "{feed}");
+    // Named as the UI names the setting.
+    assert!(
+        feed.contains(
+            "MAX_JOBS=9 is not used because Files at once is set to 2 in Settings. Choose \
+             Automatic there to use MAX_JOBS."
+        ),
+        "{feed}"
+    );
 }
 
 #[tokio::test]

@@ -210,7 +210,7 @@ fn max_jobs_note(state: &AppState) -> Option<String> {
         return None;
     }
     let message = format!(
-        "MAX_JOBS={env} is not used because Jobs at once is set to {saved} in Settings. Choose \
+        "MAX_JOBS={env} is not used because Files at once is set to {saved} in Settings. Choose \
          Automatic there to use MAX_JOBS."
     );
     tracing::warn!("{message}");
@@ -333,12 +333,16 @@ pub fn start_background(state: &AppState, startup: Startup) {
 async fn startup_scans(state: &AppState) {
     let settings = state.settings();
     let catch_up = settings.watch_folders || settings.rescan_interval_hours > 0;
+    // Files the last scan left for later (still being copied then) are
+    // looked at again by a scan: the server stopped before it got to them.
+    let settling = db::libraries::with_settling_files(state.db.pool())
+        .await
+        .unwrap_or_default();
     match db::libraries::list(state.db.pool()).await {
         Ok(libs) => {
-            for lib in libs
-                .into_iter()
-                .filter(|l| l.enabled && (catch_up || l.last_scan_at.is_none()))
-            {
+            for lib in libs.into_iter().filter(|l| {
+                l.enabled && (catch_up || l.last_scan_at.is_none() || settling.contains(&l.id))
+            }) {
                 if state.shutdown.is_cancelled() {
                     return;
                 }
@@ -429,9 +433,12 @@ pub async fn run(config: Config, toolkit: Toolkit) -> anyhow::Result<()> {
     let addr = listener
         .local_addr()
         .map_or_else(|_| "?".to_string(), |a| a.to_string());
+    let version = match crate::api::system::build_label() {
+        Some(build) => format!("{} (build {build})", env!("CARGO_PKG_VERSION")),
+        None => env!("CARGO_PKG_VERSION").to_string(),
+    };
     tracing::info!(
-        "Chrysopoeia {} is running on http://{addr} (data in {})",
-        env!("CARGO_PKG_VERSION"),
+        "Chrysopoeia {version} is running on http://{addr} (data in {})",
         state.config.data_dir.display()
     );
     start_background(&state, startup);

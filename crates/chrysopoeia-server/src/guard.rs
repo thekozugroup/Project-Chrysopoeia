@@ -7,13 +7,17 @@
 //!   but GET/HEAD/OPTIONS) and every WebSocket upgrade must come from a page
 //!   on Chrysopoeia's own address. Browsers always send `Origin` on those, so
 //!   it is compared with the address the request was sent to (`Host`, or
-//!   `X-Forwarded-Host` behind a reverse proxy). Requests without `Origin` or
-//!   `Referer` (curl, scripts) are not browser requests and pass.
+//!   `X-Forwarded-Host` behind a reverse proxy). When that address has no
+//!   port (reverse proxies such as Nginx Proxy Manager pass `Host` without
+//!   the port the browser used), only the host names are compared; the
+//!   host allowlist below still keeps other websites' names out. Requests
+//!   without `Origin` or `Referer` (curl, scripts) are not browser requests
+//!   and pass.
 //! - **DNS rebinding**: a hostile domain that resolves to the server's LAN
 //!   address makes the browser treat the API as that domain's own. So the
 //!   `Host` must be an IP address, `localhost`, a local name (`tower`,
-//!   `tower.local`, `nas.lan`, a Tailscale name) or a name listed in
-//!   `ALLOWED_HOSTS`.
+//!   `tower.local`, `nas.lan`, `nas.fritz.box`, a Tailscale name) or a name
+//!   listed in `ALLOWED_HOSTS`.
 //!
 //! `--dev-cors` (for `next dev` on another port) turns the origin check off.
 
@@ -40,7 +44,12 @@ const LOCAL_SUFFIXES: &[&str] = &[
     ".localdomain",
     ".localhost",
     ".ts.net",
+    // Home networks behind an AVM FRITZ!Box router.
+    ".fritz.box",
 ];
+
+/// Advice added to refusals that a reverse proxy can cause.
+const PROXY_ADVICE: &str = "If you use a reverse proxy, make it pass the original Host header.";
 
 /// Which requests `/api` accepts.
 #[derive(Debug, Clone, Default)]
@@ -102,7 +111,7 @@ impl RequestGuard {
                     format!(
                         "Chrysopoeia doesn't answer to the address \"{name}\". If you reach it \
                          through a domain name (for example behind a reverse proxy), add that \
-                         name to ALLOWED_HOSTS in the container settings."
+                         name to ALLOWED_HOSTS in the container settings. {PROXY_ADVICE}"
                     ),
                 ));
             }
@@ -136,8 +145,10 @@ impl RequestGuard {
         }
         Err(ApiError::forbidden(
             "forbidden_origin",
-            "This request came from another website, so Chrysopoeia refused it. Open \
-             Chrysopoeia at its own address to make changes.",
+            format!(
+                "This request came from another website, so Chrysopoeia refused it. Open \
+                 Chrysopoeia at its own address to make changes. {PROXY_ADVICE}"
+            ),
         ))
     }
 }
@@ -167,7 +178,10 @@ pub fn split_host_port(value: &str) -> (&str, Option<&str>) {
 }
 
 /// Whether `source` (an `Origin` or `Referer` URL) points at `target` (a
-/// `Host` value). Ports left out mean the scheme's default port.
+/// `Host` value). A port left out of `source` means the scheme's default
+/// port. A `target` without a port matches any port: reverse proxies (Nginx
+/// Proxy Manager, Traefik, Caddy) often pass the host name alone, even when
+/// the browser used a port such as 8443.
 fn same_origin(source: &str, target: &str) -> bool {
     let Some((scheme, rest)) = source.split_once("://") else {
         // `Origin: null` (sandboxed pages, file://) and anything unparsable.
@@ -184,8 +198,13 @@ fn same_origin(source: &str, target: &str) -> bool {
     let authority = authority.rsplit('@').next().unwrap_or_default();
     let (source_name, source_port) = split_host_port(authority);
     let (target_name, target_port) = split_host_port(target);
-    source_name.eq_ignore_ascii_case(target_name)
-        && source_port.unwrap_or(default_port) == target_port.unwrap_or(default_port)
+    if !source_name.eq_ignore_ascii_case(target_name) {
+        return false;
+    }
+    match target_port {
+        Some(port) => source_port.unwrap_or(default_port) == port,
+        None => true,
+    }
 }
 
 /// Middleware applying a [`RequestGuard`] to every request it wraps.
@@ -247,6 +266,7 @@ mod tests {
             "nas.lan",
             "nas.home.arpa",
             "tower.tail1234.ts.net",
+            "nas.fritz.box",
             "media.example.com",
             "chrysopoeia.mydomain.org",
             "mydomain.org",
@@ -283,6 +303,16 @@ mod tests {
         assert!(same_origin("http://[::1]:8080", "[::1]:8080"));
         assert!(!same_origin("http://tower:3000", "tower:8080"));
         assert!(!same_origin("http://evil.example", "tower:8080"));
+        // A proxy that passes the host name without the port.
+        assert!(same_origin(
+            "https://media.example.com:8443",
+            "media.example.com"
+        ));
+        assert!(same_origin("http://tower:8080", "tower"));
+        assert!(!same_origin(
+            "https://evil.example:8443",
+            "media.example.com"
+        ));
         assert!(!same_origin("null", "tower:8080"));
         assert!(!same_origin("file:///x", "tower:8080"));
     }
@@ -321,15 +351,31 @@ mod tests {
         assert!(g.check(&get, None, &h).is_ok());
         let h = headers(&[("host", "tower:8080")]);
         assert!(g.check(&post, None, &h).is_ok());
+        // Nginx Proxy Manager: Host without the port the browser used.
+        let g2 = guard(&["name"]);
+        let h = headers(&[("host", "name"), ("origin", "https://name:8443")]);
+        assert!(g2.check(&post, None, &h).is_ok());
+        let h = headers(&[("host", "name"), ("origin", "https://other:8443")]);
+        assert_eq!(
+            g2.check(&post, None, &h).unwrap_err().code,
+            "forbidden_origin"
+        );
+        let e = g
+            .check(
+                &post,
+                None,
+                &headers(&[("host", "tower:8080"), ("origin", "http://evil.example")]),
+            )
+            .unwrap_err();
+        assert!(e.message.ends_with(PROXY_ADVICE), "{}", e.message);
         // DNS rebinding: a foreign host name is refused whatever the origin.
         let h = headers(&[
             ("host", "attacker.example:8080"),
             ("origin", "http://attacker.example:8080"),
         ]);
-        assert_eq!(
-            g.check(&get, None, &h).unwrap_err().code,
-            "host_not_allowed"
-        );
+        let e = g.check(&get, None, &h).unwrap_err();
+        assert_eq!(e.code, "host_not_allowed");
+        assert!(e.message.ends_with(PROXY_ADVICE), "{}", e.message);
     }
 
     #[test]

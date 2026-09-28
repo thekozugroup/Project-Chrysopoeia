@@ -119,6 +119,11 @@ pub async fn get(
 pub struct QueueBody {
     #[serde(default)]
     pub priority: Option<i32>,
+    /// "Convert anyway": convert even a file the goal would leave as it is
+    /// (already efficient or in the target format), whatever the result's
+    /// size. Verification still applies.
+    #[serde(default)]
+    pub force: bool,
 }
 
 /// `POST /api/files/{id}/queue`
@@ -127,7 +132,9 @@ pub async fn queue_file(
     ApiPath(id): ApiPath<Uuid>,
     OptionalJson(body): OptionalJson<QueueBody>,
 ) -> ApiResult<Json<Job>> {
-    Ok(Json(queue::queue_file(&state, id, body.priority).await?))
+    Ok(Json(
+        queue::queue_file(&state, id, body.priority, body.force).await?,
+    ))
 }
 
 /// `POST /api/files/{id}/skip`
@@ -171,7 +178,7 @@ pub async fn bulk(
             parse_statuses(&v.iter().map(String::as_str).collect::<Vec<_>>())?
         }
     };
-    let affected = queue::bulk(
+    let outcome = queue::bulk(
         &state,
         body.action,
         BulkSelection {
@@ -181,5 +188,8 @@ pub async fn bulk(
         },
     )
     .await?;
-    Ok(Json(json!({ "affected": affected })))
+    Ok(Json(json!({
+        "affected": outcome.affected,
+        "left_out": outcome.left_out,
+    })))
 }

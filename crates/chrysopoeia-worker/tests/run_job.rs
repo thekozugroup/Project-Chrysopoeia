@@ -67,6 +67,7 @@ fn spec(input: &Path, library_root: &Path, profile: TranscodeProfile) -> JobSpec
         probe: support::probe(input),
         profile,
         candidates: vec![software()],
+        force: false,
     }
 }
 
@@ -332,6 +333,45 @@ async fn size_rule_skips_and_keeps_the_original() {
     );
 }
 
+/// "Convert anyway": neither the decider's skip nor the size rule stops a
+/// forced job, and the result is still verified before it replaces anything.
+#[tokio::test]
+async fn forced_jobs_ignore_the_size_rule_and_efficiency_skips() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MKV_1080P_SUBS, dir.path());
+    let profile = TranscodeProfile {
+        min_savings_pct: Some(90),
+        ..profile()
+    };
+    let mut spec = spec(&input, dir.path(), profile);
+    spec.force = true;
+    let cfg = config(ValidationLevel::Quick);
+    let already = |_: &ProbeInfo, _: &TranscodeProfile| Decision::Skip {
+        reason: "Already H.264".into(),
+    };
+    let (tx, mut rx) = mpsc::channel(1024);
+    let outcome = run_job_with(
+        &cfg,
+        &spec,
+        &fake_plan,
+        &already,
+        tx,
+        CancellationToken::new(),
+    )
+    .await;
+    let mut verified = false;
+    while let Some(p) = rx.recv().await {
+        verified |= p.stage == JobStage::Verifying;
+    }
+    let JobOutcome::Done { validation, .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert!(verified, "a forced result is still verified");
+    assert!(validation.is_some_and(|r| r.passed));
+    assert!(support::artifacts_in(dir.path()).is_empty());
+}
+
 #[tokio::test]
 async fn failing_first_candidate_falls_back_to_the_next() {
     require_ffmpeg!();
@@ -463,10 +503,12 @@ async fn verification_failure_on_the_last_attempt_fails_the_job() {
     else {
         panic!("expected Failed, got {outcome:?}");
     };
+    // Phrased as the failure it is, not with the check's pass-form label.
     assert!(
-        error.starts_with("Verification failed: Looks like the original — "),
+        error.starts_with("The new file doesn't look like the original. "),
         "{error}"
     );
+    assert!(!error.contains("Looks like the original"), "{error}");
     assert!(validation.is_some_and(|r| !r.passed));
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert!(support::artifacts_in(dir.path()).is_empty());

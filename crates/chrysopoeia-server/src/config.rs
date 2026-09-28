@@ -52,7 +52,7 @@ pub struct Cli {
     /// Scratch folder for in-progress encodes when the setting is unset.
     #[arg(long, env = "TEMP_DIR")]
     pub temp_dir: Option<String>,
-    /// Jobs at once while "Jobs at once" in Settings is Automatic: 1-32, or
+    /// Files converted at once while "Files at once" in Settings is Automatic: 1-32, or
     /// auto for the count recommended for this machine. A number chosen in
     /// Settings wins.
     #[arg(long, env = "MAX_JOBS")]

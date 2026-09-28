@@ -954,7 +954,10 @@ fn probe_check(output: &MediaProbe, profile: &TranscodeProfile) -> CheckResult {
         let found = VideoCodec::from_probe_name(&video.codec)
             .map_or_else(|| video.codec.clone(), |c| c.label().to_string());
         return CheckResult::fail(
-            format!("The video is {found} instead of {}", target.label()),
+            format!(
+                "The new file's video is {found} instead of {}",
+                target.label()
+            ),
             None,
         );
     }
@@ -1056,9 +1059,10 @@ fn duration_check(source: Option<f64>, output: Option<f64>) -> CheckResult {
             Some(diff),
         )
     } else {
+        let compared = if out < src { "shorter" } else { "longer" };
         CheckResult::fail(
             format!(
-                "The new file is {} long but the original is {}",
+                "The new file is {compared} than the original ({} instead of {})",
                 format_time(out),
                 format_time(src)
             ),

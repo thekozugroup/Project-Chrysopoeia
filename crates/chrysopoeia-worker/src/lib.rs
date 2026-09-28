@@ -13,6 +13,8 @@ pub mod quality;
 pub mod run;
 pub mod validate;
 
-pub use plan::{Decision, FfmpegPlan, PlanRequest, StreamSummary, build_plan, decide};
+pub use plan::{
+    Decision, FfmpegPlan, PlanRequest, StreamSummary, build_plan, decide, decide_forced,
+};
 pub use run::{JobOutcome, JobSpec, RunConfig, run_job};
 pub use validate::{ValidateRequest, validate_output};

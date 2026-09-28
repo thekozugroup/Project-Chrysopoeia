@@ -12,7 +12,7 @@ use super::{
 
 const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, stage, priority, \
     progress, fps, speed, eta_secs, encoder, hw_api, attempt, input_size, output_size, error, \
-    skip_reason, validation, command, log_tail, notes, created_at, started_at, finished_at";
+    skip_reason, validation, command, log_tail, notes, force, created_at, started_at, finished_at";
 
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
@@ -29,7 +29,9 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let priority: i64 = row.try_get("priority")?;
     let attempt: i64 = row.try_get("attempt")?;
     let notes: Option<String> = row.try_get("notes")?;
+    let force: i64 = row.try_get("force")?;
     Ok(Job {
+        force: force != 0,
         notes: notes
             .as_deref()
             .map(parse_json::<Vec<String>>)
@@ -228,6 +230,8 @@ pub struct NewJob<'a> {
     pub file_path: &'a str,
     pub input_size: u64,
     pub priority: i32,
+    /// "Convert anyway" (see `Job::force`).
+    pub force: bool,
 }
 
 /// Create a queued job and mark its file queued. Returns the job id, or
@@ -251,8 +255,8 @@ pub async fn create(conn: &mut SqliteConnection, new: &NewJob<'_>) -> sqlx::Resu
     }
     sqlx::query(
         "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, stage, \
-         priority, progress, attempt, input_size, created_at) \
-         VALUES (?, ?, ?, ?, ?, 'queued', 'waiting', ?, 0, 0, ?, ?)",
+         priority, progress, attempt, input_size, force, created_at) \
+         VALUES (?, ?, ?, ?, ?, 'queued', 'waiting', ?, 0, 0, ?, ?, ?)",
     )
     .bind(id.to_string())
     .bind(new.file_id.to_string())
@@ -261,6 +265,7 @@ pub async fn create(conn: &mut SqliteConnection, new: &NewJob<'_>) -> sqlx::Resu
     .bind(new.file_path)
     .bind(new.priority)
     .bind(i64_of(new.input_size))
+    .bind(new.force)
     .bind(&now)
     .execute(conn)
     .await?;

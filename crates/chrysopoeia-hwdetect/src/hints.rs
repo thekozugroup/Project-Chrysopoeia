@@ -9,7 +9,8 @@
 use std::collections::BTreeSet;
 
 use chrysopoeia_core::{
-    EncoderStatus, FfmpegInfo, GpuVendor, HwApi, SetupHint, SetupHintLevel, VideoCodec,
+    EncoderStatus, FfmpegInfo, GpuVendor, HardwareInfo, HwApi, HwPreference, SetupHint,
+    SetupHintLevel, VideoCodec,
 };
 
 use crate::devices::{DetectedGpu, Devices, NodeAccess, Platform, vendor_label};
@@ -173,6 +174,87 @@ pub fn build_hints(input: &HintInput<'_>) -> Vec<SetupHint> {
         SetupHintLevel::Info => 2,
     });
     hints
+}
+
+/// Title of the hint shown when the hardware chosen in Settings has no
+/// working encoder (see [`preference_hint`]).
+pub const PREFERENCE_UNAVAILABLE_TITLE: &str = "The hardware you chose isn't working";
+
+/// How an API's encoders are named in a sentence: "no working NVIDIA
+/// encoder was found".
+fn encoder_noun(api: HwApi) -> &'static str {
+    match api {
+        HwApi::Software => "CPU encoder",
+        HwApi::Nvenc => "NVIDIA encoder",
+        HwApi::Qsv => "Intel Quick Sync encoder",
+        HwApi::Vaapi => "VA-API encoder",
+        HwApi::VideoToolbox => "VideoToolbox encoder",
+        HwApi::Amf => "AMD encoder",
+        HwApi::Rkmpp => "Rockchip encoder",
+        HwApi::V4l2m2m => "V4L2 encoder",
+    }
+}
+
+/// Why the hardware chosen in Settings (`preference`) can't be used, as the
+/// start of a sentence: "You chose NVIDIA NVENC, but no working NVIDIA
+/// encoder was found here". With a `codec`, also when that hardware works
+/// but can't make the codec ("…, but it can't make AV1 video here").
+/// `None` when nothing is pinned (Automatic, CPU) or the hardware works.
+pub fn preference_problem(
+    hw: &HardwareInfo,
+    preference: HwPreference,
+    codec: Option<VideoCodec>,
+) -> Option<String> {
+    let api = preference.api().filter(|a| a.is_hardware())?;
+    let works = |codec: Option<VideoCodec>| {
+        hw.encoders.iter().any(|e| {
+            e.api == api && e.available && e.verified && codec.is_none_or(|c| e.codec == c)
+        })
+    };
+    if !works(None) {
+        return Some(format!(
+            "You chose {}, but no working {} was found here",
+            api.label(),
+            encoder_noun(api)
+        ));
+    }
+    let codec = codec?;
+    (!works(Some(codec))).then(|| {
+        format!(
+            "You chose {}, but it can't make {} video here",
+            api.label(),
+            codec.label()
+        )
+    })
+}
+
+/// A hint when the hardware chosen in Settings has no working encoder at
+/// all: files are converted on the CPU instead, or, with CPU fallback off,
+/// not at all. `None` while it works (or nothing is pinned).
+pub fn preference_hint(
+    hw: &HardwareInfo,
+    preference: HwPreference,
+    cpu_fallback: bool,
+) -> Option<SetupHint> {
+    let problem = preference_problem(hw, preference, None)?;
+    let (level, detail) = if cpu_fallback {
+        (
+            SetupHintLevel::Warning,
+            format!(
+                "{problem}, so files are converted on the CPU. The other hints here say how to \
+                 make it work, or choose Automatic under Hardware in Settings."
+            ),
+        )
+    } else {
+        (
+            SetupHintLevel::Error,
+            format!(
+                "{problem}, and converting on the CPU instead is turned off, so files can't be \
+                 converted. Choose Automatic under Hardware in Settings, or allow CPU fallback."
+            ),
+        )
+    };
+    Some(hint(level, PREFERENCE_UNAVAILABLE_TITLE, detail, None))
 }
 
 fn ffmpeg_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
@@ -1517,5 +1599,77 @@ mod tests {
             join_list(&["a".into(), "b".into(), "c".into()]),
             "a, b and c"
         );
+    }
+
+    fn hardware(hw_failure: impl Fn(HwApi) -> Option<FailureKind>) -> HardwareInfo {
+        HardwareInfo {
+            cpu: Default::default(),
+            memory: Default::default(),
+            gpus: Vec::new(),
+            encoders: checks(hw_failure, None)
+                .into_iter()
+                .map(|c| c.status)
+                .collect(),
+            audio_encoders: Vec::new(),
+            filters: all_filters(),
+            ffmpeg: ffmpeg_ok(),
+            recommended_jobs: chrysopoeia_core::JobRecommendation {
+                cpu_jobs: 1,
+                gpu_jobs: 0,
+                total: 1,
+                reason: String::new(),
+            },
+            hints: Vec::new(),
+            in_container: true,
+            detecting: false,
+            detected_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_chosen_api_without_a_working_encoder_is_explained() {
+        let no_gpu = hardware(|_| Some(FailureKind::NoDevice));
+        assert_eq!(
+            preference_problem(&no_gpu, HwPreference::Nvenc, None).as_deref(),
+            Some("You chose NVIDIA NVENC, but no working NVIDIA encoder was found here")
+        );
+        let hint = preference_hint(&no_gpu, HwPreference::Nvenc, true).unwrap();
+        assert_eq!(hint.title, PREFERENCE_UNAVAILABLE_TITLE);
+        assert_eq!(hint.level, SetupHintLevel::Warning);
+        assert!(
+            hint.detail.starts_with(
+                "You chose NVIDIA NVENC, but no working NVIDIA encoder was found here, so files \
+                 are converted on the CPU."
+            ),
+            "{}",
+            hint.detail
+        );
+        // Without CPU fallback nothing is converted: an error.
+        let hint = preference_hint(&no_gpu, HwPreference::Nvenc, false).unwrap();
+        assert_eq!(hint.level, SetupHintLevel::Error);
+        assert!(
+            hint.detail.contains("can't be converted"),
+            "{}",
+            hint.detail
+        );
+        // Automatic and CPU pin nothing.
+        assert!(preference_hint(&no_gpu, HwPreference::Auto, true).is_none());
+        assert!(preference_hint(&no_gpu, HwPreference::Cpu, false).is_none());
+
+        // A working API gets no hint, but a codec it can't make is named.
+        let mut working = hardware(|_| None);
+        assert!(preference_hint(&working, HwPreference::Qsv, true).is_none());
+        for e in working
+            .encoders
+            .iter_mut()
+            .filter(|e| e.api == HwApi::Qsv && e.codec == VideoCodec::Av1)
+        {
+            e.verified = false;
+        }
+        assert_eq!(
+            preference_problem(&working, HwPreference::Qsv, Some(VideoCodec::Av1)).as_deref(),
+            Some("You chose Intel Quick Sync, but it can't make AV1 video here")
+        );
+        assert!(preference_problem(&working, HwPreference::Qsv, Some(VideoCodec::Hevc)).is_none());
     }
 }

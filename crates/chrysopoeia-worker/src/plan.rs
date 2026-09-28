@@ -82,6 +82,18 @@ fn skip(reason: impl Into<String>) -> Decision {
 /// 6. Audio tracks exist but none of them can be read: skip rather than
 ///    write a silent file.
 pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
+    decide_with(probe, profile, false)
+}
+
+/// [`decide`] for a file the user asked to convert anyway ("Convert
+/// anyway"): rule 3 (already efficient, already in the target format) does
+/// not apply. The other rules still do: they skip files that can't be
+/// converted without losing something.
+pub fn decide_forced(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
+    decide_with(probe, profile, true)
+}
+
+fn decide_with(probe: &ProbeInfo, profile: &TranscodeProfile, force: bool) -> Decision {
     let Some(video) = probe.primary_video() else {
         return if probe.audio_streams().next().is_some() {
             skip("Audio-only file — nothing to convert")
@@ -102,7 +114,7 @@ pub fn decide(probe: &ProbeInfo, profile: &TranscodeProfile) -> Decision {
 
     let target = profile.video_codec;
     let too_big = size_limit(profile).is_some_and(|limit| !limit.fits(width, height));
-    if !too_big {
+    if !too_big && !force {
         if profile.skip_efficient {
             let rank = source_efficiency_rank(&video.codec);
             if rank >= target.efficiency_rank() {

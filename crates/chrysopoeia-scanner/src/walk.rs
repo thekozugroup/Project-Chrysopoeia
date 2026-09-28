@@ -187,6 +187,14 @@ pub(crate) fn is_media(path: &Path) -> bool {
         && disc_structure_note(path).is_none()
 }
 
+/// [`is_media`] for video containers only ([`VIDEO_EXTENSIONS`]): the files
+/// a library would convert.
+pub(crate) fn is_video(path: &Path) -> bool {
+    has_extension_in(path, VIDEO_EXTENSIONS)
+        && !is_artifact_path(path)
+        && disc_structure_note(path).is_none()
+}
+
 /// Whether the file name of `path` marks it as a Chrysopoeia temporary or
 /// backup file.
 pub(crate) fn is_artifact_path(path: &Path) -> bool {
@@ -333,10 +341,31 @@ fn compile_pattern(pattern: &str) -> Result<Glob, String> {
         .build()
         .map_err(|error| {
             format!(
-                "The ignore pattern \"{pattern}\" is not valid ({}), so it was not used",
-                error.kind()
+                "The ignore pattern \"{pattern}\" {}, so it was not used",
+                glob_problem(error.kind())
             )
         })
+}
+
+/// What is wrong with a pattern, in plain words, to follow "The ignore
+/// pattern "…"". Never the glob library's own message, which quotes its
+/// internal form of the pattern ("error parsing glob '**/…': …").
+fn glob_problem(kind: &globset::ErrorKind) -> String {
+    use globset::ErrorKind;
+    match kind {
+        ErrorKind::UnclosedClass => "has a [ without a closing ]".to_string(),
+        ErrorKind::InvalidRange(start, end) => {
+            format!("has the range {start}-{end}, which runs backwards (write {end}-{start})")
+        }
+        ErrorKind::UnopenedAlternates => "has a } without an opening {".to_string(),
+        ErrorKind::UnclosedAlternates => "has a { without a closing }".to_string(),
+        ErrorKind::NestedAlternates => "has a {…} group inside another one".to_string(),
+        ErrorKind::InvalidRecursive => {
+            "uses ** inside a name (it must stand alone between slashes)".to_string()
+        }
+        ErrorKind::DanglingEscape => "ends with a lone \\".to_string(),
+        _ => "can't be understood".to_string(),
+    }
 }
 
 /// Apply the anchoring rules described in the module documentation.
@@ -781,7 +810,31 @@ mod tests {
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(result.notes.len(), 1);
         assert_eq!(result.notes[0].0, root);
-        assert!(result.notes[0].1.contains("not valid"));
+        assert_eq!(
+            result.notes[0].1,
+            "The ignore pattern \"Movies/[abc\" has a [ without a closing ], so it was not used"
+        );
+    }
+
+    /// The glob library's wording ("error parsing glob '…': …") never
+    /// reaches the user; each problem is named plainly with the pattern.
+    #[test]
+    fn invalid_patterns_are_explained_plainly() {
+        for (pattern, expected) in [
+            ("Extras/{a,b", "has a { without a closing }"),
+            ("Extras/a,b}", "has a } without an opening {"),
+            (
+                "[z-a]",
+                "has the range z-a, which runs backwards (write a-z)",
+            ),
+        ] {
+            let problem = validate_ignore_pattern(pattern).unwrap_err();
+            assert_eq!(
+                problem,
+                format!("The ignore pattern \"{pattern}\" {expected}, so it was not used")
+            );
+            assert!(!problem.contains("error parsing glob"), "{problem}");
+        }
     }
 
     #[test]

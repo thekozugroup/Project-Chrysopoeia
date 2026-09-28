@@ -496,7 +496,7 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         state.emit(Event::JobUpdated { job: job.clone() });
         state.broadcast_file(job.file_id).await;
         state.broadcast_queue_state().await;
-        tracing::info!(job = %job.id, file = %job.file_path, "job started");
+        tracing::debug!(job = %job.id, file = %job.file_path, "job started");
 
         let (disposition, ctx) = execute(&state, &job, cancel).await;
         let intent = guard.intent();
@@ -688,6 +688,21 @@ async fn execute(
     } else {
         candidates
     };
+    // The hardware chosen in Settings can't make this codec here: say so
+    // on the job instead of quietly converting on the CPU, and don't
+    // convert at all when converting on the CPU is turned off.
+    let preference_problem = hw.as_deref().and_then(|hw| {
+        chrysopoeia_hwdetect::preference_problem(
+            hw,
+            settings.hardware,
+            Some(lib.profile.video_codec),
+        )
+    });
+    if let Some(problem) = &preference_problem
+        && !settings.cpu_fallback
+    {
+        return done(failed(preference_failure(problem)), ctx);
+    }
 
     let cfg = run_config(state, &settings);
     // Where the result goes, so start-up recovery can finish the
@@ -712,6 +727,7 @@ async fn execute(
         probe,
         profile: lib.profile.clone(),
         candidates,
+        force: job.force,
     };
 
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
@@ -723,6 +739,39 @@ async fn execute(
              are in the server log.",
         ),
     };
+    let outcome = match (outcome, &preference_problem) {
+        (
+            JobOutcome::Done {
+                output_path,
+                output_size,
+                original_size,
+                encoder,
+                hw_api,
+                attempt,
+                validation,
+                command,
+                mut notes,
+            },
+            Some(problem),
+        ) => {
+            notes.push(format!(
+                "{problem}, so this file was converted on the {}",
+                hw_api.label()
+            ));
+            JobOutcome::Done {
+                output_path,
+                output_size,
+                original_size,
+                encoder,
+                hw_api,
+                attempt,
+                validation,
+                command,
+                notes,
+            }
+        }
+        (outcome, _) => outcome,
+    };
     // The sender is gone once `run_job` returns, so the forwarder drains and
     // ends; don't wait on a worker that leaked a clone of it.
     if tokio::time::timeout(Duration::from_secs(2), forwarder)
@@ -732,6 +781,15 @@ async fn execute(
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
     }
     done(outcome, ctx)
+}
+
+/// The error of a job that wasn't converted because the hardware chosen in
+/// Settings can't be used and converting on the CPU instead is turned off.
+fn preference_failure(problem: &str) -> String {
+    format!(
+        "{problem}, and converting on the CPU instead is turned off, so this file wasn't \
+         converted. Choose Automatic under Hardware in Settings, or allow CPU fallback."
+    )
 }
 
 /// Whether a stored probe of PQ (HDR10-style) video has no mastering
@@ -906,7 +964,7 @@ async fn apply_requeue(
         }
         Requeue::LibraryOffline(_) => {}
         Requeue::Settling => {
-            tracing::info!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
+            tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
         }
     }
     Ok(())
@@ -1033,7 +1091,7 @@ async fn apply_outcome(
             .execute(&mut *tx)
             .await?;
             let saved_now = db::i64_of(original_size) - db::i64_of(output_size);
-            db::stats::add_savings(&mut tx, saved_now).await?;
+            db::stats::add_savings(&mut tx, job.library_id, saved_now).await?;
             tx.commit().await?;
 
             let pct = format::percent(saved_now, original_size);
@@ -1077,7 +1135,12 @@ async fn apply_outcome(
                 },
             )
             .await?;
-            if exists {
+            // A file Chrysopoeia already converted (queued again, e.g. to
+            // try another goal) stays done with its savings when the new
+            // attempt is skipped: the file on disk is still the converted
+            // one. The job row records the skip.
+            let kept_done = exists && db::files::keep_converted(&mut tx, job.file_id).await?;
+            if exists && !kept_done {
                 db::files::set_status(
                     &mut tx,
                     job.file_id,
@@ -1089,13 +1152,12 @@ async fn apply_outcome(
             }
             tx.commit().await?;
             if exists {
-                state
-                    .activity(
-                        ActivityLevel::Info,
-                        format!("Skipped {name} — {reason}"),
-                        refs,
-                    )
-                    .await;
+                let message = if kept_done {
+                    format!("Kept {name} as it is — {reason}")
+                } else {
+                    format!("Skipped {name} — {reason}")
+                };
+                state.activity(ActivityLevel::Info, message, refs).await;
             }
         }
         JobOutcome::Failed {
@@ -1368,7 +1430,7 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             command: String::new(),
             notes: vec![RESUMED_NOTE.to_string()],
         };
-        tracing::info!(job = %job.id, file = %job.file_path, "finished a conversion the last stop interrupted");
+        tracing::debug!(job = %job.id, file = %job.file_path, "finished a conversion the last stop interrupted");
         record(state, &job, Disposition::Finished(outcome), None, &ctx).await;
         completed += 1;
     }

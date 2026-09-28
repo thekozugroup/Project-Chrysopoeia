@@ -6,6 +6,7 @@ mod files;
 mod followups;
 mod fs_browse;
 mod libraries;
+mod polish;
 mod regressions;
 mod scan;
 mod settings;

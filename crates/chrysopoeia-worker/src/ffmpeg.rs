@@ -4,9 +4,10 @@
 //! [`run_ffmpeg`]: stdin is closed, the child is killed if the future is
 //! dropped, stdout is parsed as `-progress pipe:1` key/value blocks, and the
 //! last [`STDERR_TAIL_LINES`] stderr lines are kept for error reports.
-//! Cancellation asks ffmpeg to stop (SIGTERM) and kills it after
-//! [`KILL_GRACE`]. A process that prints nothing for its stall timeout is
-//! treated as hung and stopped the same way.
+//! Cancellation kills ffmpeg at once: a cancelled encode is thrown away, so
+//! there is nothing worth waiting for (x265 and SVT-AV1 ignore SIGTERM for
+//! many seconds while they flush their frame queues). A process that prints
+//! nothing for its stall timeout is treated as hung and killed the same way.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -22,9 +23,6 @@ use tokio_util::sync::CancellationToken;
 
 /// Number of stderr lines kept for error reports.
 pub const STDERR_TAIL_LINES: usize = 40;
-
-/// How long ffmpeg gets to exit after SIGTERM before it is killed.
-pub const KILL_GRACE: Duration = Duration::from_secs(5);
 
 /// Default time without any output after which an encode counts as hung.
 /// ffmpeg prints a progress block every half second while it works, so ten
@@ -664,13 +662,13 @@ pub async fn run_ffmpeg(
             biased;
             () = cancel.cancelled() => {
                 drop((stdout.take(), stderr.take()));
-                stop_child(&mut child).await;
+                kill_child(&mut child).await;
                 return FfmpegExit::Cancelled;
             }
             () = &mut stall => {
                 drop((stdout.take(), stderr.take()));
                 tracing::warn!(program = %cmd.program.display(), "ffmpeg printed nothing for {:?}; stopping it", cmd.stall_timeout);
-                stop_child(&mut child).await;
+                kill_child(&mut child).await;
                 return FfmpegExit::Stalled { after: cmd.stall_timeout, tail: tail.joined() };
             }
             segment = next_segment(&mut stdout), if stdout.is_some() => match segment {
@@ -714,36 +712,16 @@ async fn next_segment<R: AsyncBufRead + Unpin>(reader: &mut Option<Split<R>>) ->
     }
 }
 
-/// Ask the child to stop, then kill it after [`KILL_GRACE`]; always reaps it.
-async fn stop_child(child: &mut Child) {
-    if send_terminate(child) && tokio::time::timeout(KILL_GRACE, child.wait()).await.is_ok() {
-        return;
-    }
+/// Kill the child at once and reap it. Its output is discarded, so a
+/// graceful stop would only keep the caller (and a user pressing Cancel)
+/// waiting while the encoder flushes frames nobody will use.
+async fn kill_child(child: &mut Child) {
     if let Err(e) = child.start_kill() {
         tracing::debug!("could not kill ffmpeg: {e}");
     }
     if let Err(e) = child.wait().await {
         tracing::debug!("could not reap ffmpeg: {e}");
     }
-}
-
-/// Send SIGTERM. Returns false when no signal could be sent.
-#[cfg(unix)]
-fn send_terminate(child: &Child) -> bool {
-    use rustix::process::{Pid, Signal, kill_process};
-    let Some(pid) = child
-        .id()
-        .and_then(|id| i32::try_from(id).ok())
-        .and_then(Pid::from_raw)
-    else {
-        return false;
-    };
-    kill_process(pid, Signal::TERM).is_ok()
-}
-
-#[cfg(not(unix))]
-fn send_terminate(_child: &Child) -> bool {
-    false
 }
 
 static NICE_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -1197,6 +1175,32 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
         let exit = run_ffmpeg(&cmd, &cancel, &mut |_| {}, &mut |_| {}).await;
         assert_eq!(exit, FfmpegExit::Cancelled);
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// Encoders that ignore SIGTERM while they flush (x265, SVT-AV1) must
+    /// not keep a cancelled job running: it stops well within a second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_does_not_wait_for_a_process_ignoring_sigterm() {
+        let args = vec![
+            "-c".to_string(),
+            "trap '' TERM; sleep 30; sleep 30".to_string(),
+        ];
+        let cancel = CancellationToken::new();
+        let cmd = FfmpegCommand::new(Path::new("sh"), &args);
+        let cancelled_at = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            cancel.cancel();
+            std::time::Instant::now()
+        };
+        let (mut on_progress, mut on_stderr) = (|_: &ProgressBlock| {}, |_: &str| {});
+        let (exit, cancelled_at) = tokio::join!(
+            run_ffmpeg(&cmd, &cancel, &mut on_progress, &mut on_stderr),
+            cancelled_at
+        );
+        assert_eq!(exit, FfmpegExit::Cancelled);
+        let took = cancelled_at.elapsed();
+        assert!(took < Duration::from_millis(1000), "took {took:?}");
     }
 
     #[cfg(unix)]

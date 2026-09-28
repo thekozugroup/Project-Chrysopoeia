@@ -404,3 +404,42 @@ fn default_goals_behave_as_documented() {
     );
     assert_eq!(decide(&hevc, &compatible), Decision::Transcode);
 }
+
+/// "Convert anyway": the efficiency and same-format rules are set aside,
+/// the rules that protect a file are not.
+#[test]
+fn forced_decisions_skip_only_what_cannot_be_converted() {
+    use chrysopoeia_core::{Goal, TranscodeProfile};
+    use chrysopoeia_worker::decide_forced;
+    let av1 = probe_of("matroska", vec![video(0, "av1", 1920, 1080)]);
+    assert!(reason(decide(&av1, &efficient(VideoCodec::Hevc))).starts_with("Already AV1"));
+    assert_eq!(
+        decide_forced(&av1, &efficient(VideoCodec::Hevc)),
+        Decision::Transcode
+    );
+    let h264 = probe_of(
+        "mov",
+        vec![
+            video(0, "h264", 1920, 1080),
+            audio(1, "aac", 2, 48_000, None),
+        ],
+    );
+    let compatible = TranscodeProfile::from_goal(Goal::Compatible);
+    assert!(matches!(decide(&h264, &compatible), Decision::Skip { .. }));
+    assert_eq!(decide_forced(&h264, &compatible), Decision::Transcode);
+
+    // Still skipped: nothing to convert, or it would lose its colours.
+    let flac = probe_of("flac", vec![audio(0, "flac", 2, 44_100, None)]);
+    assert_eq!(
+        reason(decide_forced(&flac, &efficient(VideoCodec::Hevc))),
+        "Audio-only file — nothing to convert"
+    );
+    let hdr = probe_of("matroska", vec![hdr10(video_10bit(0, "hevc", 3840, 2160))]);
+    assert!(matches!(
+        decide_forced(
+            &hdr,
+            &profile(VideoCodec::H264, AudioCodec::Copy, Container::Mkv)
+        ),
+        Decision::Skip { .. }
+    ));
+}

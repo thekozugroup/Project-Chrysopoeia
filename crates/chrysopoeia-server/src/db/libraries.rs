@@ -95,7 +95,17 @@ pub async fn set_last_scan(pool: &SqlitePool, id: Uuid, at: DateTime<Utc>) -> sq
     Ok(())
 }
 
-/// Delete a library; its files and jobs cascade. Returns whether it existed.
+/// Libraries whose last scan left files for later because they were still
+/// being copied.
+pub async fn with_settling_files(pool: &SqlitePool) -> sqlx::Result<Vec<Uuid>> {
+    let rows = sqlx::query("SELECT id FROM libraries WHERE settling > 0")
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(|r| uuid_col(r, "id")).collect()
+}
+
+/// Delete a library; its files, jobs and savings history cascade. Returns
+/// whether it existed.
 pub async fn delete(pool: &SqlitePool, id: Uuid) -> sqlx::Result<bool> {
     let done = sqlx::query("DELETE FROM libraries WHERE id = ?")
         .bind(id.to_string())

@@ -127,6 +127,13 @@ pub fn is_media_path(path: &Path) -> bool {
     walk::is_media(path)
 }
 
+/// Whether a path is a video file Chrysopoeia would convert: like
+/// [`is_media_path`], but only [`VIDEO_EXTENSIONS`] (music and other
+/// audio-only files are left out). The folder picker counts these.
+pub fn is_video_path(path: &Path) -> bool {
+    walk::is_video(path)
+}
+
 /// Walk `root` recursively. Errors only if `root` itself is unreadable.
 ///
 /// Blocking: call it from `spawn_blocking`. Nothing is probed, so large

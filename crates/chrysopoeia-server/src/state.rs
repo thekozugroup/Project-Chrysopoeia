@@ -120,6 +120,13 @@ impl AppState {
         let _ = self.events.send(event);
     }
 
+    /// Whether the database was closed at the end of shutdown. A job that
+    /// finished just before then has nothing left to publish or record, and
+    /// no error to report about it.
+    fn closed(&self) -> bool {
+        self.db.pool().is_closed()
+    }
+
     /// Record an activity entry and publish it. Failures are logged only:
     /// the feed must never break the operation it describes.
     pub async fn activity(
@@ -133,6 +140,9 @@ impl AppState {
             ActivityLevel::Error => tracing::warn!("{message}"),
             ActivityLevel::Warning => tracing::warn!("{message}"),
             _ => tracing::info!("{message}"),
+        }
+        if self.closed() {
+            return;
         }
         match crate::db::activity::insert(self.db.pool(), level, &message, refs).await {
             Ok(entry) => self.emit(Event::Activity { entry }),
@@ -156,6 +166,9 @@ impl AppState {
 
     /// Publish the queue state.
     pub async fn broadcast_queue_state(&self) {
+        if self.closed() {
+            return;
+        }
         match crate::services::dispatcher::queue_state(self).await {
             Ok(q) => self.emit(Event::QueueState(q)),
             Err(e) => tracing::error!("could not compute the queue state: {e}"),
@@ -164,6 +177,9 @@ impl AppState {
 
     /// Publish overall stats.
     pub async fn broadcast_stats(&self) {
+        if self.closed() {
+            return;
+        }
         match crate::db::stats::totals(self.db.pool()).await {
             Ok(totals) => self.emit(Event::StatsUpdated { totals }),
             Err(e) => tracing::error!("could not compute stats: {e}"),
@@ -172,6 +188,9 @@ impl AppState {
 
     /// Publish a library with fresh stats.
     pub async fn broadcast_library(&self, id: Uuid) {
+        if self.closed() {
+            return;
+        }
         match crate::services::library::view_by_id(self, id).await {
             Ok(Some(library)) => self.emit(Event::LibraryUpdated { library }),
             Ok(None) => {}
@@ -181,6 +200,9 @@ impl AppState {
 
     /// Publish a file.
     pub async fn broadcast_file(&self, id: Uuid) {
+        if self.closed() {
+            return;
+        }
         match crate::db::files::get(self.db.pool(), id, false).await {
             Ok(Some(file)) => self.emit(Event::FileUpdated { file }),
             Ok(None) => {}
@@ -190,6 +212,9 @@ impl AppState {
 
     /// Publish a job.
     pub async fn broadcast_job(&self, id: Uuid) {
+        if self.closed() {
+            return;
+        }
         match crate::db::jobs::get(self.db.pool(), id).await {
             Ok(Some(job)) => self.emit(Event::JobUpdated { job }),
             Ok(None) => {}

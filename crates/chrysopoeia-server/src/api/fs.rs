@@ -5,7 +5,9 @@
 //! touching the disk), then canonicalized (so symlinks pointing outside a
 //! root are refused too).
 
+use std::collections::VecDeque;
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -16,11 +18,19 @@ use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::toolkit::Toolkit;
 
-/// Subfolders whose media files are counted; beyond this the count is left
+/// Subfolders whose video files are counted; beyond this the count is left
 /// out so huge folders stay fast.
 pub const MAX_COUNTED_DIRS: usize = 300;
-/// Entries inspected per subfolder when counting media files.
+/// How many folder levels below a listed folder its video files are counted
+/// (a show folder's seasons, a collection's movie folders).
+pub const MAX_COUNT_DEPTH: usize = 4;
+/// Entries (files and folders) looked at per listed folder when counting.
 pub const MAX_COUNTED_ENTRIES: usize = 2_000;
+/// Time spent counting per listed folder.
+pub const COUNT_TIME_PER_FOLDER: Duration = Duration::from_millis(150);
+/// Time spent counting for a whole listing; later folders get no count, so
+/// a slow disk or share never keeps the folder picker waiting.
+pub const COUNT_TIME_TOTAL: Duration = Duration::from_secs(2);
 
 /// Query of `GET /api/fs/browse`.
 #[derive(Debug, Default, Deserialize)]
@@ -34,9 +44,14 @@ pub struct BrowseEntry {
     pub name: String,
     pub path: String,
     pub is_dir: bool,
-    /// Media files directly inside (not recursive), when counted.
+    /// Video files inside, down to [`MAX_COUNT_DEPTH`] folder levels (music
+    /// and other audio-only files are not counted), when counted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count: Option<u64>,
+    /// Present with `media_count`: true when counting stopped at a limit
+    /// (depth, entries or time), so the folder holds at least that many.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_count_capped: Option<bool>,
 }
 
 /// Response of `GET /api/fs/browse`.
@@ -86,29 +101,82 @@ async fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Count media files directly inside `dir`. `Err` when the folder can't be
-/// read; `Ok(None)` when counting isn't possible.
-fn count_media(dir: &Path, toolkit: &Toolkit, count: bool) -> std::io::Result<Option<u64>> {
-    let entries = std::fs::read_dir(dir)?;
+/// Video files found below a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VideoCount {
+    videos: u64,
+    /// Counting stopped at a limit.
+    capped: bool,
+}
+
+/// Count the video files in `dir` and the folders below it, level by level
+/// down to [`MAX_COUNT_DEPTH`] levels, stopping after `max_entries` entries
+/// or once `budget` has passed. Hidden entries are skipped and links to
+/// folders are not followed. `Err` when `dir` itself can't be read;
+/// `Ok(None)` when `count` is false or counting isn't possible.
+fn count_videos(
+    dir: &Path,
+    toolkit: &Toolkit,
+    count: bool,
+    max_entries: usize,
+    budget: Duration,
+) -> std::io::Result<Option<VideoCount>> {
+    let top = std::fs::read_dir(dir)?;
     if !count {
         return Ok(None);
     }
-    let mut n = 0u64;
-    for entry in entries.take(MAX_COUNTED_ENTRIES).flatten() {
-        let is_file = entry
-            .file_type()
-            .map(|t| t.is_file() || t.is_symlink())
-            .unwrap_or(false);
-        if !is_file {
-            continue;
-        }
-        match toolkit.is_media_path_blocking(&entry.path()) {
-            Ok(true) => n += 1,
-            Ok(false) => {}
-            Err(_) => return Ok(None),
+    let started = Instant::now();
+    let mut videos = 0u64;
+    let mut seen = 0usize;
+    let mut capped = false;
+    let mut below: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    let mut current = Some((top, 0usize));
+    'folders: loop {
+        let (entries, depth) = match current.take() {
+            Some(c) => c,
+            None => match below.pop_front() {
+                Some((path, depth)) => match std::fs::read_dir(&path) {
+                    Ok(entries) => (entries, depth),
+                    Err(_) => continue,
+                },
+                None => break,
+            },
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > max_entries || started.elapsed() > budget {
+                capped = true;
+                break 'folders;
+            }
+            if entry
+                .file_name()
+                .to_str()
+                .is_none_or(|n| n.starts_with('.'))
+            {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if depth < MAX_COUNT_DEPTH {
+                    below.push_back((entry.path(), depth + 1));
+                } else {
+                    capped = true;
+                }
+                continue;
+            }
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                continue;
+            }
+            match toolkit.is_video_path_blocking(&entry.path()) {
+                Ok(true) => videos += 1,
+                Ok(false) => {}
+                Err(_) => return Ok(None),
+            }
         }
     }
-    Ok(Some(n))
+    Ok(Some(VideoCount { videos, capped }))
 }
 
 /// List the visible, readable subfolders of `dir`.
@@ -119,6 +187,7 @@ fn list_dirs(
 ) -> std::io::Result<Vec<BrowseEntry>> {
     let mut out = Vec::new();
     let mut counting = true;
+    let started = Instant::now();
     for entry in std::fs::read_dir(dir)?.flatten() {
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
@@ -141,12 +210,14 @@ fn list_dirs(
         if !is_dir {
             continue;
         }
-        let count = counting && out.len() < MAX_COUNTED_DIRS;
-        let media_count = match count_media(&path, toolkit, count) {
+        let left = COUNT_TIME_TOTAL.saturating_sub(started.elapsed());
+        let count = counting && out.len() < MAX_COUNTED_DIRS && !left.is_zero();
+        let budget = COUNT_TIME_PER_FOLDER.min(left);
+        let counted = match count_videos(&path, toolkit, count, MAX_COUNTED_ENTRIES, budget) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        if count && media_count.is_none() {
+        if count && counted.is_none() {
             counting = false;
         }
         let Some(path_str) = path.to_str() else {
@@ -156,7 +227,8 @@ fn list_dirs(
             name,
             path: path_str.to_string(),
             is_dir: true,
-            media_count,
+            media_count: counted.map(|c| c.videos),
+            media_count_capped: counted.map(|c| c.capped),
         });
     }
     out.sort_by(|a, b| {
@@ -254,6 +326,56 @@ pub async fn browse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_counts_go_down_the_levels_and_stop_at_the_limits() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let show = dir.path().join("Show");
+        let touch = |rel: &str| {
+            let p = show.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, b"x").unwrap();
+        };
+        touch("Season 1/e1.mkv");
+        touch("Season 1/e2.mp4");
+        touch("Season 2/e1.mkv");
+        touch("Season 2/e1.srt");
+        touch("Soundtrack/01.flac");
+        touch("Soundtrack/02.mp3");
+        touch(".hidden/x.mkv");
+        let toolkit = Toolkit::new(Arc::new(crate::toolkit::RealToolkit::new(PathBuf::from(
+            "ffprobe",
+        ))));
+        let long = Duration::from_secs(5);
+        let count = count_videos(&show, &toolkit, true, MAX_COUNTED_ENTRIES, long).unwrap();
+        assert_eq!(
+            count,
+            Some(VideoCount {
+                videos: 3,
+                capped: false
+            })
+        );
+        // Too many entries: at least what was seen, marked as capped.
+        let count = count_videos(&show, &toolkit, true, 3, long)
+            .unwrap()
+            .unwrap();
+        assert!(count.capped);
+        assert!(count.videos <= 3);
+        // Deeper than the depth limit.
+        touch("a/b/c/d/e/deep.mkv");
+        let count = count_videos(&show, &toolkit, true, MAX_COUNTED_ENTRIES, long)
+            .unwrap()
+            .unwrap();
+        assert_eq!(count.videos, 3);
+        assert!(count.capped);
+        // Not counted at all; a missing folder is an error.
+        assert_eq!(
+            count_videos(&show, &toolkit, false, MAX_COUNTED_ENTRIES, long).unwrap(),
+            None
+        );
+        assert!(count_videos(&show.join("nope"), &toolkit, true, 10, long).is_err());
+    }
 
     #[test]
     fn lexical_normalization() {

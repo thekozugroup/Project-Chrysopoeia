@@ -21,6 +21,10 @@ async fn lists_folders_sorted_without_hidden_ones() {
     app.write("TV Shows/a.mkv", h264());
     app.write("TV Shows/b.mp4", h264());
     app.write("TV Shows/readme.txt", "x");
+    // Counted below the folder too; music is not video.
+    app.write("TV Shows/Season 1/c.mkv", h264());
+    app.write("TV Shows/Season 1/theme.flac", "x");
+    app.write("zeta/song.mp3", "x");
     app.write("loose.mkv", h264());
 
     let r = app.get("/api/fs/browse").await;
@@ -38,8 +42,11 @@ async fn lists_folders_sorted_without_hidden_ones() {
     assert_eq!(names, ["Anime", "movies", "TV Shows", "zeta"]);
     let tv = &r.json["entries"][2];
     assert_eq!(tv["is_dir"], true);
-    assert_eq!(tv["media_count"], 2);
+    assert_eq!(tv["media_count"], 3);
+    assert_eq!(tv["media_count_capped"], false);
     assert_eq!(tv["path"], root.join("TV Shows").to_str().unwrap());
+    let zeta = &r.json["entries"][3];
+    assert_eq!(zeta["media_count"], 0, "audio-only files are not counted");
 
     let r = app
         .get(&format!(
@@ -49,7 +56,10 @@ async fn lists_folders_sorted_without_hidden_ones() {
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.json["parent"], root.to_str().unwrap());
-    assert_eq!(r.json["entries"].as_array().unwrap().len(), 0);
+    let entries = r.json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["name"], "Season 1");
+    assert_eq!(entries[0]["media_count"], 1);
 }
 
 #[tokio::test]
