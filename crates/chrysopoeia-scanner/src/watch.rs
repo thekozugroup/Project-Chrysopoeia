@@ -245,6 +245,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct LibraryWatcher {
     shared: Arc<Shared>,
     task: JoinHandle<()>,
+    waiting: WaitingFiles,
+}
+
+/// How many media files the watcher is waiting on per watched root: files
+/// with recent changes that haven't settled yet, typically copies in
+/// progress. Updated about once per second (a quarter of the settle
+/// period, when shorter). Cheap to clone; it reads empty once the watcher
+/// has stopped.
+#[derive(Debug, Clone, Default)]
+pub struct WaitingFiles(Arc<Mutex<HashMap<PathBuf, usize>>>);
+
+impl WaitingFiles {
+    /// Files waited on, by root (roots without any are left out).
+    pub fn counts(&self) -> HashMap<PathBuf, usize> {
+        lock(&self.0).clone()
+    }
+
+    fn set(&self, counts: HashMap<PathBuf, usize>) {
+        *lock(&self.0) = counts;
+    }
 }
 
 impl fmt::Debug for LibraryWatcher {
@@ -284,9 +304,17 @@ impl LibraryWatcher {
             canary: canary::Canary::new().map(Mutex::new),
         });
         let (out_tx, out_rx) = mpsc::channel(EVENT_BUFFER);
-        let debouncer = Debouncer::new(settle, Arc::clone(&shared), out_tx);
+        let waiting = WaitingFiles::default();
+        let debouncer = Debouncer::new(settle, Arc::clone(&shared), out_tx, waiting.clone());
         let task = runtime.spawn(debouncer.run(raw_rx));
-        Ok((Self { shared, task }, out_rx))
+        Ok((
+            Self {
+                shared,
+                task,
+                waiting,
+            },
+            out_rx,
+        ))
     }
 
     /// Start watching a root recursively. Watching the same root twice is a no-op.
@@ -320,6 +348,12 @@ impl LibraryWatcher {
         self.add_root(root, Some(RootFilter::new(opts)))
     }
 
+    /// The media files this watcher is waiting on because they are still
+    /// being written, per root (see [`WaitingFiles`]).
+    pub fn waiting_files(&self) -> WaitingFiles {
+        self.waiting.clone()
+    }
+
     fn add_root(&self, root: &Path, filter: Option<RootFilter>) -> anyhow::Result<()> {
         let root = absolute_root(root)?;
         let shared = &self.shared;
@@ -350,6 +384,7 @@ impl LibraryWatcher {
 impl Drop for LibraryWatcher {
     fn drop(&mut self) {
         self.task.abort();
+        self.waiting.set(HashMap::new());
         let roots = std::mem::take(&mut *lock(&self.shared.roots));
         drop(roots);
     }
@@ -1198,10 +1233,18 @@ struct Debouncer {
     next_root_check: Instant,
     /// Warnings already logged, so a stream of events does not repeat them.
     warned: HashSet<String>,
+    /// Media files waited on per root, as last published.
+    waiting: WaitingFiles,
+    published: HashMap<PathBuf, usize>,
 }
 
 impl Debouncer {
-    fn new(settle: Duration, shared: Arc<Shared>, out: mpsc::Sender<WatchEvent>) -> Self {
+    fn new(
+        settle: Duration,
+        shared: Arc<Shared>,
+        out: mpsc::Sender<WatchEvent>,
+        waiting: WaitingFiles,
+    ) -> Self {
         Self {
             settle,
             shared,
@@ -1215,6 +1258,8 @@ impl Debouncer {
             root_checks: HashSet::new(),
             next_root_check: Instant::now() + ROOT_CHECK_INTERVAL,
             warned: HashSet::new(),
+            waiting,
+            published: HashMap::new(),
         }
     }
 
@@ -1242,6 +1287,7 @@ impl Debouncer {
                 break;
             }
         }
+        self.waiting.set(HashMap::new());
         tracing::debug!("folder watcher stopped");
     }
 
@@ -1476,6 +1522,7 @@ impl Debouncer {
         // Drop work for roots that are no longer watched.
         self.pending
             .retain(|path, _| roots.iter().any(|(root, _)| path.starts_with(root)));
+        self.publish_waiting(&roots);
 
         // Group the due checks by root, leaving out roots whose previous
         // batch is still running.
@@ -1669,6 +1716,24 @@ impl Debouncer {
             .filter(|(root, _)| path.starts_with(root))
             .max_by_key(|(root, _)| root.as_os_str().len())
             .map(|(root, entry)| (root.clone(), entry.clone()))
+    }
+
+    /// Publish how many media files each root has waiting to settle (see
+    /// [`WaitingFiles`]), when that changed.
+    fn publish_waiting(&mut self, roots: &[(PathBuf, RootEntry)]) {
+        let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+        for path in self.pending.keys() {
+            if !is_media(path) {
+                continue;
+            }
+            if let Some((root, _)) = innermost_root(roots, path) {
+                *counts.entry(root.clone()).or_default() += 1;
+            }
+        }
+        if counts != self.published {
+            self.waiting.set(counts.clone());
+            self.published = counts;
+        }
     }
 
     /// Log a warning unless it was already logged.
@@ -2140,6 +2205,41 @@ mod live_tests {
             finished.elapsed()
         );
         assert_eq!(next_event(&mut events, SETTLE * 3).await, None);
+    }
+
+    /// A copy in progress counts as a file waited on for its root (so the
+    /// library can say it is waiting for it), until it is reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copies_in_progress_are_counted_per_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let (watcher, mut events) = started(dir.path());
+        let waiting = watcher.waiting_files();
+        assert!(waiting.counts().is_empty());
+        let path = dir.path().join("Movie (2020).mkv");
+        let mut file = tokio::fs::File::create(&path).await.unwrap();
+        let mut seen = 0;
+        for _ in 0..8 {
+            file.write_all(&[7u8; 64 * 1024]).await.unwrap();
+            file.flush().await.unwrap();
+            tokio::time::sleep(SETTLE / 4).await;
+            seen = seen.max(waiting.counts().get(dir.path()).copied().unwrap_or(0));
+        }
+        assert_eq!(seen, 1, "{:?}", waiting.counts());
+        // Subtitles aren't media: never counted.
+        write_file(&dir.path().join("Movie (2020).srt"), 10).await;
+        file.sync_all().await.unwrap();
+        drop(file);
+        assert_eq!(
+            next_event(&mut events, WAIT).await,
+            Some(WatchEvent::Upserted(path))
+        );
+        let deadline = Instant::now() + WAIT;
+        while !waiting.counts().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(SETTLE / 8).await;
+        }
+        assert!(waiting.counts().is_empty(), "{:?}", waiting.counts());
+        drop(watcher);
+        assert!(waiting.counts().is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

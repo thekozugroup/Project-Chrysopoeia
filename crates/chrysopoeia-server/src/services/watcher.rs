@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrysopoeia_core::ActivityLevel;
 use chrysopoeia_scanner::ScanOptions;
@@ -20,6 +21,9 @@ use crate::db::activity::ActivityRefs;
 use crate::services::library;
 use crate::state::{AppState, lock};
 use crate::toolkit::FolderWatcher;
+
+/// How often the watcher's count of files still being copied is looked at.
+const WAITING_POLL: Duration = Duration::from_secs(2);
 
 /// The filters a root is watched with, to notice when settings change them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,10 +88,31 @@ async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
         }
     };
     let consumer = state.clone();
+    let waiting = watcher.waiting_files();
     let task = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if let Err(e) = library::handle_watch_event(&consumer, event).await {
-                tracing::error!("could not apply a folder change: {e:#}");
+        let mut tick = tokio::time::interval(WAITING_POLL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last: HashMap<PathBuf, usize> = HashMap::new();
+        loop {
+            tokio::select! {
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
+                    if let Err(e) = library::handle_watch_event(&consumer, event).await {
+                        tracing::error!("could not apply a folder change: {e:#}");
+                    }
+                }
+                _ = tick.tick(), if waiting.is_some() => {
+                    // Copies in progress show as files still being copied.
+                    let now = waiting.as_ref().map(|w| w.counts()).unwrap_or_default();
+                    if now != last {
+                        match library::set_watch_settling(&consumer, &now).await {
+                            Ok(()) => last = now,
+                            Err(e) => tracing::debug!(
+                                "could not record the files still being copied: {e}"
+                            ),
+                        }
+                    }
+                }
             }
         }
     });
@@ -235,6 +260,13 @@ pub fn stop(state: &AppState) {
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 handle.spawn_blocking(move || drop(old));
+                // Nothing is waited on for the watcher any more.
+                let state = state.clone();
+                handle.spawn(async move {
+                    if let Err(e) = library::set_watch_settling(&state, &HashMap::new()).await {
+                        tracing::debug!("could not clear the files still being copied: {e}");
+                    }
+                });
             }
             Err(_) => drop(old),
         }

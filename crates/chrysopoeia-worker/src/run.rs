@@ -1057,7 +1057,13 @@ pub(crate) fn verification_error(report: &ValidationReport) -> String {
     let lead = match check.id.as_str() {
         "streams" => Some("The new file doesn't have the tracks it should"),
         "decode" => Some("The new file doesn't play start to finish"),
-        "visual" => Some("The new file doesn't look like the original"),
+        // A picture that doesn't match, or pictures that couldn't be
+        // compared at all (no video track found, a frame that can't be
+        // read): the latter is no mismatch.
+        "visual" if detail.is_empty() || is_picture_mismatch(detail) => {
+            Some("The new file doesn't look like the original")
+        }
+        "visual" => Some("The new file couldn't be compared with the original"),
         "black_frames" | "frozen_frames" if !detail.starts_with("The new file") => {
             Some("The new file has more black or frozen video than the original")
         }
@@ -1075,6 +1081,12 @@ pub(crate) fn verification_error(report: &ValidationReport) -> String {
         (Some(lead), false) => format!("{lead}. {}", capitalize_first(detail)),
         (None, _) => capitalize_first(detail),
     }
+}
+
+/// Whether a failing visual check's detail says the pictures differ (rather
+/// than that they couldn't be compared).
+fn is_picture_mismatch(detail: &str) -> bool {
+    detail.contains("different from the original") || detail.contains("doesn't match the original")
 }
 
 /// `text` with its first letter in upper case.
@@ -1726,6 +1738,28 @@ mod tests {
                 "A frame near 0:10 looks very different from the original (similarity 0.40)",
                 "The new file doesn't look like the original. A frame near 0:10 looks very \
                  different from the original (similarity 0.40)",
+            ),
+            (
+                "visual",
+                "Looks like the original",
+                "The picture near 1:05 doesn't match the original (similarity 0.70)",
+                "The new file doesn't look like the original. The picture near 1:05 doesn't \
+                 match the original (similarity 0.70)",
+            ),
+            // Not a mismatch: the pictures couldn't be compared at all.
+            (
+                "visual",
+                "Looks like the original",
+                "The video track could not be found for comparison",
+                "The new file couldn't be compared with the original. The video track could \
+                 not be found for comparison",
+            ),
+            (
+                "visual",
+                "Looks like the original",
+                "No picture could be read from the new file at 0:30",
+                "The new file couldn't be compared with the original. No picture could be read \
+                 from the new file at 0:30",
             ),
             (
                 "black_frames",

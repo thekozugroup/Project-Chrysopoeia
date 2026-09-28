@@ -12,7 +12,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
-use crate::db::jobs::{JobFinish, NewJob};
+use crate::db::jobs::NewJob;
 use crate::db::{self};
 use crate::error::{ApiError, ApiResult};
 use crate::format::plural;
@@ -204,13 +204,16 @@ pub struct BulkOutcome {
     pub affected: u64,
     /// Selected files that were not queued because the library's goal
     /// would leave them as they are (already efficient, already in the
-    /// target format, nothing to convert).
+    /// target format, nothing to convert, or not enough smaller last time
+    /// under the same goal).
     pub left_out: u64,
 }
 
 /// The files among `ids` worth a job: failed files (a retry), and files the
-/// library's goal would convert. Returns them in the given order, and how
-/// many were left out.
+/// library's goal would convert, except those a job already converted and
+/// found not small enough to keep under the same goal (they would be
+/// encoded again only to end the same way; "Convert anyway" is for those).
+/// Returns them in the given order, and how many were left out.
 async fn worth_queueing(state: &AppState, ids: Vec<Uuid>) -> ApiResult<(Vec<Uuid>, u64)> {
     let pool = state.db.pool();
     let profiles: HashMap<Uuid, TranscodeProfile> = db::libraries::list(pool)
@@ -231,16 +234,14 @@ async fn worth_queueing(state: &AppState, ids: Vec<Uuid>) -> ApiResult<(Vec<Uuid
             let Some(c) = found.get(id) else {
                 continue;
             };
-            let convert = c.status == FileStatus::Failed
-                || match (&c.probe, profiles.get(&c.library_id)) {
-                    (Some(probe), Some(profile)) => {
-                        matches!(
-                            state.toolkit.decide(probe, profile),
-                            Ok(Decision::Transcode)
-                        )
-                    }
-                    _ => false,
-                };
+            let goal_converts = match (&c.probe, profiles.get(&c.library_id)) {
+                (Some(probe), Some(profile)) => matches!(
+                    state.toolkit.decide(probe, profile),
+                    Ok(Decision::Transcode)
+                ),
+                _ => false,
+            };
+            let convert = c.status == FileStatus::Failed || (goal_converts && !c.size_rule_skip);
             if convert {
                 keep.push(*id);
             } else {
@@ -365,7 +366,9 @@ async fn cancel_running(state: &AppState, id: Uuid) -> bool {
     }
 }
 
-/// Cancel a queued or running job.
+/// Cancel a queued or running job. Its file goes back to `pending`, or to
+/// `done` when Chrysopoeia converted it before (the file on disk is still
+/// the converted one).
 pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
     let job = db::jobs::get(state.db.pool(), id)
         .await?
@@ -394,12 +397,12 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
             if cancel_running(state, id).await {
                 state.dispatcher.wait_finished(&[id], CANCEL_WAIT).await;
             } else {
-                // A row marked running without a task (should not happen
-                // after start-up recovery): close it directly.
+                // No task: the job either finished a moment ago (its result
+                // is recorded and must stay) or is a row marked running
+                // without one (should not happen after start-up recovery),
+                // which is closed directly.
                 let mut tx = state.db.write_tx().await?;
-                db::jobs::finish(&mut tx, id, JobState::Cancelled, &JobFinish::default()).await?;
-                db::files::set_status(&mut tx, job.file_id, FileStatus::Pending, None, None)
-                    .await?;
+                db::jobs::cancel_running_row(&mut tx, id).await?;
                 tx.commit().await?;
             }
         }

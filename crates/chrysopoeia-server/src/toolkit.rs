@@ -45,6 +45,11 @@ pub trait FolderWatcher: Send + Sync {
     }
     /// Stop watching a root.
     fn unwatch(&self, root: &Path) -> anyhow::Result<()>;
+    /// Media files the watcher waits on because they are still being
+    /// written, per root. `None` when the watcher can't tell.
+    fn waiting_files(&self) -> Option<chrysopoeia_scanner::WaitingFiles> {
+        None
+    }
 }
 
 /// The operations the server needs from the media crates.
@@ -150,6 +155,10 @@ impl FolderWatcher for RealWatcher {
 
     fn unwatch(&self, root: &Path) -> anyhow::Result<()> {
         self.0.unwatch(root)
+    }
+
+    fn waiting_files(&self) -> Option<chrysopoeia_scanner::WaitingFiles> {
+        Some(self.0.waiting_files())
     }
 }
 

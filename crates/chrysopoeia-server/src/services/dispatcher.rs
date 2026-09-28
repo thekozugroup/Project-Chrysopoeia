@@ -8,12 +8,14 @@
 //! job and file rows. A result is never dropped: when the database is busy,
 //! recording it is retried until it succeeds.
 //!
-//! Two kinds of jobs are passed over for a while instead of failing: jobs of
-//! a library whose folder is offline (an unmounted share or disk), until the
-//! folder is back, and jobs whose file is still being copied, until it has
-//! settled.
+//! Three kinds of jobs are passed over for a while instead of failing: jobs
+//! of a library whose folder is offline (an unmounted share or disk), until
+//! the folder is back; jobs whose file is still being copied, until it has
+//! settled; and, with CPU fallback off, the jobs of a library whose files
+//! need the GPU chosen in Settings while every one of its encoding sessions
+//! is taken (by Plex, for instance), until the next hardware detection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -26,7 +28,7 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_scanner::WatchEvent;
 use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
-use chrysopoeia_worker::{JobOutcome, JobSpec, RunConfig};
+use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -63,7 +65,8 @@ pub const MAX_JOBS_LIMIT: u32 = 32;
 /// Why a running job was cancelled; decides where its file goes next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancelIntent {
-    /// The user cancelled it: the file becomes `pending`.
+    /// The user cancelled it: the file becomes `pending` (or stays `done`
+    /// when Chrysopoeia converted it before).
     User,
     /// "Stop now": the job goes back to the queue.
     Requeue,
@@ -102,6 +105,13 @@ pub struct DispatcherHandle {
     offline: std::sync::Mutex<HashMap<Uuid, Offline>>,
     /// Jobs whose file is still being written, with when to try again.
     deferred: std::sync::Mutex<HashMap<Uuid, Instant>>,
+    /// Libraries whose jobs wait for the busy GPU chosen in Settings; they
+    /// are tried again after the next hardware detection or settings
+    /// change. (By library, not by job: a big queue would otherwise be
+    /// claimed and put back one job at a time.)
+    hardware_wait: std::sync::Mutex<HashSet<Uuid>>,
+    /// Whether the feed already says that conversions wait for a busy GPU.
+    hardware_wait_announced: AtomicBool,
 }
 
 impl DispatcherHandle {
@@ -115,6 +125,8 @@ impl DispatcherHandle {
             running: std::sync::Mutex::new(HashMap::new()),
             offline: std::sync::Mutex::new(HashMap::new()),
             deferred: std::sync::Mutex::new(HashMap::new()),
+            hardware_wait: std::sync::Mutex::new(HashSet::new()),
+            hardware_wait_announced: AtomicBool::new(false),
         }
     }
 
@@ -151,6 +163,41 @@ impl DispatcherHandle {
     /// Keep a job in the queue without starting it until `until`.
     fn defer(&self, job_id: Uuid, until: Instant) {
         lock(&self.deferred).insert(job_id, until);
+    }
+
+    /// Keep a library's jobs in the queue until the hardware is checked
+    /// again (or the hardware settings change).
+    fn wait_for_hardware(&self, library_id: Uuid) {
+        lock(&self.hardware_wait).insert(library_id);
+    }
+
+    /// Whether the feed should now say that conversions wait for a busy
+    /// GPU: true once per time the GPU is busy.
+    fn announce_hardware_wait(&self) -> bool {
+        !self.hardware_wait_announced.swap(true, Ordering::SeqCst)
+    }
+
+    /// The hardware was checked again, or the hardware settings changed:
+    /// jobs waiting for a busy GPU may try again. `still_busy` says whether
+    /// a GPU is still busy (the feed then doesn't repeat that they wait).
+    pub fn hardware_changed(&self, still_busy: bool) {
+        let released = {
+            let mut waiting = lock(&self.hardware_wait);
+            let n = waiting.len();
+            waiting.clear();
+            n
+        };
+        if !still_busy {
+            self.hardware_wait_announced.store(false, Ordering::SeqCst);
+        }
+        if released > 0 {
+            self.wake();
+        }
+    }
+
+    /// Libraries whose jobs wait for a busy GPU.
+    pub fn hardware_waiting_count(&self) -> usize {
+        lock(&self.hardware_wait).len()
     }
 
     /// Ask the loop to look for work now.
@@ -368,7 +415,7 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
     }
     recheck_offline(state).await;
     let offline: Vec<Uuid> = lock(&d.offline).keys().copied().collect();
-    let skip_jobs: Vec<Uuid> = {
+    let deferred: Vec<Uuid> = {
         let now = Instant::now();
         let mut deferred = lock(&d.deferred);
         deferred.retain(|_, until| *until > now);
@@ -382,9 +429,14 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
         // libraries whose jobs encode on the CPU until one finishes.
         let cpu_full = software_cap.is_some_and(|cap| d.software_running_count() >= cap);
         let mut skip_libraries = offline.clone();
+        skip_libraries.extend(lock(&d.hardware_wait).iter().copied());
         if cpu_full {
             skip_libraries.extend(software_libraries.iter().copied());
         }
+        // A job whose task is still recording that it goes back to the
+        // queue is already `queued` in the database: never start it twice.
+        let mut skip_jobs = deferred.clone();
+        skip_jobs.extend(lock(&d.running).keys().copied());
         let Some(job) = db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs).await? else {
             break;
         };
@@ -532,6 +584,16 @@ struct ExecContext {
     output_mode: OutputMode,
 }
 
+impl ExecContext {
+    /// Whether the file may still be one Chrysopoeia converted before: its
+    /// content didn't change since (as far as the job saw).
+    fn converted_before(&self) -> bool {
+        self.file
+            .as_ref()
+            .is_none_or(|f| f.original_size_bytes.is_some())
+    }
+}
+
 /// Why a job goes back to the queue without running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Requeue {
@@ -539,6 +601,10 @@ enum Requeue {
     LibraryOffline(String),
     /// The file changed moments ago and may still be being copied.
     Settling,
+    /// The file needs the GPU chosen in Settings, CPU fallback is off, and
+    /// every encoding session of that GPU was taken when it was checked
+    /// (the problem says so).
+    HardwareBusy(String),
 }
 
 /// How a job's run ended, as far as the queue is concerned.
@@ -652,6 +718,12 @@ async fn execute(
     if !unchanged && still_settling(modified, state.config.settle) {
         return (Disposition::Requeue(Requeue::Settling), ctx);
     }
+    if !unchanged && let Some(f) = ctx.file.as_mut() {
+        // New content: an earlier conversion's savings no longer apply
+        // (the stored row is updated with the new probe below).
+        f.original_size_bytes = None;
+        f.saved_bytes = None;
+    }
     let probe = match file.probe.clone() {
         Some(p) if unchanged && !lacks_hdr10_metadata(&p) => p,
         _ => match state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT).await {
@@ -690,19 +762,33 @@ async fn execute(
     };
     // The hardware chosen in Settings can't make this codec here: say so
     // on the job instead of quietly converting on the CPU, and don't
-    // convert at all when converting on the CPU is turned off.
-    let preference_problem = hw.as_deref().and_then(|hw| {
-        chrysopoeia_hwdetect::preference_problem(
-            hw,
-            settings.hardware,
-            Some(lib.profile.video_codec),
-        )
-    });
-    if let Some(problem) = &preference_problem
+    // convert at all when converting on the CPU is turned off. Only files
+    // that would be converted need an encoder: the others are skipped (or
+    // fail for their own reason) as usual.
+    let preference_problem = hw
+        .as_deref()
+        .filter(|_| would_convert(state, &probe, &lib.profile, job.force))
+        .and_then(|hw| {
+            let codec = Some(lib.profile.video_codec);
+            chrysopoeia_hwdetect::preference_problem(hw, settings.hardware, codec).map(|problem| {
+                let busy = chrysopoeia_hwdetect::preference_busy(hw, settings.hardware, codec);
+                (problem, busy)
+            })
+        });
+    if let Some((problem, busy)) = &preference_problem
         && !settings.cpu_fallback
     {
+        // A GPU that was only busy (every session taken, by Plex for
+        // instance) is waited for; one that doesn't work fails the job.
+        if *busy {
+            return (
+                Disposition::Requeue(Requeue::HardwareBusy(problem.clone())),
+                ctx,
+            );
+        }
         return done(failed(preference_failure(problem)), ctx);
     }
+    let preference_problem = preference_problem.map(|(problem, _)| problem);
 
     let cfg = run_config(state, &settings);
     // Where the result goes, so start-up recovery can finish the
@@ -781,6 +867,26 @@ async fn execute(
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
     }
     done(outcome, ctx)
+}
+
+/// Whether the worker would convert this file (so it needs an encoder): the
+/// decision the worker makes before its first attempt, including "Convert
+/// anyway". A decision that can't be made counts as converting; the worker
+/// reports the problem.
+fn would_convert(
+    state: &AppState,
+    probe: &chrysopoeia_core::ProbeInfo,
+    profile: &chrysopoeia_core::TranscodeProfile,
+    force: bool,
+) -> bool {
+    match state.toolkit.decide(probe, profile) {
+        Ok(Decision::Skip { .. }) if force => matches!(
+            chrysopoeia_worker::decide_forced(probe, profile),
+            Decision::Transcode
+        ),
+        Ok(Decision::Skip { .. }) => false,
+        Ok(Decision::Transcode) | Err(_) => true,
+    }
 }
 
 /// The error of a job that wasn't converted because the hardware chosen in
@@ -942,6 +1048,12 @@ async fn apply_requeue(
                 .defer(job.id, Instant::now() + state.config.settle);
             false
         }
+        Requeue::HardwareBusy(_) => {
+            state.dispatcher.wait_for_hardware(job.library_id);
+            // Check again in a few minutes for as long as jobs wait.
+            crate::services::hardware::recheck_while_waiting(state);
+            false
+        }
     };
     let mut tx = state.db.write_tx().await?;
     db::jobs::requeue(&mut tx, job.id).await?;
@@ -966,8 +1078,28 @@ async fn apply_requeue(
         Requeue::Settling => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
         }
+        Requeue::HardwareBusy(problem) => {
+            tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the chosen GPU");
+            if state.dispatcher.announce_hardware_wait() {
+                state
+                    .activity(
+                        ActivityLevel::Warning,
+                        hardware_wait_message(problem),
+                        ActivityRefs::default(),
+                    )
+                    .await;
+            }
+        }
     }
     Ok(())
+}
+
+/// The feed entry when conversions start waiting for a busy GPU.
+fn hardware_wait_message(problem: &str) -> String {
+    format!(
+        "{problem}, and converting on the CPU instead is turned off, so conversions that need it \
+         wait until it is free. Chrysopoeia checks again by itself every few minutes."
+    )
 }
 
 /// Record how a job ended on the job and file rows, and in the feed.
@@ -1184,7 +1316,14 @@ async fn apply_outcome(
                 },
             )
             .await?;
-            if exists {
+            // A file Chrysopoeia converted before is still the converted
+            // one (nothing was changed), unless it is gone: it stays done,
+            // and the failed job is the record of this attempt.
+            let kept_done = exists
+                && !error.starts_with(MISSING_INPUT_ERROR)
+                && ctx.converted_before()
+                && db::files::keep_converted(&mut tx, job.file_id).await?;
+            if exists && !kept_done {
                 db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(&error))
                     .await?;
             }
@@ -1192,13 +1331,15 @@ async fn apply_outcome(
             if exists {
                 // The activity entry below is the one warning in the log.
                 tracing::debug!(job = %job.id, "job failed: {error}");
-                state
-                    .activity(
-                        ActivityLevel::Error,
-                        format!("Failed {name}: {error}"),
-                        refs,
+                let message = if kept_done {
+                    format!(
+                        "Failed {name}: {}. The file stays as its earlier conversion left it.",
+                        error.trim_end_matches('.')
                     )
-                    .await;
+                } else {
+                    format!("Failed {name}: {error}")
+                };
+                state.activity(ActivityLevel::Error, message, refs).await;
             }
         }
         JobOutcome::Cancelled => {
@@ -1223,12 +1364,29 @@ async fn apply_outcome(
                     )
                     .await?;
                     if exists {
-                        let (status, reason) = if intent == CancelIntent::Skip {
-                            (FileStatus::Skipped, Some(USER_SKIP_REASON))
-                        } else {
-                            (FileStatus::Pending, None)
-                        };
-                        db::files::set_status(&mut tx, job.file_id, status, reason, None).await?;
+                        if intent == CancelIntent::Skip {
+                            db::files::set_status(
+                                &mut tx,
+                                job.file_id,
+                                FileStatus::Skipped,
+                                Some(USER_SKIP_REASON),
+                                None,
+                            )
+                            .await?;
+                        } else if !(ctx.converted_before()
+                            && db::files::keep_converted(&mut tx, job.file_id).await?)
+                        {
+                            // A converted file stays done (it is still the
+                            // converted one); others wait to be converted.
+                            db::files::set_status(
+                                &mut tx,
+                                job.file_id,
+                                FileStatus::Pending,
+                                None,
+                                None,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }

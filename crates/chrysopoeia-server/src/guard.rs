@@ -15,9 +15,11 @@
 //!   and pass.
 //! - **DNS rebinding**: a hostile domain that resolves to the server's LAN
 //!   address makes the browser treat the API as that domain's own. So the
-//!   `Host` must be an IP address, `localhost`, a local name (`tower`,
-//!   `tower.local`, `nas.lan`, `nas.fritz.box`, a Tailscale name) or a name
-//!   listed in `ALLOWED_HOSTS`.
+//!   `Host` header must be an IP address, `localhost`, a local name
+//!   (`tower`, `tower.local`, `nas.lan`, `nas.fritz.box`, a Tailscale name)
+//!   or a name listed in `ALLOWED_HOSTS`. `X-Forwarded-Host` is not held to
+//!   this list: a page can't set it without a CORS preflight (which is never
+//!   granted), and it only serves the origin check above.
 //!
 //! `--dev-cors` (for `next dev` on another port) turns the origin check off.
 

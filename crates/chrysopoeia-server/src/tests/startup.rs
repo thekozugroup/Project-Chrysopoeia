@@ -98,15 +98,27 @@ async fn first_run_applies_command_line_options() {
     let q = app.get("/api/queue").await;
     assert_eq!(q.json["max_jobs"], 2);
     assert_eq!(q.json["max_jobs_source"], "settings");
-    let feed = app.get("/api/activity").await.json["items"].to_string();
-    // Named as the UI names the setting.
-    assert!(
-        feed.contains(
-            "MAX_JOBS=9 is not used because Files at once is set to 2 in Settings. Choose \
-             Automatic there to use MAX_JOBS."
-        ),
-        "{feed}"
+    let feed = app.get("/api/activity").await.json["items"].clone();
+    // Named as the UI names the setting, once, as a warning (the feed entry
+    // is also the one log line).
+    let notes: Vec<&serde_json::Value> = feed
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["message"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("MAX_JOBS=9")
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{feed}");
+    assert_eq!(
+        notes[0]["message"],
+        "MAX_JOBS=9 is not used because Files at once is set to 2 in Settings. Choose \
+         Automatic there to use MAX_JOBS."
     );
+    assert_eq!(notes[0]["level"], "warning");
 }
 
 #[tokio::test]

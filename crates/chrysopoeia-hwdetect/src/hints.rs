@@ -180,6 +180,12 @@ pub fn build_hints(input: &HintInput<'_>) -> Vec<SetupHint> {
 /// working encoder (see [`preference_hint`]).
 pub const PREFERENCE_UNAVAILABLE_TITLE: &str = "The hardware you chose isn't working";
 
+/// Title of the tip shown when no GPU was found at all.
+const CPU_ONLY_TITLE: &str = "Encoding on the CPU";
+
+/// Title of the tip shown when the GPU does HEVC but not AV1.
+const AV1_TIP_TITLE: &str = "Your GPU can't encode AV1";
+
 /// How an API's encoders are named in a sentence: "no working NVIDIA
 /// encoder was found".
 fn encoder_noun(api: HwApi) -> &'static str {
@@ -195,23 +201,57 @@ fn encoder_noun(api: HwApi) -> &'static str {
     }
 }
 
+/// The hardware API chosen in Settings, when it is one.
+fn pinned_api(preference: HwPreference) -> Option<HwApi> {
+    preference.api().filter(|a| a.is_hardware())
+}
+
+/// Whether `api` has a working encoder (for `codec`, when given).
+fn api_works(hw: &HardwareInfo, api: HwApi, codec: Option<VideoCodec>) -> bool {
+    hw.encoders
+        .iter()
+        .any(|e| e.api == api && e.available && e.verified && codec.is_none_or(|c| e.codec == c))
+}
+
+/// Whether the hardware chosen in Settings has no working encoder (for
+/// `codec`, when given) only because its GPU was busy when it was tested:
+/// every NVENC session was taken, by Plex for instance. That says nothing
+/// about whether it works, so jobs that need it wait for it instead of
+/// failing, and detection runs again by itself.
+pub fn preference_busy(
+    hw: &HardwareInfo,
+    preference: HwPreference,
+    codec: Option<VideoCodec>,
+) -> bool {
+    let Some(api) = pinned_api(preference) else {
+        return false;
+    };
+    !api_works(hw, api, codec)
+        && hw.encoders.iter().any(|e| {
+            e.api == api && codec.is_none_or(|c| e.codec == c) && crate::is_busy_failure(e)
+        })
+}
+
 /// Why the hardware chosen in Settings (`preference`) can't be used, as the
 /// start of a sentence: "You chose NVIDIA NVENC, but no working NVIDIA
 /// encoder was found here". With a `codec`, also when that hardware works
-/// but can't make the codec ("…, but it can't make AV1 video here").
+/// but can't make the codec ("…, but it can't make AV1 video here"). A GPU
+/// that was only busy is described as busy (see [`preference_busy`]).
 /// `None` when nothing is pinned (Automatic, CPU) or the hardware works.
 pub fn preference_problem(
     hw: &HardwareInfo,
     preference: HwPreference,
     codec: Option<VideoCodec>,
 ) -> Option<String> {
-    let api = preference.api().filter(|a| a.is_hardware())?;
-    let works = |codec: Option<VideoCodec>| {
-        hw.encoders.iter().any(|e| {
-            e.api == api && e.available && e.verified && codec.is_none_or(|c| e.codec == c)
-        })
-    };
-    if !works(None) {
+    let api = pinned_api(preference)?;
+    if !api_works(hw, api, None) {
+        if preference_busy(hw, preference, None) {
+            return Some(format!(
+                "You chose {}, but its encoding sessions were all in use by other apps when it \
+                 was checked",
+                api.label()
+            ));
+        }
         return Some(format!(
             "You chose {}, but no working {} was found here",
             api.label(),
@@ -219,42 +259,149 @@ pub fn preference_problem(
         ));
     }
     let codec = codec?;
-    (!works(Some(codec))).then(|| {
-        format!(
-            "You chose {}, but it can't make {} video here",
+    if api_works(hw, api, Some(codec)) {
+        return None;
+    }
+    if preference_busy(hw, preference, Some(codec)) {
+        return Some(format!(
+            "You chose {}, but its {} encoder was in use by other apps when it was checked",
             api.label(),
             codec.label()
-        )
-    })
+        ));
+    }
+    Some(format!(
+        "You chose {}, but it can't make {} video here",
+        api.label(),
+        codec.label()
+    ))
+}
+
+/// Titles of hints that are about no particular GPU.
+const NOT_ABOUT_A_GPU: [&str; 3] = [PREFERENCE_UNAVAILABLE_TITLE, CPU_ONLY_TITLE, AV1_TIP_TITLE];
+
+/// Whether `hint` explains a problem with the hardware behind `api`: one
+/// naming its maker, or (for APIs that use /dev/dri) one about passing a GPU
+/// in or the permission to use it.
+fn hint_is_about(hint: &SetupHint, api: HwApi) -> bool {
+    let title = hint.title.as_str();
+    if NOT_ABOUT_A_GPU.contains(&title) {
+        return false;
+    }
+    let makers: &[&str] = match api {
+        HwApi::Nvenc => &["NVIDIA"],
+        HwApi::Qsv => &["Intel"],
+        HwApi::Vaapi => &["Intel", "AMD"],
+        HwApi::Amf => &["AMD"],
+        HwApi::Rkmpp => &["Rockchip"],
+        HwApi::Software | HwApi::VideoToolbox | HwApi::V4l2m2m => &[],
+    };
+    let uses_dri = matches!(api, HwApi::Qsv | HwApi::Vaapi | HwApi::Amf);
+    let any_maker = ["NVIDIA", "Intel", "AMD", "Rockchip"]
+        .iter()
+        .any(|m| title.contains(m));
+    makers.iter().any(|m| title.contains(m)) || (uses_dri && !any_maker && title.contains("GPU"))
+}
+
+/// What to do about a chosen API that doesn't work, when no other hint says
+/// what is wrong with it: the setting that gives the container the hardware
+/// (with its copy-paste fix), or choosing Automatic.
+fn preference_advice(api: HwApi, in_container: bool) -> (String, Option<String>) {
+    const AUTOMATIC: &str = "or choose Automatic under Hardware in Settings";
+    match (api, in_container) {
+        (HwApi::Nvenc, true) => (
+            format!(
+                "If this server has an NVIDIA GPU, give the container access to it (on Unraid, \
+                 install the Nvidia-Driver plugin and add the settings below; --runtime=nvidia \
+                 goes in Extra Parameters), {AUTOMATIC}."
+            ),
+            Some(NVIDIA_DOCKER_FIX.to_string()),
+        ),
+        (HwApi::Nvenc, false) => (
+            format!(
+                "If this server has an NVIDIA GPU, check that NVIDIA's driver is installed and \
+                 that nvidia-smi works, {AUTOMATIC}."
+            ),
+            None,
+        ),
+        (HwApi::Qsv | HwApi::Vaapi | HwApi::Amf, true) => (
+            format!(
+                "If this server has an Intel or AMD GPU, pass it to the container with the \
+                 setting below (on Unraid, add a Device with the value /dev/dri to the \
+                 template), {AUTOMATIC}."
+            ),
+            Some(DRI_DOCKER_FIX.to_string()),
+        ),
+        (HwApi::Rkmpp, true) => (
+            format!("Pass the video engine to the container with the settings below, {AUTOMATIC}."),
+            Some(ROCKCHIP_DOCKER_FIX.to_string()),
+        ),
+        (HwApi::VideoToolbox, _) => (
+            "VideoToolbox only works on a Mac; choose Automatic under Hardware in Settings."
+                .to_string(),
+            None,
+        ),
+        _ => (
+            "Check that the GPU's driver is loaded, or choose Automatic under Hardware in \
+             Settings."
+                .to_string(),
+            None,
+        ),
+    }
 }
 
 /// A hint when the hardware chosen in Settings has no working encoder at
 /// all: files are converted on the CPU instead, or, with CPU fallback off,
-/// not at all. `None` while it works (or nothing is pinned).
+/// not at all (or, when its GPU was only busy, later). It points at the
+/// hint that says what is wrong with that hardware when there is one, and
+/// otherwise says what to do. `None` while it works (or nothing is pinned).
 pub fn preference_hint(
     hw: &HardwareInfo,
     preference: HwPreference,
     cpu_fallback: bool,
 ) -> Option<SetupHint> {
     let problem = preference_problem(hw, preference, None)?;
+    let api = pinned_api(preference)?;
+    if preference_busy(hw, preference, None) {
+        let then = if cpu_fallback {
+            "so files are converted on the CPU until it is free"
+        } else {
+            "so conversions wait until it is free"
+        };
+        return Some(hint(
+            SetupHintLevel::Warning,
+            PREFERENCE_UNAVAILABLE_TITLE,
+            format!(
+                "{problem}, {then}. Chrysopoeia checks again by itself in a few minutes, or \
+                 select Check again in Settings once they finish."
+            ),
+            None,
+        ));
+    }
+    let (advice, fix) = if hw.hints.iter().any(|h| hint_is_about(h, api)) {
+        (
+            "Another hint here says what is wrong with it; or choose Automatic under Hardware \
+             in Settings."
+                .to_string(),
+            None,
+        )
+    } else {
+        preference_advice(api, hw.in_container)
+    };
     let (level, detail) = if cpu_fallback {
         (
             SetupHintLevel::Warning,
-            format!(
-                "{problem}, so files are converted on the CPU. The other hints here say how to \
-                 make it work, or choose Automatic under Hardware in Settings."
-            ),
+            format!("{problem}, so files are converted on the CPU. {advice}"),
         )
     } else {
         (
             SetupHintLevel::Error,
             format!(
                 "{problem}, and converting on the CPU instead is turned off, so files can't be \
-                 converted. Choose Automatic under Hardware in Settings, or allow CPU fallback."
+                 converted. {advice} You can also allow CPU fallback."
             ),
         )
     };
-    Some(hint(level, PREFERENCE_UNAVAILABLE_TITLE, detail, None))
+    Some(hint(level, PREFERENCE_UNAVAILABLE_TITLE, detail, fix))
 }
 
 fn ffmpeg_hints(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
@@ -895,7 +1042,7 @@ fn av1_tip(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     {
         out.push(hint(
             SetupHintLevel::Info,
-            "Your GPU can't encode AV1",
+            AV1_TIP_TITLE,
             "The Save space and Archive goals use AV1, which will run on the CPU and take much longer. \
              The Balanced goal uses HEVC, which your GPU encodes quickly.",
             None,
@@ -924,7 +1071,7 @@ fn cpu_only_hint(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
     }
     out.push(hint(
         SetupHintLevel::Info,
-        "Encoding on the CPU",
+        CPU_ONLY_TITLE,
         detail,
         pass_dri.then(|| DRI_DOCKER_FIX.to_string()),
     ));
@@ -934,6 +1081,7 @@ fn cpu_only_hint(input: &HintInput<'_>, out: &mut Vec<SetupHint>) {
 mod tests {
     use super::*;
     use crate::devices::RenderNode;
+    use crate::encoders::NVENC_BUSY_SENTENCE as NVENC_BUSY;
     use chrysopoeia_core::{EncoderStatus, VIDEO_ENCODERS};
 
     const LINUX: Platform = Platform {
@@ -1671,5 +1819,103 @@ mod tests {
             Some("You chose Intel Quick Sync, but it can't make AV1 video here")
         );
         assert!(preference_problem(&working, HwPreference::Qsv, Some(VideoCodec::Hevc)).is_none());
+    }
+
+    /// The hint only points at other hints when one is about that hardware;
+    /// otherwise it says what to do itself.
+    #[test]
+    fn the_preference_hint_says_what_to_do() {
+        let mut no_gpu = hardware(|_| Some(FailureKind::NoDevice));
+        no_gpu.hints = vec![hint(
+            SetupHintLevel::Info,
+            CPU_ONLY_TITLE,
+            "No GPU was found",
+            None,
+        )];
+        let nvidia = preference_hint(&no_gpu, HwPreference::Nvenc, true).unwrap();
+        assert!(!nvidia.detail.contains("hint"), "{}", nvidia.detail);
+        assert!(
+            nvidia.detail.contains("Nvidia-Driver plugin"),
+            "{}",
+            nvidia.detail
+        );
+        assert_eq!(nvidia.fix.as_deref(), Some(NVIDIA_DOCKER_FIX));
+        let intel = preference_hint(&no_gpu, HwPreference::Qsv, true).unwrap();
+        assert!(intel.detail.contains("/dev/dri"), "{}", intel.detail);
+        assert_eq!(intel.fix.as_deref(), Some(DRI_DOCKER_FIX));
+        // Outside a container there is nothing to pass in.
+        no_gpu.in_container = false;
+        let bare = preference_hint(&no_gpu, HwPreference::Nvenc, true).unwrap();
+        assert!(bare.detail.contains("nvidia-smi"), "{}", bare.detail);
+        assert_eq!(bare.fix, None);
+
+        // An NVIDIA hint explains the NVIDIA problem; an Intel one doesn't.
+        no_gpu.in_container = true;
+        no_gpu.hints.push(hint(
+            SetupHintLevel::Warning,
+            "NVIDIA GPU found, but it can't be used",
+            "…",
+            None,
+        ));
+        let pointed = preference_hint(&no_gpu, HwPreference::Nvenc, true).unwrap();
+        assert!(
+            pointed
+                .detail
+                .contains("Another hint here says what is wrong"),
+            "{}",
+            pointed.detail
+        );
+        assert_eq!(pointed.fix, None);
+        let intel = preference_hint(&no_gpu, HwPreference::Qsv, true).unwrap();
+        assert!(!intel.detail.contains("Another hint"), "{}", intel.detail);
+        // A hint about passing /dev/dri in explains Quick Sync and VA-API.
+        no_gpu.hints.push(hint(
+            SetupHintLevel::Warning,
+            "Your GPU isn't passed into the container",
+            "…",
+            None,
+        ));
+        for pref in [HwPreference::Qsv, HwPreference::Vaapi] {
+            let h = preference_hint(&no_gpu, pref, true).unwrap();
+            assert!(h.detail.contains("Another hint"), "{pref:?}: {}", h.detail);
+        }
+    }
+
+    /// A GPU whose sessions were all taken during the test (Plex using
+    /// NVENC) is busy, not broken: nothing fails because of it.
+    #[test]
+    fn a_busy_chosen_gpu_is_not_called_broken() {
+        let mut busy =
+            hardware(|api| (api == HwApi::Nvenc).then_some(FailureKind::NvencSessionLimit));
+        for e in busy.encoders.iter_mut().filter(|e| e.api == HwApi::Nvenc) {
+            e.error = Some(format!("{NVENC_BUSY} (details)"));
+        }
+        assert!(preference_busy(&busy, HwPreference::Nvenc, None));
+        assert!(preference_busy(
+            &busy,
+            HwPreference::Nvenc,
+            Some(VideoCodec::Hevc)
+        ));
+        assert!(!preference_busy(&busy, HwPreference::Qsv, None));
+        assert!(!preference_busy(&busy, HwPreference::Auto, None));
+        let problem = preference_problem(&busy, HwPreference::Nvenc, None).unwrap();
+        assert!(problem.contains("in use by other apps"), "{problem}");
+        assert!(!problem.contains("no working"), "{problem}");
+        for cpu_fallback in [true, false] {
+            let h = preference_hint(&busy, HwPreference::Nvenc, cpu_fallback).unwrap();
+            assert_eq!(h.level, SetupHintLevel::Warning, "{}", h.detail);
+            assert!(h.detail.contains("checks again by itself"), "{}", h.detail);
+        }
+        assert!(
+            preference_hint(&busy, HwPreference::Nvenc, false)
+                .unwrap()
+                .detail
+                .contains("conversions wait until it is free")
+        );
+
+        // Not busy: a GPU that failed for another reason stays broken.
+        let broken =
+            hardware(|api| (api == HwApi::Nvenc).then_some(FailureKind::NvidiaDriverMissing));
+        assert!(!preference_busy(&broken, HwPreference::Nvenc, None));
     }
 }

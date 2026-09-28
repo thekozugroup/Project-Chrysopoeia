@@ -62,7 +62,7 @@ container templates) mean "not set".
 | `--ffprobe` | `FFPROBE_PATH` | `ffprobe` | |
 | `--browse-root` | `BROWSE_ROOTS` (comma-sep) | `/` | Roots the folder picker may show |
 | `--temp-dir` | `TEMP_DIR` | unset | Work folder used while `settings.temp_dir` is unset (`/temp` in Docker when mounted). Unset: encodes are written next to the file (folder mode: into the output folder) |
-| `--max-jobs` | `MAX_JOBS` | unset | 1–32 or `auto`. Stands in for the automatic job count whenever `settings.max_jobs` ("Files at once" in the UI) is null; a number saved in Settings wins, and the activity feed says so at start ("MAX_JOBS=3 is not used because Files at once is set to 2 in Settings. Choose Automatic there to use MAX_JOBS.") |
+| `--max-jobs` | `MAX_JOBS` | unset | 1–32 or `auto`. Stands in for the automatic job count whenever `settings.max_jobs` ("Files at once" in the UI) is null; a number saved in Settings wins, and the activity feed says so at start, as one warning ("MAX_JOBS=3 is not used because Files at once is set to 2 in Settings. Choose Automatic there to use MAX_JOBS.") |
 | `--hw` | `HW_ACCEL` | `auto` | auto, cpu, nvenc/nvidia, qsv/intel, vaapi, amf, videotoolbox, rkmpp, v4l2m2m. Sets the `hardware` setting on the first run and again whenever the value changes; otherwise the Settings choice is kept |
 | `--library` | `LIBRARIES` (comma-sep) | none | Libraries created on the first run |
 | `--allowed-host` | `ALLOWED_HOSTS` (comma-sep) | none | Extra host names (e.g. a reverse proxy's domain; `.example.com` covers a domain; `*` = any) |
@@ -111,10 +111,12 @@ savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, sav
 Versions: 1 = base schema; 2 = job-list indexes and `finished_at` on every
 finished job; 3 = `jobs.notes`; 4 = `jobs.final_path` (where a started job
 puts its result, written when it starts); 5 = `jobs.force` ("Convert
-anyway"), `libraries.settling` (files the last scan left for later because
-they were still being copied) and `savings` keyed by day and library (with
-one library the old daily rows become its own; with several the history is
-rebuilt from the finished jobs on record, which cover the 30 days shown).
+anyway"), `libraries.settling` (files still being copied, see
+`LibraryStats.settling`) and `savings` keyed by day and library. The old
+daily rows can't be split by library and may include libraries removed
+before (even when one is left), so the history is rebuilt from the
+finished conversions on record; each file's latest conversion is kept by
+trimming, so they cover the 30 days shown (unless the history was cleared).
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -122,7 +124,15 @@ Rules:
 - `files.size_bytes`/`modified_at` always describe the file currently on disk.
   After a replace they describe the new file, so rescans see it unchanged.
 - Activity keeps the newest 5 000 rows. Finished jobs are trimmed to the
-  newest 5 000 and 90 days, except the job each file points at.
+  newest 5 000 and 90 days, except the job each file points at and the
+  latest conversion of a converted file that is queued again.
+- A file converted before (`original_size_bytes` set) whose new job ends
+  without a new result (skipped, cancelled, removed from the queue, or
+  failed for any reason but the file being gone) stays `done` with its
+  savings and points at its latest conversion again (`files.job_id`); the
+  ended job stays in the history as the record of that attempt. When a
+  job finds the file's content changed, its earlier savings are cleared
+  first (it is a different file now).
 - Savings rows belong to a library and go with it, so the savings chart
   (`Overview.savings_history`) and the total above it
   (`Overview.totals.saved_bytes`, the files listed now) describe the same
@@ -137,20 +147,24 @@ scan/watch ─► probe ─► decide(profile)
 dispatcher claims job ─► running(preparing ► transcoding ► verifying ► finalizing)
    ├─ Done     → file: done, size=new size, original_size, saved_bytes;
    │             savings[today, library] += saved
-   ├─ Skipped  → file: skipped + reason (e.g. "Only 3% smaller — kept the original");
-   │             a file converted before (original_size set) stays done with its
-   │             savings, and only the job row records the skip
+   ├─ Skipped  → file: skipped + reason (e.g. "Only 3% smaller — kept the original")
    ├─ Failed   → file: failed + error; original untouched
    └─ Cancelled→ file: pending (queued again after "Stop now" or shutdown; skipped after "Skip")
+   A file converted before (original_size set) stays done with its savings
+   when its new job is skipped, cancelled, removed from the queue or fails;
+   only the job row records that attempt.
 ```
 
 - Scans: walk (blocking thread) → compare with the DB by path, size and mtime
   → probe new/changed files (4 at a time, 60 s each) → decide with the
   profile read right before each batch of 50 is written. Files still settling
   are looked at again later; their number is stored on the library at the
-  end of each scan (`LibraryStats.settling`) and lowered as they settle
-  (a later scan of the library takes over the count). A library whose last
-  scan left such files is scanned again at start. Removed files are deleted
+  end of each scan and lowered as they settle (a later scan of the library
+  takes over the count). The folder watcher's count of media files still
+  being written (`LibraryWatcher::waiting_files`, polled every 2 s) is kept
+  beside it, and `LibraryStats.settling` is the larger of the two (both
+  usually see the same copies). A library that still had such files when
+  the server stopped is scanned again at start. Removed files are deleted
   from the DB (their jobs cascade), except below folders the walk couldn't
   read or left alone, and never when a library that had files walks empty
   (an unmounted share). A file that is still on disk is never removed.
@@ -216,25 +230,42 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Jobs of a library whose folder is offline (missing, unreadable or empty)
   wait, and the folder is checked again every 15 s; a job whose file changed
   moments ago waits for it to settle.
-- Each running job has a `CancellationToken`. Cancel → file `pending`;
+- Each running job has a `CancellationToken`. Cancel → file `pending` (a
+  file converted before stays `done`);
   "Stop now" and shutdown → job and file back to `queued`; deleting a library
   cancels its jobs (media untouched). ffmpeg is killed at once, so
   `POST /jobs/{id}/cancel` answers within a moment with the job's final
   state; the job leaves the running set (and `queue.state`) only after its
   result is recorded. A job being put in place (finalizing) is not
   interrupted; the call then waits up to 8 s and returns the job as it is.
+  A job the database shows as running but that has no task (it finished a
+  moment ago, or a stale row) is closed directly only while it is still
+  `running`, so a result recorded in the meantime is never overwritten.
 - Progress: every update is broadcast as `job.progress`; the DB is written on
   stage changes and at most every 2 s per job.
 - A result is never lost: recording it retries while the database is busy.
 - Encoder candidates come from `hwdetect::encoder_candidates(hw, profile.video_codec,
   settings.hardware, settings.cpu_fallback)`, else the codec's software encoder.
 - When `settings.hardware` names an API that can't make the library's codec
-  here (`hwdetect::preference_problem`), the job gets a note ("You chose
-  NVIDIA NVENC, but no working NVIDIA encoder was found here, so this file
-  was converted on the CPU"); with `cpu_fallback` off it fails instead
-  ("…, and converting on the CPU instead is turned off, so this file wasn't
-  converted. Choose Automatic under Hardware in Settings, or allow CPU
-  fallback.") and nothing is encoded.
+  here (`hwdetect::preference_problem`) and the file would be converted
+  (`decide`, or `decide_forced` for a forced job; files the goal leaves as
+  they are are skipped as usual, and no other check is pre-empted), the job
+  gets a note ("You chose NVIDIA NVENC, but no working NVIDIA encoder was
+  found here, so this file was converted on the CPU"); with `cpu_fallback`
+  off it fails instead ("…, and converting on the CPU instead is turned
+  off, so this file wasn't converted. Choose Automatic under Hardware in
+  Settings, or allow CPU fallback.") and nothing is encoded. A GPU that
+  only had no free encoding session when it was tested
+  (`hwdetect::preference_busy`: every NVENC session taken, e.g. by Plex) is
+  described as busy ("You chose NVIDIA NVENC, but its encoding sessions
+  were all in use by other apps when it was checked"), and with
+  `cpu_fallback` off its jobs are not failed: the job goes back to the
+  queue, and the queued jobs of its library are passed over until the next
+  hardware detection or a change of the hardware settings (by library, so
+  a big queue isn't claimed and put back one job at a time; files there
+  that need no encoding wait too). Detection then runs again every 3
+  minutes for as long as jobs wait, and the feed says once, at WARN, that
+  conversions are waiting.
 - `jobs.force` is passed to the worker as `JobSpec.force`.
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
   start (older versions didn't read it).
@@ -361,7 +392,9 @@ encode outlives a killed server.
   ("The new file is shorter than the original (0.1 s instead of 8.0 s)");
   `streams`, `decode` and `visual` lead with the problem ("The new file
   doesn't look like the original. A frame near 0:10 looks very different
-  …").
+  …"); a `visual` check that couldn't compare the pictures at all (no video
+  track found, no picture readable) leads with "The new file couldn't be
+  compared with the original."
 
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to
@@ -409,9 +442,9 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /scan` | | 202, scans all enabled libraries |
 | `GET /files` | `status`, `library`, `q` (substring of name/path), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`) |
 | `GET /files/{id}` | | `{"file": MediaFile (with probe), "jobs": Job[] (newest first, ≤10)}` |
-| `POST /files/{id}/queue` | `{"priority"?: int, "force"?: bool}` | `Job` (`force` echoed). Works for pending/failed/skipped/done (re-encode). `force` = "Convert anyway" (see `decide_forced`, no size rule; verified as usual). A done file whose new job ends skipped stays done. 409 `already_queued`. |
+| `POST /files/{id}/queue` | `{"priority"?: int, "force"?: bool}` | `Job` (`force` echoed). Works for pending/failed/skipped/done (re-encode). `force` = "Convert anyway" (see `decide_forced`, no size rule; verified as usual). A done file whose new job ends without a new result (skipped, cancelled, failed) stays done. 409 `already_queued`. |
 | `POST /files/{id}/skip` | | `MediaFile` status skipped, reason "Skipped by you"; cancels its job |
-| `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`); the rest are counted in `left_out` (0 for other selections). |
+| `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`), except files skipped by the size rule under that goal; the rest are counted in `left_out` (0 for other selections). |
 | `GET /jobs` | `state` (`active` = running+queued, `running`, `queued`, `history` = finished, `all`), `limit`, `offset` | `{"items": Job[], "total"}`; active sorted running-first then queue order; history newest first |
 | `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`) |
 | `POST /jobs/{id}/cancel` | | `Job` (409 `job_finished`) |
@@ -443,13 +476,17 @@ WebSocket: on connect the server sends `queue.state` and `stats.updated`
 immediately. Server pings every 30 s. A lagging client just misses events;
 clients refetch on reconnect.
 
-**Request guard** (no accounts; trusted LAN): the `Host` (or
-`X-Forwarded-Host`) must be an IP literal, `localhost`, a single-label name,
-a name under `.local`, `.lan`, `.home`, `.home.arpa`, `.internal`,
-`.localdomain`, `.localhost`, `.ts.net`, `.fritz.box`, or listed in
-`ALLOWED_HOSTS`; else 403 `host_not_allowed` (DNS rebinding). Requests that
+**Request guard** (no accounts; trusted LAN): the `Host` header must be an
+IP literal, `localhost`, a single-label name, a name under `.local`, `.lan`,
+`.home`, `.home.arpa`, `.internal`, `.localdomain`, `.localhost`, `.ts.net`,
+`.fritz.box`, or listed in `ALLOWED_HOSTS`; else 403 `host_not_allowed` (DNS
+rebinding: a browser always sends the name it looked up as `Host`).
+`X-Forwarded-Host` is not held to this list (a page can't set it without a
+CORS preflight, which is never granted); it only serves the origin check
+below, for proxies that pass the upstream address as `Host`. Requests that
 change something and WebSocket upgrades carrying an `Origin`/`Referer` must
-come from the same host; else 403 `forbidden_origin`. When `Host` (or
+come from the same host as `Host` or `X-Forwarded-Host`; else 403
+`forbidden_origin`. When `Host` (or
 `X-Forwarded-Host`) has no port, as reverse proxies such as Nginx Proxy
 Manager send it, only the host names are compared (`Origin:
 https://name:8443` matches `Host: name`); the host allowlist still keeps
@@ -489,7 +526,12 @@ scripts) pass. No CORS headers are sent (except with `--dev-cors`).
   "You chose NVIDIA NVENC, but no working NVIDIA encoder was found here, so
   files are converted on the CPU. …"; an error when `cpu_fallback` is off),
   after every detection and whenever the preference or CPU fallback
-  changes.
+  changes. It refers to another hint only when one is about that hardware
+  (its maker, or passing /dev/dri in for Quick Sync, VA-API and AMF);
+  otherwise it gives the fix itself (NVIDIA: the Nvidia-Driver plugin and
+  `--runtime=nvidia` settings; Intel/AMD: `--device=/dev/dri`; or choose
+  Automatic). A busy GPU gets a warning saying files wait (or use the CPU)
+  until it is free and that Chrysopoeia checks again by itself.
 - `recommend_jobs`: CPU jobs = clamp(floor(effective_cores / 4), 1, 8), further
   capped by memory (1.5 GB per job) — effective cores honor cgroup limits.
   GPU jobs: NVIDIA 3 per GPU (consumer NVENC session limits), Intel/AMD 2 per
@@ -550,20 +592,26 @@ secondary detail; every destructive action is reversible or confirmed.
 - `QueueState.max_jobs_source`: `auto` | `env` | `settings` — where the
   effective job limit comes from. The UI shows e.g. "Automatic (3, from
   MAX_JOBS)" for `env`.
-- `LibraryStats.settling`: files the last scan deferred because they are still
-  being copied; the UI shows "Waiting for N files to finish copying" instead
-  of parsing activity text.
+- `LibraryStats.settling`: files still being copied into the library, as the
+  last scan (files it deferred) or the folder watcher (copies in progress,
+  the usual case with `watch_folders` on) sees them, whichever is more; the
+  UI shows "Waiting for N files to finish copying" instead of parsing
+  activity text.
 - `SystemInfo.build`: the image build label from `CHRYSOPOEIA_VERSION`, when
   it differs from `version`; shown in Settings for bug reports.
 - `POST /api/files/{id}/queue` accepts `{"priority"?: int, "force"?: bool}`.
   `force: true` runs that one job without the skip rules (`skip_efficient`,
   same-format) and without `min_savings_pct` ("Convert anyway"). Verification
   still applies. A forced job that finishes keeps the file `done`.
-- A re-queued `done` file whose job ends `skipped` stays `done` (its savings
-  are kept); the job row records the skip.
+- A re-queued `done` file whose job ends `skipped`, is cancelled or removed
+  from the queue, or fails stays `done` (its savings are kept); the job row
+  records the attempt.
 - `POST /api/files/bulk` with `action: "queue"` and explicit `ids` only
   creates jobs for files the profile would convert (or failed files) and
-  returns `{"affected": n, "left_out": m}`.
+  returns `{"affected": n, "left_out": m}`. Files a job already found not
+  small enough under the same goal (skipped by `min_savings_pct`) are left
+  out too: they would be encoded again only to end the same way ("Convert
+  anyway" is for those).
 - `Job.force` (bool) echoes the queue request's `force`.
 - `GET /api/fs/browse` entries: `media_count` counts video files below the
   folder (see the endpoint), with `media_count_capped`.

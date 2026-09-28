@@ -68,6 +68,32 @@ pub struct LibraryHandle {
     /// are being looked at again (see [`recheck_settling`]); a newer scan
     /// takes over from an older one.
     settle_scans: std::sync::Mutex<HashMap<Uuid, u64>>,
+    /// Per library, files still being copied as the last scan and the
+    /// folder watcher see them (see [`record_settling`]).
+    settling: std::sync::Mutex<HashMap<Uuid, SettlingCounts>>,
+}
+
+/// Files of a library still being copied, as two sources see them. The
+/// library shows the larger count (both usually see the same files).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SettlingCounts {
+    /// Left for later by the last scan, not yet settled.
+    scan: u64,
+    /// Waited on by the folder watcher right now.
+    watch: u64,
+}
+
+impl SettlingCounts {
+    fn shown(self) -> u64 {
+        self.scan.max(self.watch)
+    }
+}
+
+/// Which count [`record_settling`] updates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettlingSource {
+    Scan(u64),
+    Watch(u64),
 }
 
 /// How long a removed file's row is remembered for a rename or move.
@@ -93,6 +119,7 @@ impl Default for LibraryHandle {
             removed: std::sync::Mutex::new(RecentlyRemoved::default()),
             probes: Arc::new(Semaphore::new(PROBE_CONCURRENCY)),
             settle_scans: std::sync::Mutex::new(HashMap::new()),
+            settling: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -544,10 +571,60 @@ async fn track_settling(state: &AppState, library_id: Uuid, paths: Vec<PathBuf>)
         *n += 1;
         *n
     };
-    if let Err(e) = db::stats::set_settling(state.db.pool(), library_id, paths.len() as u64).await {
+    let count = paths.len() as u64;
+    if let Err(e) = record_settling(state, library_id, SettlingSource::Scan(count)).await {
         tracing::warn!(library = %library_id, "could not record the files still being copied: {e}");
     }
     recheck_settling_for(state, paths, Some((library_id, scan)));
+}
+
+/// Update one source's count of a library's files still being copied and
+/// store the count the library shows (`LibraryStats::settling`, kept in
+/// the database so a restart rescans libraries that were waiting for
+/// copies). A scan's count is always stored (the stored one may be from
+/// before a restart). Returns whether the shown count changed.
+async fn record_settling(
+    state: &AppState,
+    library_id: Uuid,
+    source: SettlingSource,
+) -> sqlx::Result<bool> {
+    let (before, after) = {
+        let mut all = lock(&state.library.settling);
+        let counts = all.entry(library_id).or_default();
+        let before = counts.shown();
+        match source {
+            SettlingSource::Scan(n) => counts.scan = n,
+            SettlingSource::Watch(n) => counts.watch = n,
+        }
+        (before, counts.shown())
+    };
+    if before != after || matches!(source, SettlingSource::Scan(_)) {
+        db::stats::set_settling(state.db.pool(), library_id, after).await?;
+    }
+    Ok(before != after)
+}
+
+/// The folder watcher's count of media files still being written, per
+/// watched folder: store it as the libraries' settling count where it
+/// changed, and tell the UI.
+pub async fn set_watch_settling(
+    state: &AppState,
+    waiting: &HashMap<PathBuf, usize>,
+) -> sqlx::Result<()> {
+    let libs = db::libraries::list(state.db.pool()).await?;
+    lock(&state.library.settling).retain(|id, _| libs.iter().any(|l| l.id == *id));
+    let mut changed = false;
+    for lib in &libs {
+        let n = waiting.get(Path::new(&lib.path)).copied().unwrap_or(0) as u64;
+        if record_settling(state, lib.id, SettlingSource::Watch(n)).await? {
+            state.broadcast_library(lib.id).await;
+            changed = true;
+        }
+    }
+    if changed {
+        state.broadcast_stats().await;
+    }
+    Ok(())
 }
 
 /// [`recheck_settling`], keeping the settling count of the scan `owner`
@@ -582,8 +659,8 @@ fn recheck_settling_for(state: &AppState, paths: Vec<PathBuf>, owner: Option<(Uu
                     return;
                 }
                 let count = still.len() as u64;
-                match db::stats::set_settling(state.db.pool(), library_id, count).await {
-                    Ok(()) => {
+                match record_settling(&state, library_id, SettlingSource::Scan(count)).await {
+                    Ok(_) => {
                         state.broadcast_library(library_id).await;
                         state.broadcast_stats().await;
                     }

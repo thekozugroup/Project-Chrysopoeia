@@ -401,10 +401,16 @@ pub async fn update_probe(
     probe: &ProbeInfo,
 ) -> sqlx::Result<()> {
     let pc = ProbeColumns::from_probe(Some(probe))?;
+    // Savings from an earlier conversion don't apply to new content (a
+    // probe made again for the same content keeps them).
     sqlx::query(
-        "UPDATE files SET size_bytes = ?, modified_at = ?, probe = ?, container = ?, \
-         video_codec = ?, audio_codec = ?, resolution = ?, hdr = ?, duration_secs = ?, \
-         bit_rate = ?, scanned_at = ?, updated_at = ? WHERE id = ?",
+        "UPDATE files SET \
+         original_size_bytes = CASE WHEN size_bytes = ?1 AND modified_at = ?2 \
+             THEN original_size_bytes END, \
+         saved_bytes = CASE WHEN size_bytes = ?1 AND modified_at = ?2 THEN saved_bytes END, \
+         size_bytes = ?1, modified_at = ?2, probe = ?3, container = ?4, \
+         video_codec = ?5, audio_codec = ?6, resolution = ?7, hdr = ?8, duration_secs = ?9, \
+         bit_rate = ?10, scanned_at = ?11, updated_at = ?12 WHERE id = ?13",
     )
     .bind(i64_of(size_bytes))
     .bind(ts(modified_at))
@@ -505,16 +511,26 @@ pub async fn set_status_where(
     Ok(qb.build().execute(conn).await?.rows_affected() > 0)
 }
 
+/// The file's newest finished conversion, else the job it points at: used
+/// in `UPDATE files` so the job that records the conversion on disk stays
+/// the one the file points at (and so is kept by history trimming).
+pub(crate) const LAST_CONVERSION_JOB: &str = "COALESCE((SELECT j.id FROM jobs j \
+    WHERE j.file_id = files.id AND j.state = 'done' \
+    ORDER BY j.finished_at DESC, j.rowid DESC LIMIT 1), job_id)";
+
 /// After a job for a file Chrysopoeia converted before ended without a new
-/// result (skipped): the file on disk is still the converted one, so it
-/// stays `done` with its savings. Only files with `original_size_bytes`
-/// qualify (set when a conversion replaced the file, cleared when its
-/// content changes). Returns whether the file was kept done.
+/// result (skipped, cancelled, removed from the queue or failed): the file
+/// on disk is still the converted one, so it stays `done` with its savings,
+/// and points at its last conversion again; the ended job stays in the
+/// history as the record of what happened. Only files with
+/// `original_size_bytes` qualify (set when a conversion replaced the file,
+/// cleared when its content changes). Returns whether the file was kept
+/// done.
 pub async fn keep_converted(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<bool> {
-    let done = sqlx::query(
-        "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ? \
-         WHERE id = ? AND original_size_bytes IS NOT NULL",
-    )
+    let done = sqlx::query(&format!(
+        "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ?, \
+         job_id = {LAST_CONVERSION_JOB} WHERE id = ? AND original_size_bytes IS NOT NULL"
+    ))
     .bind(now_ts())
     .bind(id.to_string())
     .execute(conn)
@@ -739,6 +755,13 @@ pub struct RedecideCandidate {
     pub size_rule_skip: bool,
 }
 
+/// Whether a file (`f`) is skipped because a job's result was not small
+/// enough under the size rule (`min_savings_pct`), with `f.job_id` joined
+/// as `j`: its job made an encode, then kept the original for the reason
+/// the file shows.
+const SIZE_RULE_SKIP: &str = "(f.status = 'skipped' AND j.state = 'skipped' \
+    AND j.output_size IS NOT NULL AND j.skip_reason IS f.skip_reason)";
+
 /// Condition for files a profile change re-decides: `pending` and `skipped`
 /// files with a probe, except files the user skipped by hand (`?` is the
 /// user's skip reason).
@@ -769,12 +792,10 @@ pub async fn redecide_candidates(
     ids: &[Uuid],
     user_skip_reason: &str,
 ) -> sqlx::Result<Vec<RedecideCandidate>> {
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT f.id, f.status, f.probe, f.skip_reason, \
-         (f.status = 'skipped' AND j.state = 'skipped' AND j.output_size IS NOT NULL \
-          AND j.skip_reason IS f.skip_reason) AS size_rule_skip \
-         FROM files f LEFT JOIN jobs j ON j.id = f.job_id WHERE f.id IN (",
-    );
+    let mut qb = QueryBuilder::<Sqlite>::new(format!(
+        "SELECT f.id, f.status, f.probe, f.skip_reason, {SIZE_RULE_SKIP} AS size_rule_skip \
+         FROM files f LEFT JOIN jobs j ON j.id = f.job_id WHERE f.id IN ("
+    ));
     let mut sep = qb.separated(", ");
     for id in ids {
         sep.push_bind(id.to_string());
@@ -820,6 +841,10 @@ pub struct QueueCandidate {
     pub status: FileStatus,
     /// `None` when the file was never probed (or its probe no longer parses).
     pub probe: Option<ProbeInfo>,
+    /// Skipped because a job's result was not small enough under the size
+    /// rule (the library's goal would convert it, only to keep the original
+    /// again).
+    pub size_rule_skip: bool,
 }
 
 /// The files among `ids` (at most a few hundred), with their probes.
@@ -830,9 +855,10 @@ pub async fn queue_candidates(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, library_id, status, probe FROM files WHERE id IN (",
-    );
+    let mut qb = QueryBuilder::<Sqlite>::new(format!(
+        "SELECT f.id, f.library_id, f.status, f.probe, {SIZE_RULE_SKIP} AS size_rule_skip \
+         FROM files f LEFT JOIN jobs j ON j.id = f.job_id WHERE f.id IN ("
+    ));
     let mut sep = qb.separated(", ");
     for id in ids {
         sep.push_bind(id.to_string());
@@ -846,11 +872,13 @@ pub async fn queue_candidates(
             continue;
         };
         let probe: Option<String> = row.try_get("probe")?;
+        let size_rule_skip: Option<bool> = row.try_get("size_rule_skip")?;
         out.push(QueueCandidate {
             id: uuid_col(row, "id")?,
             library_id: uuid_col(row, "library_id")?,
             status,
             probe: probe.and_then(|p| parse_json::<ProbeInfo>(&p).ok()),
+            size_rule_skip: size_rule_skip.unwrap_or(false),
         });
     }
     Ok(out)

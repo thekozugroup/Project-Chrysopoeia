@@ -497,8 +497,10 @@ pub async fn requeue(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<()> 
     Ok(())
 }
 
-/// Cancel a job that has not started. Its file goes back to `pending` (or to
-/// `file_status` when given). Returns false when the job was not queued.
+/// Cancel a job that has not started. Its file goes to `file_status`,
+/// except that a file Chrysopoeia converted before goes back to `done` when
+/// `file_status` is `pending` (see [`super::files::keep_converted`]).
+/// Returns false when the job was not queued.
 pub async fn cancel_queued(
     conn: &mut SqliteConnection,
     id: Uuid,
@@ -517,18 +519,75 @@ pub async fn cancel_queued(
     let Some(file_id) = file_id else {
         return Ok(false);
     };
+    close_file(conn, &file_id, id, "queued", file_status, skip_reason).await?;
+    Ok(true)
+}
+
+/// Close a job the database says is running but that has no task (the
+/// queue marks a job running a moment before its task starts, and a crash
+/// can leave one): only while it is still running, so a result recorded in
+/// the meantime is never overwritten. Its file goes back to `pending`, or
+/// to `done` when Chrysopoeia converted it before. Returns false when the
+/// job was no longer running.
+pub async fn cancel_running_row(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<bool> {
+    let file_id: Option<String> = sqlx::query_scalar(
+        "UPDATE jobs SET state = 'cancelled', eta_secs = NULL, finished_at = ? \
+         WHERE id = ? AND state = 'running' RETURNING file_id",
+    )
+    .bind(now_ts())
+    .bind(id.to_string())
+    .fetch_optional(&mut *conn)
+    .await?;
+    let Some(file_id) = file_id else {
+        return Ok(false);
+    };
+    close_file(conn, &file_id, id, "processing", FileStatus::Pending, None).await?;
+    Ok(true)
+}
+
+/// After cancelling job `job_id`, move its file from `from` to `status`
+/// (a converted file to `done` instead of `pending`), if the file still
+/// belongs to that job.
+async fn close_file(
+    conn: &mut SqliteConnection,
+    file_id: &str,
+    job_id: Uuid,
+    from: &str,
+    status: FileStatus,
+    skip_reason: Option<&str>,
+) -> sqlx::Result<()> {
+    let now = now_ts();
+    if status == FileStatus::Pending {
+        let kept = sqlx::query(&format!(
+            "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ?, \
+             job_id = {} WHERE id = ? AND job_id = ? AND status = ? \
+             AND original_size_bytes IS NOT NULL",
+            super::files::LAST_CONVERSION_JOB
+        ))
+        .bind(&now)
+        .bind(file_id)
+        .bind(job_id.to_string())
+        .bind(from)
+        .execute(&mut *conn)
+        .await?
+        .rows_affected();
+        if kept > 0 {
+            return Ok(());
+        }
+    }
     sqlx::query(
         "UPDATE files SET status = ?, skip_reason = ?, updated_at = ? \
-         WHERE id = ? AND job_id = ? AND status = 'queued'",
+         WHERE id = ? AND job_id = ? AND status = ?",
     )
-    .bind(file_status.as_str())
+    .bind(status.as_str())
     .bind(skip_reason)
     .bind(&now)
     .bind(file_id)
-    .bind(id.to_string())
+    .bind(job_id.to_string())
+    .bind(from)
     .execute(conn)
     .await?;
-    Ok(true)
+    Ok(())
 }
 
 /// Set a job's priority.
@@ -559,7 +618,9 @@ const TRIM_CHUNK: u64 = 500;
 
 /// Delete old finished jobs: those older than [`HISTORY_KEEP_DAYS`] and those
 /// beyond the newest [`HISTORY_KEEP_ROWS`]. The job each file points at is
-/// always kept (the file's detail page shows it). Works in small chunks so it
+/// always kept (the file's detail page shows it), and so is the conversion
+/// of a converted file that is queued again (the file points at it again
+/// when the new job ends without a new result). Works in small chunks so it
 /// never holds the write lock for long. Returns how many were deleted.
 pub async fn trim_history(db: &Db) -> sqlx::Result<u64> {
     let cutoff = super::ts(chrono::Utc::now() - chrono::Duration::days(HISTORY_KEEP_DAYS));
@@ -581,7 +642,13 @@ pub async fn trim_history(db: &Db) -> sqlx::Result<u64> {
         let n = sqlx::query(&format!(
             "DELETE FROM jobs WHERE rowid IN (SELECT rowid FROM jobs \
              WHERE state IN {FINISHED_STATES} AND finished_at < ? \
-             AND id NOT IN (SELECT job_id FROM files WHERE job_id IS NOT NULL) LIMIT ?)"
+             AND id NOT IN (SELECT job_id FROM files WHERE job_id IS NOT NULL) \
+             AND id NOT IN (SELECT kept FROM (SELECT (SELECT d.id FROM jobs d \
+                 WHERE d.file_id = f.id AND d.state = 'done' \
+                 ORDER BY d.finished_at DESC, d.rowid DESC LIMIT 1) AS kept \
+                 FROM files f WHERE f.original_size_bytes IS NOT NULL \
+                 AND f.status IN ('queued', 'processing')) WHERE kept IS NOT NULL) \
+             LIMIT ?)"
         ))
         .bind(&boundary)
         .bind(i64_of(TRIM_CHUNK))

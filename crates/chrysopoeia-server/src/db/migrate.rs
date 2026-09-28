@@ -125,9 +125,11 @@ const MIGRATION_V4: &[&str] = &["ALTER TABLE jobs ADD COLUMN final_path TEXT"];
 ///   were still being copied.
 /// - `savings` keyed by day and library, so removing a library removes its
 ///   share of the history (the chart then describes the same files as the
-///   total above it). With one library, the old daily rows are all its own;
-///   with several, the history is rebuilt from the conversions still on
-///   record, which cover the 30 days the chart shows.
+///   total above it). The old daily rows can't be split by library and may
+///   hold savings of libraries removed before (even when one library is
+///   left), so the history is rebuilt from the conversions still on
+///   record: each file's conversion is kept by history trimming, so they
+///   cover the 30 days the chart shows (unless the history was cleared).
 const MIGRATION_V5: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN force INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE libraries ADD COLUMN settling INTEGER NOT NULL DEFAULT 0",
@@ -139,14 +141,10 @@ const MIGRATION_V5: &[&str] = &[
         PRIMARY KEY (date, library_id)
     )",
     "INSERT INTO savings_by_library (date, library_id, saved_bytes, files) \
-     SELECT s.date, l.id, s.saved_bytes, s.files FROM savings s, libraries l \
-     WHERE (SELECT COUNT(*) FROM libraries) = 1",
-    "INSERT INTO savings_by_library (date, library_id, saved_bytes, files) \
      SELECT substr(j.finished_at, 1, 10), j.library_id, \
             SUM(j.input_size - j.output_size), COUNT(*) \
      FROM jobs j JOIN libraries l ON l.id = j.library_id \
      WHERE j.state = 'done' AND j.output_size IS NOT NULL AND j.finished_at IS NOT NULL \
-       AND (SELECT COUNT(*) FROM libraries) > 1 \
      GROUP BY substr(j.finished_at, 1, 10), j.library_id",
     "DROP TABLE savings",
     "ALTER TABLE savings_by_library RENAME TO savings",
@@ -456,14 +454,16 @@ mod tests {
 
     #[tokio::test]
     async fn version_5_keys_savings_by_library() {
-        // One library: the old history is all its own, kept as it was.
+        // One library left, but the old daily total (1234) also holds the
+        // savings of libraries removed before: rebuilt from its own
+        // conversions, so the chart matches the total space saved.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("one.db");
         version_4_db(&path, &["a"], 1234).await;
         let db = Db::open(&path).await.unwrap();
         assert_eq!(
             savings_rows(db.pool()).await,
-            [("2026-09-01".to_string(), "a".to_string(), 1234, 3)]
+            [("2026-09-01".to_string(), "a".to_string(), 40, 1)]
         );
         let force: i64 = sqlx::query_scalar("SELECT force FROM jobs WHERE id = 'j0'")
             .fetch_one(db.pool())

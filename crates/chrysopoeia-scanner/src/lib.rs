@@ -34,7 +34,7 @@ pub use walk::{
     AUDIO_EXTENSIONS, BLU_RAY_FOLDERS, DVD_FOLDERS, IgnoreRules, VIDEO_EXTENSIONS,
     validate_ignore_pattern,
 };
-pub use watch::{LibraryWatcher, WatchEvent};
+pub use watch::{LibraryWatcher, WaitingFiles, WatchEvent};
 
 /// Bytes in the megabyte of `Settings::min_file_size_mb` (decimal, like
 /// the "MB" the UI shows).

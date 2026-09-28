@@ -1,5 +1,6 @@
 //! Integration tests with a fake toolkit and a temp-file SQLite database.
 
+mod converted;
 mod dispatcher;
 mod durability;
 mod files;

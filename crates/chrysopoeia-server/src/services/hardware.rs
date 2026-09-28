@@ -249,6 +249,14 @@ async fn run_detection(state: &AppState) -> Arc<HardwareInfo> {
     state.emit(Event::HardwareUpdated {
         hardware: Box::new((*info).clone()),
     });
+    // Jobs waiting for a busy GPU try again with the new result.
+    state
+        .dispatcher
+        .hardware_changed(chrysopoeia_hwdetect::preference_busy(
+            &info,
+            settings.hardware,
+            None,
+        ));
     state.dispatcher.wake();
     state.broadcast_queue_state().await;
     if busy {
@@ -300,6 +308,16 @@ fn schedule_busy_recheck(state: &AppState) {
         return;
     }
     *lock(&hw.recheck_at) = Some(Instant::now() + BUSY_RECHECK_DELAY);
+}
+
+/// Check the hardware again in a few minutes because jobs are waiting for
+/// the busy GPU chosen in Settings. Unlike [`schedule_busy_recheck`] this
+/// has no limit: the jobs would otherwise wait for a manual check.
+pub fn recheck_while_waiting(state: &AppState) {
+    let mut at = lock(&state.hardware.recheck_at);
+    if at.is_none() {
+        *at = Some(Instant::now() + BUSY_RECHECK_DELAY);
+    }
 }
 
 /// Runs the re-checks [`schedule_busy_recheck`] asks for, until shutdown.
@@ -369,6 +387,12 @@ pub async fn apply_preference(state: &AppState, preference: HwPreference, cpu_fa
     state.emit(Event::HardwareUpdated {
         hardware: Box::new((*info).clone()),
     });
+    // Jobs waiting for a busy GPU may run with the new choice.
+    state
+        .dispatcher
+        .hardware_changed(chrysopoeia_hwdetect::preference_busy(
+            &info, preference, None,
+        ));
 }
 
 #[cfg(test)]

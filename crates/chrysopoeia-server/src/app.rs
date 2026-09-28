@@ -122,10 +122,13 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
     db::settings::set_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY, false).await?;
 
     let state = AppState::new(config, db, toolkit, settings, paused);
-    for note in hw_note.into_iter().chain(max_jobs_note(&state)) {
-        state
-            .activity(ActivityLevel::Info, note, ActivityRefs::default())
-            .await;
+    // Each note is one feed entry and one log line (the feed logs it).
+    let notes = hw_note
+        .map(|n| (ActivityLevel::Info, n))
+        .into_iter()
+        .chain(max_jobs_note(&state).map(|n| (ActivityLevel::Warning, n)));
+    for (level, note) in notes {
+        state.activity(level, note, ActivityRefs::default()).await;
     }
     if first_run {
         tracing::info!("first start: settings created");
@@ -206,15 +209,12 @@ async fn apply_hw_accel(
 fn max_jobs_note(state: &AppState) -> Option<String> {
     let env = state.config.max_jobs?;
     let saved = state.settings().max_jobs?;
-    if env == saved {
-        return None;
-    }
-    let message = format!(
-        "MAX_JOBS={env} is not used because Files at once is set to {saved} in Settings. Choose \
-         Automatic there to use MAX_JOBS."
-    );
-    tracing::warn!("{message}");
-    Some(message)
+    (env != saved).then(|| {
+        format!(
+            "MAX_JOBS={env} is not used because Files at once is set to {saved} in Settings. \
+             Choose Automatic there to use MAX_JOBS."
+        )
+    })
 }
 
 /// Folders that may hold leftover temp files.
