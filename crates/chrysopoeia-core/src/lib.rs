@@ -24,7 +24,9 @@ pub mod validation;
 pub use codec::{AudioCodec, Container, SubtitleAction, VideoCodec};
 pub use encoder::{EncoderInfo, HwApi, VIDEO_ENCODERS};
 pub use error::CoreError;
-pub use event::{ActivityEntry, ActivityLevel, Event, QueueState, ScanPhase, ScanProgress};
+pub use event::{
+    ActivityEntry, ActivityLevel, Event, MaxJobsSource, QueueState, ScanPhase, ScanProgress,
+};
 pub use hardware::{
     CpuInfo, EncoderCandidate, EncoderStatus, FfmpegInfo, GpuDevice, GpuVendor, HardwareInfo,
     HwPreference, JobRecommendation, MemoryInfo, SetupHint, SetupHintLevel,

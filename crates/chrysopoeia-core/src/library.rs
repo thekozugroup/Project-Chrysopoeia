@@ -98,6 +98,11 @@ pub struct LibraryStats {
     pub skipped: u64,
     pub failed: u64,
     pub saved_bytes: i64,
+    /// Files found by the last scan that are still being copied (size or
+    /// modification time changed within the settle window); they are added
+    /// once they settle.
+    #[serde(default)]
+    pub settling: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

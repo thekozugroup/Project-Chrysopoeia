@@ -1451,7 +1451,13 @@ fn encode_audio_args(
 ///   rates up to 48 kHz; AAC up to 96 kHz. Other rates move to 44.1 kHz when
 ///   they are a multiple of 11 025 Hz (so 88.2 kHz halves cleanly), else 48 kHz.
 fn output_sample_rate(codec: AudioCodec, source: Option<u32>) -> Option<u32> {
-    let family = |rate: u32| if rate % 11_025 == 0 { 44_100 } else { 48_000 };
+    let family = |rate: u32| {
+        if rate.is_multiple_of(11_025) {
+            44_100
+        } else {
+            48_000
+        }
+    };
     match codec {
         AudioCodec::Opus => match source {
             Some(48_000 | 24_000 | 16_000 | 12_000 | 8_000) => None,

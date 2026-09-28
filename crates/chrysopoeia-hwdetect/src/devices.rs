@@ -763,10 +763,10 @@ pub fn cgroup_cpu_limit(root: &Path) -> Option<f64> {
         for dir in cgroup_dirs(&v2_base.join(mount), rel) {
             let quota = read_text(&dir.join("cpu.cfs_quota_us"));
             let period = read_text(&dir.join("cpu.cfs_period_us"));
-            if let (Some(q), Some(p)) = (quota, period) {
-                if let Some(limit) = parse_cfs_quota(&q, &p) {
-                    limits.push(limit);
-                }
+            if let (Some(q), Some(p)) = (quota, period)
+                && let Some(limit) = parse_cfs_quota(&q, &p)
+            {
+                limits.push(limit);
             }
         }
     }
@@ -791,10 +791,10 @@ fn cgroup_memory(root: &Path) -> (Option<u64>, Option<u64>) {
     let base = root.join("sys/fs/cgroup");
     let mut best: Option<(u64, Option<u64>)> = None;
     let mut consider = |limit: Option<u64>, usage: Option<u64>| {
-        if let Some(limit) = limit {
-            if best.is_none_or(|(b, _)| limit < b) {
-                best = Some((limit, usage));
-            }
+        if let Some(limit) = limit
+            && best.is_none_or(|(b, _)| limit < b)
+        {
+            best = Some((limit, usage));
         }
     };
 
@@ -1422,13 +1422,13 @@ async fn apply_macos_details(devices: &mut Devices) {
         devices.memory.total_bytes = total;
         devices.memory.available_bytes = total;
     }
-    if let Ok(out) = run_capture("vm_stat", std::iter::empty::<&str>(), TOOL_TIMEOUT).await {
-        if let Some(available) = parse_vm_stat(&out.stdout) {
-            devices.memory.available_bytes = match devices.memory.total_bytes {
-                0 => available,
-                total => available.min(total),
-            };
-        }
+    if let Ok(out) = run_capture("vm_stat", std::iter::empty::<&str>(), TOOL_TIMEOUT).await
+        && let Some(available) = parse_vm_stat(&out.stdout)
+    {
+        devices.memory.available_bytes = match devices.memory.total_bytes {
+            0 => available,
+            total => available.min(total),
+        };
     }
     let mut gpu = DetectedGpu::new(GpuVendor::Apple);
     gpu.name = Some(match brand {

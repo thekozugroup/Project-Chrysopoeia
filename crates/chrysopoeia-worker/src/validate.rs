@@ -1140,17 +1140,17 @@ fn decode_check(
         }
     }
     let decoded = decode.decoded_secs;
-    if let (Some(expected), Some(got)) = (expected_len, decoded) {
-        if got + duration_tolerance(expected) < expected {
-            return CheckResult::fail(
-                format!(
-                    "Playback stopped at {} of {}",
-                    format_time(got),
-                    format_time(expected)
-                ),
-                Some(got),
-            );
-        }
+    if let (Some(expected), Some(got)) = (expected_len, decoded)
+        && got + duration_tolerance(expected) < expected
+    {
+        return CheckResult::fail(
+            format!(
+                "Playback stopped at {} of {}",
+                format_time(got),
+                format_time(expected)
+            ),
+            Some(got),
+        );
     }
     if !inherited.decoders.is_empty() {
         let tracks: Vec<String> = inherited
@@ -1335,21 +1335,20 @@ impl DetectLog {
             }
         } else if let Some(start) = value_after(message, "lavfi.freezedetect.freeze_start:") {
             self.open_freeze = Some(start);
-        } else if let Some(end) = value_after(message, "lavfi.freezedetect.freeze_end:") {
-            if let Some(start) = self.open_freeze.take() {
-                if end > start {
-                    self.frozen.push((start, end));
-                }
-            }
+        } else if let Some(end) = value_after(message, "lavfi.freezedetect.freeze_end:")
+            && let Some(start) = self.open_freeze.take()
+            && end > start
+        {
+            self.frozen.push((start, end));
         }
     }
 
     /// Close a freeze still running at `end`.
     fn finish(mut self, end: f64) -> Self {
-        if let Some(start) = self.open_freeze.take() {
-            if end > start {
-                self.frozen.push((start, end));
-            }
+        if let Some(start) = self.open_freeze.take()
+            && end > start
+        {
+            self.frozen.push((start, end));
         }
         self
     }
@@ -1587,10 +1586,10 @@ fn judge_scan(scan: &ScanOutcome) -> Option<(BadRun, &'static str)> {
     } else {
         25.0
     };
-    if let Some(run) = longest_run(frames, |v| v < FRAME_SSIM_FAIL) {
-        if run.1 >= SCAN_MIN_BAD_FRAMES {
-            return Some((run, "garbage"));
-        }
+    if let Some(run) = longest_run(frames, |v| v < FRAME_SSIM_FAIL)
+        && run.1 >= SCAN_MIN_BAD_FRAMES
+    {
+        return Some((run, "garbage"));
     }
     let window = (rate.round() as usize).clamp(1, frames.len());
     let mut sum: f64 = frames[..window].iter().sum();

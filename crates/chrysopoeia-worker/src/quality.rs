@@ -495,7 +495,7 @@ mod tests {
             let args = video_quality_args(&q(enc.name, enc.api, enc.codec));
             assert!(!args.is_empty(), "{} produced no args", enc.name);
             assert!(
-                args.len() % 2 == 0,
+                args.len().is_multiple_of(2),
                 "{} args are not flag/value pairs: {args:?}",
                 enc.name
             );

@@ -62,13 +62,14 @@ fn help_options(kind: &str, name: &str) -> HashMap<String, Vec<String>> {
         } else if kind == "filter" && indent <= 3 && trimmed.contains('<') {
             current = Some(first.to_string());
             options.entry(first.to_string()).or_default();
-        } else if indent >= 5 && !first.is_empty() {
-            if let Some(opt) = &current {
-                options
-                    .entry(opt.clone())
-                    .or_default()
-                    .push(first.to_string());
-            }
+        } else if indent >= 5
+            && !first.is_empty()
+            && let Some(opt) = &current
+        {
+            options
+                .entry(opt.clone())
+                .or_default()
+                .push(first.to_string());
         }
     }
     options

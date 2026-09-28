@@ -681,10 +681,10 @@ mod canary {
                         let all: Vec<PathBuf> = self.watches.values().flatten().cloned().collect();
                         self.dead.extend(all);
                     }
-                    if event.mask.contains(EventMask::IGNORED) {
-                        if let Some(roots) = self.watches.remove(&event.wd) {
-                            self.dead.extend(roots);
-                        }
+                    if event.mask.contains(EventMask::IGNORED)
+                        && let Some(roots) = self.watches.remove(&event.wd)
+                    {
+                        self.dead.extend(roots);
                     }
                 }
                 if !read_any {
@@ -1626,14 +1626,14 @@ impl Debouncer {
                     ready.push((path, size));
                 }
                 Verdict::GiveUp => {
-                    if let Some(pending) = self.pending.remove(&path) {
-                        if pending.trouble_since.is_some() {
-                            tracing::warn!(
-                                path = %path.display(),
-                                "A changed file still cannot be read, so the watcher stopped \
-                                 waiting for it; the next scan will pick it up."
-                            );
-                        }
+                    if let Some(pending) = self.pending.remove(&path)
+                        && pending.trouble_since.is_some()
+                    {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "A changed file still cannot be read, so the watcher stopped \
+                             waiting for it; the next scan will pick it up."
+                        );
                     }
                 }
             }

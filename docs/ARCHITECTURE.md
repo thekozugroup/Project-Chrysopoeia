@@ -483,3 +483,24 @@ secondary detail; every destructive action is reversible or confirmed.
 - `unraid/chrysopoeia.xml`: Community Applications template with those fields.
 - `docker-compose.yml` (CPU), `docker-compose.nvidia.yml`,
   `docker-compose.intel-amd.yml` overlays.
+
+## Contract additions, round 3 (normative)
+
+- `QueueState.max_jobs_source`: `auto` | `env` | `settings` — where the
+  effective job limit comes from. The UI shows e.g. "Automatic (3, from
+  MAX_JOBS)" for `env`.
+- `LibraryStats.settling`: files the last scan deferred because they are still
+  being copied; the UI shows "Waiting for N files to finish copying" instead
+  of parsing activity text.
+- `SystemInfo.build`: the image build label from `CHRYSOPOEIA_VERSION`, when
+  it differs from `version`; shown in Settings for bug reports.
+- `POST /api/files/{id}/queue` accepts `{"priority"?: int, "force"?: bool}`.
+  `force: true` runs that one job without the skip rules (`skip_efficient`,
+  same-format) and without `min_savings_pct` ("Convert anyway"). Verification
+  still applies. A forced job that finishes keeps the file `done`.
+- A re-queued `done` file whose job ends `skipped` stays `done` (its savings
+  are kept); the job row records the skip.
+- `POST /api/files/bulk` with `action: "queue"` and explicit `ids` only
+  creates jobs for files the profile would convert (or failed files) and
+  returns `{"affected": n, "left_out": m}`.
+- Workspace MSRV is Rust 1.88.

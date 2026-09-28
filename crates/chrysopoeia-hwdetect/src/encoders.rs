@@ -522,12 +522,11 @@ pub fn classify_failure(stderr: &str, timed_out: bool) -> FailureKind {
 
 /// Strip the `[h264_nvenc @ 0x55d...] ` context prefix ffmpeg puts on lines.
 fn strip_context(line: &str) -> &str {
-    if let Some(rest) = line.strip_prefix('[') {
-        if let Some(end) = rest.find("] ") {
-            if rest[..end].contains(" @ 0x") {
-                return rest[end + 2..].trim_start();
-            }
-        }
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some(end) = rest.find("] ")
+        && rest[..end].contains(" @ 0x")
+    {
+        return rest[end + 2..].trim_start();
     }
     line
 }

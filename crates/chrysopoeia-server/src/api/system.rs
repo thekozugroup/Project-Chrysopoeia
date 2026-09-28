@@ -13,6 +13,10 @@ pub async fn get(State(state): State<AppState>) -> Json<SystemInfo> {
     let config = &state.config;
     Json(SystemInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
+        build: std::env::var("CHRYSOPOEIA_VERSION")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && v != env!("CARGO_PKG_VERSION")),
         default_temp_dir: config.temp_dir.as_ref().map(|d| d.display().to_string()),
         browse_roots: config
             .browse_roots

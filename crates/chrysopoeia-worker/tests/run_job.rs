@@ -645,10 +645,11 @@ async fn run_with_hook(
     let watcher = tokio::spawn(async move {
         let mut during = Some(during);
         while let Some(p) = rx.recv().await {
-            if p.stage == JobStage::Transcoding && p.progress > 0.0 {
-                if let Some(f) = during.take() {
-                    f();
-                }
+            if p.stage == JobStage::Transcoding
+                && p.progress > 0.0
+                && let Some(f) = during.take()
+            {
+                f();
             }
         }
         during.is_none()

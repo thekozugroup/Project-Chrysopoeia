@@ -42,6 +42,7 @@ fn stats_from_row(row: &SqliteRow) -> sqlx::Result<LibraryStats> {
         skipped: count(row, "skipped")?,
         failed: count(row, "failed")?,
         saved_bytes: row.try_get("saved_bytes")?,
+        settling: 0,
     })
 }
 

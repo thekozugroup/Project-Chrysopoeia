@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemInfo {
     pub version: String,
+    /// Image build label from `CHRYSOPOEIA_VERSION` (e.g. `edge-1a2b3c4`),
+    /// when it differs from `version`.
+    #[serde(default)]
+    pub build: Option<String>,
     /// Scratch folder used when `Settings::temp_dir` is unset (`--temp-dir` /
     /// `TEMP_DIR`, e.g. `/temp` in Docker). `None` means next to each file.
     pub default_temp_dir: Option<String>,

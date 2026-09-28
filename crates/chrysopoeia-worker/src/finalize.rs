@@ -442,11 +442,11 @@ fn commit_without_backup(
     }
     // The original changed after the new file went in: the new file is a
     // conversion of the old version, so take it out again.
-    if let Err(e) = req.check_original() {
-        if e.is::<OriginalChanged>() {
-            remove_quietly(&req.final_path);
-            return Err(e);
-        }
+    if let Err(e) = req.check_original()
+        && e.is::<OriginalChanged>()
+    {
+        remove_quietly(&req.final_path);
+        return Err(e);
     }
     if let Err(e) = fs::remove_file(&req.input) {
         tracing::warn!(
@@ -616,17 +616,17 @@ impl Mover<'_> {
             .saturating_add(size / 100)
             .saturating_add(COPY_MARGIN_BYTES);
         let dir = parent_dir(staged);
-        if let Some((_, free)) = filesystem_of(&dir) {
-            if free < needed {
-                return Err(io::Error::new(
-                    io::ErrorKind::StorageFull,
-                    format!(
-                        "there is not enough free space in {} (needs about {})",
-                        dir.display(),
-                        crate::validate::human_bytes(needed)
-                    ),
-                ));
-            }
+        if let Some((_, free)) = filesystem_of(&dir)
+            && free < needed
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "there is not enough free space in {} (needs about {})",
+                    dir.display(),
+                    crate::validate::human_bytes(needed)
+                ),
+            ));
         }
         let result = (|| {
             fs::copy(src, staged)?;
@@ -670,10 +670,10 @@ impl Mover<'_> {
 
 /// Delete a file, logging anything but "already gone".
 fn remove_quietly(path: &Path) {
-    if let Err(e) = fs::remove_file(path) {
-        if e.kind() != io::ErrorKind::NotFound {
-            tracing::warn!(path = %path.display(), "could not delete a leftover file: {e}");
-        }
+    if let Err(e) = fs::remove_file(path)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), "could not delete a leftover file: {e}");
     }
 }
 

@@ -1320,10 +1320,10 @@ impl Drop for TempGuard {
         // async threads when a runtime is available.
         let path = std::mem::take(&mut self.path);
         let remove = move || {
-            if let Err(e) = std::fs::remove_file(&path) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %path.display(), "could not delete the temp file: {e}");
-                }
+            if let Err(e) = std::fs::remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), "could not delete the temp file: {e}");
             }
         };
         match tokio::runtime::Handle::try_current() {

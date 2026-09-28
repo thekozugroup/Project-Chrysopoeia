@@ -45,8 +45,24 @@ pub struct QueueState {
     pub max_jobs: u32,
     /// True when `max_jobs` comes from hardware detection.
     pub max_jobs_auto: bool,
+    /// Where `max_jobs` comes from, so the UI can explain it.
+    #[serde(default)]
+    pub max_jobs_source: MaxJobsSource,
     /// True when jobs are waiting for the configured active hours.
     pub waiting_for_schedule: bool,
+}
+
+/// Origin of the effective concurrent job limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxJobsSource {
+    /// Hardware detection (`recommended_jobs.total`).
+    #[default]
+    Auto,
+    /// The `MAX_JOBS` environment variable, used while Settings say Automatic.
+    Env,
+    /// A number saved in Settings.
+    Settings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

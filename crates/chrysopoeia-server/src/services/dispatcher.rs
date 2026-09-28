@@ -22,7 +22,7 @@ use chrono::{DateTime, Local, Timelike, Utc};
 use chrysopoeia_core::encoder::VIDEO_ENCODERS;
 use chrysopoeia_core::{
     ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
-    JobState, MediaFile, OutputMode, QueueState, Settings,
+    JobState, MaxJobsSource, MediaFile, OutputMode, QueueState, Settings,
 };
 use chrysopoeia_scanner::WatchEvent;
 use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
@@ -297,14 +297,23 @@ pub fn outside_active_hours(settings: &Settings) -> bool {
 pub async fn queue_state(state: &AppState) -> sqlx::Result<QueueState> {
     let (running, queued) = db::jobs::counts(state.db.pool()).await?;
     let (max_jobs, max_jobs_auto) = effective_max_jobs(state);
+    let settings = state.settings();
+    let max_jobs_source = if settings.max_jobs.is_some() {
+        MaxJobsSource::Settings
+    } else if state.config.max_jobs.is_some() {
+        MaxJobsSource::Env
+    } else {
+        MaxJobsSource::Auto
+    };
     let paused = state.dispatcher.is_paused();
-    let waiting = !paused && queued > 0 && outside_active_hours(&state.settings());
+    let waiting = !paused && queued > 0 && outside_active_hours(&settings);
     Ok(QueueState {
         paused,
         running,
         queued,
         max_jobs,
         max_jobs_auto,
+        max_jobs_source,
         waiting_for_schedule: waiting,
     })
 }
@@ -805,7 +814,7 @@ async fn record(
                 return;
             }
         }
-        if attempts == 1 || attempts % 10 == 0 {
+        if attempts == 1 || attempts.is_multiple_of(10) {
             tracing::warn!(
                 job = %job.id,
                 attempts,

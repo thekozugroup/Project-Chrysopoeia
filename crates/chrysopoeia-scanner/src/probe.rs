@@ -424,10 +424,10 @@ fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> 
 /// Strip the `[demuxer @ 0x…] ` and `<input path>: ` prefixes from a line.
 fn clean_ffprobe_line<'a>(line: &'a str, input: &str) -> &'a str {
     let mut line = line.trim();
-    if line.starts_with('[') {
-        if let Some(end) = line.find("] ") {
-            line = line[end + 2..].trim_start();
-        }
+    if line.starts_with('[')
+        && let Some(end) = line.find("] ")
+    {
+        line = line[end + 2..].trim_start();
     }
     if let Some(rest) = line.strip_prefix(input) {
         line = rest.trim_start_matches(':').trim_start();
@@ -693,10 +693,11 @@ fn bit_depth_from_pix_fmt(pix_fmt: &str) -> Option<u8> {
         .unwrap_or(&name);
 
     // Semi-planar formats: p010, p012, p016, p210, p410, ...
-    if let Some(digits) = base.strip_prefix('p') {
-        if digits.len() == 3 && digits.bytes().all(|b| b.is_ascii_digit()) {
-            return digits[1..].parse().ok();
-        }
+    if let Some(digits) = base.strip_prefix('p')
+        && digits.len() == 3
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return digits[1..].parse().ok();
     }
     match base {
         "y210" | "xv30" | "v30x" | "x2rgb10" | "x2bgr10" | "nv20" => return Some(10),
@@ -709,12 +710,12 @@ fn bit_depth_from_pix_fmt(pix_fmt: &str) -> Option<u8> {
     let digits = &base[stem.len()..];
     let planar = stem == "gray"
         || (stem.ends_with('p') && (stem.starts_with("yuv") || stem.starts_with("gbr")));
-    if planar && !digits.is_empty() {
-        if let Ok(depth) = digits.parse::<u8>() {
-            if (8..=16).contains(&depth) {
-                return Some(depth);
-            }
-        }
+    if planar
+        && !digits.is_empty()
+        && let Ok(depth) = digits.parse::<u8>()
+        && (8..=16).contains(&depth)
+    {
+        return Some(depth);
     }
     EIGHT_BIT.contains(&base).then_some(8)
 }
