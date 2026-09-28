@@ -290,6 +290,32 @@ async fn patch_and_delete_library() {
 }
 
 #[tokio::test]
+async fn delete_library_while_a_job_runs() {
+    let app = TestApp::new().await;
+    app.fake.set_default(Behavior::Hold);
+    app.write("Movies/a.mkv", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    let app_ref = &app;
+    wait_until("running", || async {
+        app_ref.state.dispatcher.running_count() == 1
+    })
+    .await;
+    let r = app
+        .delete(&format!("/api/libraries/{}", lib["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(r.status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        app.state.dispatcher.running_count(),
+        0,
+        "its job was cancelled"
+    );
+    assert_eq!(app.get("/api/jobs").await.json["total"], 0);
+    assert!(app.media.join("Movies/a.mkv").exists());
+    let q = app.get("/api/queue").await;
+    assert_eq!(q.json["running"], 0);
+}
+
+#[tokio::test]
 async fn scan_endpoints() {
     let app = TestApp::new().await;
     let lib = app.add_library("Movies", json!({})).await;
