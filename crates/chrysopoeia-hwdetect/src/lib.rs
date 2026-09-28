@@ -1,49 +1,78 @@
-//! Hardware capability detection for Chrysopeia.
+//! Hardware and encoder detection.
 //!
-//! Detects available GPUs, hardware encoders, and recommends
-//! the best encoding path for the current system.
+//! Finds CPUs, memory limits and GPUs, checks which ffmpeg encoders are
+//! compiled in, and runs a tiny test encode with each hardware encoder so the
+//! UI only offers what actually works inside this container.
+//!
+//! Public API (fixed; see docs/ARCHITECTURE.md):
+//! - [`detect`] — full detection, never fails (problems become `hints`).
+//! - [`recommend_jobs`] — concurrent job count for the hardware.
+//! - [`encoder_candidates`] — ordered encoders to try for a job.
 
-pub mod ffmpeg;
-pub mod gpu;
+use std::path::PathBuf;
+
+use chrysopoeia_core::{
+    EncoderCandidate, HardwareInfo, HwPreference, JobRecommendation, VideoCodec,
+};
+
+pub mod devices;
+pub mod encoders;
+pub mod hints;
 pub mod recommend;
 
-use chrysopoeia_core::models::HardwareCapability;
-
-/// Error type for hardware detection failures.
-#[derive(Debug, thiserror::Error)]
-pub enum HwDetectError {
-    #[error("GPU detection failed: {0}")]
-    GpuDetection(String),
-
-    #[error("FFmpeg detection failed: {0}")]
-    FfmpegDetection(String),
-
-    #[error("No suitable hardware found")]
-    NoHardware,
+/// Inputs for [`detect`].
+#[derive(Debug, Clone)]
+pub struct DetectOptions {
+    pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
+    /// Run a short test encode per hardware encoder (recommended). When
+    /// false, encoders listed by ffmpeg are reported as unverified.
+    pub verify_encoders: bool,
+    /// Root for `/proc`, `/sys` and `/dev` lookups. `/` in production; tests
+    /// point it at a fake tree.
+    pub system_root: PathBuf,
+    /// Preference used to compute `recommended_jobs.total`.
+    pub preference: HwPreference,
 }
 
-/// Detect all available hardware encoding capabilities on this system.
+impl Default for DetectOptions {
+    fn default() -> Self {
+        Self {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+            verify_encoders: true,
+            system_root: PathBuf::from("/"),
+            preference: HwPreference::Auto,
+        }
+    }
+}
+
+/// Detect everything. Never returns an error: missing ffmpeg, missing GPUs and
+/// failing encoders are reported through `HardwareInfo::hints`.
+pub async fn detect(opts: &DetectOptions) -> HardwareInfo {
+    let _ = opts;
+    todo!("implemented by the hwdetect agent")
+}
+
+/// Recommend concurrent jobs for this hardware and preference.
+pub fn recommend_jobs(hw: &HardwareInfo, preference: HwPreference) -> JobRecommendation {
+    let _ = (hw, preference);
+    todo!("implemented by the hwdetect agent")
+}
+
+/// Ordered list of encoders to try for `codec`.
 ///
-/// Combines GPU detection via oximedia-accel with FFmpeg encoder probing
-/// to build a complete picture of available hardware.
-pub async fn detect_hardware() -> Result<Vec<HardwareCapability>, HwDetectError> {
-    let mut capabilities = Vec::new();
-
-    // Try GPU detection via oximedia-accel Vulkan enumeration
-    match gpu::detect_gpus().await {
-        Ok(gpu_caps) => capabilities.extend(gpu_caps),
-        Err(e) => tracing::warn!("GPU detection failed, continuing with FFmpeg: {e}"),
-    }
-
-    // Try FFmpeg encoder detection as fallback / supplement
-    match ffmpeg::detect_ffmpeg_encoders().await {
-        Ok(ffmpeg_caps) => capabilities.extend(ffmpeg_caps),
-        Err(e) => tracing::warn!("FFmpeg encoder detection failed: {e}"),
-    }
-
-    if capabilities.is_empty() {
-        tracing::info!("No hardware acceleration detected; CPU-only encoding will be used");
-    }
-
-    Ok(capabilities)
+/// Verified hardware encoders matching `preference` come first (each with
+/// `hw_decode: true`; the worker retries the same encoder with CPU decoding
+/// before moving on). The software encoder is appended when `preference` is
+/// `Cpu`, when there is no usable hardware encoder, or when `cpu_fallback` is
+/// true. Never returns an empty list if a software encoder is available.
+pub fn encoder_candidates(
+    hw: &HardwareInfo,
+    codec: VideoCodec,
+    preference: HwPreference,
+    cpu_fallback: bool,
+) -> Vec<EncoderCandidate> {
+    let _ = (hw, codec, preference, cpu_fallback);
+    todo!("implemented by the hwdetect agent")
 }

@@ -1,73 +1,43 @@
-//! Filesystem watcher using the `notify` crate.
-//!
-//! Watches library directories for new, modified, or deleted media files
-//! and emits events via a tokio channel.
+//! Debounced folder watching. Implemented by the scanner agent.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 
-/// Events emitted by the file watcher.
-#[derive(Debug, Clone)]
-pub enum FileEvent {
-    /// A new file was created.
-    Created(PathBuf),
-    /// An existing file was modified.
-    Modified(PathBuf),
-    /// A file was removed.
+/// A settled change under a watched root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchEvent {
+    /// A media file was created or modified and its size has stopped
+    /// changing for the settle period (i.e. the copy finished).
+    Upserted(PathBuf),
+    /// A media file (or a folder containing media) was removed or moved away.
     Removed(PathBuf),
 }
 
-/// Watches library directories for filesystem changes.
-pub struct FileWatcher {
-    _watcher: RecommendedWatcher,
-    /// Receive file events from this channel.
-    pub receiver: mpsc::Receiver<FileEvent>,
+/// Watches library roots. Dropping it stops watching.
+pub struct LibraryWatcher {
+    _private: (),
 }
 
-impl FileWatcher {
-    /// Create a new file watcher for the given directories.
-    ///
-    /// Returns the watcher and a channel receiver for file events.
-    pub fn new(directories: &[PathBuf]) -> anyhow::Result<Self> {
-        let (tx, rx) = mpsc::channel(256);
-
-        let sender = tx.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if let Ok(event) = res {
-                    let file_events = translate_event(event);
-                    for fe in file_events {
-                        let _ = sender.blocking_send(fe);
-                    }
-                }
-            })?;
-
-        for dir in directories {
-            tracing::info!("Watching directory: {}", dir.display());
-            watcher.watch(dir, RecursiveMode::Recursive)?;
-        }
-
-        Ok(Self {
-            _watcher: watcher,
-            receiver: rx,
-        })
+impl LibraryWatcher {
+    /// Start a watcher. `settle` is how long a file's size must stay
+    /// unchanged before `Upserted` is emitted. Temp/backup artifacts and
+    /// non-media files never produce events.
+    pub fn start(settle: Duration) -> anyhow::Result<(Self, mpsc::Receiver<WatchEvent>)> {
+        let _ = settle;
+        todo!("implemented by the scanner agent")
     }
-}
 
-/// Translate a notify event into our domain events.
-fn translate_event(event: notify::Event) -> Vec<FileEvent> {
-    use notify::EventKind;
-
-    let mut out = Vec::new();
-    for path in event.paths {
-        match event.kind {
-            EventKind::Create(_) => out.push(FileEvent::Created(path)),
-            EventKind::Modify(_) => out.push(FileEvent::Modified(path)),
-            EventKind::Remove(_) => out.push(FileEvent::Removed(path)),
-            _ => {}
-        }
+    /// Start watching a root recursively. Watching the same root twice is a no-op.
+    pub fn watch(&self, root: &Path) -> anyhow::Result<()> {
+        let _ = root;
+        todo!("implemented by the scanner agent")
     }
-    out
+
+    /// Stop watching a root. Unknown roots are a no-op.
+    pub fn unwatch(&self, root: &Path) -> anyhow::Result<()> {
+        let _ = root;
+        todo!("implemented by the scanner agent")
+    }
 }

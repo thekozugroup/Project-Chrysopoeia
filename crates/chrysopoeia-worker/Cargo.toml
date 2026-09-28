@@ -1,34 +1,23 @@
 [package]
 name = "chrysopoeia-worker"
-description = "Transcoding worker for Chrysopeia job processing"
+description = "ffmpeg job planning, execution, verification and file replacement for Chrysopoeia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-oximedia = [
-    "dep:oximedia-transcode",
-    "dep:oximedia-accel",
-    "dep:oximedia-jobs",
-    "dep:oximedia-presets",
-    "dep:oximedia-compat-ffmpeg",
-]
-
 [dependencies]
+chrysopoeia-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tokio-util = "0.7"
-chrysopoeia-core = { workspace = true }
-chrysopoeia-hwdetect = { workspace = true }
-oximedia-transcode = { workspace = true, optional = true }
-oximedia-accel = { workspace = true, optional = true }
-oximedia-jobs = { workspace = true, optional = true }
-oximedia-presets = { workspace = true, optional = true }
-oximedia-compat-ffmpeg = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+chrysopoeia-scanner = { workspace = true }

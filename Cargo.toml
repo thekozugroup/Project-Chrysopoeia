@@ -9,32 +9,22 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/michaelwong/chrysopoeia"
+repository = "https://github.com/thekozugroup/Project-Chrysopoeia"
 
 [workspace.dependencies]
-# OxiMedia crates (optional - enable with "oximedia" feature on each crate)
-oximedia-core = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-transcode = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-accel = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-jobs = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-codec = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-audio = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-container = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-quality = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-compat-ffmpeg = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-presets = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-oximedia-io = { git = "https://github.com/cool-japan/oximedia", branch = "master" }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
 
 # Web framework
-axum = { version = "0.8", features = ["ws", "json", "multipart"] }
+axum = { version = "0.8", features = ["ws", "json"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace", "compression-gzip", "set-header"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -50,13 +40,26 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 thiserror = "2"
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 notify = "7"
 walkdir = "2"
 globset = "0.4"
+tempfile = "3"
 
 # Internal crates
 chrysopoeia-core = { path = "crates/chrysopoeia-core" }
 chrysopoeia-hwdetect = { path = "crates/chrysopoeia-hwdetect" }
 chrysopoeia-scanner = { path = "crates/chrysopoeia-scanner" }
 chrysopoeia-worker = { path = "crates/chrysopoeia-worker" }
+
+# Smaller, faster debug builds. Line tables keep backtraces useful.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

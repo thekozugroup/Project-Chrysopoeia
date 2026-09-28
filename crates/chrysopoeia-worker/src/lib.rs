@@ -1,11 +1,18 @@
-//! Transcoding worker for Chrysopeia.
+//! Transcode execution: decide what to do with a file, build the ffmpeg
+//! command, run it with a hardware-to-software fallback chain, verify the
+//! result, and put it in place safely.
 //!
-//! Processes transcode jobs using either native oximedia or FFmpeg backends.
+//! Module ownership (see docs/ARCHITECTURE.md):
+//! - `plan`, `quality` — pure planning: skip decisions and ffmpeg arguments.
+//! - `ffmpeg`, `run`, `validate`, `finalize` — processes, verification, files.
 
-pub mod engine;
-pub mod ffmpeg_backend;
-pub mod oximedia_backend;
-pub mod progress;
-pub mod strategy;
+pub mod ffmpeg;
+pub mod finalize;
+pub mod plan;
+pub mod quality;
+pub mod run;
+pub mod validate;
 
-pub use engine::TranscodeEngine;
+pub use plan::{Decision, FfmpegPlan, PlanRequest, StreamSummary, build_plan, decide};
+pub use run::{JobOutcome, JobSpec, RunConfig, run_job};
+pub use validate::{ValidateRequest, validate_output};
