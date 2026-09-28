@@ -73,14 +73,15 @@ export function NavTabs({ tabs, label, className }: { tabs: NavTab[]; label: str
               href={tab.href}
               aria-current={tab.active ? "page" : undefined}
               className={cn(
-                "relative -mb-px flex h-10 items-center gap-2 border-b-2 px-3 text-sm font-medium no-underline transition-colors",
+                "relative -mb-px flex h-10 items-center gap-2 border-b-2 px-3 text-sm font-medium no-underline transition-colors pointer-coarse:h-11",
                 tab.active
                   ? "border-accent-ink text-fg"
                   : "border-transparent text-muted hover:border-line-strong hover:text-fg",
               )}
             >
               {tab.label}
-              {tab.count !== undefined && tab.count !== null ? (
+              {/* A zero count says nothing the empty tab doesn't. */}
+              {tab.count ? (
                 <span
                   className={cn(
                     "rounded-full px-1.5 text-xs tabular",
@@ -125,7 +126,7 @@ export function Pager({
           type="button"
           onClick={() => onPage(Math.max(0, offset - limit))}
           disabled={offset === 0}
-          className="h-8 rounded-md border border-line-strong/60 bg-surface px-3 font-medium text-fg hover:bg-raised disabled:opacity-50"
+          className="h-8 rounded-md border border-line-strong/60 bg-surface px-3 font-medium text-fg hover:bg-raised disabled:opacity-50 pointer-coarse:h-11"
         >
           Previous
         </button>
@@ -133,7 +134,7 @@ export function Pager({
           type="button"
           onClick={() => onPage(offset + limit)}
           disabled={to >= total}
-          className="h-8 rounded-md border border-line-strong/60 bg-surface px-3 font-medium text-fg hover:bg-raised disabled:opacity-50"
+          className="h-8 rounded-md border border-line-strong/60 bg-surface px-3 font-medium text-fg hover:bg-raised disabled:opacity-50 pointer-coarse:h-11"
         >
           Next
         </button>

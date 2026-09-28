@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { profileForGoal } from "./profile";
-import { changedKeys, errorsFrom, saveBarMessage, settingForField } from "./settings-form";
+import { changedKeys, errorsFrom, profileFieldOf, saveBarMessage, sectionFor, settingForField } from "./settings-form";
 import type { Settings } from "./types";
 
 const base: Settings = {
@@ -169,5 +169,45 @@ describe("saveBarMessage", () => {
       role: "status",
       blocked: false,
     });
+  });
+});
+
+describe("nested profile fields", () => {
+  it("finds the profile control a server field names", () => {
+    expect(profileFieldOf("profile.quality", "profile")).toBe("quality");
+    expect(profileFieldOf("profile.max_height", "profile")).toBe("max_height");
+    expect(profileFieldOf("default_profile.quality_override", "default_profile")).toBe("quality_override");
+    expect(profileFieldOf("default_profile.audio_languages[0]", "default_profile")).toBe("audio_languages");
+    expect(profileFieldOf("profile.nonsense", "profile")).toBeNull();
+    expect(profileFieldOf("default_profile.quality", "profile")).toBeNull();
+    expect(profileFieldOf("name", "profile")).toBeNull();
+    expect(profileFieldOf(null, "profile")).toBeNull();
+  });
+
+  it("points at a default-profile error shown under its control, and spells it out elsewhere", () => {
+    const errors = { default_profile: 'The value for "default_profile.quality" isn\'t valid.' };
+    expect(saveBarMessage({ errors, draft: base, section: "advanced", advancedValid: true, profileFieldShown: true })).toEqual({
+      message: "Fix the highlighted setting to save.",
+      role: "status",
+      blocked: false,
+    });
+    expect(saveBarMessage({ errors, draft: base, section: "advanced", advancedValid: true }).role).toBe("alert");
+    expect(
+      saveBarMessage({ errors, draft: base, section: "output", advancedValid: true, profileFieldShown: true }).message,
+    ).toBe(`${errors.default_profile} (Advanced)`);
+  });
+
+  it("puts a nested default-profile error on the default profile", () => {
+    const err = new ApiError(400, "invalid_settings", "Pick a quality.", "default_profile.quality");
+    expect(errorsFrom(err, ["default_profile"])).toEqual({ default_profile: "Pick a quality." });
+  });
+});
+
+describe("sectionFor", () => {
+  it("sends old verification links to Output, and anything unknown to Processing", () => {
+    expect(sectionFor("verification")).toBe("output");
+    expect(sectionFor("hardware")).toBe("hardware");
+    expect(sectionFor("nope")).toBe("processing");
+    expect(sectionFor(undefined)).toBe("processing");
   });
 });

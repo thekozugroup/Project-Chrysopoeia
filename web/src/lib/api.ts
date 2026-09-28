@@ -22,6 +22,7 @@ import type {
   MediaFile,
   Overview,
   Presets,
+  QueueFileRequest,
   QueueState,
   Settings,
   SystemInfo,
@@ -113,6 +114,8 @@ const FALLBACK_MESSAGES: Record<number, string> = {
   403: "That folder is outside the folders Chrysopoeia is allowed to show.",
   404: "That item no longer exists. It may have been removed.",
   409: "That conflicts with something that's already happening.",
+  413: "That request was too large for the server.",
+  415: "The server couldn't read that request. Reload the page and try again.",
   500: "The server ran into a problem. Check the container logs for details.",
   502: "The server isn't answering. It may be restarting.",
   503: "The server isn't ready yet. It may still be starting up.",
@@ -228,11 +231,8 @@ export const api = {
   files: (query: FileQuery, signal?: AbortSignal) =>
     request<ListResponse<MediaFile>>("/files", { query: { ...query }, signal }),
   file: (id: string, signal?: AbortSignal) => request<FileDetail>(`/files/${seg(id)}`, { signal }),
-  queueFile: (id: string, priority?: number) =>
-    request<Job>(`/files/${seg(id)}/queue`, {
-      method: "POST",
-      body: priority === undefined ? {} : { priority },
-    }),
+  queueFile: (id: string, options: QueueFileRequest = {}) =>
+    request<Job>(`/files/${seg(id)}/queue`, { method: "POST", body: options }),
   skipFile: (id: string) => request<MediaFile>(`/files/${seg(id)}/skip`, { method: "POST" }),
   bulk: (body: BulkRequest) => request<Affected>("/files/bulk", { method: "POST", body }),
 

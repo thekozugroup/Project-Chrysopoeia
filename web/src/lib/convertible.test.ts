@@ -140,21 +140,21 @@ describe("planBulkConvert", () => {
     const none = { settings: 0, converted: 0, unconvertible: 0, busy: 0 };
     expect(leftOutText(none)).toBeNull();
     expect(leftOutText({ ...none, settings: 1 })).toMatch(/^1 file was left out because this library's settings skip it\./);
-    expect(leftOutText({ ...none, settings: 2, unconvertible: 1 })).toMatch(/^2 files were left out .* 1 file has no video/);
+    expect(leftOutText({ ...none, settings: 2, unconvertible: 1 })).toMatch(/^2 files were left out .* 1 file can't be converted/);
     expect(leftOutText({ ...none, converted: 2 })).toBe("2 files are already converted to this library's format.");
   });
 
   it("explains a selection with nothing to convert", () => {
     const none = { settings: 0, converted: 0, unconvertible: 0, busy: 0 };
     expect(nothingToConvertText({ ...none, settings: 2 })).toBe(
-      "These files are skipped by this library's settings. To convert them, change the goal in the library's Settings tab first.",
+      "These files are skipped by this library's settings. To convert one anyway, open it and choose Convert anyway.",
     );
     expect(nothingToConvertText({ ...none, converted: 1 })).toBe(
-      "This file is already converted to this library's format. To convert it, change the goal in the library's Settings tab first.",
+      "This file is already converted to this library's format. To convert it again, change the library's goal first.",
     );
     expect(nothingToConvertText({ ...none, busy: 3 })).toBe("These files are already in the queue.");
     expect(nothingToConvertText({ ...none, converted: 1, unconvertible: 1 })).toBe(
-      "Nothing to convert: 1 file is already converted to this library's format, 1 file has no video to convert. To convert them, change the goal in the library's Settings tab first.",
+      "Nothing to convert: 1 file is already converted to this library's format, 1 file can't be converted. To convert them again, change the library's goal first.",
     );
   });
 });

@@ -1,5 +1,5 @@
 import { clsx, type ClassValue } from "clsx";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { twMerge } from "tailwind-merge";
 
 /** Join class names and let later Tailwind utilities win over earlier ones. */
@@ -53,4 +53,18 @@ export function useRetained<T>(value: T | null): T | null {
   const [kept, setKept] = useState<T | null>(value);
   if (value !== null && value !== kept) setKept(value);
   return value ?? kept;
+}
+
+/** Whether `value` has been true for at least `ms` (false again at once). */
+export function useSustained(value: boolean, ms: number): boolean {
+  const [sustained, setSustained] = useState(false);
+  useEffect(() => {
+    if (!value) return;
+    const timer = setTimeout(() => setSustained(true), ms);
+    return () => {
+      clearTimeout(timer);
+      setSustained(false);
+    };
+  }, [value, ms]);
+  return value && sustained;
 }

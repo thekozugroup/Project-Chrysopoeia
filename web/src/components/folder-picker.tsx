@@ -2,8 +2,8 @@
 
 /**
  * Server-side folder browser (`GET /api/fs/browse`). Click or press Enter to
- * open a folder, Backspace or ← to go up, ↑/↓ to move; "Use this folder"
- * picks the folder you are in.
+ * open a folder, Backspace or ← to go up, ↑/↓ to move; the "Use “…”" button
+ * names the folder you are in, and how many videos it holds, and picks it.
  */
 
 import { ChevronLeft, ChevronRight, CornerDownLeft, Folder, FolderOpen, HardDrive } from "lucide-react";
@@ -12,7 +12,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/controls";
 import { Callout, Skeleton } from "@/components/ui/display";
 import { ApiError, errorMessage } from "@/lib/api";
-import { plural } from "@/lib/format";
+import { formatCount } from "@/lib/format";
 import { useBrowse } from "@/lib/queries";
 import type { FsBrowse } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -47,11 +47,29 @@ function crumbsFor(data: FsBrowse): Crumb[] {
   return crumbs;
 }
 
+/**
+ * "12 videos", "1 video", "1,000+ videos" (the server stopped counting), or
+ * `null` when there are none or the server didn't count.
+ */
+export function videoCount(count: number | null | undefined, capped = false): string | null {
+  if (!count || count <= 0) return null;
+  return `${formatCount(count)}${capped ? "+" : ""} ${count === 1 && !capped ? "video" : "videos"}`;
+}
+
+/** The last part of a folder path, for naming it on the button. */
+function folderName(path: string, roots: string[]): string {
+  const trimmed = path.replace(/(.)\/+$/, "$1");
+  if (trimmed === "/") return "/";
+  if (roots.includes(trimmed)) return trimmed;
+  return trimmed.slice(trimmed.lastIndexOf("/") + 1) || trimmed;
+}
+
 interface FolderPickerProps {
   /** Folder to open first; defaults to the first browse root. */
   initialPath?: string;
   /** Called with the folder the user settled on. */
   onSelect: (path: string) => void;
+  /** Button text instead of "Use “<folder>”". */
   actionLabel?: string;
   /** Inline error from the step that uses the folder (e.g. library_exists). */
   error?: string | null;
@@ -64,7 +82,7 @@ interface FolderPickerProps {
 export function FolderPicker({
   initialPath,
   onSelect,
-  actionLabel = "Use this folder",
+  actionLabel,
   error,
   busy,
   className,
@@ -73,7 +91,8 @@ export function FolderPicker({
   const [path, setPath] = useState<string | undefined>(initialPath || undefined);
   const [typed, setTyped] = useState("");
   const [showTyped, setShowTyped] = useState(false);
-  const [focusIndex, setFocusIndex] = useState(0);
+  // No row is highlighted until an arrow key moves into the list.
+  const [focusIndex, setFocusIndex] = useState(-1);
   const listRef = useRef<HTMLUListElement>(null);
   const emptyRef = useRef<HTMLDivElement>(null);
   const shouldFocusList = useRef(false);
@@ -88,21 +107,32 @@ export function FolderPicker({
   const [lastGood, setLastGood] = useState<FsBrowse | null>(null);
   if (data && !loadingNew && data !== lastGood) setLastGood(data);
   const shown = data ?? (browse.error ? lastGood : undefined);
+  // Video counts seen in listings, so the folder you're in can say its own.
+  const [counts, setCounts] = useState<Record<string, { count: number; capped: boolean }>>({});
+  const [countedFrom, setCountedFrom] = useState<FsBrowse | null>(null);
+  if (data && data !== countedFrom) {
+    setCountedFrom(data);
+    const next: Record<string, { count: number; capped: boolean }> = {};
+    for (const e of data.entries) {
+      if (typeof e.media_count === "number") next[e.path] = { count: e.media_count, capped: Boolean(e.media_count_capped) };
+    }
+    if (Object.keys(next).length) setCounts((prev) => ({ ...prev, ...next }));
+  }
 
   const go = (next: string | undefined, focusList = true) => {
     shouldFocusList.current = focusList;
-    setFocusIndex(0);
+    setFocusIndex(-1);
     setPath(next);
     if (next) onNavigate?.(next);
   };
 
-  // After navigating with the keyboard, keep focus in the list, or on the
-  // "No folders inside" note (where Backspace still goes up) when it's empty.
+  // After opening a folder from the list, keep focus in the list (on the
+  // list itself, so no row looks chosen), or on the "No folders inside"
+  // note (where Backspace still goes up) when it's empty.
   useEffect(() => {
     if (!shouldFocusList.current || browse.isFetching || !data) return;
     shouldFocusList.current = false;
-    const first = listRef.current?.querySelector<HTMLButtonElement>("button[data-index='0']");
-    if (first) first.focus();
+    if (listRef.current) listRef.current.focus();
     else emptyRef.current?.focus();
   }, [browse.isFetching, data]);
 
@@ -134,7 +164,7 @@ export function FolderPicker({
         move(count - 1);
         break;
       case "ArrowRight": {
-        const entry = entries[focusIndex];
+        const entry = focusIndex >= 0 ? entries[focusIndex] : undefined;
         if (entry) {
           event.preventDefault();
           go(entry.path);
@@ -295,27 +325,30 @@ export function FolderPicker({
         ) : (
           <ul
             ref={listRef}
+            tabIndex={-1}
             aria-label={`Folders in ${current}`}
             aria-busy={loadingNew || undefined}
             onKeyDown={onKeyDown}
             // The old listing can't be clicked while the new one loads.
             inert={loadingNew || undefined}
-            className={cn("py-1", browse.isFetching && "opacity-60 transition-opacity")}
+            className={cn("py-1 outline-none", browse.isFetching && "opacity-60 transition-opacity")}
           >
             {entries.map((entry, i) => (
               <li key={entry.path}>
                 <button
                   type="button"
                   data-index={i}
-                  tabIndex={i === focusIndex ? 0 : -1}
+                  tabIndex={i === Math.max(0, focusIndex) ? 0 : -1}
                   onFocus={() => setFocusIndex(i)}
                   onClick={() => go(entry.path)}
-                  className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-raised focus-visible:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-ink"
+                  className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-raised focus-visible:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-ink pointer-coarse:min-h-11"
                 >
                   <Folder className="size-[1.125rem] shrink-0 text-accent-ink" aria-hidden />
                   <span className="min-w-0 flex-1 truncate text-fg">{entry.name}</span>
-                  {entry.media_count ? (
-                    <span className="shrink-0 text-xs text-muted tabular">{plural(entry.media_count, "media file")}</span>
+                  {videoCount(entry.media_count, entry.media_count_capped) ? (
+                    <span className="shrink-0 text-[0.8125rem] text-muted tabular">
+                      {videoCount(entry.media_count, entry.media_count_capped)}
+                    </span>
                   ) : null}
                   <ChevronRight className="size-4 shrink-0 text-muted" aria-hidden />
                 </button>
@@ -335,8 +368,16 @@ export function FolderPicker({
           onClick={() => data && !loadingNew && onSelect(data.path)}
           disabled={!data || loadingNew || Boolean(browse.error)}
           loading={busy}
+          className="max-w-full min-w-0"
         >
-          {actionLabel}
+          {actionLabel ?? (
+            <>
+              <span className="min-w-0 truncate">Use “{folderName(current || "/", shown?.roots ?? [])}”</span>
+              {videoCount(counts[current]?.count, counts[current]?.capped) ? (
+                <span className="shrink-0 font-normal">· {videoCount(counts[current]?.count, counts[current]?.capped)}</span>
+              ) : null}
+            </>
+          )}
         </Button>
       </div>
       {error ? (

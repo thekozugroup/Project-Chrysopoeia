@@ -1,11 +1,12 @@
 "use client";
 
-/** "Add library": the folder and goal steps from setup, inside the app frame. */
+/**
+ * "Add library": the folder and goal steps from setup, inside the app frame.
+ * Each step's question is the page's one heading.
+ */
 
 import { ArrowLeft } from "lucide-react";
 import { useState } from "react";
-import { toast } from "sonner";
-import { PageHeader } from "@/components/shell";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { href, navigate } from "@/lib/router";
 import { FolderStep, GoalStep } from "./library-steps";
@@ -17,14 +18,11 @@ export function AddLibraryScreen() {
 
   return (
     <div className="max-w-3xl">
-      <PageHeader
-        title="Add a library"
-        description="A library is a folder Chrysopoeia watches. Each library has its own goal."
-      />
       {step === "folder" ? (
         <>
           <FolderStep
-            step="Step 1 of 2"
+            level={1}
+            step="Add a library, step 1 of 2"
             initialPath={path ?? undefined}
             error={folderError}
             onNavigate={() => setFolderError(null)}
@@ -42,7 +40,8 @@ export function AddLibraryScreen() {
         </>
       ) : path ? (
         <GoalStep
-          step="Step 2 of 2"
+          level={1}
+          step="Add a library, step 2 of 2"
           path={path}
           submitLabel="Add library"
           onChangeFolder={() => setStep("folder")}
@@ -51,7 +50,7 @@ export function AddLibraryScreen() {
             setStep("folder");
           }}
           onCreated={(library) => {
-            toast.success(`Scanning ${library.name}`, { description: "Files appear here as they're found." });
+            // The library page says it's scanning; no toast needed.
             navigate(`/library/${library.id}`, { replace: true });
           }}
           secondary={

@@ -45,7 +45,8 @@ function StepIndicator({ step }: { step: Step }) {
   );
 }
 
-function hardwareLine(hw: HardwareInfo | undefined, detecting: boolean): ReactNode {
+/** What this machine brings, in one line (the welcome, and an empty overview). */
+export function HardwareLine({ hw, detecting }: { hw: HardwareInfo | undefined; detecting: boolean }): ReactNode {
   if (detecting) return "Checking your hardware… this takes a few seconds.";
   if (!hw) return <Skeleton className="mt-1 h-3.5 w-56" />;
   if (!hw.ffmpeg.found) return "ffmpeg wasn't found in the container, so nothing can be converted yet.";
@@ -121,7 +122,7 @@ export function SetupScreen({ settings }: { settings: Settings }) {
                   glitches{settings.output_mode === "folder" ? ". Your originals stay untouched." : "."}
                 </Fact>
                 <Fact icon={<Cpu aria-hidden />} title="Uses your hardware automatically">
-                  {hardwareLine(hardware.hw, hardware.detecting)}
+                  <HardwareLine hw={hardware.hw} detecting={hardware.detecting} />
                 </Fact>
                 <Fact icon={<Clock aria-hidden />} title="About a minute to set up">
                   Everything can be changed later in Settings.
@@ -142,6 +143,7 @@ export function SetupScreen({ settings }: { settings: Settings }) {
           {step === "folder" ? (
             <div>
               <FolderStep
+                level={1}
                 step={stepLabel("folder")}
                 initialPath={path ?? undefined}
                 error={folderError}
@@ -163,6 +165,7 @@ export function SetupScreen({ settings }: { settings: Settings }) {
 
           {step === "goal" && path ? (
             <GoalStep
+              level={1}
               step={stepLabel("goal")}
               path={path}
               submitLabel="Start"
@@ -172,10 +175,8 @@ export function SetupScreen({ settings }: { settings: Settings }) {
                 goTo("folder");
               }}
               afterCreate={finishOnboarding}
-              onCreated={(library) => {
-                toast.success(`Scanning ${library.name}`, {
-                  description: "Files appear in the library as they're found.",
-                });
+              onCreated={() => {
+                // No toast: the overview already says it's looking through the folder.
                 navigate("/", { replace: true });
                 // The app replaces this screen: start it at the top, with
                 // focus on its content rather than lost on the page.

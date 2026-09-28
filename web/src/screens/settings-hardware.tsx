@@ -1,9 +1,9 @@
 "use client";
 
 /**
- * Settings › Hardware: what was detected, which encoders really work (each
- * hardware encoder is proven by a test encode), setup fixes, and the
- * preference for which to use.
+ * Settings › Hardware: a read-only status of this machine (its devices and
+ * one sentence about what does the converting), fix tips, the preference
+ * for which to use, and, closed, the encoder matrix and ffmpeg details.
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -24,10 +24,10 @@ import { toast } from "sonner";
 import { SetupHints } from "@/components/hints";
 import { Button } from "@/components/ui/button";
 import { Field, Select, SwitchRow } from "@/components/ui/controls";
-import { Callout, CodeBlock, SectionHeading, Skeleton } from "@/components/ui/display";
+import { Callout, CodeBlock, Disclosure, SectionHeading, Skeleton } from "@/components/ui/display";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { ffmpegVersionLabel, formatBytes, formatRelative } from "@/lib/format";
-import { encoderCell, isDetecting, matrixApis, preferenceChoices } from "@/lib/hardware";
+import { encoderCell, isDetecting, machineSummary, matrixApis, preferenceChoices } from "@/lib/hardware";
 import {
   GPU_VENDOR_LABEL,
   HW_API_LABEL,
@@ -81,8 +81,7 @@ function Devices({ hw }: { hw: HardwareInfo }) {
         ))
       ) : (
         <DeviceCard icon={<MonitorPlay aria-hidden />} title="Graphics">
-          <p className="font-medium">No GPU found</p>
-          <p className="mt-0.5 text-[0.8125rem] text-muted">Converting on the CPU works; it&apos;s just slower.</p>
+          <p className="font-medium">None found</p>
         </DeviceCard>
       )}
     </div>
@@ -190,7 +189,7 @@ function EncoderMatrix({ hw }: { hw: HardwareInfo }) {
                     <td key={api} className="px-3 py-3 text-[0.8125rem] whitespace-nowrap">
                       {content}
                       {e && cell !== "unavailable" ? (
-                        <span className="mt-0.5 block font-mono text-[0.6875rem] text-muted">{e.name}</span>
+                        <span className="mt-0.5 block font-mono text-xs text-muted">{e.name}</span>
                       ) : null}
                     </td>
                   );
@@ -263,7 +262,8 @@ export function HardwareSection({
           </p>
         ) : null}
         {hw ? (
-          <div className={cn(detecting && "opacity-60 transition-opacity")}>
+          <div className={cn("flex flex-col gap-4", detecting && "opacity-60 transition-opacity")}>
+            <p className="text-[1.0625rem] font-medium text-fg">{machineSummary(hw, draft.hardware)}</p>
             <Devices hw={hw} />
           </div>
         ) : hardware.error && !stillStarting ? (
@@ -286,13 +286,6 @@ export function HardwareSection({
         <section>
           <SectionHeading title="Setup tips" description="Plain-language fixes for anything that's slowing things down." />
           <SetupHints hints={hw.hints} />
-        </section>
-      ) : null}
-
-      {hw ? (
-        <section>
-          <SectionHeading title="What can encode what" />
-          <EncoderMatrix hw={hw} />
         </section>
       ) : null}
 
@@ -330,32 +323,38 @@ export function HardwareSection({
         </div>
       </section>
 
+      {hw && !hw.ffmpeg.found ? (
+        <Callout tone="danger" title="ffmpeg wasn't found">
+          <p>Nothing can be converted until ffmpeg is available. The official image includes it.</p>
+          <CodeBlock className="mt-3" code={`FFMPEG_PATH=${hw.ffmpeg.ffmpeg_path}`} label="Path Chrysopoeia tried" />
+        </Callout>
+      ) : null}
+
       {hw ? (
-        <section>
-          <SectionHeading title="ffmpeg" />
+        <Disclosure title="Details: encoders and ffmpeg">
+          <section aria-label="What can encode what">
+            <h3 className="mb-2.5 text-sm font-semibold text-fg">What can encode what</h3>
+            <EncoderMatrix hw={hw} />
+          </section>
           {hw.ffmpeg.found ? (
-            <div className="flex flex-col gap-3">
+            <section aria-label="ffmpeg" className="flex flex-col gap-2">
+              <h3 className="text-sm font-semibold text-fg">ffmpeg</h3>
               <p className="flex items-center gap-2 text-sm text-fg">
                 <Server className="size-4 text-muted" aria-hidden />
                 {ffmpegVersionLabel(hw.ffmpeg.version)}
               </p>
-              <p className="font-mono text-xs text-muted">
+              <p className="font-mono text-xs break-all text-muted">
                 {hw.ffmpeg.ffmpeg_path} · {hw.ffmpeg.ffprobe_path}
                 {hw.ffmpeg.ffprobe_found ? "" : " (ffprobe not found)"}
               </p>
               {hw.filters.length ? (
                 <p className="text-[0.8125rem] text-muted">
-                  Verification filters available: <span className="font-mono text-xs">{hw.filters.join(", ")}</span>
+                  Filters used for checks: <span className="font-mono text-xs">{hw.filters.join(", ")}</span>
                 </p>
               ) : null}
-            </div>
-          ) : (
-            <Callout tone="danger" title="ffmpeg wasn't found">
-              <p>Nothing can be converted until ffmpeg is available. The official image includes it.</p>
-              <CodeBlock className="mt-3" code={`FFMPEG_PATH=${hw.ffmpeg.ffmpeg_path}`} label="Path Chrysopoeia tried" />
-            </Callout>
-          )}
-        </section>
+            </section>
+          ) : null}
+        </Disclosure>
       ) : null}
     </div>
   );

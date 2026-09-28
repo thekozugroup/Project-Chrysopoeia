@@ -25,6 +25,7 @@
   --color-accent-soft: var(--accent-soft);
   --color-meter: var(--meter);
   --color-bar-todo: var(--bar-todo);
+  --color-bar-skipped: var(--bar-skipped);
   --color-success: var(--success);
   --color-success-soft: var(--success-soft);
   --color-danger: var(--danger);
@@ -34,6 +35,14 @@
   --color-info: var(--info);
   --color-info-soft: var(--info-soft);
   --color-overlay: var(--overlay);
+
+  /*
+   * UI type scale: 15px for everything people read (text-sm), 13px for
+   * secondary lines, 12px (text-xs) only for tabular meta and timestamps.
+   * Display sizes (Instrument Serif) are set where they're used.
+   */
+  --text-sm: 0.9375rem;
+  --text-sm--line-height: 1.4;
 
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --font-display: "Instrument Serif", ui-serif, Georgia, "Times New Roman", serif;
@@ -66,12 +75,15 @@
   --meter: oklch(0.62 0.125 76);
   /* "To convert" in the library bar: ≥3:1 against the track, darker than gold. */
   --bar-todo: oklch(0.5 0.014 78);
+  /* "Skipped" in the library bar: finished without converting, a quieter neutral. */
+  --bar-skipped: oklch(0.66 0.012 80);
   --success: oklch(0.48 0.11 152);
   --success-soft: oklch(0.6 0.12 152 / 0.12);
   --danger: oklch(0.52 0.18 28);
   --danger-soft: oklch(0.6 0.18 28 / 0.1);
-  --warning: oklch(0.52 0.12 58);
-  --warning-soft: oklch(0.75 0.14 70 / 0.18);
+  /* Amber leans orange, so a problem never reads as the gold of progress. */
+  --warning: oklch(0.53 0.14 47);
+  --warning-soft: oklch(0.72 0.15 52 / 0.16);
   --info: oklch(0.48 0.1 245);
   --info-soft: oklch(0.6 0.1 245 / 0.1);
   --overlay: oklch(0.2 0.02 70 / 0.35);
@@ -94,12 +106,13 @@
   --accent-soft: oklch(0.8 0.125 82 / 0.14);
   --meter: oklch(0.8 0.125 82);
   --bar-todo: oklch(0.56 0.012 78);
+  --bar-skipped: oklch(0.43 0.01 78);
   --success: oklch(0.78 0.13 152);
   --success-soft: oklch(0.78 0.13 152 / 0.12);
   --danger: oklch(0.74 0.15 28);
   --danger-soft: oklch(0.7 0.16 28 / 0.14);
-  --warning: oklch(0.82 0.13 70);
-  --warning-soft: oklch(0.82 0.13 70 / 0.13);
+  --warning: oklch(0.79 0.14 56);
+  --warning-soft: oklch(0.79 0.14 56 / 0.13);
   --info: oklch(0.78 0.08 240);
   --info-soft: oklch(0.78 0.08 240 / 0.12);
   --overlay: oklch(0.08 0.005 75 / 0.6);
@@ -127,7 +140,7 @@
     min-height: 100dvh;
     background: var(--bg);
     color: var(--fg);
-    font-size: 0.875rem;
+    font-size: 0.9375rem;
     line-height: 1.5;
     font-feature-settings: "ss01" off;
     caret-color: var(--accent-ink);
@@ -291,17 +304,12 @@
 }
 
 /*
- * Library bar patterns, so segments differ by more than colour: files in
- * the queue are gold stripes (converted ones solid gold), skipped files a
- * neutral hatch (to-convert ones solid neutral). Each mark is at least 3:1
- * against the track in both themes.
+ * Library bar: two textures only. Converted files are solid gold, files in
+ * the queue gold stripes; the rest are plain neutrals, and every segment is
+ * also listed in words.
  */
 .bar-active {
   background-image: repeating-linear-gradient(-45deg, var(--meter) 0 3px, transparent 3px 6px);
-}
-
-.bar-skipped {
-  background-image: repeating-linear-gradient(-45deg, var(--bar-todo) 0 1.5px, transparent 1.5px 4.5px);
 }
 
 .progress-live {

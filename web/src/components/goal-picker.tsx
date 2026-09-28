@@ -1,43 +1,60 @@
 "use client";
 
 /**
- * Goal cards: Save space / Balanced / Plays everywhere / Archive, each with a
- * one-line trade-off, the formats as secondary detail, and what this
- * machine's hardware means for speed.
+ * Goal cards: Save space / Balanced / Plays everywhere / Archive. Each card
+ * says what you get in one line, how fast it converts on this machine in a
+ * word, and the formats as small secondary detail. The "Best fit" badge
+ * carries the hardware recommendation, so nothing else repeats it.
  */
 
-import { Cpu, Gauge, Hourglass, TriangleAlert, Zap } from "lucide-react";
+import { Gauge, Hourglass, TriangleAlert, Zap } from "lucide-react";
 import { useId } from "react";
 import { ChoiceCard } from "@/components/ui/controls";
 import { Badge, Skeleton } from "@/components/ui/display";
-import { codecSpeedHint, cpuOnlyNote, recommendedGoal, type SpeedHint } from "@/lib/hardware";
+import { recommendedGoal, speedWord, type SpeedWord } from "@/lib/hardware";
 import { GOAL_LABEL, GOAL_SUMMARY, GOALS, profileSummary } from "@/lib/labels";
 import { presetProfile } from "@/lib/profile";
 import type { Goal, HardwareInfo, HwPreference, Presets, TranscodeProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-function SpeedLine({ hint }: { hint: SpeedHint }) {
-  const icon =
-    hint.tone === "fast" ? (
-      <Zap aria-hidden />
-    ) : hint.tone === "cpu" ? (
-      <Cpu aria-hidden />
-    ) : hint.tone === "slow" ? (
-      <Hourglass aria-hidden />
-    ) : (
-      <TriangleAlert aria-hidden />
-    );
+const SPEED_ICON: Record<SpeedWord["tone"], typeof Zap> = {
+  fast: Zap,
+  medium: Gauge,
+  slow: Hourglass,
+  blocked: TriangleAlert,
+};
+
+/** "AV1 · Opus · MKV" on the left, "Slow here" on the right. */
+function Formats({
+  profile,
+  hardware,
+  hardwarePending,
+  preference,
+}: {
+  profile: TranscodeProfile;
+  hardware: HardwareInfo | undefined;
+  hardwarePending?: boolean;
+  preference: HwPreference;
+}) {
+  const speed = speedWord(hardware, profile.video_codec, preference);
+  const Icon = speed ? SPEED_ICON[speed.tone] : null;
   return (
-    <span
-      className={cn(
-        "mt-2 flex items-start gap-1.5 text-[0.8125rem] leading-snug [&_svg]:mt-0.5 [&_svg]:size-3.5 [&_svg]:shrink-0",
-        hint.tone === "fast" && "text-success",
-        (hint.tone === "slow" || hint.tone === "cpu") && "text-muted",
-        hint.tone === "blocked" && "text-danger",
-      )}
-    >
-      {icon}
-      {hint.text}
+    <span className="mt-1.5 flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+      <span className="font-mono text-xs text-muted">{profileSummary(profile)}</span>
+      {speed && Icon ? (
+        <span
+          className={cn(
+            "inline-flex items-center gap-1 text-[0.8125rem] font-medium",
+            speed.tone === "fast" ? "text-success" : speed.tone === "blocked" ? "text-danger" : "text-muted",
+          )}
+        >
+          <Icon className="size-3.5" aria-hidden />
+          <span className="sr-only">Speed on this machine: </span>
+          {speed.label}
+        </span>
+      ) : hardwarePending ? (
+        <Skeleton className="h-3.5 w-16" />
+      ) : null}
     </span>
   );
 }
@@ -78,23 +95,12 @@ export function GoalPicker({
 }: GoalPickerProps) {
   const name = useId();
   const recommended = hardware ? recommendedGoal(hardware) : null;
-  // Said once here, so each card only compares speeds.
-  const cpuNote = cpuOnlyNote(hardware, preference);
-  const speedLine = (codec: TranscodeProfile["video_codec"]) =>
-    hardware ? (
-      <SpeedLine hint={codecSpeedHint(hardware, codec, preference)} />
-    ) : hardwarePending ? (
-      <Skeleton className="mt-2.5 h-3.5 w-3/4" />
-    ) : null;
+  const formats = (p: TranscodeProfile) => (
+    <Formats profile={p} hardware={hardware} hardwarePending={hardwarePending} preference={preference} />
+  );
   return (
     <fieldset className={className}>
       <legend className="sr-only">{label}</legend>
-      {cpuNote ? (
-        <p className="mb-3 flex items-start gap-2 text-[0.8125rem] leading-snug text-muted">
-          <Cpu className="mt-0.5 size-3.5 shrink-0" aria-hidden />
-          {cpuNote}
-        </p>
-      ) : null}
       <div className={cn("grid gap-3", columns === 2 && "sm:grid-cols-2")}>
         {defaults ? (
           <ChoiceCard
@@ -106,13 +112,11 @@ export function GoalPicker({
             description="The settings for new libraries you chose in Settings › Advanced."
             className={cn(columns === 2 && "sm:col-span-2")}
           >
-            <span className="block font-mono text-xs text-muted">{profileSummary(defaults.profile)}</span>
-            {speedLine(defaults.profile.video_codec)}
+            {formats(defaults.profile)}
           </ChoiceCard>
         ) : null}
         {GOALS.map((goal) => {
           const preset = presets?.goals.find((g) => g.goal === goal);
-          const goalProfile = presetProfile(presets, goal);
           return (
             <ChoiceCard
               key={goal}
@@ -121,7 +125,9 @@ export function GoalPicker({
               checked={!defaults?.selected && value === goal}
               onChange={() => onChange(goal)}
               title={preset?.title ?? GOAL_LABEL[goal]}
-              description={preset?.summary ?? GOAL_SUMMARY[goal]}
+              // Our own outcome line: the server's summary names formats and
+              // speeds, which the line below already shows.
+              description={GOAL_SUMMARY[goal]}
               badge={
                 recommended === goal ? (
                   <Badge tone="accent" icon={<Gauge aria-hidden />}>
@@ -130,8 +136,7 @@ export function GoalPicker({
                 ) : null
               }
             >
-              <span className="block font-mono text-xs text-muted">{profileSummary(goalProfile)}</span>
-              {speedLine(goalProfile.video_codec)}
+              {formats(presetProfile(presets, goal))}
             </ChoiceCard>
           );
         })}
@@ -142,10 +147,10 @@ export function GoalPicker({
             checked
             onChange={() => undefined}
             title="Custom"
-            description="You changed the format under Advanced. Pick a goal to start from its defaults again."
+            description="You changed the format under More format options. Pick a goal to start from its defaults again."
             className={cn(columns === 2 && "sm:col-span-2")}
           >
-            <span className="block font-mono text-xs text-muted">{profileSummary(profile)}</span>
+            {formats(profile)}
           </ChoiceCard>
         ) : null}
       </div>

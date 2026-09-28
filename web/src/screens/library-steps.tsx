@@ -75,16 +75,21 @@ export function FolderStep({
   onPicked,
   onNavigate,
   step,
+  level = 2,
 }: {
   initialPath?: string;
   error?: string | null;
   onPicked: (path: string) => void;
   onNavigate?: () => void;
   step?: string;
+  /** 1 when the step is the page's own heading (Add library). */
+  level?: 1 | 2;
 }) {
   return (
     <div>
-      <StepHeading step={step}>Where are your videos?</StepHeading>
+      <StepHeading step={step} level={level}>
+        Where are your videos?
+      </StepHeading>
       <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
         Choose the folder that holds your movies or shows; folders inside it are included. In Docker this is the
         path inside the container, such as <code className="font-mono text-[0.8125rem] text-fg">/media</code>.
@@ -110,6 +115,8 @@ interface GoalStepProps {
   afterCreate?: () => Promise<void>;
   secondary?: ReactNode;
   step?: string;
+  /** 1 when the step is the page's own heading (Add library). */
+  level?: 1 | 2;
 }
 
 export function GoalStep({
@@ -121,6 +128,7 @@ export function GoalStep({
   afterCreate,
   secondary,
   step,
+  level = 2,
 }: GoalStepProps) {
   const client = useQueryClient();
   const presets = usePresets();
@@ -174,7 +182,9 @@ export function GoalStep({
         create.mutate();
       }}
     >
-      <StepHeading step={step}>What should happen to these videos?</StepHeading>
+      <StepHeading step={step} level={level}>
+        What should happen to these videos?
+      </StepHeading>
       <p className="mt-2 max-w-xl text-sm leading-relaxed text-muted">
         Pick what matters most. You can fine-tune quality, formats and tracks later in the library&apos;s settings.
       </p>
@@ -204,7 +214,7 @@ export function GoalStep({
       />
       {hardware.pending ? (
         <p className="mt-3 text-[0.8125rem] text-muted" role="status">
-          Checking your hardware to estimate speed…
+          Checking your hardware to see how fast each goal converts…
         </p>
       ) : null}
 

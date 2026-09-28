@@ -11,7 +11,7 @@ import { Dialog } from "@base-ui/react/dialog";
 import { Menu } from "@base-ui/react/menu";
 import { Tooltip as BaseTooltip } from "@base-ui/react/tooltip";
 import { X } from "lucide-react";
-import type { ReactElement, ReactNode } from "react";
+import { useRef, type ReactElement, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { Button, buttonVariants } from "./button";
 
@@ -28,11 +28,15 @@ interface SheetProps {
 
 /** Detail panel for a job or file. */
 export function Sheet({ open, onOpenChange, title, description, children, footer, headerExtra }: SheetProps) {
+  // Focus lands on the title, so screen readers start at the top and no
+  // focus ring appears on the close button after a mouse click.
+  const titleRef = useRef<HTMLHeadingElement>(null);
   return (
     <Dialog.Root open={open} onOpenChange={(next) => onOpenChange(next)}>
       <Dialog.Portal>
         <Dialog.Backdrop className="fixed inset-0 z-40 bg-overlay transition-opacity duration-200 data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
         <Dialog.Popup
+          initialFocus={titleRef}
           className={cn(
             "fixed z-50 flex flex-col bg-surface text-fg shadow-pop outline-none",
             "inset-x-0 bottom-0 max-h-[92dvh] rounded-t-xl border-t border-line",
@@ -44,7 +48,13 @@ export function Sheet({ open, onOpenChange, title, description, children, footer
         >
           <div className="flex items-start gap-3 border-b border-line px-5 pt-4 pb-3.5">
             <div className="min-w-0 flex-1">
-              <Dialog.Title className="text-base leading-snug font-semibold break-words text-fg">{title}</Dialog.Title>
+              <Dialog.Title
+                ref={titleRef}
+                tabIndex={-1}
+                className="text-base leading-snug font-semibold break-words text-fg outline-none"
+              >
+                {title}
+              </Dialog.Title>
               {description ? (
                 <Dialog.Description className="mt-1 text-[0.8125rem] text-muted">{description}</Dialog.Description>
               ) : null}
@@ -232,7 +242,7 @@ export function ActionMenu({ trigger, actions, align = "end" }: ActionMenuProps)
                   disabled={action.disabled}
                   onClick={action.onSelect}
                   className={cn(
-                    "flex h-9 cursor-default items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-[disabled]:opacity-50 data-[highlighted]:bg-raised [&_svg]:size-4 [&_svg]:shrink-0",
+                    "flex h-9 cursor-default items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-[disabled]:opacity-50 data-[highlighted]:bg-raised pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
                     action.destructive ? "text-danger" : "text-fg [&_svg]:text-muted",
                   )}
                 >

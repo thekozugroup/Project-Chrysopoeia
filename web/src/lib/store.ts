@@ -9,6 +9,7 @@
 import { create } from "zustand";
 import { overallProgress } from "./progress";
 import type { Job, JobProgress, JobStage, ScanProgress } from "./types";
+import { useSustained } from "./utils";
 
 /**
  * WebSocket connection state as shown to the user. `unavailable` means the
@@ -29,6 +30,12 @@ interface LiveState {
   scans: Record<string, ScanProgress>;
   /** Latest polite screen-reader announcement. */
   announcement: string;
+  /**
+   * Jobs queued with "Convert anyway" in this browser session, so a server
+   * that ignored the request (and skipped the file again) can be told apart
+   * from an ordinary skip.
+   */
+  forced: Record<string, true>;
   setConnection: (state: ConnectionState) => void;
   setPolling: (polling: boolean) => void;
   setServerDown: (down: boolean) => void;
@@ -39,6 +46,7 @@ interface LiveState {
   /** Forget live progress, e.g. when the connection drops and it goes stale. */
   clearProgress: () => void;
   announce: (text: string) => void;
+  markForced: (jobId: string) => void;
 }
 
 export const useLive = create<LiveState>((set) => ({
@@ -48,6 +56,7 @@ export const useLive = create<LiveState>((set) => ({
   jobs: {},
   scans: {},
   announcement: "",
+  forced: {},
   setConnection: (connection) => set((s) => (s.connection === connection ? s : { connection })),
   setPolling: (polling) => set((s) => (s.polling === polling ? s : { polling })),
   setServerDown: (serverDown) => set((s) => (s.serverDown === serverDown ? s : { serverDown })),
@@ -70,7 +79,22 @@ export const useLive = create<LiveState>((set) => ({
   clearProgress: () =>
     set((s) => (Object.keys(s.jobs).length || Object.keys(s.scans).length ? { jobs: {}, scans: {} } : s)),
   announce: (announcement) => set({ announcement }),
+  markForced: (jobId) => set((s) => ({ forced: { ...s.forced, [jobId]: true } })),
 }));
+
+/**
+ * Whether the server has been unreachable for a moment (the same signal as
+ * the "Can't reach Chrysopoeia" banner). Actions that change something are
+ * disabled meanwhile, since they would fail.
+ */
+export function useServerDown(): boolean {
+  const down = useLive((s) => s.serverDown && s.connection !== "open");
+  // A single failed request during a blip shouldn't flash anything.
+  return useSustained(down, 1500);
+}
+
+/** Why a control is disabled while the server is away. */
+export const SERVER_DOWN_TITLE = "Available when Chrysopoeia is back";
 
 /** A job with its latest live progress applied (only while it is running). */
 export function useLiveJob(job: Job): Job {

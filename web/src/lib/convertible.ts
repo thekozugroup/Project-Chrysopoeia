@@ -9,19 +9,29 @@
 
 import { plural } from "./format";
 import { skippedByUser } from "./labels";
-import type { ActivityEntry, Container, MediaFile, TranscodeProfile, VideoCodec } from "./types";
+import type { ActivityEntry, Container, Library, MediaFile, TranscodeProfile, VideoCodec } from "./types";
+
+/**
+ * Skip reasons that come from the library's settings, which "Convert anyway"
+ * can set aside: already efficient ("Already HEVC"), already in the target
+ * format, or not enough smaller ("Only 4% smaller — kept the original",
+ * "The new file was 7% larger — kept the original"). Safety skips (Dolby
+ * Vision without a standard layer, HDR to H.264, unreadable picture size or
+ * audio) always apply, so they don't match.
+ */
+const SETTINGS_SKIP = /^already\b|\d+(?:\.\d+)?\s*% (?:smaller|larger)|kept the original/i;
 
 /**
  * Whether the library's settings decided to skip this file and could decide
- * otherwise: it has real video, and the skip wasn't the user's own. Audio-only
- * and unreadable files are left alone whatever the settings say.
+ * otherwise: it has real video, the skip wasn't the user's own, and the
+ * reason is one of the settings' rules rather than a safety one.
  */
 export function skipFollowsSettings(file: MediaFile): boolean {
   if (file.status !== "skipped" || skippedByUser(file.skip_reason)) return false;
   const hasVideo = file.probe
     ? file.probe.streams.some((s) => s.kind === "video" && !s.is_attached_pic)
     : Boolean(file.video_codec);
-  return hasVideo && (file.duration_secs ?? 0) >= 1;
+  return hasVideo && (file.duration_secs ?? 0) >= 1 && SETTINGS_SKIP.test(file.skip_reason?.trim() ?? "");
 }
 
 /** Efficiency rank of an ffprobe codec name (core `source_efficiency_rank`). */
@@ -174,21 +184,31 @@ type LeftOut = Pick<BulkConvertPlan, "settings" | "converted" | "unconvertible" 
 export function leftOutText(plan: LeftOut): string | null {
   const parts: string[] = [];
   if (plan.settings) {
-    const them = plan.settings === 1 ? "it" : "them";
+    const it = plan.settings === 1 ? "it" : "them";
     parts.push(
-      `${plural(plan.settings, "file was", "files were")} left out because this library's settings skip ${them}. Change the goal in the library's Settings tab to include ${them}.`,
+      `${plural(plan.settings, "file was", "files were")} left out because this library's settings skip ${it}. To convert one anyway, open it and choose Convert anyway.`,
     );
   }
   if (plan.converted) {
     parts.push(`${plural(plan.converted, "file is", "files are")} already converted to this library's format.`);
   }
   if (plan.unconvertible) {
-    parts.push(`${plural(plan.unconvertible, "file has", "files have")} no video that can be converted.`);
+    parts.push(`${plural(plan.unconvertible, "file", "files")} can't be converted (each file says why).`);
   }
   if (plan.busy) {
     parts.push(`${plural(plan.busy, "file is", "files are")} already in the queue.`);
   }
   return parts.length ? parts.join(" ") : null;
+}
+
+/**
+ * What the server's own count of left-out files means (bulk "queue" with
+ * ids answers `left_out`): files its settings skip that the selection
+ * didn't know about yet.
+ */
+export function serverLeftOutText(leftOut: number | undefined): string | null {
+  if (!leftOut) return null;
+  return `${plural(leftOut, "file was", "files were")} left out because this library's settings skip ${leftOut === 1 ? "it" : "them"}.`;
 }
 
 /** Why none of the selected files can be converted, when that's the case. */
@@ -198,14 +218,19 @@ export function nothingToConvertText(plan: LeftOut): string {
     plan.converted
       ? { n: plan.converted, one: "is already converted to this library's format", many: "are already converted to this library's format" }
       : null,
-    plan.unconvertible ? { n: plan.unconvertible, one: "has no video to convert", many: "have no video to convert" } : null,
+    plan.unconvertible ? { n: plan.unconvertible, one: "can't be converted", many: "can't be converted" } : null,
     plan.busy ? { n: plan.busy, one: "is already in the queue", many: "are already in the queue" } : null,
   ].filter((g): g is { n: number; one: string; many: string } => g !== null);
   if (groups.length === 0) return "Nothing selected can be converted.";
-  const hint = plan.settings || plan.converted ? " To convert them, change the goal in the library's Settings tab first." : "";
+  const total = groups.reduce((sum, g) => sum + g.n, 0);
+  const hint = plan.converted
+    ? ` To convert ${total === 1 ? "it" : "them"} again, change the library's goal first.`
+    : plan.settings
+      ? ` To convert ${total === 1 ? "it" : "one"} anyway, open it and choose Convert anyway.`
+      : "";
   if (groups.length === 1) {
     const [g] = groups;
-    return `${g.n === 1 ? "This file" : "These files"} ${g.n === 1 ? g.one : g.many}.${hint.replace("them", g.n === 1 ? "it" : "them")}`;
+    return `${g.n === 1 ? "This file" : "These files"} ${g.n === 1 ? g.one : g.many}.${hint}`;
   }
   return `Nothing to convert: ${groups.map((g) => `${plural(g.n, "file")} ${g.n === 1 ? g.one : g.many}`).join(", ")}.${hint}`;
 }
@@ -222,4 +247,15 @@ export function stillCopyingCount(entries: ActivityEntry[] | undefined, libraryI
   const latest = entries?.find((e) => e.library_id === libraryId && e.message.startsWith("Scanned "));
   const match = latest ? STILL_COPYING.exec(latest.message) : null;
   return match ? Number(match[1].replace(/,/g, "")) || 0 : 0;
+}
+
+/**
+ * How many of a library's files are still being copied: the server's
+ * `stats.settling`, or, from servers without it, the latest scan summary in
+ * the activity feed.
+ */
+export function settlingCount(library: Pick<Library, "id" | "stats">, entries: ActivityEntry[] | undefined): number {
+  const settling = library.stats.settling ?? 0;
+  if (settling > 0) return settling;
+  return stillCopyingCount(entries, library.id);
 }

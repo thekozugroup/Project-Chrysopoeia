@@ -1,19 +1,31 @@
 "use client";
 
 /**
- * Job views: the live "now converting" card and the detail sheet with the
- * before/after, verification report, ffmpeg command and log.
+ * Job views: the live "now converting" card and the detail sheet. Every
+ * sheet reads in the same order: what happened, the size before and after,
+ * the checks in plain sentences, then one closed "Technical details" with
+ * the encoder, similarity scores, ffmpeg command and log.
  */
 
-import { ArrowRight, Check, CircleSlash, FileVideo, Info, RotateCcw, ArrowUpToLine, SlidersHorizontal, X } from "lucide-react";
+import {
+  ArrowRight,
+  ArrowUpToLine,
+  Check,
+  CircleMinus,
+  CircleStop,
+  FileVideo,
+  Info,
+  Play,
+  RotateCcw,
+} from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Callout, CodeBlock, Detail, Meter, Skeleton } from "@/components/ui/display";
+import { Callout, CodeBlock, Detail, Disclosure, Meter, Skeleton } from "@/components/ui/display";
 import { ConfirmDialog, Sheet } from "@/components/ui/overlays";
-import { useJobActions } from "@/lib/actions";
-import { convertsAgain } from "@/lib/convertible";
+import { useFileActions, useJobActions } from "@/lib/actions";
+import { convertsAgain, skipFollowsSettings } from "@/lib/convertible";
 import {
   formatBytes,
   formatDateTime,
@@ -23,88 +35,106 @@ import {
   middleTruncate,
   percentOf,
 } from "@/lib/format";
-import { HW_API_LABEL, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
+import { HW_API_LABEL, HW_API_TECH, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
+import { isUnreadableSource, skipSummary, unreadableDetail } from "@/lib/outcomes";
 import { overallProgress } from "@/lib/progress";
 import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
-import { useLiveJob } from "@/lib/store";
+import { useLive, useLiveJob } from "@/lib/store";
 import type { Job, JobStage, MediaFile, TranscodeProfile, ValidationCheck, ValidationReport } from "@/lib/types";
 import { cn, useRetained } from "@/lib/utils";
 
-/** Where a job is in Preparing → Converting → Checking quality → Finishing. */
+/**
+ * Where a job is in Preparing → Converting → Checking quality → Finishing.
+ * Phones get one line ("Checking quality · step 3 of 4") instead of the
+ * stepper, which would wrap.
+ */
 function StageSteps({ stage }: { stage: JobStage }) {
   const current = JOB_STAGES.indexOf(stage);
   return (
-    <ol className="flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs" aria-label="Steps">
-      {JOB_STAGES.map((s, i) => {
-        const done = current > i;
-        const active = current === i;
-        return (
-          <li key={s} className="flex items-center gap-1.5">
-            {i > 0 ? <span aria-hidden className={cn("h-px w-3", done || active ? "bg-accent-ink/60" : "bg-line")} /> : null}
-            <span
-              aria-current={active ? "step" : undefined}
-              className={cn("inline-flex items-center gap-1", active ? "font-semibold text-fg" : "text-muted")}
-            >
-              {/* Done: a check. Current: a gold dot. Not reached: a hollow ring. */}
-              {done ? (
-                <Check className="size-3 text-success" aria-hidden />
-              ) : (
-                <span
-                  aria-hidden
-                  className={cn(
-                    "size-1.5 rounded-full",
-                    active ? "bg-accent-ink" : "border border-line-strong bg-transparent",
-                  )}
-                />
-              )}
-              {JOB_STAGE_LABEL[s]}
-              {done ? <span className="sr-only"> (done)</span> : null}
-            </span>
-          </li>
-        );
-      })}
-    </ol>
+    <>
+      <p className="text-[0.8125rem] text-muted sm:hidden">
+        <span className="font-medium text-fg">{JOB_STAGE_LABEL[stage]}</span>
+        {current >= 0 ? ` · step ${current + 1} of ${JOB_STAGES.length}` : ""}
+      </p>
+      <ol className="hidden flex-wrap items-center gap-x-1.5 gap-y-1 text-xs sm:flex" aria-label="Steps">
+        {JOB_STAGES.map((s, i) => {
+          const done = current > i;
+          const active = current === i;
+          return (
+            <li key={s} className="flex items-center gap-1.5">
+              {i > 0 ? (
+                <span aria-hidden className={cn("h-px w-3", done || active ? "bg-accent-ink/60" : "bg-line")} />
+              ) : null}
+              <span
+                aria-current={active ? "step" : undefined}
+                className={cn("inline-flex items-center gap-1", active ? "font-semibold text-fg" : "text-muted")}
+              >
+                {/* Done: a check. Current: a gold dot. Not reached: a hollow ring. */}
+                {done ? (
+                  <Check className="size-3 text-success" aria-hidden />
+                ) : (
+                  <span
+                    aria-hidden
+                    className={cn(
+                      "size-1.5 rounded-full",
+                      active ? "bg-accent-ink" : "border border-line-strong bg-transparent",
+                    )}
+                  />
+                )}
+                {JOB_STAGE_LABEL[s]}
+                {done ? <span className="sr-only"> (done)</span> : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </>
   );
 }
 
-function speedText(job: Job): string | null {
+/** "235 fps · 9.8× real time", for the technical details. */
+function speedText(job: Pick<Job, "fps" | "speed">): string | null {
   const parts = [
     // Slow CPU encodes run below 10 fps; "0 fps" would read as stuck.
     job.fps && job.fps >= 0.05 ? `${job.fps >= 10 ? Math.round(job.fps) : job.fps.toFixed(1)} fps` : null,
-    job.speed ? `${job.speed >= 10 ? Math.round(job.speed) : job.speed.toFixed(1)}×` : null,
+    job.speed ? `${job.speed >= 10 ? Math.round(job.speed) : job.speed.toFixed(1)}× real time` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : null;
 }
 
 /**
  * Stop a running job (after asking: its work so far is lost) or take a
- * queued one out of the queue (one click; nothing is lost).
+ * queued one out of the queue (one click; nothing is lost). "Stop", not
+ * "Cancel", so it can't be mistaken for closing a dialog.
  */
-export function CancelJobButton({
+export function StopJobButton({
   job,
   size = "sm",
   variant = "quiet",
+  label = "Stop",
 }: {
   job: Job;
   size?: "sm" | "md";
   variant?: "quiet" | "secondary";
+  /** "Stop" on a card, "Stop converting" in the sheet. */
+  label?: string;
 }) {
   const { cancel } = useJobActions();
   const [confirm, setConfirm] = useState(false);
   if (job.state === "queued") {
     return (
-      <Button variant={variant} size={size} onClick={() => cancel.mutate(job)} loading={cancel.isPending}>
-        <CircleSlash aria-hidden />
+      <Button variant={variant} size={size} onClick={() => cancel.mutate(job)} loading={cancel.isPending} needsServer>
+        <CircleMinus aria-hidden />
         Remove from queue
       </Button>
     );
   }
   return (
     <>
-      <Button variant={variant} size={size} onClick={() => setConfirm(true)}>
-        <X aria-hidden />
-        Cancel
+      <Button variant={variant} size={size} onClick={() => setConfirm(true)} needsServer>
+        <CircleStop aria-hidden />
+        {label}
       </Button>
       <ConfirmDialog
         open={confirm}
@@ -128,12 +158,6 @@ export function jobOverall(job: Pick<Job, "stage" | "progress">): number {
   return overallProgress(job.stage, job.progress);
 }
 
-/** "Checking quality · 27%": the stage and how far into it, as secondary detail. */
-function stageDetail(job: Job): string {
-  const stage = JOB_STAGE_LABEL[job.stage];
-  return job.stage === "transcoding" || job.stage === "waiting" ? stage : `${stage} · ${Math.round(job.progress)}%`;
-}
-
 /** Live card for a running job. */
 export function JobCard({
   job: baseJob,
@@ -149,10 +173,8 @@ export function JobCard({
   const libraries = useLibraries();
   const libraryName = libraries.data?.find((l) => l.id === job.library_id)?.name;
   const eta = formatEta(job.eta_secs);
-  const speed = speedText(job);
   const stage = JOB_STAGE_LABEL[job.stage];
   const overall = jobOverall(job);
-  const showStage = eta !== null && job.stage !== "transcoding" && job.stage !== "waiting";
 
   useThrottledAnnouncement(
     announce ? `${job.file_name}: ${Math.round(overall)}% done, ${stage.toLowerCase()}${eta ? `, ${eta}` : ""}.` : null,
@@ -183,17 +205,10 @@ export function JobCard({
 
       <div>
         <Meter value={overall} label={`${job.file_name}: whole file`} live size="md" />
-        <div className="mt-2 flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1 text-[0.8125rem]">
-          <p className="text-fg">
-            <span className="font-semibold tabular">{Math.round(overall)}%</span>
-            <span className="text-muted"> · {eta ?? stage.toLowerCase()}</span>
-          </p>
-          <p className="text-xs text-muted tabular">
-            {/* Without a time estimate the left side already names the stage. */}
-            {showStage ? <span>{stageDetail(job)}</span> : null}
-            {speed ? <span className="font-mono">{showStage ? " · " : ""}{speed}</span> : null}
-          </p>
-        </div>
+        <p className="mt-2 text-[0.8125rem] text-fg">
+          <span className="font-semibold tabular">{Math.round(overall)}%</span>
+          {eta ? <span className="text-muted"> · {eta}</span> : null}
+        </p>
         {job.attempt > 1 ? (
           <p className="mt-2 text-[0.8125rem] text-warning">
             Attempt {job.attempt}: the first try didn&apos;t work, so Chrysopoeia is trying another way.
@@ -202,7 +217,7 @@ export function JobCard({
       </div>
 
       <div className="flex items-center justify-end gap-2 border-t border-line pt-3">
-        <CancelJobButton job={job} />
+        <StopJobButton job={job} />
         <Button variant="secondary" size="sm" onClick={() => onOpen(job)}>
           Details
         </Button>
@@ -233,6 +248,20 @@ export function savingsText(input: number, output: number | null): { text: strin
   return { text: `${formatBytes(-diff)} larger`, saved: false };
 }
 
+/** The second line of a finished job in a list: what came of it, briefly. */
+export function historyNote(job: Job): string {
+  switch (job.state) {
+    case "done":
+      return savingsText(job.input_size, job.output_size)?.text ?? "Converted";
+    case "failed":
+      return isUnreadableSource(job.error) ? "Looks damaged or isn't a video" : (job.error ?? "Failed");
+    case "skipped":
+      return job.skip_reason ?? (job.output_size !== null ? "Kept the original" : "No conversion needed");
+    default:
+      return "Stopped. The original was left as it is.";
+  }
+}
+
 export function SheetSection({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="mt-7 first:mt-0">
@@ -242,29 +271,28 @@ export function SheetSection({ title, children }: { title: string; children: Rea
   );
 }
 
-function BeforeAfter({ job }: { job: Job }) {
+/** Before and after sizes; only for jobs that produced a new file. */
+function BeforeAfter({ job, output }: { job: Job; output: number }) {
   const kept = job.state === "done";
-  const savings = savingsText(job.input_size, job.output_size);
+  const savings = savingsText(job.input_size, output);
   return (
     <div className="rounded-lg border border-line bg-sunken/50 p-4">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <p className="text-xs text-muted">Before</p>
+          <p className="text-[0.8125rem] text-muted">Before</p>
           <p className="mt-0.5 text-lg font-semibold text-fg tabular">{formatBytes(job.input_size)}</p>
         </div>
         <ArrowRight className="size-5 shrink-0 text-muted" aria-label="became" />
         <div className="text-right">
-          <p className="text-xs text-muted">{kept || job.output_size === null ? "After" : "New file (not kept)"}</p>
-          <p className="mt-0.5 text-lg font-semibold text-fg tabular">
-            {job.output_size === null ? "—" : formatBytes(job.output_size)}
-          </p>
+          <p className="text-[0.8125rem] text-muted">{kept ? "After" : "New file (not kept)"}</p>
+          <p className="mt-0.5 text-lg font-semibold text-fg tabular">{formatBytes(output)}</p>
         </div>
       </div>
       {savings ? (
         <>
           <Meter
             className="mt-3"
-            value={job.output_size === null ? 0 : Math.min(100, percentOf(job.output_size, job.input_size))}
+            value={Math.min(100, percentOf(output, job.input_size))}
             label="New size compared with the original"
             tone={!kept ? "muted" : savings.saved ? "accent" : "danger"}
           />
@@ -276,7 +304,7 @@ function BeforeAfter({ job }: { job: Job }) {
           >
             {kept
               ? savings.text
-              : `Would have been ${Math.round(Math.abs(percentOf(job.input_size - (job.output_size ?? 0), job.input_size)))}% ${
+              : `Would have been ${Math.round(Math.abs(percentOf(job.input_size - output, job.input_size)))}% ${
                   savings.saved ? "smaller" : "larger"
                 }. The original was kept.`}
           </p>
@@ -286,14 +314,6 @@ function BeforeAfter({ job }: { job: Job }) {
   );
 }
 
-/** Tone for the similarity numbers, from the worker's own verdict on the visual check. */
-function metricTone(report: ValidationReport): "danger" | "warning" | null {
-  const visual = report.checks.find((c) => c.id === "visual");
-  if (visual?.status === "fail") return "danger";
-  if (visual?.status === "warn") return "warning";
-  return null;
-}
-
 /** A check's measured value in words, or `null` when the sentence already says it all. */
 export function checkValueText(check: ValidationCheck): string | null {
   const v = check.value;
@@ -301,61 +321,43 @@ export function checkValueText(check: ValidationCheck): string | null {
   switch (check.id) {
     case "duration":
       return v < 0.05 ? null : `${v < 10 ? v.toFixed(1) : Math.round(v)} s off`;
-    case "visual":
-      return `similarity ${v.toFixed(2)}`;
     case "black_frames":
     case "frozen_frames":
       return v < 0.05 ? null : `+${v < 10 ? v.toFixed(1) : Math.round(v)} s`;
     default:
+      // Similarity scores live in the technical details.
       return null;
   }
 }
 
-function Verification({ job }: { job: Job }) {
-  const report = job.validation;
-  if (!report) {
-    return (
-      <p className="text-sm text-muted">
-        {job.state === "running" || job.state === "queued"
-          ? "Checks run after converting."
-          : "No checks ran for this file."}
-      </p>
-    );
+/** "99.6%": a similarity score (0..1) as a percentage people can read. */
+function similarityPercent(ssim: number): string {
+  const pct = ssim * 100;
+  return `${pct >= 99.95 ? "100" : pct.toFixed(1)}%`;
+}
+
+/**
+ * The checks' verdict in one sentence: "Looks the same as the original:
+ * 99.6% similar at its lowest point."
+ */
+export function checksLead(report: ValidationReport): string {
+  const visual = report.checks.find((c) => c.id === "visual");
+  const lowest = report.ssim_min ?? visual?.value ?? null;
+  if (visual && lowest !== null && Number.isFinite(lowest)) {
+    if (visual.status === "fail") {
+      return `Looked different from the original: only ${similarityPercent(lowest)} similar at its lowest point.`;
+    }
+    return `Looks the same as the original: ${similarityPercent(lowest)} similar at its lowest point.`;
   }
-  const tone = metricTone(report);
-  const metrics = [
-    report.ssim_min !== null
-      ? { label: "Lowest similarity", value: report.ssim_min.toFixed(3), hint: "SSIM, 1 = identical" }
-      : null,
-    report.ssim_avg !== null ? { label: "Average similarity", value: report.ssim_avg.toFixed(3), hint: "SSIM" } : null,
-    report.psnr_avg !== null ? { label: "Signal to noise", value: `${report.psnr_avg.toFixed(1)} dB`, hint: "PSNR" } : null,
-  ].filter((m): m is { label: string; value: string; hint: string } => m !== null);
+  const failure = report.checks.find((c) => c.status === "fail");
+  if (failure) return `Failed a check: ${failure.label.charAt(0).toLowerCase()}${failure.label.slice(1)}.`;
+  return report.passed ? "Passed every check." : "Didn't pass its checks.";
+}
+
+function Checks({ report }: { report: ValidationReport }) {
   return (
     <div className="overflow-hidden rounded-lg border border-line">
-      <p className="border-b border-line px-3.5 py-2.5 text-[0.8125rem] text-muted">
-        {VALIDATION_LABEL[report.level]} checks, took {formatDuration(report.elapsed_secs)}
-      </p>
-      {metrics.length ? (
-        // One row of numbers with dividers, inside the checks box rather than
-        // as separate cards.
-        <dl className="grid grid-cols-3 divide-x divide-line border-b border-line">
-          {metrics.map((m) => (
-            <div key={m.label} className="min-w-0 px-3.5 py-2.5">
-              <dt className="text-xs leading-snug text-muted">{m.label}</dt>
-              <dd
-                className={cn(
-                  "mt-0.5 font-mono text-sm font-medium tabular",
-                  tone === "danger" ? "text-danger" : tone === "warning" ? "text-warning" : "text-fg",
-                )}
-              >
-                {m.value}
-                {tone ? <span className="sr-only"> ({tone === "danger" ? "failed the check" : "a warning"})</span> : null}
-              </dd>
-              <dd className="text-[0.6875rem] text-muted">{m.hint}</dd>
-            </div>
-          ))}
-        </dl>
-      ) : null}
+      <p className="border-b border-line px-3.5 py-3 text-sm font-medium text-fg">{checksLead(report)}</p>
       <ul className="divide-y divide-line">
         {report.checks.map((check) => {
           const value = checkValueText(check);
@@ -363,7 +365,7 @@ function Verification({ job }: { job: Job }) {
             <li key={check.id} className="flex gap-3 px-3.5 py-3">
               <CheckIcon status={check.status} />
               <div className="min-w-0 flex-1">
-                <p className="text-sm font-medium text-fg">{check.label}</p>
+                <p className="text-sm text-fg">{check.label}</p>
                 <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">{check.detail}</p>
               </div>
               {value ? <span className="shrink-0 text-xs text-muted tabular">{value}</span> : null}
@@ -371,6 +373,9 @@ function Verification({ job }: { job: Job }) {
           );
         })}
       </ul>
+      <p className="border-t border-line px-3.5 py-2.5 text-[0.8125rem] text-muted">
+        {VALIDATION_LABEL[report.level]} checks · took {formatDuration(report.elapsed_secs)}
+      </p>
     </div>
   );
 }
@@ -380,9 +385,38 @@ function originalAffected(error: string | null): boolean {
   return /original[^.]*\b(missing|deleted|removed|damaged|modified|overwritten|lost)\b/i.test(error ?? "");
 }
 
+/** Lines of an ffmpeg log that say what went wrong. */
+const ERROR_LINE = /\b(error|errors|failed|invalid|corrupt|cannot|could not|couldn't|unable|no such|denied|not found|unsupported)\b/i;
+
+/** The log with the lines that name the problem first, so a bug report starts with them. */
+export function errorLinesFirst(log: string): { errors: string | null; rest: string } {
+  const lines = log.split("\n");
+  const errors = lines.filter((line) => ERROR_LINE.test(line));
+  return { errors: errors.length ? errors.join("\n") : null, rest: log };
+}
+
+/** What happens next for a file whose original can't be read. */
+export function CantBeReadCallout({ error }: { error: string | null }) {
+  const found = unreadableDetail(error)?.replace(/\.$/, "");
+  const detail = found ? `${found.charAt(0).toLowerCase()}${found.slice(1)}` : null;
+  return (
+    <Callout tone="warning" title="Can't be read">
+      <p>
+        This file looks damaged or isn&apos;t a video{detail ? ` (${detail})` : ""}.
+        Chrysopoeia left it alone.
+      </p>
+      <p className="mt-1.5">
+        Play it in Plex or Jellyfin to check. If it&apos;s broken, replace it; the new copy is picked up automatically.
+      </p>
+    </Callout>
+  );
+}
+
 function Outcome({ job }: { job: Job }) {
   const settings = useSettings();
+  const forced = useLive((s) => Boolean(s.forced[job.id]));
   if (job.state === "failed") {
+    if (isUnreadableSource(job.error)) return <CantBeReadCallout error={job.error} />;
     return (
       <Callout tone="danger" title="This file couldn't be converted">
         <p>{job.error ?? "ffmpeg stopped with an error."}</p>
@@ -393,21 +427,22 @@ function Outcome({ job }: { job: Job }) {
   if (job.state === "skipped") {
     // A new file was made and thrown away (the size rule), or the file never
     // needed work under the library's settings.
-    const keptOriginal = job.output_size !== null;
+    const summary = skipSummary(job.skip_reason, job.output_size !== null);
     return (
-      <Callout tone="info" title={keptOriginal ? "Kept the original" : "Skipped"}>
-        <p>{job.skip_reason ?? (keptOriginal ? "The new file wasn't worth keeping." : "No conversion needed.")}</p>
-        <p className="mt-1.5">
-          {keptOriginal
-            ? "That follows the library's settings, so converting it again would end the same way. To keep results like this, change the goal or the minimum savings in the library settings."
-            : "That follows the library's settings, so converting it again would end the same way. To convert files like this one, change the goal in the library settings."}
-        </p>
+      <Callout tone="info" title={summary.title}>
+        <p>{summary.body}</p>
+        {forced ? (
+          <p className="mt-1.5">
+            Convert anyway didn&apos;t take effect: this server still applied the library&apos;s rules. Update the
+            Chrysopoeia container to convert files like this one.
+          </p>
+        ) : null}
       </Callout>
     );
   }
   if (job.state === "cancelled") {
     return (
-      <Callout tone="info" title="Cancelled">
+      <Callout tone="info" title="Stopped">
         The original file was left as it is.
       </Callout>
     );
@@ -425,12 +460,59 @@ function Outcome({ job }: { job: Job }) {
             ? "The new file passed every check and was saved to the output folder. The original is untouched."
             : "The new file passed every check before it took the original's place."
           : toFolder
-            ? "The new file was saved to the output folder. Verification was off, so it wasn't checked."
-            : "The new file took the original's place. Verification was off, so it wasn't checked."}
+            ? "The new file was saved to the output folder. Checks were off, so it wasn't checked."
+            : "The new file took the original's place. Checks were off, so it wasn't checked."}
       </Callout>
     );
   }
   return null;
+}
+
+/** Encoder, similarity scores, command and log: everything an expert or a bug report needs. */
+function JobTechnical({ job }: { job: Job }) {
+  const report = job.validation;
+  const log = job.log_tail ? errorLinesFirst(job.log_tail) : null;
+  const speed = job.state === "running" ? speedText(job) : null;
+  const scores = [
+    report?.ssim_min != null ? `lowest ${report.ssim_min.toFixed(3)}` : null,
+    report?.ssim_avg != null ? `average ${report.ssim_avg.toFixed(3)}` : null,
+  ].filter(Boolean);
+  const rows = [
+    job.encoder || job.hw_api ? (
+      <Detail key="encoder" label="Encoder" mono>
+        {[job.encoder, job.hw_api ? HW_API_TECH[job.hw_api] : null].filter(Boolean).join(" · ")}
+      </Detail>
+    ) : null,
+    job.attempt > 1 ? (
+      <Detail key="attempt" label="Attempt">
+        {job.attempt}
+      </Detail>
+    ) : null,
+    speed ? (
+      <Detail key="speed" label="Speed" mono>
+        {speed}
+      </Detail>
+    ) : null,
+    scores.length ? (
+      <Detail key="ssim" label="Similarity (SSIM)" mono>
+        {scores.join(" · ")}
+      </Detail>
+    ) : null,
+    report?.psnr_avg != null ? (
+      <Detail key="psnr" label="Signal to noise (PSNR)" mono>
+        {`${report.psnr_avg.toFixed(1)} dB`}
+      </Detail>
+    ) : null,
+  ].filter(Boolean);
+  if (!rows.length && !job.command && !log) return null;
+  return (
+    <Disclosure className="mt-7">
+      {rows.length ? <dl className="-my-2 divide-y divide-line">{rows}</dl> : null}
+      {log?.errors ? <CodeBlock code={log.errors} label="What ffmpeg reported" /> : null}
+      {job.command ? <CodeBlock code={job.command} label="ffmpeg command of the final attempt" /> : null}
+      {log ? <CodeBlock code={log.rest} label="Last lines from ffmpeg" maxHeight="20rem" /> : null}
+    </Disclosure>
+  );
 }
 
 function JobSheetBody({ job: baseJob }: { job: Job }) {
@@ -443,7 +525,6 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
     <>
       <div className="mb-6 flex flex-wrap items-center gap-2">
         <JobStateBadge job={job} />
-        <EncoderBadge api={job.hw_api} encoder={job.encoder} />
         <span className="text-[0.8125rem] text-muted">
           {job.finished_at
             ? `Finished ${formatRelative(job.finished_at)}`
@@ -454,13 +535,12 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
       </div>
 
       {job.state === "running" ? (
-        <div className="mb-6">
+        <div className="mb-6 flex flex-col gap-3">
           <StageSteps stage={job.stage} />
-          <Meter className="mt-3" value={overall} label="Whole file" live size="md" />
-          <p className="mt-2 text-[0.8125rem] text-muted">
+          <Meter value={overall} label="Whole file" live size="md" />
+          <p className="text-[0.8125rem] text-muted">
             <span className="font-semibold text-fg tabular">{Math.round(overall)}%</span>
             {eta ? ` · ${eta}` : ""}
-            {speedText(job) ? <span className="font-mono text-xs"> · {speedText(job)}</span> : null}
           </p>
         </div>
       ) : null}
@@ -480,13 +560,17 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
         </SheetSection>
       ) : null}
 
-      <SheetSection title="Size">
-        <BeforeAfter job={job} />
-      </SheetSection>
+      {job.output_size !== null ? (
+        <SheetSection title="Size">
+          <BeforeAfter job={job} output={job.output_size} />
+        </SheetSection>
+      ) : null}
 
-      <SheetSection title="Checks">
-        <Verification job={job} />
-      </SheetSection>
+      {job.validation ? (
+        <SheetSection title="Checks">
+          <Checks report={job.validation} />
+        </SheetSection>
+      ) : null}
 
       <SheetSection title="Details">
         <dl className="divide-y divide-line">
@@ -494,33 +578,18 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
           <Detail label="File" mono>
             {job.file_path}
           </Detail>
-          <Detail label="Done by">
-            {job.hw_api ? HW_API_LABEL[job.hw_api] : "—"}
-            {job.encoder ? <span className="ml-1.5 font-mono text-xs text-muted"><span className="sr-only">, encoder </span>{job.encoder}</span> : null}
-          </Detail>
-          {job.attempt > 1 ? <Detail label="Attempts">{job.attempt}</Detail> : null}
-          <Detail label="Added">{formatDateTime(job.created_at)}</Detail>
-          {job.started_at ? <Detail label="Started">{formatDateTime(job.started_at)}</Detail> : null}
-          {job.finished_at ? <Detail label="Finished">{formatDateTime(job.finished_at)}</Detail> : null}
+          {job.hw_api ? <Detail label="Converted on">{HW_API_LABEL[job.hw_api]}</Detail> : null}
           {job.started_at && job.finished_at ? (
             <Detail label="Took">
               {formatDuration((Date.parse(job.finished_at) - Date.parse(job.started_at)) / 1000)}
             </Detail>
           ) : null}
+          <Detail label="Added">{formatDateTime(job.created_at)}</Detail>
+          {job.finished_at ? <Detail label="Finished">{formatDateTime(job.finished_at)}</Detail> : null}
         </dl>
       </SheetSection>
 
-      {job.command ? (
-        <SheetSection title="ffmpeg command">
-          <CodeBlock code={job.command} label="Command of the final attempt" />
-        </SheetSection>
-      ) : null}
-
-      {job.log_tail ? (
-        <SheetSection title="Log">
-          <CodeBlock code={job.log_tail} label="Last lines from ffmpeg" wrap={false} maxHeight="20rem" />
-        </SheetSection>
-      ) : null}
+      <JobTechnical job={job} />
     </>
   );
 }
@@ -542,7 +611,7 @@ export function ConvertAgainButton({
   const toFolder = settings.data?.output_mode === "folder";
   return (
     <>
-      <Button variant="secondary" size="sm" onClick={() => setConfirm(true)}>
+      <Button variant="secondary" size="sm" onClick={() => setConfirm(true)} needsServer>
         <RotateCcw aria-hidden />
         {label}
       </Button>
@@ -560,10 +629,10 @@ export function ConvertAgainButton({
         {toFolder ? (
           <p>The original is converted again and the file in the output folder is replaced with the new result.</p>
         ) : (
-          <>
-            <p>This converts the already-converted file again. Quality can drop a little each time a file is converted.</p>
-            <p>Usually this is only worth it after changing the library&apos;s goal.</p>
-          </>
+          <p>
+            It was converted for this library&apos;s old goal. Converting it again uses the new one; quality can drop a
+            little each time.
+          </p>
         )}
       </ConfirmDialog>
     </>
@@ -571,64 +640,86 @@ export function ConvertAgainButton({
 }
 
 /**
- * "Convert again" for a converted file, when it would do anything: the
- * worker decides again and skips a file already in the library's format, so
- * then the way forward is changing the library's goal instead.
+ * "Convert again" for a converted file, only when it would do anything: the
+ * library's goal changed since, so the file isn't in its format any more.
+ * A good result needs no homework, so otherwise there's nothing here.
  */
 export function ConvertAgainAction({
   file,
   profile,
   onConfirm,
   loading,
-  explain = false,
 }: {
   file: MediaFile;
   profile: TranscodeProfile | undefined;
   onConfirm: () => void;
   loading: boolean;
-  /** Say why there's no "Convert again" (the file sheet); the job sheet stays quiet. */
-  explain?: boolean;
 }) {
-  if (convertsAgain(file, profile)) {
-    return <ConvertAgainButton fileName={file.file_name} onConfirm={onConfirm} loading={loading} />;
-  }
-  if (!explain) return null;
+  if (!convertsAgain(file, profile)) return null;
+  return <ConvertAgainButton fileName={file.file_name} onConfirm={onConfirm} loading={loading} />;
+}
+
+/**
+ * "Convert anyway" for a file the library's settings skip (already
+ * efficient, or kept because the result wasn't smaller): one conversion
+ * without those rules, after a one-line confirmation.
+ */
+export function ConvertAnywayButton({ file, variant = "secondary" }: { file: MediaFile; variant?: "secondary" | "primary" }) {
+  const { convertAnyway } = useFileActions();
+  const [confirm, setConfirm] = useState(false);
   return (
     <>
-      <p className="mr-auto min-w-0 flex-1 basis-48 text-[0.8125rem] leading-snug text-muted">
-        Already in this library&apos;s format. To convert it again, change the library&apos;s goal first.
-      </p>
-      <a
-        href={href(`/library/${file.library_id}/settings`)}
-        className={buttonVariants({ variant: "secondary", size: "sm" })}
+      <Button variant={variant} size="sm" onClick={() => setConfirm(true)} needsServer>
+        <Play aria-hidden />
+        Convert anyway
+      </Button>
+      <ConfirmDialog
+        open={confirm}
+        onOpenChange={setConfirm}
+        title={`Convert ${middleTruncate(file.file_name, 60)} anyway?`}
+        confirmLabel="Convert anyway"
+        loading={convertAnyway.isPending}
+        onConfirm={() => convertAnyway.mutate(file, { onSettled: () => setConfirm(false) })}
       >
-        <SlidersHorizontal aria-hidden />
-        Library settings
-      </a>
+        <p>
+          It&apos;s converted once, ignoring this library&apos;s rules for skipping files. The usual checks still run
+          before anything is replaced.
+        </p>
+      </ConfirmDialog>
     </>
   );
 }
 
-/** "Convert again" in the job sheet, judged against the file as it is now. */
-function JobConvertAgain({ job }: { job: Job }) {
-  const { retry } = useJobActions();
-  const file = useFile(job.file_id);
-  const { library } = useLibrary(job.library_id);
-  if (!file.data) return null;
+/** "Ignore this file": a damaged original is left alone for good ("Skipped by you"). */
+export function IgnoreFileButton({ file, variant = "primary" }: { file: MediaFile; variant?: "primary" | "secondary" }) {
+  const { ignore } = useFileActions();
   return (
-    <ConvertAgainAction
-      file={file.data.file}
-      profile={library?.profile}
-      onConfirm={() => retry.mutate(job)}
-      loading={retry.isPending}
-    />
+    <Button variant={variant} size="sm" onClick={() => ignore.mutate(file)} loading={ignore.isPending} needsServer>
+      <CircleMinus aria-hidden />
+      Ignore this file
+    </Button>
   );
 }
 
 function JobSheetActions({ job }: { job: Job }) {
   const { moveToTop, retry } = useJobActions();
+  const file = useFile(job.file_id).data?.file;
+  const { library } = useLibrary(job.library_id);
   // A plain link: the new address has no `?job=`, which closes this sheet.
   const fileLink = href(`/library/${job.library_id}`, { file: job.file_id });
+  const unreadable = job.state === "failed" && isUnreadableSource(job.error);
+  const retryButton = (primary: boolean) => (
+    <Button
+      variant={primary ? "primary" : "secondary"}
+      size="sm"
+      onClick={() => retry.mutate(job)}
+      loading={retry.isPending}
+      needsServer
+    >
+      <RotateCcw aria-hidden />
+      {job.state === "cancelled" ? "Queue again" : "Try again"}
+    </Button>
+  );
   return (
     <>
       <a href={fileLink} className={cn(buttonVariants({ variant: "quiet", size: "sm" }), "mr-auto")}>
@@ -637,36 +728,37 @@ function JobSheetActions({ job }: { job: Job }) {
       </a>
       {job.state === "queued" ? (
         <>
-          <CancelJobButton job={job} variant="secondary" />
-          <Button variant="primary" size="sm" onClick={() => moveToTop.mutate(job)} loading={moveToTop.isPending}>
+          <StopJobButton job={job} variant="secondary" />
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => moveToTop.mutate(job)}
+            loading={moveToTop.isPending}
+            needsServer
+          >
             <ArrowUpToLine aria-hidden />
             Move to top
           </Button>
         </>
       ) : null}
-      {job.state === "running" ? <CancelJobButton job={job} variant="secondary" /> : null}
-      {job.state === "failed" || job.state === "cancelled" ? (
-        <Button
-          variant={job.state === "failed" ? "primary" : "secondary"}
-          size="sm"
-          onClick={() => retry.mutate(job)}
+      {job.state === "running" ? <StopJobButton job={job} variant="secondary" label="Stop converting" /> : null}
+      {job.state === "failed" && unreadable ? (
+        <>
+          {retryButton(false)}
+          {file?.status === "failed" ? <IgnoreFileButton file={file} /> : null}
+        </>
+      ) : null}
+      {job.state === "failed" && !unreadable ? retryButton(true) : null}
+      {job.state === "cancelled" ? retryButton(false) : null}
+      {job.state === "skipped" && file && skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null}
+      {job.state === "done" && file ? (
+        <ConvertAgainAction
+          file={file}
+          profile={library?.profile}
+          onConfirm={() => retry.mutate(job)}
           loading={retry.isPending}
-        >
-          <RotateCcw aria-hidden />
-          {job.state === "failed" ? "Try again" : "Queue again"}
-        </Button>
+        />
       ) : null}
-      {job.state === "skipped" ? (
-        // Queueing it again would reach the same verdict; the settings decide.
-        <a
-          href={href(`/library/${job.library_id}/settings`)}
-          className={buttonVariants({ variant: "secondary", size: "sm" })}
-        >
-          <SlidersHorizontal aria-hidden />
-          Library settings
-        </a>
-      ) : null}
-      {job.state === "done" ? <JobConvertAgain job={job} /> : null}
     </>
   );
 }

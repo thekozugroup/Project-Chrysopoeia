@@ -8,6 +8,7 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowDownUp,
   CirclePause,
   CirclePlay,
   CircleMinus,
@@ -19,6 +20,7 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
+  SlidersHorizontal,
   Trash2,
   X,
 } from "lucide-react";
@@ -36,11 +38,21 @@ import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ActionMenu, ConfirmDialog } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { leftOutText, nothingToConvertText, planBulkConvert, stillCopyingCount } from "@/lib/convertible";
+import { leftOutText, nothingToConvertText, planBulkConvert, settlingCount } from "@/lib/convertible";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
-import { keys, useActivity, useFiles, useHardwareInfo, useLibrary, usePresets, useSettings } from "@/lib/queries";
+import {
+  keys,
+  useActivity,
+  useFailures,
+  useFiles,
+  useHardwareInfo,
+  useLibrary,
+  usePresets,
+  useSettings,
+} from "@/lib/queries";
+import { profileFieldOf, type ProfileErrors } from "@/lib/settings-form";
 import { href, navigate, openSheet, updateParams, type Route } from "@/lib/router";
 import { useFileLive, useLive } from "@/lib/store";
 import type { FileSort, FileStatus, Library, MediaFile } from "@/lib/types";
@@ -122,71 +134,49 @@ function ScanBanner({ library }: { library: Library }) {
   );
 }
 
+/**
+ * Title, folder and goal. The rarely needed "Scan now" (folders are
+ * watched and rescanned on their own) sits in the "…" menu with a way to
+ * the library's settings, where pausing and removing live.
+ */
 function Header({ library }: { library: Library }) {
-  const { scan, setEnabled, remove } = useLibraryActions(library);
-  const [confirmRemove, setConfirmRemove] = useState(false);
+  const { scan } = useLibraryActions(library);
   return (
-    <>
-      <PageHeader
-        title={library.name}
-        actions={
-          <>
-            <Button
-              variant="secondary"
-              onClick={() => scan.mutate()}
-              loading={scan.isPending}
-              disabled={library.scanning || !library.enabled}
-            >
-              <RefreshCw aria-hidden />
-              Scan now
+    <PageHeader
+      title={library.name}
+      inlineActions
+      actions={
+        <ActionMenu
+          trigger={
+            <Button variant="secondary" size="icon" aria-label={`More actions for ${library.name}`}>
+              <Ellipsis />
             </Button>
-            <ActionMenu
-              trigger={
-                <Button variant="secondary" size="icon" aria-label={`More actions for ${library.name}`}>
-                  <Ellipsis />
-                </Button>
-              }
-              actions={[
-                library.enabled
-                  ? {
-                      label: "Pause library",
-                      icon: <CirclePause aria-hidden />,
-                      onSelect: () => setEnabled.mutate(false),
-                    }
-                  : {
-                      label: "Resume library",
-                      icon: <CirclePlay aria-hidden />,
-                      onSelect: () => setEnabled.mutate(true),
-                    },
-                "separator",
-                {
-                  label: "Remove library…",
-                  icon: <Trash2 aria-hidden />,
-                  destructive: true,
-                  onSelect: () => setConfirmRemove(true),
-                },
-              ]}
-            />
-          </>
-        }
-      >
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <span className="min-w-0 truncate font-mono text-[0.8125rem] text-muted">{library.path}</span>
-          <Badge tone="accent">{GOAL_LABEL[library.profile.goal]}</Badge>
-          {!library.enabled ? <Badge icon={<CirclePause aria-hidden />}>Paused</Badge> : null}
-          {library.last_scan_at ? (
-            <span className="text-xs text-muted">Scanned {formatRelative(library.last_scan_at)}</span>
-          ) : null}
-        </div>
-      </PageHeader>
-      <RemoveLibraryDialog
-        library={library}
-        open={confirmRemove}
-        onOpenChange={setConfirmRemove}
-        onConfirm={() => remove.mutate()}
-        loading={remove.isPending}
-      />
-    </>
+          }
+          actions={[
+            {
+              label: library.scanning ? "Scanning…" : "Scan now",
+              icon: <RefreshCw aria-hidden />,
+              disabled: library.scanning || !library.enabled || scan.isPending,
+              onSelect: () => scan.mutate(),
+            },
+            {
+              label: "Library settings",
+              icon: <SlidersHorizontal aria-hidden />,
+              onSelect: () => navigate(`/library/${library.id}/settings`),
+            },
+          ]}
+        />
+      }
+    >
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className="min-w-0 truncate font-mono text-[0.8125rem] text-muted">{library.path}</span>
+        <Badge tone="accent">{GOAL_LABEL[library.profile.goal]}</Badge>
+        {!library.enabled ? <Badge icon={<CirclePause aria-hidden />}>Paused</Badge> : null}
+        {library.last_scan_at ? (
+          <span className="text-xs text-muted">Scanned {formatRelative(library.last_scan_at)}</span>
+        ) : null}
+      </div>
+    </PageHeader>
   );
 }
 
@@ -224,6 +214,8 @@ function RemoveLibraryDialog({
 
 function Summary({ library }: { library: Library }) {
   const stats = library.stats;
+  const failures = useFailures();
+  const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   return (
     <section aria-label="Progress" className="rounded-lg border border-line bg-surface p-4 sm:p-5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
@@ -246,8 +238,8 @@ function Summary({ library }: { library: Library }) {
           {formatBytes(stats.total_bytes)} in total
         </p>
       </div>
-      <LibraryBar stats={stats} className="mt-3" />
-      <LibraryLegend stats={stats} className="mt-3" />
+      <LibraryBar stats={stats} unreadable={unreadable} className="mt-3" />
+      <LibraryLegend stats={stats} unreadable={unreadable} className="mt-3 hidden sm:flex" />
     </section>
   );
 }
@@ -300,8 +292,25 @@ function StatusChips({ library, status }: { library: Library; status: FileStatus
     { value: null, label: "All", count: stats.file_count },
     ...FILE_STATUSES.map((s) => ({ value: s, label: FILE_STATUS_LABEL[s], count: stats[s] })),
   ];
+  // On phones the chips scroll sideways: keep the chosen one in view (a
+  // "Review" link lands here with ?status=failed).
+  const row = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = row.current;
+    const active = el?.querySelector<HTMLElement>("[aria-pressed='true']");
+    if (!el || !active) return;
+    const start = active.offsetLeft - 16;
+    const end = active.offsetLeft + active.offsetWidth + 16;
+    if (start < el.scrollLeft) el.scrollLeft = start;
+    else if (end > el.scrollLeft + el.clientWidth) el.scrollLeft = end - el.clientWidth;
+  }, [status]);
   return (
-    <div role="group" aria-label="Filter by status" className="-mx-4 flex gap-1.5 overflow-x-auto px-4 pb-1 sm:mx-0 sm:flex-wrap sm:px-0">
+    <div
+      ref={row}
+      role="group"
+      aria-label="Filter by status"
+      className="relative -mx-4 flex gap-1.5 overflow-x-auto px-4 pb-1 sm:mx-0 sm:flex-wrap sm:px-0"
+    >
       {chips.map((chip) => {
         const active = chip.value === status;
         if (chip.value && chip.count === 0 && !active) return null;
@@ -313,7 +322,7 @@ function StatusChips({ library, status }: { library: Library; status: FileStatus
             title={chip.value ? FILE_STATUS_HELP[chip.value] : "Every file in this library"}
             onClick={() => updateParams({ status: chip.value, offset: null })}
             className={cn(
-              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-3 text-[0.8125rem] font-medium transition-colors [&_svg]:size-3.5",
+              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full border px-3 text-[0.8125rem] font-medium transition-colors pointer-coarse:h-11 [&_svg]:size-3.5",
               active
                 ? "border-accent-ink bg-accent-soft text-fg"
                 : "border-line-strong/50 bg-surface text-muted hover:border-line-strong hover:text-fg",
@@ -344,7 +353,13 @@ function SavedCell({ file }: { file: MediaFile }) {
 /** Status with live whole-file progress while converting (see `overallProgress`). */
 function StatusCell({ file }: { file: MediaFile }) {
   const live = useFileLive(file.id);
-  return <FileStatusBadge status={file.status} progress={file.status === "processing" ? (live?.overall ?? null) : null} />;
+  return (
+    <FileStatusBadge
+      status={file.status}
+      error={file.error}
+      progress={file.status === "processing" ? (live?.overall ?? null) : null}
+    />
+  );
 }
 
 function Checkbox({
@@ -384,7 +399,7 @@ function Checkbox({
  */
 function NoFilesYet({ library }: { library: Library }) {
   const activity = useActivity();
-  const copying = stillCopyingCount(activity.data?.items, library.id);
+  const copying = settlingCount(library, activity.data?.items);
   const latest = activity.data?.items.find((e) => e.library_id === library.id);
   if (copying > 0) {
     return (
@@ -424,6 +439,9 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const offset = Math.max(0, Number(route.params.get("offset")) || 0);
   const files = useFiles({ library: library.id, status: status ?? undefined, q: q || undefined, sort, limit: PAGE, offset });
   const { bulk } = useFileActions();
+  const failures = useFailures();
+  // Damaged originals are left out: trying them again can't help.
+  const retryIds = failures.ready ? (failures.retryIds[library.id] ?? []) : [];
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmSkip, setConfirmSkip] = useState(false);
   const [confirmAgain, setConfirmAgain] = useState(false);
@@ -462,6 +480,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
 
   const stats = library.stats;
   const filtered = Boolean(status || q);
+  const onSort = (value: string) => updateParams({ sort: value === "name" ? null : value, offset: null });
 
   let body: ReactNode;
   if (files.isPending) {
@@ -477,7 +496,8 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
         ))}
       </div>
     );
-  } else if (files.error) {
+  } else if (files.error && !files.data) {
+    // With a list already on screen, keep showing it; the banner says the server is away.
     body = (
       <Callout tone="danger" title="Couldn't load the files" action={<Button size="sm" onClick={() => files.refetch()}>Try again</Button>}>
         {errorMessage(files.error)}
@@ -620,24 +640,40 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
 
   return (
     <div>
-      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <div className="mb-4 flex items-center gap-2 sm:justify-between sm:gap-3">
         <SearchBox key={library.id} initial={q} />
-        <div className="flex items-center gap-2">
+        <div className="hidden items-center gap-2 sm:flex">
           <label htmlFor="file-sort" className="text-[0.8125rem] whitespace-nowrap text-muted">
             Sort by
           </label>
-          <Select
-            id="file-sort"
-            value={sort}
-            onChange={(e) => updateParams({ sort: e.target.value === "name" ? null : e.target.value, offset: null })}
-            className="w-44"
-          >
+          <Select id="file-sort" value={sort} onChange={(e) => onSort(e.target.value)} className="w-44">
             {SORTS.map((s) => (
               <option key={s.value} value={s.value}>
                 {s.label}
               </option>
             ))}
           </Select>
+        </div>
+        {/* Phones: the same native picker behind an icon button, on the search row. */}
+        <div
+          className={cn(
+            buttonVariants({ variant: "secondary", size: "icon" }),
+            "relative has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent-ink sm:hidden",
+          )}
+        >
+          <ArrowDownUp aria-hidden />
+          <select
+            aria-label={`Sort files (now: ${SORTS.find((x) => x.value === sort)?.label ?? "Name"})`}
+            value={sort}
+            onChange={(e) => onSort(e.target.value)}
+            className="absolute inset-0 cursor-pointer opacity-0"
+          >
+            {SORTS.map((s) => (
+              <option key={s.value} value={s.value}>
+                {s.label}
+              </option>
+            ))}
+          </select>
         </div>
       </div>
 
@@ -691,20 +727,22 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                 size="sm"
                 loading={bulk.isPending && bulk.variables?.action === "queue"}
                 onClick={() => bulk.mutate({ action: "queue", library: library.id, status: "pending" })}
+                needsServer
               >
                 <Play aria-hidden />
                 Add {plural(stats.pending, "file")} to the queue
               </Button>
             ) : null}
-            {stats.failed > 0 ? (
+            {retryIds.length > 0 ? (
               <Button
                 variant="secondary"
                 size="sm"
                 loading={bulk.isPending && bulk.variables?.action === "retry_failed"}
-                onClick={() => bulk.mutate({ action: "retry_failed", library: library.id })}
+                onClick={() => bulk.mutate({ action: "retry_failed", ids: retryIds })}
+                needsServer
               >
                 <RotateCcw aria-hidden />
-                Retry {formatCount(stats.failed)} failed
+                Try {plural(retryIds.length, "failed file")} again
               </Button>
             ) : null}
             {items.length > 0 ? (
@@ -771,6 +809,7 @@ function SettingsTab({ library }: { library: Library }) {
   const [valid, setValid] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [nameError, setNameError] = useState<string | null>(null);
+  const [profileErrors, setProfileErrors] = useState<ProfileErrors>({});
   const [resetKey, setResetKey] = useState(0);
 
   const dirty = draft.name !== base.name || !sameProfile(draft.profile, base.profile);
@@ -793,6 +832,7 @@ function SettingsTab({ library }: { library: Library }) {
       setBase(updated);
       setDraft({ name: updated.name, profile: updated.profile });
       setError(null);
+      setProfileErrors({});
       toast.success("Saved", {
         description: sameProfile(updated.profile, base.profile)
           ? undefined
@@ -800,9 +840,14 @@ function SettingsTab({ library }: { library: Library }) {
       });
     },
     onError: (err) => {
-      // A bad name belongs on the name field; profile errors stay on the save bar.
+      // A bad name or profile value goes under its own control; anything
+      // else stays on the save bar.
+      const profileField = err instanceof ApiError ? profileFieldOf(err.field, "profile") : null;
       if (err instanceof ApiError && err.field === "name") {
         setNameError(err.message);
+        setError(FIX_HIGHLIGHTED);
+      } else if (profileField) {
+        setProfileErrors({ [profileField]: err.message });
         setError(FIX_HIGHLIGHTED);
       } else setError(errorMessage(err));
     },
@@ -820,6 +865,7 @@ function SettingsTab({ library }: { library: Library }) {
     setDraft({ name: base.name, profile: base.profile });
     setError(null);
     setNameError(null);
+    setProfileErrors({});
     setResetKey((k) => k + 1);
   };
 
@@ -841,7 +887,7 @@ function SettingsTab({ library }: { library: Library }) {
               }}
             />
           </Field>
-          {/* Pausing takes effect right away, like the menu action: no save needed. */}
+          {/* Pausing takes effect right away: no save needed. */}
           <div className="flex flex-col items-start gap-3 sm:flex-row sm:items-center sm:justify-between sm:gap-6">
             <div className="min-w-0">
               <p className="text-sm font-medium text-fg">{library.enabled ? "Active" : "Paused"}</p>
@@ -856,6 +902,7 @@ function SettingsTab({ library }: { library: Library }) {
               className="shrink-0"
               onClick={() => setEnabled.mutate(!library.enabled)}
               loading={setEnabled.isPending}
+              needsServer
             >
               {library.enabled ? <CirclePause aria-hidden /> : <CirclePlay aria-hidden />}
               {library.enabled ? "Pause library" : "Resume library"}
@@ -867,7 +914,11 @@ function SettingsTab({ library }: { library: Library }) {
       <div className="pt-8">
         <ProfileEditor
           profile={draft.profile}
-          onChange={(profile) => setDraft((d) => ({ ...d, profile }))}
+          onChange={(profile) => {
+            setProfileErrors({});
+            setDraft((d) => ({ ...d, profile }));
+          }}
+          errors={profileErrors}
           presets={presets.data}
           hardware={hardware.hw}
           hardwarePending={hardware.pending}
@@ -887,7 +938,7 @@ function SettingsTab({ library }: { library: Library }) {
             Stops watching this folder and forgets its files and history.{" "}
             <span className="font-medium text-fg">Your media files are not deleted.</span>
           </p>
-          <Button variant="danger" onClick={() => setConfirmRemove(true)}>
+          <Button variant="danger" onClick={() => setConfirmRemove(true)} needsServer>
             <Trash2 aria-hidden />
             Remove library…
           </Button>
