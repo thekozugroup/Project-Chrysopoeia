@@ -1,0 +1,203 @@
+{
+    "streams": [
+        {
+            "index": 0,
+            "codec_name": "hevc",
+            "codec_long_name": "H.265 / HEVC (High Efficiency Video Coding)",
+            "profile": "Main 10",
+            "codec_type": "video",
+            "codec_tag_string": "hvc1",
+            "codec_tag": "0x31637668",
+            "width": 3840,
+            "height": 1608,
+            "coded_width": 3840,
+            "coded_height": 1608,
+            "closed_captions": 0,
+            "film_grain": 0,
+            "has_b_frames": 2,
+            "sample_aspect_ratio": "1:1",
+            "display_aspect_ratio": "160:67",
+            "pix_fmt": "yuv420p10le",
+            "level": 153,
+            "color_range": "tv",
+            "color_space": "bt2020nc",
+            "color_transfer": "smpte2084",
+            "color_primaries": "bt2020",
+            "chroma_location": "left",
+            "refs": 1,
+            "id": "0x1",
+            "r_frame_rate": "24000/1001",
+            "avg_frame_rate": "24000/1001",
+            "time_base": "1/24000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 158158000,
+            "duration": "6589.916667",
+            "bit_rate": "16804391",
+            "nb_frames": "157999",
+            "extradata_size": 2543,
+            "disposition": {
+                "default": 1,
+                "dub": 0,
+                "original": 0,
+                "comment": 0,
+                "lyrics": 0,
+                "karaoke": 0,
+                "forced": 0,
+                "hearing_impaired": 0,
+                "visual_impaired": 0,
+                "clean_effects": 0,
+                "attached_pic": 0,
+                "timed_thumbnails": 0,
+                "non_diegetic": 0,
+                "captions": 0,
+                "descriptions": 0,
+                "metadata": 0,
+                "dependent": 0,
+                "still_image": 0
+            },
+            "tags": {
+                "language": "und",
+                "handler_name": "VideoHandler",
+                "vendor_id": "[0][0][0][0]"
+            },
+            "side_data_list": [
+                {
+                    "side_data_type": "DOVI configuration record",
+                    "dv_version_major": 1,
+                    "dv_version_minor": 0,
+                    "dv_profile": 8,
+                    "dv_level": 6,
+                    "rpu_present_flag": 1,
+                    "el_present_flag": 0,
+                    "bl_present_flag": 1,
+                    "dv_bl_signal_compatibility_id": 1
+                },
+                {
+                    "side_data_type": "Mastering display metadata",
+                    "red_x": "34000/50000",
+                    "red_y": "16000/50000",
+                    "green_x": "13250/50000",
+                    "green_y": "34500/50000",
+                    "blue_x": "7500/50000",
+                    "blue_y": "3000/50000",
+                    "white_point_x": "15635/50000",
+                    "white_point_y": "16450/50000",
+                    "min_luminance": "1/10000",
+                    "max_luminance": "10000000/10000"
+                }
+            ]
+        },
+        {
+            "index": 1,
+            "codec_name": "eac3",
+            "codec_long_name": "ATSC A/52B (AC-3, E-AC-3)",
+            "profile": "Dolby Digital Plus + Dolby Atmos",
+            "codec_type": "audio",
+            "codec_tag_string": "ec-3",
+            "codec_tag": "0x332d6365",
+            "sample_fmt": "fltp",
+            "sample_rate": "48000",
+            "channels": 6,
+            "channel_layout": "5.1(side)",
+            "bits_per_sample": 0,
+            "initial_padding": 0,
+            "id": "0x2",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/48000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 316315648,
+            "duration": "6589.909333",
+            "bit_rate": "768000",
+            "nb_frames": "205942",
+            "disposition": {
+                "default": 1,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "language": "ENG",
+                "handler_name": "SoundHandler"
+            },
+            "side_data_list": [
+                {
+                    "side_data_type": "Audio Service Type"
+                }
+            ]
+        },
+        {
+            "index": 2,
+            "codec_name": "mov_text",
+            "codec_long_name": "MOV text",
+            "codec_type": "subtitle",
+            "codec_tag_string": "tx3g",
+            "codec_tag": "0x67337874",
+            "id": "0x3",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/1000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 6589900,
+            "duration": "6589.900000",
+            "bit_rate": "90",
+            "nb_frames": "1571",
+            "disposition": {
+                "default": 0,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "Language": "spa",
+                "handler_name": "SubtitleHandler"
+            }
+        },
+        {
+            "index": 3,
+            "codec_type": "data",
+            "codec_tag_string": "tmcd",
+            "codec_tag": "0x64636d74",
+            "id": "0x4",
+            "r_frame_rate": "0/0",
+            "avg_frame_rate": "0/0",
+            "time_base": "1/24000",
+            "start_pts": 0,
+            "start_time": "0.000000",
+            "duration_ts": 158158000,
+            "duration": "6589.916667",
+            "nb_frames": "1",
+            "disposition": {
+                "default": 1,
+                "forced": 0,
+                "attached_pic": 0
+            },
+            "tags": {
+                "handler_name": "TimeCodeHandler",
+                "timecode": "00:00:00:00"
+            }
+        }
+    ],
+    "chapters": [
+
+    ],
+    "format": {
+        "filename": "/media/Movies/Example DV (2022)/Example DV (2022).mp4",
+        "nb_streams": 4,
+        "nb_programs": 0,
+        "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+        "format_long_name": "QuickTime / MOV",
+        "start_time": "0.000000",
+        "duration": "6589.917000",
+        "size": "14471237490",
+        "bit_rate": "17567981",
+        "probe_score": 100,
+        "tags": {
+            "major_brand": "isom",
+            "minor_version": "512",
+            "compatible_brands": "isomiso2mp41",
+            "encoder": "Lavf60.16.100"
+        }
+    }
+}
