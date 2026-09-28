@@ -91,11 +91,15 @@ export function useFiles(query: FileQuery) {
   });
 }
 
-export function useFile(id: string | null) {
+/**
+ * One file with its probe and jobs. `active: false` stops fetching but keeps
+ * returning what is cached (a sheet showing its last file while it closes).
+ */
+export function useFile(id: string | null, active = true) {
   return useQuery({
     queryKey: keys.file(id ?? ""),
     queryFn: ({ signal }) => api.file(id ?? "", signal),
-    enabled: Boolean(id),
+    enabled: Boolean(id) && active,
   });
 }
 
@@ -108,11 +112,12 @@ export function useJobs(query: JobQuery, options: { enabled?: boolean } = {}) {
   });
 }
 
-export function useJob(id: string | null) {
+/** One job. `active` works as for `useFile`. */
+export function useJob(id: string | null, active = true) {
   return useQuery({
     queryKey: keys.job(id ?? ""),
     queryFn: ({ signal }) => api.job(id ?? "", signal),
-    enabled: Boolean(id),
+    enabled: Boolean(id) && active,
   });
 }
 

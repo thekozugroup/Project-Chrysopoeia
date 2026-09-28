@@ -9,6 +9,8 @@ import {
   UNAVAILABLE_AFTER,
   applyEvent,
   connectLive,
+  jobMatchesList,
+  patchJobList,
 } from "./live";
 import { keys } from "./queries";
 import { useLive } from "./store";
@@ -124,7 +126,8 @@ describe("applyEvent", () => {
     apply({ type: "job.updated", job: done });
 
     expect(client.getQueryData<Job>(keys.job(JOB_ID))?.state).toBe("done");
-    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "running" }))?.items[0].state).toBe("done");
+    // A finished job leaves "Converting now" at once (no card at 100% with Cancel).
+    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "running" }))).toEqual({ items: [], total: 0 });
     expect(client.getQueryData<FileDetail>(keys.file(FILE_ID))?.jobs[0].state).toBe("done");
     expect(useLive.getState().jobs[JOB_ID]).toBeUndefined();
     expect(scheduled(schedule)).toEqual(
@@ -139,6 +142,21 @@ describe("applyEvent", () => {
     apply({ type: "job.updated", job: job({ state: "done", notes }) });
     expect(client.getQueryData<Job>(keys.job(JOB_ID))?.notes).toEqual(notes);
     expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "history" }))?.items[0].notes).toEqual(notes);
+  });
+
+  it("job.updated keeps a job in lists it still belongs to and drops it from the others", () => {
+    const { client, apply } = setup();
+    const other = job({ id: "55555555-5555-5555-5555-555555555555", file_name: "Other.mkv" });
+    client.setQueryData<ListResponse<Job>>(keys.jobs({ state: "active" }), { items: [job(), other], total: 2 });
+    client.setQueryData<ListResponse<Job>>(keys.jobs({ state: "running", limit: 12 }), { items: [job(), other], total: 2 });
+    apply({ type: "job.updated", job: job({ stage: "verifying", progress: 30 }) });
+    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "running", limit: 12 }))?.items.map((j) => j.stage)).toEqual([
+      "verifying",
+      "transcoding",
+    ]);
+    apply({ type: "job.updated", job: job({ state: "cancelled" }) });
+    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "running", limit: 12 }))).toEqual({ items: [other], total: 1 });
+    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "active" }))?.items).toEqual([other]);
   });
 
   it("job.updated leaves other lists and unknown jobs alone", () => {
@@ -430,3 +448,23 @@ describe("connectLive", () => {
 
 /** Longer than any single backoff step the tests go through. */
 const MAX_WAIT = 20_000;
+
+describe("job list filters", () => {
+  it("match the server's list states", () => {
+    expect(jobMatchesList("running", "running")).toBe(true);
+    expect(jobMatchesList("done", "running")).toBe(false);
+    expect(jobMatchesList("queued", "active")).toBe(true);
+    expect(jobMatchesList("running", "active")).toBe(true);
+    expect(jobMatchesList("skipped", "active")).toBe(false);
+    expect(jobMatchesList("queued", "queued")).toBe(true);
+    expect(jobMatchesList("failed", "history")).toBe(true);
+    expect(jobMatchesList("running", "history")).toBe(false);
+    expect(jobMatchesList("done", undefined)).toBe(true);
+  });
+
+  it("patchJobList returns the same list when the job isn't in it", () => {
+    const list = { items: [job({ id: "55555555-5555-5555-5555-555555555555" })], total: 1 };
+    expect(patchJobList(list, job({ state: "done" }), "running")).toBe(list);
+    expect(patchJobList(undefined, job(), "running")).toBeUndefined();
+  });
+});

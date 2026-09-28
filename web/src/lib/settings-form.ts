@@ -7,6 +7,37 @@ import { ApiError, errorMessage } from "./api";
 import { sameProfile } from "./profile";
 import type { Settings } from "./types";
 
+/** The sections of the Settings screen. */
+export type SectionId = "processing" | "output" | "verification" | "hardware" | "advanced";
+
+export const SECTION_LABEL: Record<SectionId, string> = {
+  processing: "Processing",
+  output: "Output",
+  verification: "Verification",
+  hardware: "Hardware",
+  advanced: "Advanced",
+};
+
+/** Which section shows each setting, to point at it from the save bar. */
+export const SECTION_OF: Partial<Record<keyof Settings, SectionId>> = {
+  max_jobs: "processing",
+  active_hours: "processing",
+  low_priority: "processing",
+  auto_queue: "processing",
+  watch_folders: "processing",
+  rescan_interval_hours: "processing",
+  output_mode: "output",
+  output_folder: "output",
+  keep_file_dates: "output",
+  temp_dir: "output",
+  validation: "verification",
+  hardware: "hardware",
+  cpu_fallback: "hardware",
+  ignore_patterns: "advanced",
+  min_file_size_mb: "advanced",
+  default_profile: "advanced",
+};
+
 /** Errors to show, by setting, plus `general` for anything else. */
 export type FieldErrors = Partial<Record<keyof Settings | "general", string>>;
 
@@ -94,4 +125,68 @@ export function errorsFrom(err: unknown, sent: (keyof Settings)[] = []): FieldEr
   }
   if (sent.length === 1 && code !== "unknown_setting") return { [sent[0]]: message };
   return { general: message };
+}
+
+/** Settings whose section shows their error under the field itself. */
+function errorShownInline(field: keyof Settings, draft: Settings): boolean {
+  switch (field) {
+    case "max_jobs":
+    case "active_hours":
+    case "ignore_patterns":
+    case "min_file_size_mb":
+      return true;
+    case "output_folder":
+      return draft.output_mode === "folder";
+    case "temp_dir":
+      return draft.temp_dir !== null;
+    default:
+      return false;
+  }
+}
+
+/**
+ * What the save bar says, and whether saving is blocked. A server error that
+ * is already shown (and announced) under its field on screen is only pointed
+ * at, quietly; one in another section is spelled out with the section's
+ * name. Invalid text in Advanced blocks saving from every section, since
+ * it would otherwise be dropped without a word.
+ */
+export function saveBarMessage({
+  errors,
+  draft,
+  section,
+  advancedValid,
+}: {
+  errors: FieldErrors;
+  draft: Settings;
+  section: SectionId;
+  advancedValid: boolean;
+}): { message: string | null; role: "alert" | "status"; blocked: boolean } {
+  const outputMissing = draft.output_mode === "folder" && !draft.output_folder;
+  const tempMissing = draft.temp_dir !== null && draft.temp_dir === "";
+  const blockedMessage =
+    outputMissing || tempMissing
+      ? section === "output"
+        ? "Choose a folder to save."
+        : `Choose ${outputMissing ? "the output folder" : "the work folder"} in Output to save.`
+      : !advancedValid
+        ? section === "advanced"
+          ? "Fix the highlighted fields to save."
+          : "Fix the highlighted setting in Advanced to save."
+        : null;
+  const blocked = blockedMessage !== null;
+  if (errors.general) return { message: errors.general, role: "alert", blocked };
+  const first = Object.entries(errors).find(([key]) => key !== "general") as [keyof Settings, string] | undefined;
+  if (first) {
+    const [field, message] = first;
+    const fieldSection = SECTION_OF[field];
+    if (fieldSection === section && errorShownInline(field, draft)) {
+      return { message: "Fix the highlighted setting to save.", role: "status", blocked };
+    }
+    if (fieldSection && fieldSection !== section) {
+      return { message: `${message} (${SECTION_LABEL[fieldSection]})`, role: "alert", blocked };
+    }
+    return { message, role: "alert", blocked };
+  }
+  return { message: blockedMessage, role: "status", blocked };
 }

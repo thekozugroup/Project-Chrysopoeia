@@ -809,6 +809,35 @@ function queueFile(file, priority = 0) {
   return job;
 }
 
+const EFFICIENCY = { av1: 4, hevc: 3, h265: 3, vp9: 3, h264: 2, vp8: 2 };
+const TARGET_NAME = { av1: "AV1", hevc: "HEVC", h264: "H.264", vp9: "VP9" };
+
+/**
+ * The worker's own check when a job starts (`decide` in the worker): files
+ * the library's settings leave alone are skipped straight away, even when
+ * they were queued by hand. Returns the reason, or null to convert.
+ */
+function skipReasonFor(file, lib) {
+  if (!file.video_codec) return "Audio-only file — nothing to convert";
+  const profile = lib.profile;
+  const source = EFFICIENCY[file.video_codec] ?? 1;
+  const target = EFFICIENCY[profile.video_codec] ?? 3;
+  if (profile.skip_efficient && source >= target) {
+    const name = TARGET_NAME[file.video_codec] ?? file.video_codec.toUpperCase();
+    if (file.video_codec === profile.video_codec) return `Already ${name}`;
+    return `Already ${name}, which is ${source > target ? "more" : "as"} efficient ${source > target ? "than" : "as"} ${TARGET_NAME[profile.video_codec]}`;
+  }
+  return null;
+}
+
+function skipAtStart(job, file, reason) {
+  const now = iso(Date.now());
+  Object.assign(job, { state: "skipped", stage: "preparing", progress: 0, skip_reason: reason, started_at: now, finished_at: now });
+  Object.assign(file, { status: "skipped", skip_reason: reason, progress: null, updated_at: now });
+  broadcast({ type: "job.updated", job });
+  broadcast({ type: "file.updated", file: listFile(file) });
+}
+
 function startJobs() {
   if (paused || !inActiveHours()) return;
   const running = [...jobs.values()].filter((j) => j.state === "running").length;
@@ -822,6 +851,13 @@ function startJobs() {
     const file = files.get(job.file_id);
     const lib = libraries.get(job.library_id);
     if (!file || !lib) continue;
+    const reason = skipReasonFor(file, lib);
+    if (reason) {
+      skipAtStart(job, file, reason);
+      emitLibrary(lib);
+      emitStats();
+      continue;
+    }
     const { encoder, hw_api } = encoderFor(lib);
     Object.assign(job, { state: "running", stage: "preparing", progress: 0, encoder, hw_api, started_at: iso(Date.now()), command: commandFor(file, encoder) });
     file.status = "processing";

@@ -137,17 +137,16 @@ export function useFileActions() {
   });
 
   const bulk = useMutation({
-    mutationFn: (body: BulkRequest) => api.bulk(body),
-    onSuccess: (res, body) => {
+    // `note` says what the selection left out; it isn't sent.
+    mutationFn: ({ action, ids, library, status }: BulkRequest & { note?: string | null }) =>
+      api.bulk({ action, ids, library, status }),
+    onSuccess: (res, { action, note }) => {
       const n = plural(res.affected, "file");
       const text =
-        body.action === "skip"
-          ? `Skipped ${n}`
-          : body.action === "retry_failed"
-            ? `Retrying ${n}`
-            : `Added ${n} to the queue`;
-      if (res.affected === 0) toast("Nothing to do", { description: "None of those files could take that action." });
-      else toast.success(text);
+        action === "skip" ? `Skipped ${n}` : action === "retry_failed" ? `Retrying ${n}` : `Added ${n} to the queue`;
+      if (res.affected === 0) {
+        toast("Nothing to do", { description: note ?? "None of those files could take that action." });
+      } else toast.success(text, { description: note ?? undefined });
       refresh();
     },
     onError: fail("That didn't work"),

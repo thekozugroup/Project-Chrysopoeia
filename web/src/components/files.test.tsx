@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { skipFollowsSettings, trackTitle } from "./files";
+import { trackTitle } from "./files";
 import { rootOf } from "./folder-picker";
+import { skipFollowsSettings } from "@/lib/convertible";
 import type { MediaFile, ProbeInfo, StreamInfo } from "@/lib/types";
 
 function stream(partial: Partial<StreamInfo>): StreamInfo {

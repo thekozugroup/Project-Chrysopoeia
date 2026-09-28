@@ -13,6 +13,7 @@ import {
   CircleMinus,
   Ellipsis,
   FolderSearch,
+  Hourglass,
   LoaderCircle,
   Play,
   RefreshCw,
@@ -35,10 +36,11 @@ import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ActionMenu, ConfirmDialog } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
+import { leftOutText, nothingToConvertText, planBulkConvert, stillCopyingCount } from "@/lib/convertible";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
-import { keys, useFiles, useHardwareInfo, useLibrary, usePresets, useSettings } from "@/lib/queries";
+import { keys, useActivity, useFiles, useHardwareInfo, useLibrary, usePresets, useSettings } from "@/lib/queries";
 import { href, navigate, openSheet, updateParams, type Route } from "@/lib/router";
 import { useFileLive, useLive } from "@/lib/store";
 import type { FileSort, FileStatus, Library, MediaFile } from "@/lib/types";
@@ -231,7 +233,7 @@ function Summary({ library }: { library: Library }) {
           {stats.skipped > 0 ? (
             <span className="text-muted">
               {" "}
-              ({formatCount(stats.done)} converted, {formatCount(stats.skipped)} left as they were)
+              ({formatCount(stats.done)} converted, {formatCount(stats.skipped)} skipped)
             </span>
           ) : null}
         </p>
@@ -375,6 +377,40 @@ function Checkbox({
   );
 }
 
+/**
+ * An empty library. Right after files were copied in, the server waits for
+ * them to stop changing, so this mustn't send the user off to check their
+ * Docker mounts: it says what the latest scan found instead.
+ */
+function NoFilesYet({ library }: { library: Library }) {
+  const activity = useActivity();
+  const copying = stillCopyingCount(activity.data?.items, library.id);
+  const latest = activity.data?.items.find((e) => e.library_id === library.id);
+  if (copying > 0) {
+    return (
+      <EmptyState icon={<Hourglass aria-hidden />} title="Waiting for files to finish copying">
+        {plural(copying, "file")} in this folder {copying === 1 ? "is" : "are"} still being copied.{" "}
+        {copying === 1 ? "It's" : "They're"} picked up automatically once {copying === 1 ? "it stops" : "they stop"}{" "}
+        changing.
+      </EmptyState>
+    );
+  }
+  return (
+    <EmptyState icon={<FolderSearch aria-hidden />} title="No videos found yet">
+      <p>
+        Chrysopoeia looked in <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span>. Files that
+        are still being copied are picked up once they stop changing. If nothing appears, check that the folder is
+        mapped into the container, then scan again.
+      </p>
+      {latest ? (
+        <p className="mt-3 text-[0.8125rem]">
+          Latest: {latest.message} · {formatRelative(latest.at)}
+        </p>
+      ) : null}
+    </EmptyState>
+  );
+}
+
 function openFile(file: MediaFile) {
   openSheet({ file: file.id });
 }
@@ -390,6 +426,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const { bulk } = useFileActions();
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmSkip, setConfirmSkip] = useState(false);
+  const [confirmAgain, setConfirmAgain] = useState(false);
   const items = useMemo(() => files.data?.items ?? [], [files.data]);
   const total = files.data?.total ?? 0;
   useClampedOffset(offset, files.data?.total, PAGE);
@@ -398,6 +435,21 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const visibleIds = useMemo(() => new Set(items.map((f) => f.id)), [items]);
   const selection = [...selected].filter((id) => visibleIds.has(id));
   const allSelected = items.length > 0 && selection.length === items.length;
+  // The worker skips files the library's settings leave alone, so "Convert"
+  // sends only the ones it would really convert and says what it left out.
+  const convertPlan = planBulkConvert(
+    items.filter((f) => selected.has(f.id)),
+    library.profile,
+  );
+  const leftOut = leftOutText(convertPlan);
+  const convertSelection = () =>
+    bulk.mutate(
+      { action: "queue", ids: convertPlan.ids, note: leftOut },
+      {
+        onSuccess: () => setSelected(new Set()),
+        onSettled: () => setConfirmAgain(false),
+      },
+    );
 
   const toggle = useCallback((id: string, on: boolean) => {
     setSelected((prev) => {
@@ -452,10 +504,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
         Files appear here as they&apos;re found and analysed.
       </EmptyState>
     ) : (
-      <EmptyState icon={<FolderSearch aria-hidden />} title="No video files here yet">
-        Chrysopoeia looked in <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span> and found no
-        videos. Check that the folder is mounted into the container, then scan again.
-      </EmptyState>
+      <NoFilesYet library={library} />
     );
   } else {
     body = (
@@ -594,7 +643,14 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
 
       <StatusChips library={library} status={status} />
 
-      <div className="mt-4 mb-3 flex min-h-9 flex-wrap items-center gap-2">
+      <div
+        className={cn(
+          "mt-4 mb-3 flex min-h-9 flex-wrap items-center gap-2",
+          // While files are selected the actions stay in view as the list scrolls.
+          selection.length > 0 &&
+            "sticky top-14 z-20 -mx-4 border-b border-line bg-bg px-4 py-2 sm:-mx-6 sm:px-6 md:top-0 md:mx-0 md:px-0",
+        )}
+      >
         {selection.length > 0 ? (
           <>
             <p className="mr-2 text-sm font-medium text-fg tabular" role="status">
@@ -603,11 +659,15 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
             <Button
               variant="primary"
               size="sm"
-              loading={bulk.isPending}
-              onClick={() => bulk.mutate({ action: "queue", ids: selection }, { onSuccess: () => setSelected(new Set()) })}
+              loading={bulk.isPending && bulk.variables?.action === "queue"}
+              disabled={convertPlan.ids.length === 0 || bulk.isPending}
+              aria-describedby={convertPlan.ids.length === 0 ? "bulk-convert-why" : undefined}
+              onClick={() => (convertPlan.again > 0 ? setConfirmAgain(true) : convertSelection())}
             >
               <Play aria-hidden />
-              Convert
+              {convertPlan.ids.length > 0 && convertPlan.ids.length < selection.length
+                ? `Convert ${formatCount(convertPlan.ids.length)}`
+                : "Convert"}
             </Button>
             <Button variant="secondary" size="sm" onClick={() => setConfirmSkip(true)} disabled={bulk.isPending}>
               <CircleMinus aria-hidden />
@@ -617,6 +677,11 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
               <X aria-hidden />
               Clear selection
             </Button>
+            {convertPlan.ids.length === 0 ? (
+              <p id="bulk-convert-why" className="basis-full text-[0.8125rem] text-muted">
+                {nothingToConvertText(convertPlan)}
+              </p>
+            ) : null}
           </>
         ) : (
           <>
@@ -670,9 +735,29 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
         <p>They&apos;ll be left as they are and marked “Skipped by you”. Queued ones are taken out of the queue.</p>
         <p>You can convert them later from this list.</p>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        open={confirmAgain}
+        onOpenChange={setConfirmAgain}
+        title={`Convert ${plural(convertPlan.ids.length, "file")}?`}
+        confirmLabel="Convert"
+        loading={bulk.isPending}
+        onConfirm={convertSelection}
+      >
+        <p>
+          {convertPlan.again === convertPlan.ids.length
+            ? convertPlan.again === 1
+              ? "It was already converted once."
+              : "They were all converted once already."
+            : `${plural(convertPlan.again, "of them was", "of them were")} already converted once.`}{" "}
+          Quality can drop a little each time a file is converted.
+        </p>
+      </ConfirmDialog>
     </div>
   );
 }
+
+const FIX_HIGHLIGHTED = "Fix the highlighted fields to save.";
 
 function SettingsTab({ library }: { library: Library }) {
   const client = useQueryClient();
@@ -718,7 +803,7 @@ function SettingsTab({ library }: { library: Library }) {
       // A bad name belongs on the name field; profile errors stay on the save bar.
       if (err instanceof ApiError && err.field === "name") {
         setNameError(err.message);
-        setError("Fix the highlighted fields to save.");
+        setError(FIX_HIGHLIGHTED);
       } else setError(errorMessage(err));
     },
   });
@@ -816,7 +901,9 @@ function SettingsTab({ library }: { library: Library }) {
           if (canSave()) save.mutate();
         }}
         onDiscard={discard}
-        error={error ?? (valid ? null : "Fix the highlighted fields to save.")}
+        error={error ?? (valid ? null : FIX_HIGHLIGHTED)}
+        // Pointing at a field whose own error was already announced.
+        errorRole={error && error !== FIX_HIGHLIGHTED ? "alert" : "status"}
         disabled={!valid}
         blocks={(target) =>
           !(target.segments[0] === "library" && target.segments[1] === library.id && target.segments[2] === "settings")

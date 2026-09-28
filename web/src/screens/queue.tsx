@@ -258,7 +258,7 @@ function HistoryTab({ offset }: { offset: number }) {
               : job.state === "failed"
                 ? (job.error ?? "Failed")
                 : job.state === "skipped"
-                  ? (job.skip_reason ?? "Kept the original")
+                  ? (job.skip_reason ?? (job.output_size !== null ? "Kept the original" : "No conversion needed"))
                   : "Cancelled. The original was left as it is.";
           return (
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">

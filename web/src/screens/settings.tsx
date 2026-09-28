@@ -23,40 +23,25 @@ import { formatHour } from "@/lib/format";
 import { VALIDATION_HELP, VALIDATION_LABEL } from "@/lib/labels";
 import { keys, useHardwareInfo, usePresets, useSettings, useSystem } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
-import { changedKeys, errorsFrom, type FieldErrors } from "@/lib/settings-form";
+import {
+  changedKeys,
+  errorsFrom,
+  saveBarMessage,
+  SECTION_LABEL,
+  type FieldErrors,
+  type SectionId,
+} from "@/lib/settings-form";
 import type { Settings, SystemInfo, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
 
-type SectionId = "processing" | "output" | "verification" | "hardware" | "advanced";
-
 const SECTIONS: { id: SectionId; label: string; description: string }[] = [
-  { id: "processing", label: "Processing", description: "How many files at once, and when." },
-  { id: "output", label: "Output", description: "Where finished files go." },
-  { id: "verification", label: "Verification", description: "How carefully each result is checked." },
-  { id: "hardware", label: "Hardware", description: "Your CPU, GPU and which encoders work." },
-  { id: "advanced", label: "Advanced", description: "Ignored files and defaults for new libraries." },
+  { id: "processing", label: SECTION_LABEL.processing, description: "How many files at once, and when." },
+  { id: "output", label: SECTION_LABEL.output, description: "Where finished files go." },
+  { id: "verification", label: SECTION_LABEL.verification, description: "How carefully each result is checked." },
+  { id: "hardware", label: SECTION_LABEL.hardware, description: "Your CPU, GPU and which encoders work." },
+  { id: "advanced", label: SECTION_LABEL.advanced, description: "Ignored files and defaults for new libraries." },
 ];
-
-/** Which section shows each setting, to point at it from the save bar. */
-const SECTION_OF: Partial<Record<keyof Settings, SectionId>> = {
-  max_jobs: "processing",
-  active_hours: "processing",
-  low_priority: "processing",
-  auto_queue: "processing",
-  watch_folders: "processing",
-  rescan_interval_hours: "processing",
-  output_mode: "output",
-  output_folder: "output",
-  keep_file_dates: "output",
-  temp_dir: "output",
-  validation: "verification",
-  hardware: "hardware",
-  cpu_fallback: "hardware",
-  ignore_patterns: "advanced",
-  min_file_size_mb: "advanced",
-  default_profile: "advanced",
-};
 
 function Block({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
   return (
@@ -84,7 +69,7 @@ function Stepper({
   label: string;
 }) {
   return (
-    <div className="inline-flex items-center rounded-md border border-line-strong/70 bg-surface shadow-card" role="group" aria-label={label}>
+    <div className="inline-flex items-center rounded-md border border-line-strong bg-surface shadow-card" role="group" aria-label={label}>
       <Button variant="quiet" size="icon" aria-label="Fewer" disabled={value <= min} onClick={() => onChange(Math.max(min, value - 1))}>
         <Minus />
       </Button>
@@ -499,9 +484,6 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
     });
   };
 
-  const missingFolder =
-    (draft.output_mode === "folder" && !draft.output_folder) || (draft.temp_dir !== null && draft.temp_dir === "");
-
   const save = useMutation({
     mutationFn: () => {
       const patch: Partial<Settings> = {};
@@ -521,19 +503,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   });
 
   const sectionProps: SectionProps = { draft, onChange, errors, onValidity: setValid, resetKey };
-  // Only the Advanced section has free-text fields that can be invalid.
-  const fieldsValid = section !== "advanced" || valid;
-  const blocked = missingFolder ? "Choose a folder to save." : !fieldsValid ? "Fix the highlighted fields to save." : null;
-
-  // A field error names its section when that section isn't on screen.
-  const [firstField, firstMessage] =
-    (Object.entries(errors).find(([key]) => key !== "general") as [keyof Settings, string] | undefined) ?? [];
-  const fieldSection = firstField ? SECTION_OF[firstField] : undefined;
-  const fieldError = firstMessage
-    ? fieldSection && fieldSection !== section
-      ? `${firstMessage} (${SECTIONS.find((x) => x.id === fieldSection)?.label ?? "another section"})`
-      : firstMessage
-    : null;
+  const bar = saveBarMessage({ errors, draft, section, advancedValid: valid });
 
   return (
     <>
@@ -541,7 +511,11 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
       {section === "output" ? <OutputSection {...sectionProps} /> : null}
       {section === "verification" ? <VerificationSection {...sectionProps} /> : null}
       {section === "hardware" ? <HardwareSection draft={draft} onChange={onChange} /> : null}
-      {section === "advanced" ? <AdvancedSection {...sectionProps} /> : null}
+      {/* Kept mounted while hidden, so text typed there (valid or not) isn't
+          lost on switching sections, and invalid text keeps blocking Save. */}
+      <div hidden={section !== "advanced"}>
+        <AdvancedSection {...sectionProps} />
+      </div>
       <SaveBar
         dirty={dirty}
         saving={save.isPending}
@@ -551,12 +525,13 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
           setErrors({});
           setResetKey((k) => k + 1);
         }}
-        error={errors.general ?? fieldError ?? blocked}
-        disabled={Boolean(blocked)}
+        error={bar.message}
+        errorRole={bar.role}
+        disabled={bar.blocked}
         // Moving between settings sections keeps the draft; leaving Settings doesn't.
         blocks={(target) => target.segments[0] !== "settings"}
         saveAndLeave={async () => {
-          if (blocked) return false;
+          if (bar.blocked) return false;
           try {
             await save.mutateAsync();
             return true;

@@ -21,6 +21,9 @@ import type {
   ActivityEntry,
   FileDetail,
   Job,
+  JobListState,
+  JobQuery,
+  JobState,
   Library,
   ListResponse,
   MediaFile,
@@ -88,6 +91,39 @@ function replaceInList<T extends { id: string }>(
   return found ? { ...list, items } : list;
 }
 
+/** Whether a job in `state` belongs in a jobs list filtered by `filter`. */
+export function jobMatchesList(state: JobState, filter: JobListState | undefined): boolean {
+  switch (filter) {
+    case undefined:
+      return true;
+    case "active":
+      return state === "queued" || state === "running";
+    case "running":
+      return state === "running";
+    case "queued":
+      return state === "queued";
+    case "history":
+      return state !== "queued" && state !== "running";
+  }
+}
+
+/**
+ * Patch a jobs list with an updated job: replace it in place, or take it out
+ * when its new state no longer belongs in the list (a finished job leaves
+ * "Converting now" at once instead of lingering at 100% with a Cancel
+ * button until the next refetch). Jobs that newly belong are added by that
+ * refetch, which knows their position.
+ */
+export function patchJobList(
+  list: ListResponse<Job> | undefined,
+  job: Job,
+  filter: JobListState | undefined,
+): ListResponse<Job> | undefined {
+  if (!list || !list.items.some((j) => j.id === job.id)) return list;
+  if (jobMatchesList(job.state, filter)) return replaceInList(list, job);
+  return { ...list, items: list.items.filter((j) => j.id !== job.id), total: Math.max(0, list.total - 1) };
+}
+
 function upsertLibrary(list: Library[] | undefined, library: Library): Library[] | undefined {
   if (!list) return list;
   const index = list.findIndex((l) => l.id === library.id);
@@ -108,7 +144,11 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
     case "job.updated": {
       const job: Job = event.job;
       client.setQueryData<Job>(keys.job(job.id), job);
-      client.setQueriesData<ListResponse<Job>>({ queryKey: keys.jobs() }, (old) => replaceInList(old, job));
+      for (const [queryKey, list] of client.getQueriesData<ListResponse<Job>>({ queryKey: keys.jobs() })) {
+        const filter = (queryKey[1] as JobQuery | undefined)?.state;
+        const next = patchJobList(list, job, filter);
+        if (next !== list) client.setQueryData(queryKey, next);
+      }
       client.setQueryData<FileDetail>(keys.file(job.file_id), (old) => {
         if (!old) return old;
         const others = old.jobs.filter((j) => j.id !== job.id);

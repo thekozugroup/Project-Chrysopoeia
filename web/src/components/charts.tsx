@@ -138,11 +138,11 @@ export function Breakdown({
           {rows.map((row) => {
             const pct = percentOf(row.files, totalFiles);
             return (
-              <li key={row.name} title={`${formatCount(row.files)} files · ${formatBytes(row.bytes)}`}>
+              <li key={row.name} title={`${plural(row.files, "file")} · ${formatBytes(row.bytes)}`}>
                 <div className="flex items-baseline justify-between gap-3 text-[0.8125rem]">
                   <span className="truncate text-fg">{row.name === "Other" ? "Other" : labelFor(row.name)}</span>
                   <span className="shrink-0 text-muted tabular">
-                    {formatCount(row.files)} <span className="sr-only">files</span>
+                    {formatCount(row.files)} <span className="sr-only">{row.files === 1 ? "file" : "files"}</span>
                     <span aria-hidden> · </span>
                     {Math.round(pct)}%
                   </span>

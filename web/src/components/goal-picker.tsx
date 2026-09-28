@@ -6,11 +6,11 @@
  * machine's hardware means for speed.
  */
 
-import { Gauge, Hourglass, TriangleAlert, Zap } from "lucide-react";
+import { Cpu, Gauge, Hourglass, TriangleAlert, Zap } from "lucide-react";
 import { useId } from "react";
 import { ChoiceCard } from "@/components/ui/controls";
 import { Badge, Skeleton } from "@/components/ui/display";
-import { codecSpeedHint, recommendedGoal, type SpeedHint } from "@/lib/hardware";
+import { codecSpeedHint, cpuOnlyNote, recommendedGoal, type SpeedHint } from "@/lib/hardware";
 import { GOAL_LABEL, GOAL_SUMMARY, GOALS, profileSummary } from "@/lib/labels";
 import { presetProfile } from "@/lib/profile";
 import type { Goal, HardwareInfo, HwPreference, Presets, TranscodeProfile } from "@/lib/types";
@@ -20,6 +20,8 @@ function SpeedLine({ hint }: { hint: SpeedHint }) {
   const icon =
     hint.tone === "fast" ? (
       <Zap aria-hidden />
+    ) : hint.tone === "cpu" ? (
+      <Cpu aria-hidden />
     ) : hint.tone === "slow" ? (
       <Hourglass aria-hidden />
     ) : (
@@ -30,7 +32,7 @@ function SpeedLine({ hint }: { hint: SpeedHint }) {
       className={cn(
         "mt-2 flex items-start gap-1.5 text-[0.8125rem] leading-snug [&_svg]:mt-0.5 [&_svg]:size-3.5 [&_svg]:shrink-0",
         hint.tone === "fast" && "text-success",
-        hint.tone === "slow" && "text-muted",
+        (hint.tone === "slow" || hint.tone === "cpu") && "text-muted",
         hint.tone === "blocked" && "text-danger",
       )}
     >
@@ -76,6 +78,8 @@ export function GoalPicker({
 }: GoalPickerProps) {
   const name = useId();
   const recommended = hardware ? recommendedGoal(hardware) : null;
+  // Said once here, so each card only compares speeds.
+  const cpuNote = cpuOnlyNote(hardware, preference);
   const speedLine = (codec: TranscodeProfile["video_codec"]) =>
     hardware ? (
       <SpeedLine hint={codecSpeedHint(hardware, codec, preference)} />
@@ -85,6 +89,12 @@ export function GoalPicker({
   return (
     <fieldset className={className}>
       <legend className="sr-only">{label}</legend>
+      {cpuNote ? (
+        <p className="mb-3 flex items-start gap-2 text-[0.8125rem] leading-snug text-muted">
+          <Cpu className="mt-0.5 size-3.5 shrink-0" aria-hidden />
+          {cpuNote}
+        </p>
+      ) : null}
       <div className={cn("grid gap-3", columns === 2 && "sm:grid-cols-2")}>
         {defaults ? (
           <ChoiceCard

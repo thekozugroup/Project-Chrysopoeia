@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { profileForGoal } from "./profile";
-import { changedKeys, errorsFrom, settingForField } from "./settings-form";
+import { changedKeys, errorsFrom, saveBarMessage, settingForField } from "./settings-form";
 import type { Settings } from "./types";
 
 const base: Settings = {
@@ -113,5 +113,61 @@ describe("settingForField", () => {
     expect(settingForField("colour")).toBeNull();
     expect(settingForField("")).toBeNull();
     expect(settingForField(null)).toBeNull();
+  });
+});
+
+describe("saveBarMessage", () => {
+  const folderError = "The output folder can't be inside the library Smoke media.";
+  const folderDraft: Settings = { ...base, output_mode: "folder", output_folder: "/media/out" };
+
+  it("only points at a field error that is announced next to the field on screen", () => {
+    expect(saveBarMessage({ errors: { output_folder: folderError }, draft: folderDraft, section: "output", advancedValid: true })).toEqual({
+      message: "Fix the highlighted setting to save.",
+      role: "status",
+      blocked: false,
+    });
+  });
+
+  it("spells out an error from another section, with its name", () => {
+    expect(saveBarMessage({ errors: { output_folder: folderError }, draft: folderDraft, section: "processing", advancedValid: true })).toEqual({
+      message: `${folderError} (Output)`,
+      role: "alert",
+      blocked: false,
+    });
+    // A setting without its own error line keeps the full message.
+    expect(
+      saveBarMessage({ errors: { rescan_interval_hours: "Rescan interval is too long." }, draft: base, section: "processing", advancedValid: true }).message,
+    ).toBe("Rescan interval is too long.");
+    expect(saveBarMessage({ errors: { general: "Server error." }, draft: base, section: "output", advancedValid: true }).role).toBe("alert");
+  });
+
+  it("keeps blocking while Advanced holds invalid text, from any section", () => {
+    expect(saveBarMessage({ errors: {}, draft: base, section: "advanced", advancedValid: false })).toEqual({
+      message: "Fix the highlighted fields to save.",
+      role: "status",
+      blocked: true,
+    });
+    expect(saveBarMessage({ errors: {}, draft: base, section: "processing", advancedValid: false })).toEqual({
+      message: "Fix the highlighted setting in Advanced to save.",
+      role: "status",
+      blocked: true,
+    });
+  });
+
+  it("names the missing folder when its section isn't on screen", () => {
+    const missing: Settings = { ...base, output_mode: "folder", output_folder: null };
+    expect(saveBarMessage({ errors: {}, draft: missing, section: "output", advancedValid: true }).message).toBe("Choose a folder to save.");
+    expect(saveBarMessage({ errors: {}, draft: missing, section: "hardware", advancedValid: true })).toMatchObject({
+      message: "Choose the output folder in Output to save.",
+      blocked: true,
+    });
+    expect(saveBarMessage({ errors: {}, draft: { ...base, temp_dir: "" }, section: "advanced", advancedValid: true }).message).toBe(
+      "Choose the work folder in Output to save.",
+    );
+    expect(saveBarMessage({ errors: {}, draft: base, section: "output", advancedValid: true })).toEqual({
+      message: null,
+      role: "status",
+      blocked: false,
+    });
   });
 });

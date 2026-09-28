@@ -263,12 +263,19 @@ export function SectionHeading({
   action,
   id,
   className,
+  quietAction = true,
 }: {
   title: ReactNode;
   description?: ReactNode;
   action?: ReactNode;
   id?: string;
   className?: string;
+  /**
+   * The action starts with a borderless button, whose text is pulled left
+   * to line up with the heading on phones. Pass `false` for a bordered one,
+   * whose edge must line up instead.
+   */
+  quietAction?: boolean;
 }) {
   return (
     <div className={cn("mb-3 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4", className)}>
@@ -278,7 +285,9 @@ export function SectionHeading({
         </h2>
         {description ? <p className="mt-0.5 text-[0.8125rem] text-muted">{description}</p> : null}
       </div>
-      {action ? <div className="-ml-2 flex shrink-0 flex-wrap items-center gap-2 sm:ml-0">{action}</div> : null}
+      {action ? (
+        <div className={cn("flex shrink-0 flex-wrap items-center gap-2", quietAction && "-ml-2 sm:ml-0")}>{action}</div>
+      ) : null}
     </div>
   );
 }

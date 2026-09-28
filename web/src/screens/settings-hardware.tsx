@@ -245,6 +245,7 @@ export function HardwareSection({
     <div className="flex flex-col gap-10">
       <section>
         <SectionHeading
+          quietAction={false}
           title="This machine"
           description={
             hw ? `Checked ${formatRelative(hw.detected_at)}${hw.in_container ? " · running in a container" : ""}.` : undefined
@@ -317,12 +318,15 @@ export function HardwareSection({
               ))}
             </Select>
           </Field>
-          <SwitchRow
-            label="If the GPU fails, try the CPU"
-            description="A file that the GPU can't convert is retried on the CPU instead of being marked failed."
-            checked={draft.cpu_fallback}
-            onCheckedChange={(cpu_fallback) => onChange({ cpu_fallback })}
-          />
+          {/* Only matters with a GPU; on a CPU-only machine it would do nothing. */}
+          {!hw || matrixApis(hw).length > 0 ? (
+            <SwitchRow
+              label="If the GPU fails, try the CPU"
+              description="A file that the GPU can't convert is retried on the CPU instead of being marked failed."
+              checked={draft.cpu_fallback}
+              onCheckedChange={(cpu_fallback) => onChange({ cpu_fallback })}
+            />
+          ) : null}
         </div>
       </section>
 
