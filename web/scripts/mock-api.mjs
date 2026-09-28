@@ -23,6 +23,9 @@
  *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
  *                           start, one every few seconds ("Found … in <library>"),
  *                           and LibraryStats.settling goes down to 0 (0 = never)
+ *   MOCK_BULK_FAILED=0      add a "Demo Bulk" library with this many files that all
+ *                           failed because the work folder can't be used (more than
+ *                           one 500-file page: the UI must read them all)
  *
  * Error codes, messages and the `field` of validation errors follow the
  * real server (crates/chrysopoeia-server), so the UI's error handling is
@@ -33,6 +36,20 @@
  * counts with `media_count_capped`, 415 `unsupported_media_type`, and
  * nested error fields (`profile.max_height`). Failed files use the real
  * server's sentences, including its "can't be read as a video" ones.
+ *
+ * Round 4: every failure carries its `problem` code and the server's own
+ * sentence (the demo has damaged originals, a failed check, a work folder
+ * that can't be written in two libraries, a destination that can't be
+ * written and a name clash in one library, and a file that was moved away
+ * while it was converted: `source_changed`; an original whose content
+ * changed meanwhile is a skip, as on the server), a second conversion that
+ * the work folder stopped (the file stays converted), an old failure the
+ * file has been converted since, the browsed folder has its own
+ * `media_count`, `Job.force` echoes "Convert anyway", a converted file
+ * queued again stays converted (with its savings) when the new job is
+ * skipped, stopped or fails, and bulk queue leaves out files the size rule
+ * already kept. Settings errors use the server's words ("Files at once
+ * must be between 1 and 32.").
  */
 
 import { randomUUID } from "node:crypto";
@@ -48,6 +65,10 @@ const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const FORCE = process.env.MOCK_FORCE ?? "on";
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
+const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
+/** The server's sentence when the work folder can't be created (chrysopoeia-worker run.rs). */
+const WORK_FOLDER_ERROR =
+  "The work folder /temp can't be created because Chrysopoeia doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
 /** Jobs queued with "Convert anyway" (force). */
 const forcedJobs = new Set();
 const STARTED = Date.now();
@@ -303,8 +324,15 @@ const FS = {
   "/media/demo/home-videos": [],
   "/media/demo/music": [],
 };
-/** Videos in each folder and every folder inside it (audio-only files aren't counted). */
+/**
+ * Videos in each folder and every folder inside it (audio-only files aren't
+ * counted); folders not listed hold none.
+ */
 const MEDIA_COUNT = {
+  "/": 1000,
+  "/mnt": 3,
+  "/mnt/user": 3,
+  "/mnt/user/downloads": 3,
   "/media": 1000,
   "/media/demo": 412,
   "/media/demo/movies": 136,
@@ -320,7 +348,14 @@ const MEDIA_COUNT = {
   "/media/demo/movies/Tears of Steel (2012)": 1,
 };
 /** Folders where the server stopped counting (so the count is "1,000+"). */
-const MEDIA_COUNT_CAPPED = new Set(["/media"]);
+const MEDIA_COUNT_CAPPED = new Set(["/", "/media"]);
+
+/** A folder's count as the server sends it, for an entry or the browsed folder itself. */
+function mediaCount(path) {
+  return MEDIA_COUNT_CAPPED.has(path)
+    ? { media_count: MEDIA_COUNT[path] ?? 0, media_count_capped: true }
+    : { media_count: MEDIA_COUNT[path] ?? 0 };
+}
 
 // ---------------------------------------------------------------------------
 // Libraries, files, jobs
@@ -476,11 +511,13 @@ function makeJob(file, state, extra = {}) {
     input_size: file.original_size_bytes ?? file.size_bytes,
     output_size: null,
     error: null,
+    problem: null,
     skip_reason: null,
     validation: null,
     command: state === "queued" ? null : commandFor(file, encoder),
     log_tail: null,
     notes: [],
+    force: false,
     created_at: ago(between(600, 86400)),
     started_at: null,
     finished_at: null,
@@ -514,6 +551,7 @@ function makeFile(library, relative, opts) {
     saved_bytes: null,
     skip_reason: null,
     error: null,
+    problem: null,
     job_id: null,
     progress: null,
     scanned_at: ago(between(600, 7200)),
@@ -657,12 +695,14 @@ function seedDemo() {
   const failedA = pendingMovies[0];
   failedA.status = "failed";
   failedA.error = "The new file didn't match the original: 1 of 4 checked moments looked different (similarity 0.61, 0.90 needed). The original was kept.";
+  failedA.problem = "verification";
   const jobA = makeJob(failedA, "failed", {
     stage: "verifying",
     progress: 100,
     input_size: failedA.size_bytes,
     output_size: Math.round(failedA.size_bytes * 0.44),
     error: failedA.error,
+    problem: failedA.problem,
     validation: {
       passed: false,
       level: "standard",
@@ -687,10 +727,12 @@ function seedDemo() {
   const failedB = pendingMovies[1];
   failedB.status = "failed";
   failedB.error = "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.";
+  failedB.problem = "unreadable_source";
   makeJob(failedB, "failed", {
     stage: "transcoding",
     progress: 63,
     error: failedB.error,
+    problem: failedB.problem,
     log_tail:
       "Svt[info]: -------------------------------------------\nSvt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v2.1.0\nSvt[info]: -------------------------------------------\n[matroska,webm @ 0x5581a2c0] Read error at pos. 4829122560 (0x11fd84000)\n[in#0/matroska @ 0x5580] Error during demuxing: I/O error\nConversion failed!",
     started_at: ago(12000),
@@ -705,7 +747,115 @@ function seedDemo() {
     duration_secs: null,
     bit_rate: null,
     error: "This file can't be read as a video: it has no MP4 index, so it's incomplete or not really a video.",
+    problem: "unreadable_source",
   });
+
+  // The work folder can't be written: one setup problem, in two libraries.
+  const noWorkFolder = [pendingMovies[4], [...files.values()].find((f) => f.library_id === tv.id && f.status === "pending" && f.video_codec === "h264")];
+  for (const f of noWorkFolder.filter(Boolean)) {
+    f.status = "failed";
+    f.error = WORK_FOLDER_ERROR;
+    f.problem = "work_folder";
+    makeJob(f, "failed", { stage: "preparing", progress: 0, error: f.error, problem: f.problem, started_at: ago(2600), finished_at: ago(2590) });
+  }
+  // A season folder the container user can't write to, and a name clash:
+  // both "destination", each with its own cause and fix.
+  const tvPending = [...files.values()].filter((f) => f.library_id === tv.id && f.status === "pending" && f.video_codec === "h264");
+  const lockedEpisode = tvPending.find((f) => f.relative_path.startsWith("Demo Show/Season 02/"));
+  if (lockedEpisode) {
+    const folder = lockedEpisode.path.slice(0, lockedEpisode.path.lastIndexOf("/"));
+    lockedEpisode.status = "failed";
+    lockedEpisode.error = `Chrysopoeia doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
+    lockedEpisode.problem = "destination";
+    makeJob(lockedEpisode, "failed", { stage: "finalizing", progress: 60, error: lockedEpisode.error, problem: "destination", started_at: ago(3300), finished_at: ago(3000) });
+  }
+  const clash = pendingMovies.slice(10).find((f) => f.file_name.endsWith(".mp4") && f.status === "pending");
+  if (clash) {
+    const taken = clash.file_name.replace(/\.mp4$/, ".mkv");
+    clash.status = "failed";
+    clash.error = `A file named "${taken}" is already next to the original, so the new file can't take its name. Move or rename that file, then try again.`;
+    clash.problem = "destination";
+    makeJob(clash, "failed", { stage: "finalizing", progress: 90, error: clash.error, problem: "destination", started_at: ago(3500), finished_at: ago(3400) });
+  }
+  // Moved away while it was being converted: the server's `source_changed`.
+  const moved = pendingMovies[5];
+  moved.status = "failed";
+  moved.error = "The file is no longer there. It was moved or deleted while it was being converted.";
+  moved.problem = "source_changed";
+  makeJob(moved, "failed", { stage: "finalizing", progress: 40, error: moved.error, problem: moved.problem, started_at: ago(4200), finished_at: ago(3900) });
+  // Replaced by a new copy meanwhile: a skip on the server, converted again later.
+  const replaced = pendingMovies[6];
+  if (replaced) {
+    makeJob(replaced, "skipped", {
+      stage: "finalizing",
+      progress: 100,
+      output_size: Math.round(replaced.size_bytes * 0.5),
+      skip_reason: "The original changed while it was being converted, so it was left alone",
+      started_at: ago(8200),
+      finished_at: ago(8000),
+    });
+    replaced.skip_reason = null;
+  }
+
+  // Failed once on the work folder, converted since: the old failure is history.
+  const recovered = [...files.values()].find(
+    (f) => f.library_id === tv.id && f.status === "done" && Date.parse(jobs.get(f.job_id)?.created_at ?? "") < Date.now() - 3 * 3600_000,
+  );
+  if (recovered) {
+    const conversion = jobs.get(recovered.job_id);
+    const failedAt = Date.parse(conversion.created_at) - 3600_000;
+    const old = makeJob(recovered, "failed", {
+      stage: "preparing",
+      progress: 0,
+      error: WORK_FOLDER_ERROR,
+      problem: "work_folder",
+      started_at: iso(failedAt + 60_000),
+      finished_at: iso(failedAt + 65_000),
+    });
+    old.created_at = iso(failedAt);
+    recovered.job_id = conversion.id;
+  }
+
+  // A converted file converted again after a goal change that the work
+  // folder stopped: it stays converted, and the Overview says the fix.
+  const stoppedAgain = [...files.values()].find(
+    (f) => f.library_id === tv.id && f.status === "done" && f !== recovered && Date.parse(jobs.get(f.job_id)?.finished_at ?? "") < Date.now() - 86400_000,
+  );
+  if (stoppedAgain) {
+    const conversion = stoppedAgain.job_id;
+    makeJob(stoppedAgain, "failed", {
+      stage: "preparing",
+      progress: 0,
+      input_size: stoppedAgain.size_bytes,
+      error: WORK_FOLDER_ERROR,
+      problem: "work_folder",
+      created_at: ago(500),
+      started_at: ago(480),
+      finished_at: ago(470),
+    });
+    stoppedAgain.job_id = conversion;
+  }
+
+  // A converted file converted again after a goal change, whose new result
+  // wasn't smaller enough: it stays converted ("Kept as converted").
+  const again = [...files.values()].find(
+    (f) => f.library_id === movies.id && f.status === "done" && Date.parse(jobs.get(f.job_id)?.finished_at ?? "") < Date.now() - 86400_000,
+  );
+  if (again) {
+    // The file keeps pointing at the conversion that made it (like the server).
+    const conversion = again.job_id;
+    makeJob(again, "skipped", {
+      stage: "transcoding",
+      progress: 100,
+      input_size: again.size_bytes,
+      output_size: Math.round(again.size_bytes * 0.97),
+      skip_reason: "Only 3% smaller — kept the original",
+      created_at: ago(1300),
+      started_at: ago(1200),
+      finished_at: ago(700),
+    });
+    again.job_id = conversion;
+  }
 
   // Dolby Vision profile 5: always left unchanged.
   const dv = makeFile(movies, "Demo Dolby Vision (2021)/Demo Dolby Vision (2021).mkv", {
@@ -758,10 +908,12 @@ function seedDemo() {
   if (brokenEpisode) {
     brokenEpisode.status = "failed";
     brokenEpisode.error = "The original file appears damaged or incomplete (it stops after 2.4 s). It was left unchanged.";
+    brokenEpisode.problem = "unreadable_source";
     makeJob(brokenEpisode, "failed", {
       stage: "transcoding",
       progress: 4,
       error: brokenEpisode.error,
+      problem: brokenEpisode.problem,
       started_at: ago(7000),
       finished_at: ago(6900),
     });
@@ -779,7 +931,20 @@ function seedDemo() {
   activity.forEach((e, i) => (e.at = ago(600 + i * 1900)));
 }
 
+/** Many files that all failed on the work folder: more than one page of failed files. */
+function seedBulkFailed(count) {
+  const bulk = createLibrary("Demo Bulk", "/media/demo/bulk", "balanced");
+  for (let i = 1; i <= count; i++) {
+    const file = makeFile(bulk, `clip${String(i).padStart(4, "0")}.mp4`, {
+      size: between(2e6, 30e6), codec: "h264", resolution: "1080p", duration: between(5, 60), audio: "aac",
+    });
+    Object.assign(file, { status: "failed", error: WORK_FOLDER_ERROR, problem: "work_folder" });
+    makeJob(file, "failed", { stage: "preparing", progress: 0, error: file.error, problem: "work_folder", started_at: ago(120), finished_at: ago(119) });
+  }
+}
+
 if (SCENARIO === "demo" || SCENARIO === "nogpu") seedDemo();
+if (BULK_FAILED > 0) seedBulkFailed(BULK_FAILED);
 
 // ---------------------------------------------------------------------------
 // Derived views
@@ -794,7 +959,9 @@ function statsFor(list, libraryId = null) {
     s.file_count += 1;
     s.total_bytes += f.size_bytes;
     s[f.status] += 1;
-    if (f.status === "done" && f.saved_bytes) s.saved_bytes += f.saved_bytes;
+    // Like the server: every file's savings, so a converted file queued
+    // again keeps counting.
+    if (f.saved_bytes) s.saved_bytes += f.saved_bytes;
   }
   return s;
 }
@@ -878,6 +1045,7 @@ function listFile(f) {
   delete out.probe;
   delete out.unreadable;
   delete out.dvNoBaseLayer;
+  delete out.wasDone;
   return out;
 }
 
@@ -895,11 +1063,32 @@ const emitStats = () => broadcast({ type: "stats.updated", totals: statsFor([...
 const emitLibrary = (lib) => broadcast({ type: "library.updated", library: libraryView(lib) });
 const emitActivity = (entry) => broadcast({ type: "activity", entry });
 
-function queueFile(file, priority = 0) {
-  const job = makeJob(file, "queued", { priority, created_at: iso(Date.now()) });
-  file.status = "queued";
-  file.updated_at = iso(Date.now());
+/**
+ * Queue a file. A converted file queued again ("Convert again") is read as
+ * it is now, and stays converted, with its savings, unless the new job
+ * gives a new result (round 4).
+ */
+function queueFile(file, priority = 0, force = false) {
+  const again = file.status === "done";
+  const job = makeJob(file, "queued", {
+    priority,
+    force,
+    created_at: iso(Date.now()),
+    ...(again ? { input_size: file.size_bytes } : {}),
+  });
+  if (again) file.wasDone = true;
+  if (force) forcedJobs.add(job.id);
+  Object.assign(file, { status: "queued", error: null, problem: null, updated_at: iso(Date.now()) });
   return job;
+}
+
+/** A job that ended without a new result: a converted file stays converted, anything else takes `status`. */
+function settleFile(file, status, extra = {}) {
+  const now = iso(Date.now());
+  if (file.wasDone) {
+    delete file.wasDone;
+    Object.assign(file, { status: "done", progress: null, updated_at: now });
+  } else Object.assign(file, { status, progress: null, updated_at: now, ...extra });
 }
 
 const EFFICIENCY = { av1: 4, hevc: 3, h265: 3, vp9: 3, h264: 2, vp8: 2 };
@@ -926,7 +1115,7 @@ function skipReasonFor(file, lib) {
 function skipAtStart(job, file, reason) {
   const now = iso(Date.now());
   Object.assign(job, { state: "skipped", stage: "preparing", progress: 0, skip_reason: reason, started_at: now, finished_at: now });
-  Object.assign(file, { status: "skipped", skip_reason: reason, progress: null, updated_at: now });
+  settleFile(file, "skipped", { skip_reason: reason });
   broadcast({ type: "job.updated", job });
   broadcast({ type: "file.updated", file: listFile(file) });
 }
@@ -981,9 +1170,11 @@ function finishJob(job) {
     finished_at: iso(Date.now()),
   });
   if (file) {
-    file.original_size_bytes = job.input_size;
+    // A second conversion saves against the first original, not the converted file.
+    file.original_size_bytes = file.wasDone ? (file.original_size_bytes ?? job.input_size) : job.input_size;
+    delete file.wasDone;
     file.size_bytes = out;
-    file.saved_bytes = job.input_size - out;
+    file.saved_bytes = file.original_size_bytes - out;
     file.status = "done";
     file.progress = null;
     file.video_codec = lib?.profile.video_codec ?? file.video_codec;
@@ -1339,8 +1530,8 @@ route("POST", "/api/files/:id/queue", async ({ id }, _q, req) => {
   }
   if (file.status === "queued" || file.status === "processing")
     throw new HttpError(409, "already_queued", "This file is already in the queue.");
-  const job = queueFile(file, Number(body.priority ?? 0));
-  if (body.force === true) forcedJobs.add(job.id);
+  // Job.force echoes the request; a server that ignores the field doesn't.
+  const job = queueFile(file, Number(body.priority ?? 0), body.force === true && FORCE === "on");
   broadcast({ type: "file.updated", file: listFile(file) });
   broadcast({ type: "job.updated", job });
   emitQueue();
@@ -1371,10 +1562,13 @@ route("POST", "/api/files/bulk", async (_p, _q, req) => {
   let affected = 0;
   let leftOut = 0;
   for (const file of list) {
-    // With explicit ids, only files the settings would convert (or failed ones) are queued.
+    // With explicit ids, only files the settings would convert (or failed
+    // ones) are queued; files the size rule already kept under this goal
+    // are left out too (they would end the same way).
     if (body.action === "queue" && body.ids && file.status !== "failed" && !["queued", "processing"].includes(file.status)) {
       const lib = libraries.get(file.library_id);
-      if (lib && skipReasonFor(file, lib)) {
+      const sizeRule = file.status === "skipped" && /% (?:smaller|larger)|kept the original/i.test(file.skip_reason ?? "");
+      if (lib && (skipReasonFor(file, lib) || sizeRule)) {
         leftOut++;
         continue;
       }
@@ -1417,7 +1611,8 @@ route("POST", "/api/jobs/:id/cancel", ({ id }) => {
   Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
   const file = files.get(job.file_id);
   if (file) {
-    Object.assign(file, { status: "pending", progress: null, updated_at: iso(Date.now()) });
+    // A converted file queued again stays converted.
+    settleFile(file, "pending");
     broadcast({ type: "file.updated", file: listFile(file) });
   }
   broadcast({ type: "job.updated", job });
@@ -1492,12 +1687,12 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
   // `invalid_settings` for every validation failure, naming the setting.
   const invalid = (message, field) => new HttpError(400, "invalid_settings", message, field);
   if (next.max_jobs !== null && !(Number.isInteger(next.max_jobs) && next.max_jobs >= 1 && next.max_jobs <= 32))
-    throw invalid("Jobs at once must be between 1 and 32.", "max_jobs");
+    throw invalid("Files at once must be between 1 and 32.", "max_jobs");
   if (next.active_hours && (next.active_hours.start > 23 || next.active_hours.end > 23))
     throw invalid("Active hours must be whole hours from 0 to 23.", "active_hours");
   for (const pattern of next.ignore_patterns ?? []) {
     if (/\[[^\]]*$/.test(pattern))
-      throw invalid(`"${pattern}" isn't a valid ignore pattern: unclosed character class`, "ignore_patterns");
+      throw invalid(`The ignore pattern "${pattern}" has a [ without a closing ].`, "ignore_patterns");
   }
   if (next.temp_dir && !next.temp_dir.startsWith("/"))
     throw invalid("The temporary folder must be a full path starting with /.", "temp_dir");
@@ -1568,10 +1763,10 @@ route("GET", "/api/fs/browse", (_p, q) => {
     roots: BROWSE_ROOTS,
     entries: FS[path].map((name) => {
       const full = path === "/" ? `/${name}` : `${path}/${name}`;
-      const entry = { name, path: full, is_dir: true, media_count: MEDIA_COUNT[full] ?? null };
-      if (MEDIA_COUNT_CAPPED.has(full)) entry.media_count_capped = true;
-      return entry;
+      return { name, path: full, is_dir: true, ...mediaCount(full) };
     }),
+    // Round 4: the browsed folder's own count, by the same rules.
+    ...mediaCount(path),
   };
 });
 

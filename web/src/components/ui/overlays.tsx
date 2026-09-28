@@ -210,13 +210,17 @@ export function UnsavedChangesDialog({ open, onSave, onDiscard, onStay, saving }
   );
 }
 
-export interface MenuAction {
+/**
+ * One menu entry: a command (`onSelect`) or a place to go (`href`). A place
+ * is a real link, so it opens in a new tab with a middle click, Cmd- or
+ * Ctrl-click, or the browser's context menu.
+ */
+export type MenuAction = {
   label: string;
   icon?: ReactNode;
-  onSelect: () => void;
   destructive?: boolean;
   disabled?: boolean;
-}
+} & ({ onSelect: () => void; href?: never } | { href: string; onSelect?: never });
 
 interface ActionMenuProps {
   /** The trigger button element; receives menu props via `render`. */
@@ -233,24 +237,26 @@ export function ActionMenu({ trigger, actions, align = "end" }: ActionMenuProps)
       <Menu.Portal>
         <Menu.Positioner side="bottom" align={align} sideOffset={6} className="z-50 outline-none">
           <Menu.Popup className="min-w-52 origin-[var(--transform-origin)] rounded-lg border border-line bg-surface p-1 text-sm text-fg shadow-pop outline-none transition-[transform,opacity] duration-150 data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0">
-            {actions.map((action, i) =>
-              action === "separator" ? (
-                <Menu.Separator key={`sep-${i}`} className="mx-1 my-1 h-px bg-line" />
+            {actions.map((action, i) => {
+              if (action === "separator") {
+                return <Menu.Separator key={`sep-${i}`} className="mx-1 my-1 h-px bg-line" />;
+              }
+              const className = cn(
+                "flex h-9 cursor-default items-center gap-2.5 rounded-md px-2.5 no-underline outline-none select-none data-[disabled]:opacity-50 data-[highlighted]:bg-raised pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
+                action.destructive ? "text-danger" : "text-fg [&_svg]:text-muted",
+              );
+              return action.href !== undefined ? (
+                <Menu.LinkItem key={action.label} href={action.href} closeOnClick className={className}>
+                  {action.icon}
+                  {action.label}
+                </Menu.LinkItem>
               ) : (
-                <Menu.Item
-                  key={action.label}
-                  disabled={action.disabled}
-                  onClick={action.onSelect}
-                  className={cn(
-                    "flex h-9 cursor-default items-center gap-2.5 rounded-md px-2.5 outline-none select-none data-[disabled]:opacity-50 data-[highlighted]:bg-raised pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
-                    action.destructive ? "text-danger" : "text-fg [&_svg]:text-muted",
-                  )}
-                >
+                <Menu.Item key={action.label} disabled={action.disabled} onClick={action.onSelect} className={className}>
                   {action.icon}
                   {action.label}
                 </Menu.Item>
-              ),
-            )}
+              );
+            })}
           </Menu.Popup>
         </Menu.Positioner>
       </Menu.Portal>

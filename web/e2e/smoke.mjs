@@ -173,7 +173,14 @@ async function main() {
     if (created.length !== 1) throw new StepError(`Expected one library after Start, found ${created.length}`);
     const library = created[0];
     if (library.profile.goal !== opts.goal) throw new StepError(`The library's goal is ${library.profile.goal}, not ${opts.goal}`);
-    if (!(await api("/settings")).onboarded) throw new StepError("Setup finished but the server wasn't told (onboarded is false)");
+    // The new library can reach the page (over the WebSocket) a moment
+    // before setup's own "onboarded" request has landed: allow for that.
+    let onboarded = false;
+    for (let i = 0; i < 20 && !onboarded; i += 1) {
+      onboarded = Boolean((await api("/settings")).onboarded);
+      if (!onboarded) await sleep(250);
+    }
+    if (!onboarded) throw new StepError("Setup finished but the server wasn't told (onboarded is false)");
     await page.getByRole("link", { name: new RegExp(library.name) }).first().waitFor();
     log(`Library "${library.name}" created with goal ${opts.goal}; overview shown`);
     await shot("overview-start");

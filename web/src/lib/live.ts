@@ -154,7 +154,11 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
         const others = old.jobs.filter((j) => j.id !== job.id);
         return { ...old, jobs: [job, ...others].sort((a, b) => b.created_at.localeCompare(a.created_at)) };
       });
-      if (job.state !== "running") live.clearJob(job.id);
+      if (job.state !== "running") {
+        live.clearJob(job.id);
+        // Where this file's earlier jobs stand may have changed (queued again, converted since).
+        invalidate.schedule(keys.fileJobs(job.file_id), 1000);
+      }
       // State changes move jobs between Running / Up next / History.
       invalidate.schedule(keys.jobs());
       if (job.state !== "running" && job.state !== "queued") {
@@ -181,6 +185,7 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
         return { ...old, file: { ...file, probe: file.probe ?? before.probe } };
       });
       if (reprobe) invalidate.schedule(keys.file(file.id), 300);
+      invalidate.schedule(keys.fileJobs(file.id), 1000);
       const listFile: MediaFile = { ...file };
       delete listFile.probe;
       client.setQueriesData<ListResponse<MediaFile>>({ queryKey: keys.files() }, (old) =>

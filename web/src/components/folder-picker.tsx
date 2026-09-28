@@ -56,6 +56,14 @@ export function videoCount(count: number | null | undefined, capped = false): st
   return `${formatCount(count)}${capped ? "+" : ""} ${count === 1 && !capped ? "video" : "videos"}`;
 }
 
+/**
+ * The count on the "Use" button: "1,204 videos", "2,000+ videos", or "no
+ * videos", so picking a folder that holds none is noticed before Start.
+ */
+export function folderVideos(count: number, capped = false): string {
+  return videoCount(count, capped) ?? "no videos";
+}
+
 /** The last part of a folder path, for naming it on the button. */
 function folderName(path: string, roots: string[]): string {
   const trimmed = path.replace(/(.)\/+$/, "$1");
@@ -107,7 +115,9 @@ export function FolderPicker({
   const [lastGood, setLastGood] = useState<FsBrowse | null>(null);
   if (data && !loadingNew && data !== lastGood) setLastGood(data);
   const shown = data ?? (browse.error ? lastGood : undefined);
-  // Video counts seen in listings, so the folder you're in can say its own.
+  // Video counts seen in listings: the server counts the folder you're in
+  // too, and older servers only its entries, so a folder opened from its
+  // parent still knows its own.
   const [counts, setCounts] = useState<Record<string, { count: number; capped: boolean }>>({});
   const [countedFrom, setCountedFrom] = useState<FsBrowse | null>(null);
   if (data && data !== countedFrom) {
@@ -116,8 +126,12 @@ export function FolderPicker({
     for (const e of data.entries) {
       if (typeof e.media_count === "number") next[e.path] = { count: e.media_count, capped: Boolean(e.media_count_capped) };
     }
+    if (typeof data.media_count === "number") {
+      next[data.path] = { count: data.media_count, capped: Boolean(data.media_count_capped) };
+    }
     if (Object.keys(next).length) setCounts((prev) => ({ ...prev, ...next }));
   }
+  const own = counts[current];
 
   const go = (next: string | undefined, focusList = true) => {
     shouldFocusList.current = focusList;
@@ -373,9 +387,7 @@ export function FolderPicker({
           {actionLabel ?? (
             <>
               <span className="min-w-0 truncate">Use “{folderName(current || "/", shown?.roots ?? [])}”</span>
-              {videoCount(counts[current]?.count, counts[current]?.capped) ? (
-                <span className="shrink-0 font-normal">· {videoCount(counts[current]?.count, counts[current]?.capped)}</span>
-              ) : null}
+              {own && !loadingNew ? <span className="shrink-0 font-normal">· {folderVideos(own.count, own.capped)}</span> : null}
             </>
           )}
         </Button>

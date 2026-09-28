@@ -330,6 +330,11 @@ export interface MediaFile {
   saved_bytes: number | null;
   skip_reason: string | null;
   error: string | null;
+  /**
+   * Machine-readable cause of `error` (see `ProblemKind`). Older servers,
+   * and files that failed before the server had it, leave it out or null.
+   */
+  problem?: ProblemKind | null;
   job_id: Uuid | null;
   progress: number | null;
   /** Only present on `GET /files/{id}`. */
@@ -397,6 +402,34 @@ export interface ValidationReport {
 // ---------------------------------------------------------------------------
 
 export type JobState = "queued" | "running" | "done" | "skipped" | "failed" | "cancelled";
+
+/**
+ * Why a file couldn't be converted (core `ProblemKind`), sent with every
+ * `error` so the UI can group problems and offer the fix without parsing
+ * sentences. A newer server may add kinds; unknown ones read as `other`.
+ */
+export type ProblemKind =
+  | "unreadable_source"
+  | "work_folder"
+  | "destination"
+  | "disk_full"
+  | "encoder"
+  | "hardware_unavailable"
+  | "verification"
+  | "source_changed"
+  | "other";
+
+export const PROBLEM_KINDS: readonly ProblemKind[] = [
+  "unreadable_source",
+  "work_folder",
+  "destination",
+  "disk_full",
+  "encoder",
+  "hardware_unavailable",
+  "verification",
+  "source_changed",
+  "other",
+];
 export type JobStage = "waiting" | "preparing" | "transcoding" | "verifying" | "finalizing";
 
 export interface Job {
@@ -418,6 +451,8 @@ export interface Job {
   input_size: number;
   output_size: number | null;
   error: string | null;
+  /** Machine-readable cause of `error`. Older servers leave it out. */
+  problem?: ProblemKind | null;
   skip_reason: string | null;
   validation: ValidationReport | null;
   command: string | null;
@@ -428,6 +463,8 @@ export interface Job {
    * leave it out.
    */
   notes?: string[];
+  /** Queued with "Convert anyway". Older servers leave it out. */
+  force?: boolean;
   created_at: Timestamp;
   started_at: Timestamp | null;
   finished_at: Timestamp | null;
@@ -623,6 +660,13 @@ export interface FsBrowse {
   parent: string | null;
   roots: string[];
   entries: FsEntry[];
+  /**
+   * Videos in the browsed folder itself and the folders inside it, counted
+   * like the entries'. Older servers leave it out.
+   */
+  media_count?: number | null;
+  /** True when counting the browsed folder stopped early ("1,000+"). */
+  media_count_capped?: boolean;
 }
 
 export type BulkAction = "queue" | "skip" | "retry_failed";

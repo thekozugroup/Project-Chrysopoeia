@@ -9,7 +9,7 @@
 
 import { plural } from "./format";
 import { skippedByUser } from "./labels";
-import { isUnreadableSource } from "./outcomes";
+import { isUnreadable } from "./outcomes";
 import type { ActivityEntry, Container, Library, MediaFile, TranscodeProfile, VideoCodec } from "./types";
 
 /**
@@ -178,7 +178,7 @@ export function planBulkConvert(files: MediaFile[], profile: TranscodeProfile | 
         } else plan.converted += 1;
         break;
       case "failed":
-        if (isUnreadableSource(file.error)) plan.damaged += 1;
+        if (isUnreadable(file)) plan.damaged += 1;
         else plan.ids.push(file.id);
         break;
       default:
@@ -289,4 +289,9 @@ export function settlingCount(library: Pick<Library, "id" | "stats">, entries: A
   const settling = library.stats.settling;
   if (typeof settling === "number" && Number.isFinite(settling)) return Math.max(0, settling);
   return stillCopyingCount(entries, library.id);
+}
+
+/** "Waiting for 3 files to finish copying" (see `settlingCount`). */
+export function settlingText(copying: number): string {
+  return `Waiting for ${plural(copying, "file")} to finish copying`;
 }
