@@ -1,308 +1,82 @@
+"use client";
+
+/**
+ * Small client-side store for state that changes many times a second and
+ * does not belong in the TanStack Query cache: the WebSocket connection,
+ * live job progress, scan progress and screen-reader announcements.
+ */
+
 import { create } from "zustand";
-import { toast } from "sonner";
-import type {
-  MediaFile,
-  LibraryStats,
-  HardwareInfo,
-  LibraryPath,
-  LibraryTranscodeConfig,
-  GlobalSettings,
-  LogEntry,
-} from "./types";
-import {
-  MOCK_FILES,
-  MOCK_STATS,
-  MOCK_HARDWARE,
-  MOCK_GLOBAL,
-  MOCK_LIBRARY_PATHS,
-  MOCK_LOG_ENTRIES,
-} from "./mock-data";
+import type { Job, JobProgress, ScanProgress } from "./types";
 
-// ---------------------------------------------------------------------------
-// Store
-// ---------------------------------------------------------------------------
+/** WebSocket connection state as shown to the user. */
+export type ConnectionState = "connecting" | "open" | "reconnecting";
 
-interface AppStore {
-  files: MediaFile[];
-  stats: LibraryStats;
-  hardware: HardwareInfo;
-
-  // Global settings (defaults for new libraries)
-  globalSettings: GlobalSettings;
-  updateGlobalSettings: (patch: Partial<GlobalSettings>) => void;
-
-  // Library paths with per-library transcode config
-  library_paths: LibraryPath[];
-  addLibraryPath: (path: string) => void;
-  removeLibraryPath: (id: string) => void;
-  toggleLibraryPath: (id: string) => void;
-  updateLibraryConfig: (libraryId: string, patch: Partial<LibraryTranscodeConfig>) => void;
-
-  // Selected library for sidebar filtering
-  selectedLibraryId: string | null;
-  setSelectedLibrary: (id: string | null) => void;
-
-  // Settings page/modal
-  settingsOpen: boolean;
-  setSettingsOpen: (v: boolean) => void;
-
-  // Main area tab
-  activeTab: "overview" | "queue" | "settings";
-  setActiveTab: (tab: "overview" | "queue" | "settings") => void;
-
-  // Adding new library (inline in sidebar)
-  isAddingLibrary: boolean;
-  setIsAddingLibrary: (v: boolean) => void;
-
-  // Theme
-  theme: "dark" | "light";
-  toggleTheme: () => void;
-
-  isLoading: boolean;
-  setIsLoading: (v: boolean) => void;
-  isProcessing: boolean;
-  startProcessing: () => void;
-  stopProcessing: () => void;
-  isScanning: boolean;
-  startScan: () => void;
-  scanComplete: (newFiles?: number) => void;
-  wsConnected: boolean;
-  setWsConnected: (v: boolean) => void;
-
-  // WS-driven actions
-  updateFileProgress: (
-    fileId: string,
-    progress: number,
-    speed: string | null,
-    eta: number | null,
-  ) => void;
-  updateFileStatus: (
-    fileId: string,
-    status: MediaFile["status"],
-    outputSize?: number | null,
-    error?: string | null,
-  ) => void;
-  updateStats: (stats: LibraryStats) => void;
-
-  // Activity log
-  logEntries: LogEntry[];
-  addLogEntry: (entry: LogEntry) => void;
-  clearLog: () => void;
+interface LiveState {
+  connection: ConnectionState;
+  /** Live progress by job id, from `job.progress` events. */
+  jobs: Record<string, JobProgress>;
+  /** Scan progress by library id, from `scan.progress` events. */
+  scans: Record<string, ScanProgress>;
+  /** Latest polite screen-reader announcement. */
+  announcement: string;
+  setConnection: (state: ConnectionState) => void;
+  setJobProgress: (progress: JobProgress) => void;
+  clearJob: (jobId: string) => void;
+  setScan: (scan: ScanProgress) => void;
+  clearScan: (libraryId: string) => void;
+  announce: (text: string) => void;
 }
 
-export const useAppStore = create<AppStore>((set) => ({
-  files: MOCK_FILES,
-  stats: MOCK_STATS,
-  hardware: MOCK_HARDWARE,
-
-  // Global settings
-  globalSettings: MOCK_GLOBAL,
-  updateGlobalSettings: (patch) =>
-    set((state) => ({ globalSettings: { ...state.globalSettings, ...patch } })),
-
-  // Library paths
-  library_paths: MOCK_LIBRARY_PATHS,
-
-  addLibraryPath: (path) =>
-    set((state) => ({
-      library_paths: [
-        ...state.library_paths,
-        {
-          id: `lib-${Date.now()}`,
-          path,
-          file_count: 0,
-          total_size_bytes: 0,
-          enabled: true,
-          transcode: {
-            output_video: state.globalSettings.default_video,
-            output_audio: state.globalSettings.default_audio,
-            output_container: state.globalSettings.default_container,
-            crf: state.globalSettings.default_crf,
-            skip_open_formats: state.globalSettings.default_skip_open,
-          },
-        },
-      ],
-    })),
-
-  removeLibraryPath: (id) =>
-    set((state) => ({
-      library_paths: state.library_paths.filter((p) => p.id !== id),
-    })),
-
-  toggleLibraryPath: (id) =>
-    set((state) => ({
-      library_paths: state.library_paths.map((p) =>
-        p.id === id ? { ...p, enabled: !p.enabled } : p,
-      ),
-    })),
-
-  updateLibraryConfig: (libraryId, patch) =>
-    set((state) => ({
-      library_paths: state.library_paths.map((p) =>
-        p.id === libraryId
-          ? { ...p, transcode: { ...p.transcode, ...patch } }
-          : p,
-      ),
-    })),
-
-  // Selected library
-  selectedLibraryId: null,
-  setSelectedLibrary: (id) => set({ selectedLibraryId: id }),
-
-  // Settings
-  settingsOpen: false,
-  setSettingsOpen: (v) => set({ settingsOpen: v }),
-
-  // Tab
-  activeTab: "overview",
-  setActiveTab: (tab) => set({ activeTab: tab }),
-
-  // Adding library
-  isAddingLibrary: false,
-  setIsAddingLibrary: (v) => set({ isAddingLibrary: v }),
-
-  // Theme
-  theme: "dark",
-  toggleTheme: () =>
-    set((state) => ({ theme: state.theme === "dark" ? "light" : "dark" })),
-
-  isLoading: true,
-  setIsLoading: (v) => set({ isLoading: v }),
-
-  isProcessing: true,
-  startProcessing: () => {
-    set((state) => ({
-      isProcessing: true,
-      logEntries: [
-        {
-          id: `log-${Date.now()}-start`,
-          timestamp: new Date().toISOString(),
-          level: "info" as const,
-          message: "Processing started",
-        },
-        ...state.logEntries,
-      ].slice(0, 500),
-    }));
-    toast("Processing started");
-  },
-  stopProcessing: () => {
-    set((state) => ({
-      isProcessing: false,
-      logEntries: [
-        {
-          id: `log-${Date.now()}-stop`,
-          timestamp: new Date().toISOString(),
-          level: "info" as const,
-          message: "Processing paused",
-        },
-        ...state.logEntries,
-      ].slice(0, 500),
-    }));
-    toast("Processing paused");
-  },
-
-  isScanning: false,
-  startScan: () => set({ isScanning: true }),
-  scanComplete: (newFiles?: number) => {
-    set((state) => ({
-      isScanning: false,
-      logEntries: [
-        {
-          id: `log-${Date.now()}-scan`,
-          timestamp: new Date().toISOString(),
-          level: "info" as const,
-          message: `Library scan complete. Found ${newFiles ?? 0} new files.`,
-        },
-        ...state.logEntries,
-      ].slice(0, 500),
-    }));
-    toast.info("Scan complete", {
-      description: `Found ${newFiles ?? 0} new files`,
-    });
-  },
-
-  wsConnected: true,
-  setWsConnected: (v) => set({ wsConnected: v }),
-
-  // Activity log
-  logEntries: MOCK_LOG_ENTRIES,
-  addLogEntry: (entry) =>
-    set((state) => ({
-      logEntries: [entry, ...state.logEntries].slice(0, 500),
-    })),
-  clearLog: () => set({ logEntries: [] }),
-
-  // WS-driven actions
-  updateFileProgress: (fileId, progress, speed, eta) =>
-    set((state) => ({
-      files: state.files.map((f) =>
-        f.id === fileId
-          ? { ...f, progress, speed, eta_secs: eta }
-          : f,
-      ),
-    })),
-
-  updateFileStatus: (fileId, status, outputSize, error) => {
-    const file = useAppStore.getState().files.find((f) => f.id === fileId);
-    const name = file?.filename ?? fileId;
-
-    let logEntry: LogEntry | null = null;
-    if (status === "transcoding") {
-      logEntry = {
-        id: `log-${Date.now()}-${fileId}`,
-        timestamp: new Date().toISOString(),
-        level: "info",
-        message: `Started transcoding ${name}`,
-        fileId,
-        fileName: name,
-      };
-    } else if (status === "complete" && file) {
-      const original = file.size_bytes;
-      const output = outputSize ?? 0;
-      const reduction =
-        original > 0 ? Math.round((1 - output / original) * 100) : 0;
-      logEntry = {
-        id: `log-${Date.now()}-${fileId}`,
-        timestamp: new Date().toISOString(),
-        level: "success",
-        message: `Completed ${name} \u2014 saved ${reduction}%`,
-        fileId,
-        fileName: name,
-      };
-      toast.success(`Completed: ${name}`, {
-        description: `Saved ${reduction}%`,
-      });
-    } else if (status === "error") {
-      logEntry = {
-        id: `log-${Date.now()}-${fileId}`,
-        timestamp: new Date().toISOString(),
-        level: "error",
-        message: `Failed ${name}: ${error ?? "Unknown error"}`,
-        fileId,
-        fileName: name,
-      };
-      toast.error(`Failed: ${name}`, {
-        description: error ?? "Unknown error",
-      });
-    }
-
-    set((state) => ({
-      files: state.files.map((f) =>
-        f.id === fileId
-          ? {
-              ...f,
-              status,
-              output_size_bytes: outputSize ?? f.output_size_bytes,
-              error_message: error ?? f.error_message,
-              progress: status === "complete" ? 100 : f.progress,
-            }
-          : f,
-      ),
-      logEntries: logEntry
-        ? [logEntry, ...state.logEntries].slice(0, 500)
-        : state.logEntries,
-    }));
-  },
-
-  updateStats: (stats) => set({ stats }),
+export const useLive = create<LiveState>((set) => ({
+  connection: "connecting",
+  jobs: {},
+  scans: {},
+  announcement: "",
+  setConnection: (connection) => set({ connection }),
+  setJobProgress: (progress) =>
+    set((s) => ({ jobs: { ...s.jobs, [progress.job_id]: progress } })),
+  clearJob: (jobId) =>
+    set((s) => {
+      if (!(jobId in s.jobs)) return s;
+      const jobs = { ...s.jobs };
+      delete jobs[jobId];
+      return { jobs };
+    }),
+  setScan: (scan) => set((s) => ({ scans: { ...s.scans, [scan.library_id]: scan } })),
+  clearScan: (libraryId) =>
+    set((s) => {
+      if (!(libraryId in s.scans)) return s;
+      const scans = { ...s.scans };
+      delete scans[libraryId];
+      return { scans };
+    }),
+  announce: (announcement) => set({ announcement }),
 }));
+
+/** A job with its latest live progress applied (only while it is running). */
+export function useLiveJob(job: Job): Job {
+  const live = useLive((s) => s.jobs[job.id]);
+  if (!live || job.state !== "running") return job;
+  return {
+    ...job,
+    stage: live.stage,
+    progress: live.progress,
+    fps: live.fps,
+    speed: live.speed,
+    eta_secs: live.eta_secs,
+    encoder: live.encoder ?? job.encoder,
+    hw_api: live.hw_api ?? job.hw_api,
+    attempt: live.attempt,
+  };
+}
+
+/** Live progress (0..100) of whichever running job belongs to a file. */
+export function useFileProgress(fileId: string): number | null {
+  return useLive((s) => {
+    for (const p of Object.values(s.jobs)) {
+      if (p.file_id === fileId) return p.progress;
+    }
+    return null;
+  });
+}

@@ -1,36 +1,53 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Chrysopoeia web UI
 
-## Getting Started
+The browser interface for Chrysopoeia. It is a Next.js app exported as static
+files (`web/out`) that the Rust server hosts next to the API, so the container
+needs no Node at runtime. Everything talks to `/api` on the same origin; see
+`docs/ARCHITECTURE.md` ("REST API", "WebSocket", "Web UI") for the contract.
 
-First, run the development server:
+## Scripts
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+| Command | What it does |
+|---|---|
+| `pnpm install` | Install dependencies (fonts are self-hosted via `@fontsource`, no Google access needed) |
+| `pnpm dev` | Dev server on http://localhost:3000 |
+| `pnpm build` | Static export to `web/out` (`out/index.html` plus `_next/` assets) |
+| `pnpm lint` | ESLint |
+| `pnpm typecheck` | `tsc --noEmit` |
+| `pnpm mock` | Dev-only mock API with fake sample data on http://localhost:8787 |
+
+## Working on the UI
+
+Against a real server (start it with `--dev-cors` so the browser may call it
+from another port):
+
+```sh
+NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Without a server, run the mock API in another terminal:
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```sh
+pnpm mock                        # a populated demo library
+MOCK_SCENARIO=fresh pnpm mock    # first run: shows the setup flow
+MOCK_SCENARIO=nogpu pnpm mock    # no GPU, with setup hints
+MOCK_SCENARIO=empty pnpm mock    # set up, but no libraries yet
+NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+`scripts/mock-api.mjs` is never imported by the app and is not part of the
+exported bundle. `NEXT_PUBLIC_API_URL` is baked in at build time; production
+builds leave it unset so the UI uses the same origin.
 
-## Learn More
+## Layout
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `src/app` — root layout (fonts, theme boot script) and the single page.
+- `src/components/app.tsx` — picks setup, "can't reach the server" or the app,
+  and maps hash routes (`#/`, `#/queue`, `#/library/<id>`, `#/settings/hardware`,
+  …) to screens. Detail sheets open from `?job=<id>` and `?file=<id>`.
+- `src/screens` — one file per screen.
+- `src/components` — shared pieces; `ui/` holds the primitives.
+- `src/lib/types.ts` — mirror of `crates/chrysopoeia-core` (keep in sync).
+- `src/lib/api.ts` — REST client and `ApiError`.
+- `src/lib/live.ts` — WebSocket client that patches the query cache.
+- `src/lib/format.ts`, `labels.ts` — plain-language wording and number formats.
