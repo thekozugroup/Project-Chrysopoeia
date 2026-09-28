@@ -34,12 +34,13 @@ import { useFileActions, useQueueActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { settlingText } from "@/lib/convertible";
 import { formatBytes, formatCount, formatHour, formatPercent, formatRelative, plural, splitBytes } from "@/lib/format";
-import { SETUP_PROBLEMS, setupFix, type SetupProblem } from "@/lib/outcomes";
+import { SETUP_PROBLEMS, reasonsFor, setupFix, type SetupProblem } from "@/lib/outcomes";
 import {
   useFailures,
   useHardwareInfo,
+  useJobStandings,
   useJobs,
-  useKeptAsConverted,
+  useKeptSetupFailures,
   useLibraries,
   useOverview,
   useSavedFileCount,
@@ -50,6 +51,7 @@ import {
 import { href, openSheet } from "@/lib/router";
 import { useLive, useServerDown } from "@/lib/store";
 import type {
+  BulkRequest,
   HardwareInfo,
   Job,
   JobQuery,
@@ -92,11 +94,23 @@ interface Status {
   resume?: boolean;
 }
 
-/** The one status sentence: "Converting 2 files · 3 waiting", "All caught up", "Paused · Resume". */
+/** What still needs the user once nothing is converting: failed files, and whether a setup problem stops conversions. */
+export interface Attention {
+  failed: number;
+  /** A setup problem (work folder, destination, disk space, hardware) is open. */
+  blocked: boolean;
+}
+
+/**
+ * The one status sentence: "Converting 2 files · 3 waiting", "All caught
+ * up", "Paused · Resume". Never "All caught up" while a setup problem
+ * stops conversions.
+ */
 export function overviewStatus(
   queue: QueueState,
   settings: Settings | undefined,
   scanning: string | null,
+  attention: Attention = { failed: 0, blocked: false },
 ): Status {
   const waiting = queue.queued ? `${formatCount(queue.queued)} waiting` : undefined;
   if (queue.paused) {
@@ -121,21 +135,29 @@ export function overviewStatus(
   }
   if (scanning) return { icon: <LoaderCircle className="spin text-accent-ink" aria-hidden />, text: scanning };
   if (queue.queued) return { icon: <Clock aria-hidden />, text: `${plural(queue.queued, "file")} waiting to start` };
+  // "Needs your attention" follows right below with the fix.
+  if (attention.blocked) return { icon: <TriangleAlert className="text-warning" aria-hidden />, text: "Waiting for a fix" };
   return {
     icon: <CircleCheck className="text-success" aria-hidden />,
     text: "All caught up",
-    detail: settings?.watch_folders === false ? "new files are picked up at the next scan" : "new files are picked up as they appear",
+    detail:
+      attention.failed > 0
+        ? `${plural(attention.failed, "file")} to review`
+        : settings?.watch_folders === false
+          ? "new files are picked up at the next scan"
+          : "new files are picked up as they appear",
   };
 }
 
-function StatusLine({ queue }: { queue: QueueState }) {
+function StatusLine({ queue, failed }: { queue: QueueState; failed: number }) {
   const settings = useSettings();
   const libraries = useLibraries();
   const scans = useLive((s) => s.scans);
   const { resume } = useQueueActions();
+  const blocked = useSetupProblems().open;
   // While the server is away this is only what it last said: no live icon.
   const down = useServerDown();
-  const status = overviewStatus(queue, settings.data, scanSentence(libraries.data ?? [], scans));
+  const status = overviewStatus(queue, settings.data, scanSentence(libraries.data ?? [], scans), { failed, blocked });
   return (
     <div className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-2">
       <p
@@ -193,25 +215,33 @@ function SavedHero({ overview }: { overview: Overview }) {
   if (saved === 0) {
     // Nothing to report yet: say what is happening instead of a giant "0 GB".
     const scanning = scanSentence(libraries.data ?? [], scans) !== null;
+    const failed = totals.failed;
+    // Failed files are never "in good shape": say they're waiting on the user.
     const title = scanning
       ? "Getting to know your library"
       : remaining > 0
         ? "Your first files are on their way"
-        : totals.file_count > 0
-          ? "Nothing needs converting"
-          : "Waiting for videos";
+        : failed > 0
+          ? totals.done > 0
+            ? "Nothing saved yet"
+            : "Nothing converted yet"
+          : totals.file_count > 0
+            ? "Nothing needs converting"
+            : "Waiting for videos";
     const detail = scanning
       ? "Conversions start as soon as files are checked."
       : remaining > 0
         ? "The space you get back shows up here as soon as the first files are verified."
-        : totals.file_count > 0
-          ? "Every file is already in good shape or was left as it is."
-          : "Once a library is scanned and files are converted, the space you get back shows up here.";
+        : failed > 0
+          ? `${plural(failed, "file")} ${failed === 1 ? "needs" : "need"} your attention below.`
+          : totals.file_count > 0
+            ? "Every file is already in good shape or was left as it is."
+            : "Once a library is scanned and files are converted, the space you get back shows up here.";
     return (
       <div className="min-w-0">
         <h1 className="font-display text-[2.5rem] leading-[1.05] text-fg sm:text-[3.25rem]">{title}</h1>
         <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">{detail}</p>
-        <StatusLine queue={overview.queue} />
+        <StatusLine queue={overview.queue} failed={totals.failed} />
         {holdings}
       </div>
     );
@@ -238,7 +268,7 @@ function SavedHero({ overview }: { overview: Overview }) {
           "."
         )}
       </p>
-      <StatusLine queue={overview.queue} />
+      <StatusLine queue={overview.queue} failed={totals.failed} />
       {holdings}
     </div>
   );
@@ -250,10 +280,20 @@ interface Problem {
   tone: "warning" | "danger" | "info";
   title: string;
   detail: string;
+  /** The server's own sentences for it (the exact cause and fix), most common first. */
+  reasons?: string[];
   /** Where to look or fix it. */
   action?: { label: string; href: string };
-  /** Failed files to try again, once the cause is fixed. */
-  retry?: string[];
+  /** "Try again" for every file it stopped, once it's fixed. */
+  retry?: Retry;
+}
+
+/** The requests behind one "Try again", and how many files they're for. */
+interface Retry {
+  requests: BulkRequest[];
+  /** Converted files whose stopped conversion was "Convert anyway": queued the same way. */
+  forced?: string[];
+  count: number;
 }
 
 /**
@@ -286,39 +326,88 @@ const SETUP_ICON: Record<SetupProblem, ReactNode> = {
   destination: <FolderLock aria-hidden />,
 };
 
-/** "3 files couldn't be converted because of it." */
-function blockedText(n: number): string {
-  return `${plural(n, "file")} couldn't be converted because of it.`;
+/**
+ * "3 files couldn't be converted because of it." `kept` counts converted
+ * files whose second conversion it stopped; `atLeast` marks a count cut
+ * short (too many failed files to read them all).
+ */
+function blockedText(failed: number, kept = 0, atLeast = false): string {
+  const files = `${atLeast ? "At least " : ""}${plural(failed, "file")}`;
+  if (failed > 0 && kept > 0) {
+    return `${files} couldn't be converted because of it, and ${plural(kept, "converted file")} couldn't be converted again.`;
+  }
+  if (kept > 0) {
+    return `${plural(kept, "converted file")} couldn't be converted again because of it. ${kept === 1 ? "It's" : "They're"} still as ${kept === 1 ? "it was" : "they were"}.`;
+  }
+  return `${files} couldn't be converted because of it.`;
+}
+
+/**
+ * The server's sentences for a group of failures, as lines: the one
+ * sentence when they all share it, else up to three, each with its count
+ * (two, and how many more there are, when there are more than three).
+ */
+function reasonLines(items: { error: string | null }[]): string[] {
+  const all = reasonsFor(items, 3);
+  if (all.reasons.length === 1 && all.rest === 0) return [all.reasons[0].text];
+  const { reasons, rest } = all.rest > 0 ? reasonsFor(items, 2) : all;
+  const lines = reasons.map((r) => `${plural(r.count, "file")}: ${r.text}`);
+  if (rest > 0) lines.push(`${plural(rest, "more file")} with other messages: open one from its library to see why.`);
+  return lines;
+}
+
+/**
+ * "Try again" for the files one problem stopped: the failed ones by id (or,
+ * when there were too many to read them all, every failed file), and
+ * converted files whose second conversion it stopped queued again.
+ */
+function retryFor(failed: { id: string }[], kept: Job[], failures: Failures, failedTotal: number): Retry | undefined {
+  const requests: BulkRequest[] = [];
+  if (failed.length) {
+    requests.push(failures.complete ? { action: "retry_failed", ids: failed.map((f) => f.id) } : { action: "retry_failed" });
+  }
+  const forced = [...new Set(kept.filter((j) => j.force).map((j) => j.file_id))];
+  const keptIds = [...new Set(kept.filter((j) => !j.force).map((j) => j.file_id))];
+  if (keptIds.length) requests.push({ action: "queue", ids: keptIds });
+  if (!requests.length && !forced.length) return undefined;
+  const count = (failed.length ? (failures.complete ? failed.length : failedTotal) : 0) + keptIds.length + forced.length;
+  return forced.length ? { requests, forced, count } : { requests, count };
 }
 
 /**
  * Problems the user can fix, one row per cause. Setup problems (work
  * folder, destination, disk space, chosen hardware) are one row each
- * across every library, with the exact fix, a link to the setting and
- * "Try again" for all their files; damaged originals and failed
- * conversions get a row per library with "Review".
+ * across every library, with the server's own sentences (the exact cause
+ * and fix), a link to the setting and "Try again" for all their files,
+ * including converted files whose second conversion they stopped (`kept`);
+ * damaged originals and failed conversions get a row per library with
+ * "Review".
  */
 export function problemsFrom(
   libraries: Library[],
   failures: Failures,
   hw: HardwareInfo | undefined,
   settings?: Pick<Settings, "output_mode">,
+  kept: Partial<Record<SetupProblem, Job[]>> = {},
 ): Problem[] {
   const problems: Problem[] = [];
+  const failedTotal = libraries.reduce((sum, l) => sum + l.stats.failed, 0);
   const hints = hw?.hints.filter((h) => h.level !== "info") ?? [];
   // Files the chosen hardware couldn't convert belong with the hardware tips.
   const hardwareFailed = failures.ready ? (failures.setup.hardware_unavailable ?? []) : [];
+  const hardwareKept = kept.hardware_unavailable ?? [];
   if (hints.length) {
     const blocking = hints.some((h) => h.level === "error");
     const tips = hints.length > 1 ? `${hints[0].title}, and ${plural(hints.length - 1, "more tip")}.` : `${hints[0].title}.`;
+    const stopped = hardwareFailed.length + hardwareKept.length;
     problems.push({
       key: "hardware",
       icon: <MonitorCog aria-hidden />,
       tone: blocking ? "danger" : "warning",
       title: blocking ? "Nothing can be converted until setup is fixed" : "Hardware setup needs a fix",
-      detail: hardwareFailed.length ? `${tips} ${blockedText(hardwareFailed.length)}` : tips,
+      detail: stopped ? `${tips} ${blockedText(hardwareFailed.length, hardwareKept.length, !failures.complete)}` : tips,
       action: { label: "Show me", href: href("/settings/hardware") },
-      retry: hardwareFailed.length ? hardwareFailed.map((f) => f.id) : undefined,
+      retry: retryFor(hardwareFailed, hardwareKept, failures, failedTotal),
     });
   }
   for (const library of libraries.filter((l) => l.path_error)) {
@@ -334,21 +423,33 @@ export function problemsFrom(
   if (failures.ready) {
     for (const kind of SETUP_PROBLEMS) {
       const files = failures.setup[kind] ?? [];
+      const keptJobs = kept[kind] ?? [];
       // Already said with the hardware tips.
-      if (!files.length || (kind === "hardware_unavailable" && hints.length)) continue;
+      if ((!files.length && !keptJobs.length) || (kind === "hardware_unavailable" && hints.length)) continue;
       const fix = setupFix(kind, settings?.output_mode);
+      const reasons = reasonLines([...files, ...keptJobs]);
       problems.push({
         key: `setup-${kind}`,
         icon: SETUP_ICON[kind],
         tone: "warning",
         title: fix.title,
-        detail: `${blockedText(files.length)} ${fix.fix}`,
+        // The server's sentences name the exact cause and fix; the generic fix only without them.
+        detail: reasons.length
+          ? blockedText(files.length, keptJobs.length, !failures.complete)
+          : `${blockedText(files.length, keptJobs.length, !failures.complete)} ${fix.fix}`,
+        reasons,
         action: { label: fix.setting.label, href: href(fix.setting.path) },
-        retry: files.map((f) => f.id),
+        retry: retryFor(files, keptJobs, failures, failedTotal),
       });
     }
     const count = (kind: "unreadable" | "conversion") =>
-      Object.fromEntries(Object.entries(failures.byLibrary).map(([id, c]) => [id, c[kind]]));
+      Object.fromEntries(
+        Object.entries(failures.byLibrary).map(([id, c]) => [
+          id,
+          // Files not read aren't known to be failed conversions: they get their own row.
+          kind === "conversion" ? c.conversion - (failures.unsorted[id] ?? 0) : c[kind],
+        ]),
+      );
     problems.push(
       ...perLibrary("unreadable", libraries, count("unreadable"), (n) => ({
         icon: <FileWarning aria-hidden />,
@@ -362,33 +463,47 @@ export function problemsFrom(
         title: `${plural(n, "file")} couldn't be converted`,
         detail: `The ${n === 1 ? "original is" : "originals are"} untouched. See why, then try again.`,
       })),
+      ...perLibrary("unsorted", libraries, failures.unsorted, (n) => ({
+        icon: <TriangleAlert aria-hidden />,
+        tone: "danger",
+        title: `${plural(n, "more file")} couldn't be converted`,
+        detail: "There are too many failed files to sort them all here. The list shows why each one failed.",
+      })),
     );
     const changed = failures.changed;
     if (changed.length) {
       const one = changed.length === 1;
+      const reasons = reasonLines(changed);
       problems.push({
         key: "changed",
         icon: <FileClock aria-hidden />,
         tone: "info",
-        title: `${plural(changed.length, "file")} changed while ${one ? "it was" : "they were"} being converted`,
-        detail: `${one ? "It was" : "They were"} being copied or replaced at the time, so nothing was replaced. Try again once ${one ? "it has" : "they have"} finished changing.`,
-        retry: changed.map((f) => f.id),
+        title: `${plural(changed.length, "file")} changed or moved while ${one ? "it was" : "they were"} being converted`,
+        detail: reasons.length
+          ? "Nothing was replaced."
+          : `${one ? "It was" : "They were"} moved, deleted or replaced during the conversion, so nothing was replaced.`,
+        reasons,
+        retry: retryFor(changed, [], failures, failedTotal),
       });
     }
   }
   return problems;
 }
 
-/** "Try again" for every file of one cause, once it's fixed. */
-function RetryAll({ ids }: { ids: string[] }) {
-  const { bulk } = useFileActions();
+/**
+ * "Try again" for every file of one cause, once it's fixed. Its accessible
+ * name starts with the words on the button ("Try again, 5 files"), so a
+ * voice command for what's on screen reaches it.
+ */
+function RetryAll({ retry }: { retry: Retry }) {
+  const { retryAll } = useFileActions();
   return (
     <Button
       variant="secondary"
       size="sm"
-      onClick={() => bulk.mutate({ action: "retry_failed", ids })}
-      loading={bulk.isPending}
-      aria-label={ids.length === 1 ? "Try the file again" : `Try the ${formatCount(ids.length)} files again`}
+      onClick={() => retryAll.mutate({ requests: retry.requests, forced: retry.forced })}
+      loading={retryAll.isPending}
+      aria-label={`Try again, ${plural(retry.count, "file")}`}
       needsServer
     >
       <RotateCcw aria-hidden />
@@ -397,12 +512,31 @@ function RetryAll({ ids }: { ids: string[] }) {
   );
 }
 
+const RECENT_QUERY: JobQuery = { state: "history", limit: 6 };
+const EMPTY_JOBS: Job[] = [];
+
+/**
+ * Setup problems from both places they show: failed files, and converted
+ * files whose second conversion a setup problem stopped (read from the
+ * recent history, see `useKeptSetupFailures`). `open` when there's any.
+ */
+function useSetupProblems(): { kept: Partial<Record<SetupProblem, Job[]>>; open: boolean } {
+  const failures = useFailures();
+  const recent = useJobs(RECENT_QUERY);
+  const kept = useKeptSetupFailures(recent.data?.items ?? EMPTY_JOBS);
+  const open =
+    Object.values(failures.setup).some((files) => files && files.length > 0) ||
+    Object.values(kept).some((jobs) => jobs && jobs.length > 0);
+  return { kept, open };
+}
+
 function NeedsAttention() {
   const libraries = useLibraries();
   const failures = useFailures();
   const settings = useSettings();
   const { hw } = useHardwareInfo();
-  const problems = problemsFrom(libraries.data ?? [], failures, hw, settings.data);
+  const { kept } = useSetupProblems();
+  const problems = problemsFrom(libraries.data ?? [], failures, hw, settings.data, kept);
   if (!problems.length) return null;
   return (
     <section aria-labelledby="attention-heading">
@@ -410,18 +544,20 @@ function NeedsAttention() {
       <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
         {problems.map((p) => {
           // Two actions go under the text on phones, lined up with it.
-          const two = Boolean(p.action && p.retry?.length);
+          const two = Boolean(p.action && p.retry);
           return (
             <li
               key={p.key}
               className={cn(
-                "flex items-start gap-x-3 gap-y-2.5 px-4 py-3.5 sm:items-center sm:px-5",
+                "flex items-start gap-x-3 gap-y-2.5 px-4 py-3.5 sm:px-5",
+                !p.reasons?.length && "sm:items-center",
                 two && "max-sm:flex-wrap",
               )}
             >
               <span
                 className={cn(
-                  "mt-0.5 shrink-0 sm:mt-0 [&_svg]:size-[1.125rem]",
+                  "mt-0.5 shrink-0 [&_svg]:size-[1.125rem]",
+                  !p.reasons?.length && "sm:mt-0",
                   p.tone === "danger" ? "text-danger" : p.tone === "warning" ? "text-warning" : "text-info",
                 )}
               >
@@ -429,7 +565,17 @@ function NeedsAttention() {
               </span>
               <div className={cn("min-w-0 flex-1", two && "max-sm:basis-[calc(100%-1.875rem)]")}>
                 <p className="text-sm font-medium text-fg">{p.title}</p>
-                <p className="mt-0.5 max-w-[30rem] text-[0.8125rem] leading-snug text-muted">{p.detail}</p>
+                <p className="mt-0.5 max-w-[31rem] text-[0.8125rem] leading-snug text-muted">{p.detail}</p>
+                {p.reasons?.length ? (
+                  // The server's own words: the exact cause and what to do about it.
+                  <ul className="mt-2 max-w-[31rem] space-y-1.5 border-l-2 border-line pl-3 text-[0.8125rem] leading-snug text-fg/85">
+                    {p.reasons.map((reason) => (
+                      <li key={reason} className="break-words">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
               </div>
               <div className={cn("flex shrink-0 gap-2", two && "max-sm:ml-[1.875rem]")}>
                 {p.action ? (
@@ -437,7 +583,7 @@ function NeedsAttention() {
                     {p.action.label}
                   </a>
                 ) : null}
-                {p.retry?.length ? <RetryAll ids={p.retry} /> : null}
+                {p.retry ? <RetryAll retry={p.retry} /> : null}
               </div>
             </li>
           );
@@ -522,7 +668,12 @@ export function LibraryRow({ library }: { library: Library }) {
     status = "No videos found yet";
   } else {
     // Failed files aren't finished; "to review" follows.
-    status = stats.failed > 0 ? "Everything else is finished" : "Everything is finished";
+    status =
+      stats.failed > 0
+        ? stats.done + stats.skipped === 0
+          ? "Nothing converted yet"
+          : "Everything else is finished"
+        : "Everything is finished";
   }
   return (
     <li className="group relative px-4 py-4 transition-colors hover:bg-raised/60 sm:px-5">
@@ -613,15 +764,12 @@ function Libraries() {
   );
 }
 
-/** The latest results (shared with the layout, which gives them a column only when there are some). */
-const RECENT_QUERY: JobQuery = { state: "history", limit: 6 };
-const EMPTY_JOBS: Job[] = [];
-
+/** The latest results (the layout gives them a column only when there are some). */
 function RecentResults() {
   const history = useJobs(RECENT_QUERY);
   const libraries = useLibraries();
   const items = history.data?.items ?? EMPTY_JOBS;
-  const kept = useKeptAsConverted(items);
+  const standings = useJobStandings(items);
   if (!history.isPending && items.length === 0) return null;
   const libraryName = (id: string) => libraries.data?.find((l) => l.id === id)?.name;
   const minSavings = (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
@@ -646,28 +794,36 @@ function RecentResults() {
         </div>
       ) : (
         <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
-          {items.map((job) => (
-            <li key={job.id}>
-              <button
-                type="button"
-                onClick={() => openSheet({ job: job.id })}
-                className="flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-raised/60"
-              >
-                <span className="flex w-full items-center justify-between gap-3">
-                  <span className="min-w-0 truncate text-sm font-medium text-fg">{job.file_name}</span>
-                  <JobStateBadge job={job} kept={kept.has(job.id)} />
-                </span>
-                <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">
-                  <span className={cn("min-w-0 truncate", job.state === "done" ? "text-fg/85" : "text-muted")}>
-                    {historyNote(job, minSavings(job.library_id), kept.has(job.id))}
+          {items.map((job) => {
+            const standing = standings.get(job.id) ?? "current";
+            return (
+              <li key={job.id}>
+                <button
+                  type="button"
+                  onClick={() => openSheet({ job: job.id })}
+                  className="flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-raised/60"
+                >
+                  <span className="flex w-full items-center justify-between gap-3">
+                    <span className="min-w-0 truncate text-sm font-medium text-fg">{job.file_name}</span>
+                    <JobStateBadge job={job} standing={standing} />
                   </span>
-                  <span className="shrink-0 text-xs text-muted">
-                    {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
+                  <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">
+                    {standing === "unknown" ? (
+                      <span aria-hidden className="skeleton inline-block h-3 w-40" />
+                    ) : (
+                      // The reason comes first; two lines hold it in this narrow column.
+                      <span className={cn("line-clamp-2 min-w-0", job.state === "done" ? "text-fg/85" : "text-muted")}>
+                        {historyNote(job, minSavings(job.library_id), standing)}
+                      </span>
+                    )}
+                    <span className="shrink-0 text-xs text-muted">
+                      {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
+                    </span>
                   </span>
-                </span>
-              </button>
-            </li>
-          ))}
+                </button>
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
@@ -697,7 +853,8 @@ function Welcome() {
   const libraries = useLibraries();
   const failures = useFailures();
   const settings = useSettings();
-  const problems = problemsFrom(libraries.data ?? [], failures, hardware.hw, settings.data);
+  const { kept } = useSetupProblems();
+  const problems = problemsFrom(libraries.data ?? [], failures, hardware.hw, settings.data, kept);
   return (
     <div className="max-w-2xl">
       <h1 className="font-display text-[2.75rem] leading-[1.05] text-fg sm:text-[3.5rem]">

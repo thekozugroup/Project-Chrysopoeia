@@ -23,6 +23,9 @@
  *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
  *                           start, one every few seconds ("Found … in <library>"),
  *                           and LibraryStats.settling goes down to 0 (0 = never)
+ *   MOCK_BULK_FAILED=0      add a "Demo Bulk" library with this many files that all
+ *                           failed because the work folder can't be used (more than
+ *                           one 500-file page: the UI must read them all)
  *
  * Error codes, messages and the `field` of validation errors follow the
  * real server (crates/chrysopoeia-server), so the UI's error handling is
@@ -34,14 +37,19 @@
  * nested error fields (`profile.max_height`). Failed files use the real
  * server's sentences, including its "can't be read as a video" ones.
  *
- * Round 4: every failure carries its `problem` code (the demo has damaged
- * originals, a failed check, a work folder that can't be written in two
- * libraries and a file that changed while it was converted), the browsed
- * folder has its own `media_count`, `Job.force` echoes "Convert anyway", a
- * converted file queued again stays converted (with its savings) when the
- * new job is skipped, stopped or fails, and bulk queue leaves out files the
- * size rule already kept. Settings errors use the server's words ("Files at
- * once must be between 1 and 32.").
+ * Round 4: every failure carries its `problem` code and the server's own
+ * sentence (the demo has damaged originals, a failed check, a work folder
+ * that can't be written in two libraries, a destination that can't be
+ * written and a name clash in one library, and a file that was moved away
+ * while it was converted: `source_changed`; an original whose content
+ * changed meanwhile is a skip, as on the server), a second conversion that
+ * the work folder stopped (the file stays converted), an old failure the
+ * file has been converted since, the browsed folder has its own
+ * `media_count`, `Job.force` echoes "Convert anyway", a converted file
+ * queued again stays converted (with its savings) when the new job is
+ * skipped, stopped or fails, and bulk queue leaves out files the size rule
+ * already kept. Settings errors use the server's words ("Files at once
+ * must be between 1 and 32.").
  */
 
 import { randomUUID } from "node:crypto";
@@ -57,6 +65,10 @@ const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const FORCE = process.env.MOCK_FORCE ?? "on";
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
+const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
+/** The server's sentence when the work folder can't be created (chrysopoeia-worker run.rs). */
+const WORK_FOLDER_ERROR =
+  "The work folder /temp can't be created because Chrysopoeia doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
 /** Jobs queued with "Convert anyway" (force). */
 const forcedJobs = new Set();
 const STARTED = Date.now();
@@ -742,16 +754,87 @@ function seedDemo() {
   const noWorkFolder = [pendingMovies[4], [...files.values()].find((f) => f.library_id === tv.id && f.status === "pending" && f.video_codec === "h264")];
   for (const f of noWorkFolder.filter(Boolean)) {
     f.status = "failed";
-    f.error = "Chrysopoeia can't write to the work folder /temp (permission denied), so the file couldn't be converted.";
+    f.error = WORK_FOLDER_ERROR;
     f.problem = "work_folder";
     makeJob(f, "failed", { stage: "preparing", progress: 0, error: f.error, problem: f.problem, started_at: ago(2600), finished_at: ago(2590) });
   }
-  // The original was replaced while it was being converted (a new download).
-  const changed = pendingMovies[5];
-  changed.status = "failed";
-  changed.error = "The original changed while it was being converted, so it was left alone.";
-  changed.problem = "source_changed";
-  makeJob(changed, "failed", { stage: "finalizing", progress: 40, error: changed.error, problem: changed.problem, started_at: ago(4200), finished_at: ago(3900) });
+  // A season folder the container user can't write to, and a name clash:
+  // both "destination", each with its own cause and fix.
+  const tvPending = [...files.values()].filter((f) => f.library_id === tv.id && f.status === "pending" && f.video_codec === "h264");
+  const lockedEpisode = tvPending.find((f) => f.relative_path.startsWith("Demo Show/Season 02/"));
+  if (lockedEpisode) {
+    const folder = lockedEpisode.path.slice(0, lockedEpisode.path.lastIndexOf("/"));
+    lockedEpisode.status = "failed";
+    lockedEpisode.error = `Chrysopoeia doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
+    lockedEpisode.problem = "destination";
+    makeJob(lockedEpisode, "failed", { stage: "finalizing", progress: 60, error: lockedEpisode.error, problem: "destination", started_at: ago(3300), finished_at: ago(3000) });
+  }
+  const clash = pendingMovies.slice(10).find((f) => f.file_name.endsWith(".mp4") && f.status === "pending");
+  if (clash) {
+    const taken = clash.file_name.replace(/\.mp4$/, ".mkv");
+    clash.status = "failed";
+    clash.error = `A file named "${taken}" is already next to the original, so the new file can't take its name. Move or rename that file, then try again.`;
+    clash.problem = "destination";
+    makeJob(clash, "failed", { stage: "finalizing", progress: 90, error: clash.error, problem: "destination", started_at: ago(3500), finished_at: ago(3400) });
+  }
+  // Moved away while it was being converted: the server's `source_changed`.
+  const moved = pendingMovies[5];
+  moved.status = "failed";
+  moved.error = "The file is no longer there. It was moved or deleted while it was being converted.";
+  moved.problem = "source_changed";
+  makeJob(moved, "failed", { stage: "finalizing", progress: 40, error: moved.error, problem: moved.problem, started_at: ago(4200), finished_at: ago(3900) });
+  // Replaced by a new copy meanwhile: a skip on the server, converted again later.
+  const replaced = pendingMovies[6];
+  if (replaced) {
+    makeJob(replaced, "skipped", {
+      stage: "finalizing",
+      progress: 100,
+      output_size: Math.round(replaced.size_bytes * 0.5),
+      skip_reason: "The original changed while it was being converted, so it was left alone",
+      started_at: ago(8200),
+      finished_at: ago(8000),
+    });
+    replaced.skip_reason = null;
+  }
+
+  // Failed once on the work folder, converted since: the old failure is history.
+  const recovered = [...files.values()].find(
+    (f) => f.library_id === tv.id && f.status === "done" && Date.parse(jobs.get(f.job_id)?.created_at ?? "") < Date.now() - 3 * 3600_000,
+  );
+  if (recovered) {
+    const conversion = jobs.get(recovered.job_id);
+    const failedAt = Date.parse(conversion.created_at) - 3600_000;
+    const old = makeJob(recovered, "failed", {
+      stage: "preparing",
+      progress: 0,
+      error: WORK_FOLDER_ERROR,
+      problem: "work_folder",
+      started_at: iso(failedAt + 60_000),
+      finished_at: iso(failedAt + 65_000),
+    });
+    old.created_at = iso(failedAt);
+    recovered.job_id = conversion.id;
+  }
+
+  // A converted file converted again after a goal change that the work
+  // folder stopped: it stays converted, and the Overview says the fix.
+  const stoppedAgain = [...files.values()].find(
+    (f) => f.library_id === tv.id && f.status === "done" && f !== recovered && Date.parse(jobs.get(f.job_id)?.finished_at ?? "") < Date.now() - 86400_000,
+  );
+  if (stoppedAgain) {
+    const conversion = stoppedAgain.job_id;
+    makeJob(stoppedAgain, "failed", {
+      stage: "preparing",
+      progress: 0,
+      input_size: stoppedAgain.size_bytes,
+      error: WORK_FOLDER_ERROR,
+      problem: "work_folder",
+      created_at: ago(500),
+      started_at: ago(480),
+      finished_at: ago(470),
+    });
+    stoppedAgain.job_id = conversion;
+  }
 
   // A converted file converted again after a goal change, whose new result
   // wasn't smaller enough: it stays converted ("Kept as converted").
@@ -848,7 +931,20 @@ function seedDemo() {
   activity.forEach((e, i) => (e.at = ago(600 + i * 1900)));
 }
 
+/** Many files that all failed on the work folder: more than one page of failed files. */
+function seedBulkFailed(count) {
+  const bulk = createLibrary("Demo Bulk", "/media/demo/bulk", "balanced");
+  for (let i = 1; i <= count; i++) {
+    const file = makeFile(bulk, `clip${String(i).padStart(4, "0")}.mp4`, {
+      size: between(2e6, 30e6), codec: "h264", resolution: "1080p", duration: between(5, 60), audio: "aac",
+    });
+    Object.assign(file, { status: "failed", error: WORK_FOLDER_ERROR, problem: "work_folder" });
+    makeJob(file, "failed", { stage: "preparing", progress: 0, error: file.error, problem: "work_folder", started_at: ago(120), finished_at: ago(119) });
+  }
+}
+
 if (SCENARIO === "demo" || SCENARIO === "nogpu") seedDemo();
+if (BULK_FAILED > 0) seedBulkFailed(BULK_FAILED);
 
 // ---------------------------------------------------------------------------
 // Derived views

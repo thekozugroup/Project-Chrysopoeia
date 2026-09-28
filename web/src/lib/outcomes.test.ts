@@ -8,8 +8,10 @@ import {
   hdrTechnical,
   isUnreadable,
   isUnreadableSource,
+  jobStanding,
   keptAsConverted,
   problemKind,
+  reasonsFor,
   retryableCount,
   setupFix,
   setupProblem,
@@ -122,7 +124,9 @@ describe("problem codes", () => {
   it("says each kind in a few words for list rows", () => {
     expect(failureNote(failure("unreadable_source"))).toBe("Looks damaged or isn't a video");
     expect(failureNote(failure("disk_full"))).toBe("The disk is full");
-    expect(failureNote(failure("source_changed"))).toBe("The file changed while it was being converted");
+    // A moved or replaced file: the server's sentence says which.
+    expect(failureNote(failure("source_changed"))).toBe("Something went wrong.");
+    expect(failureNote(failure("source_changed", null))).toBe("Moved or changed during the conversion");
     expect(failureNote(failure("verification", VISUAL))).toBe(VISUAL);
     expect(failureNote(failure(null, null))).toBe("Failed");
   });
@@ -141,6 +145,18 @@ describe("keptAsConverted", () => {
     expect(keptAsConverted(stopped, { file: { status: "done" }, jobs: [stopped, done] })).toBe(true);
   });
 
+  it("reads the server's sentences once each, most common first", () => {
+    const e = (error: string | null) => ({ error });
+    expect(reasonsFor([e("A"), e("B"), e("A"), e(null), e("C"), e(" A ")], 2)).toEqual({
+      reasons: [
+        { text: "A", count: 3 },
+        { text: "B", count: 1 },
+      ],
+      rest: 1,
+    });
+    expect(reasonsFor([e(null)])).toEqual({ reasons: [], rest: 0 });
+  });
+
   it("leaves first attempts, finished conversions and unknown files alone", () => {
     // It failed first; a later conversion is what made the file converted.
     const first = job("f", "failed", "2026-09-10T10:00:00Z");
@@ -155,6 +171,31 @@ describe("keptAsConverted", () => {
     expect(keptAsConverted(job("old", "skipped", "2026-09-01T00:00:00Z"), { file: { status: "done" }, jobs: newer })).toBe(
       false,
     );
+  });
+});
+
+describe("jobStanding", () => {
+  const job = (id: string, state: JobState, created_at: string) => ({ id, state, created_at });
+  const done = job("d", "done", "2026-09-20T10:00:00Z");
+  const failed = job("f", "failed", "2026-09-10T10:00:00Z");
+
+  it("sees that a file has moved past an old failure, so it's never tried again unasked", () => {
+    // Failed first, converted later: the failure is history.
+    expect(jobStanding(failed, { file: { status: "done" }, jobs: [done, failed] })).toBe("converted");
+    // Converted again later after a kept attempt: that attempt is history too.
+    const again = job("a", "failed", "2026-09-25T10:00:00Z");
+    const redone = job("r", "done", "2026-09-26T10:00:00Z");
+    expect(jobStanding(again, { file: { status: "done" }, jobs: [redone, again, done] })).toBe("converted");
+    expect(jobStanding(failed, { file: { status: "queued" }, jobs: [failed] })).toBe("queued");
+    expect(jobStanding(failed, { file: { status: "processing" }, jobs: [failed] })).toBe("queued");
+  });
+
+  it("keeps a failure current while the file is still failed, and waits for the file", () => {
+    expect(jobStanding(failed, { file: { status: "failed" }, jobs: [failed] })).toBe("current");
+    expect(jobStanding(failed, undefined)).toBe("unknown");
+    expect(jobStanding(done, undefined)).toBe("current");
+    // A conversion the list no longer holds (history trimmed) came before a listed job.
+    expect(jobStanding(failed, { file: { status: "done" }, jobs: [failed] })).toBe("kept");
   });
 });
 
@@ -288,6 +329,9 @@ describe("failedFilterLabel", () => {
     // A setup problem or a changed file is no damaged original either.
     expect(failedFilterLabel(counts(2, 0, 1))).toBe("Needs review");
     expect(failedFilterLabel(counts(0, 0, 0, 2))).toBe("Failed");
+    // Every one waits on a setup fix: named like their badges.
+    expect(failedFilterLabel(counts(0, 0, 3))).toBe("Needs a fix");
+    expect(failedFilterLabel(counts(0, 1, 3))).toBe("Failed");
     expect(failedFilterLabel(undefined)).toBe("Needs review");
   });
 });

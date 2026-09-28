@@ -71,8 +71,8 @@ export const SETUP_PROBLEMS: readonly SetupProblem[] = ["hardware_unavailable", 
  *   hardware; fixed once, then every file tried again.
  * - `conversion`: the encoder or the checks failed ("Couldn't be
  *   converted"), or a cause that isn't known.
- * - `changed`: the file changed while it was being converted; nothing is
- *   wrong, try again once it's finished changing.
+ * - `changed`: the file was moved, deleted or replaced while it was being
+ *   converted; nothing was replaced.
  */
 export type FailureGroup = "unreadable" | "setup" | "conversion" | "changed";
 
@@ -145,8 +145,43 @@ export function setupFix(kind: SetupProblem, outputMode?: OutputMode): SetupFix 
   }
 }
 
-/** The title for a file that changed while it was being converted. */
-export const CHANGED_TITLE = "The file changed while it was being converted";
+/**
+ * The title for a file that was moved, deleted or replaced while it was
+ * being converted (`source_changed`). The server's own sentence says which.
+ */
+export const CHANGED_TITLE = "The file changed or moved while it was being converted";
+
+/** What a `source_changed` failure means when the server gave no sentence. */
+export const CHANGED_FALLBACK = "It was moved, deleted or replaced during the conversion, so nothing was replaced.";
+
+/** One of the server's sentences for a group of failures, and how many share it. */
+export interface Reason {
+  text: string;
+  count: number;
+}
+
+/**
+ * The server's sentences for a group of failures, most common first, at
+ * most `max` of them; `rest` counts the failures whose sentence isn't
+ * shown. The server's sentence names the exact cause and fix ("A file named
+ * \"dup.mkv\" is already next to the original…", "The work folder /temp
+ * can't be created because…"), so it's shown instead of a generic fix,
+ * and failures of one kind with different causes are never merged into one
+ * explanation.
+ */
+export function reasonsFor(items: { error: string | null }[], max = 2): { reasons: Reason[]; rest: number } {
+  const counts = new Map<string, number>();
+  let without = 0;
+  for (const item of items) {
+    const text = item.error?.trim();
+    if (text) counts.set(text, (counts.get(text) ?? 0) + 1);
+    else without += 1;
+  }
+  const sorted = [...counts.entries()].map(([text, count]) => ({ text, count })).sort((a, b) => b.count - a.count);
+  const reasons = sorted.slice(0, max);
+  const shown = reasons.reduce((sum, r) => sum + r.count, 0);
+  return { reasons, rest: items.length - shown - without };
+}
 
 /**
  * The specific part of a source problem, as its own sentence: "It stops
@@ -204,13 +239,17 @@ export function retryableCount(counts: FailureCounts): number {
 
 /**
  * The words for a library's "failed" filter, matching the rows it lists:
- * "Can't be read" when every failed file is a damaged original, "Failed"
- * when none is, "Needs review" when it's both (or the split isn't known
- * yet).
+ * "Can't be read" when every failed file is a damaged original, "Needs a
+ * fix" when every one waits on a setup fix (like their badges), "Failed"
+ * when none is a damaged original, "Needs review" when it's a mix with
+ * damaged originals (or the split isn't known yet).
  */
-export function failedFilterLabel(counts: FailureCounts | undefined): "Can't be read" | "Failed" | "Needs review" {
+export function failedFilterLabel(
+  counts: FailureCounts | undefined,
+): "Can't be read" | "Needs a fix" | "Failed" | "Needs review" {
   if (!counts) return "Needs review";
   if (counts.unreadable > 0 && retryableCount(counts) === 0) return "Can't be read";
+  if (counts.setup > 0 && counts.setup === counts.unreadable + retryableCount(counts)) return "Needs a fix";
   if (counts.unreadable === 0) return "Failed";
   return "Needs review";
 }
@@ -225,7 +264,8 @@ export function failureNote(item: Failure): string {
     case "unreadable":
       return "Looks damaged or isn't a video";
     case "changed":
-      return CHANGED_TITLE;
+      // The server's sentence says whether it was moved, deleted or replaced.
+      return item.error?.trim() || "Moved or changed during the conversion";
     case "setup": {
       const kind = setupProblem(item);
       return kind ? setupFix(kind).title : (item.error ?? "Failed");
@@ -383,25 +423,49 @@ export const KEPT_CONVERTED = "Kept as converted";
 const FILE_JOBS_LISTED = 10;
 
 /**
- * Whether a finished job was a second conversion of a file that was
- * already converted, and left that converted file in place: it was skipped
- * (the new result wasn't worth keeping), failed or was stopped, and the
- * file is still converted by a conversion from before that job (the server
- * keeps a converted file converted when a new attempt doesn't replace it).
- * Such a row reads "Kept as converted", never "Skipped" or "Kept original":
- * the file on disk is the converted one. `detail` is the file with its
- * latest jobs (`GET /files/{id}`), newest first; `false` when it can't
- * tell (a job older than the jobs listed).
+ * What a finished job that didn't convert its file (skipped, failed or
+ * stopped) means now, read from its file:
+ * - `kept`: a second conversion that left an already converted file as it
+ *   was (the server keeps a converted file converted when a new attempt
+ *   doesn't replace it). It reads "Kept as converted", never "Skipped" or
+ *   "Kept original": the file on disk is the converted one.
+ * - `converted`: the file has been converted since (a later attempt
+ *   worked). The old outcome is history: nothing to try again.
+ * - `queued`: the file is queued or converting again right now.
+ * - `current`: nothing has happened since; the job's own outcome stands.
+ * - `unknown`: the file's details haven't loaded yet. Rows show no action
+ *   until they have, so a converted file is never queued again unasked.
  */
-export function keptAsConverted(
-  job: Pick<Job, "id" | "state" | "created_at">,
-  detail: { file: Pick<MediaFile, "status">; jobs: Pick<Job, "id" | "state" | "created_at">[] } | undefined,
-): boolean {
-  if (!detail || detail.file.status !== "done") return false;
-  if (job.state !== "skipped" && job.state !== "failed" && job.state !== "cancelled") return false;
-  const listed = detail.jobs.some((j) => j.id === job.id) || detail.jobs.length < FILE_JOBS_LISTED;
-  if (!listed) return false;
+export type JobStanding = "kept" | "converted" | "queued" | "current" | "unknown";
+
+type StandingJob = Pick<Job, "id" | "state" | "created_at">;
+
+/** A file with its latest jobs (`GET /files/{id}`), newest first. */
+export interface FileJobs {
+  file: Pick<MediaFile, "status">;
+  jobs: StandingJob[];
+}
+
+/** Where `job` stands now (see `JobStanding`); `detail` is its file with its latest jobs. */
+export function jobStanding(job: StandingJob, detail: FileJobs | undefined): JobStanding {
+  if (job.state !== "skipped" && job.state !== "failed" && job.state !== "cancelled") return "current";
+  if (!detail) return "unknown";
+  const status = detail.file.status;
+  if (status === "queued" || status === "processing") return "queued";
+  if (status !== "done") return "current";
+  const created = Date.parse(job.created_at);
+  const conversions = detail.jobs.filter((j) => j.id !== job.id && j.state === "done");
   // A conversion queued after this job is what made the file converted.
-  const queued = Date.parse(job.created_at);
-  return !detail.jobs.some((j) => j.id !== job.id && j.state === "done" && Date.parse(j.created_at) > queued);
+  if (conversions.some((j) => Date.parse(j.created_at) > created)) return "converted";
+  if (conversions.some((j) => Date.parse(j.created_at) < created)) return "kept";
+  // The conversion isn't among the jobs listed. When this job is (or every
+  // job is listed), anything after it would be too: the conversion came
+  // first. Otherwise it can't be told; the file is converted now either way.
+  const listed = detail.jobs.some((j) => j.id === job.id) || detail.jobs.length < FILE_JOBS_LISTED;
+  return listed ? "kept" : "converted";
+}
+
+/** Whether a finished job left an already converted file as it was (see `jobStanding`). */
+export function keptAsConverted(job: StandingJob, detail: FileJobs | undefined): boolean {
+  return jobStanding(job, detail) === "kept";
 }

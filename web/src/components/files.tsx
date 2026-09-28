@@ -31,7 +31,7 @@ import {
   middleTruncate,
 } from "@/lib/format";
 import { channelsLabel, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
-import { hdrSummary, hdrTechnical, isUnreadable, keptAsConverted, skipSummary } from "@/lib/outcomes";
+import { hdrSummary, hdrTechnical, isUnreadable, jobStanding, skipSummary } from "@/lib/outcomes";
 import { useFile, useLibrary } from "@/lib/queries";
 import { openSheet } from "@/lib/router";
 import { useFileLive, useLive } from "@/lib/store";
@@ -405,7 +405,7 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
                         onClick={() => openSheet({ file: null, job: job.id })}
                         className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3.5 py-3 text-left hover:bg-raised pointer-coarse:min-h-11"
                       >
-                        <JobStateBadge job={job} kept={keptAsConverted(job, detail)} />
+                        <JobStateBadge job={job} standing={jobStanding(job, detail)} />
                         <span className="text-[0.8125rem] text-muted">
                           {formatRelative(job.finished_at ?? job.started_at ?? job.created_at)}
                         </span>

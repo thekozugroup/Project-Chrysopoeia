@@ -134,12 +134,16 @@ describe("job summaries", () => {
     expect(historyNote(job({ state: "skipped", output_size: null, skip_reason: null }))).toBe("No conversion needed");
   });
 
-  it("names a failure by its code: the setup cause, a changed file, else the server's sentence", () => {
+  it("names a failure by its code: the setup cause, else the server's sentence", () => {
     const failed = (problem: Job["problem"], error = "Not enough free space in /temp for the new file (needs about 4 GB)") =>
       job({ state: "failed", output_size: null, error, problem });
     expect(historyNote(failed("disk_full"))).toBe("The disk is full");
     expect(historyNote(failed("work_folder"))).toBe("The work folder can't be used");
-    expect(historyNote(failed("source_changed"))).toBe("The file changed while it was being converted");
+    // A moved or replaced file: the server's sentence says which.
+    expect(historyNote(failed("source_changed", "The file is no longer there. It may have been moved or deleted."))).toBe(
+      "The file is no longer there. It may have been moved or deleted.",
+    );
+    expect(historyNote(failed("source_changed", ""))).toBe("Moved or changed during the conversion");
     expect(historyNote(failed("verification", "Looked different."))).toBe("Looked different.");
     // The code wins over a damaged-sounding sentence.
     expect(historyNote(failed("encoder", "The original file appears damaged or incomplete."))).toBe(
@@ -147,18 +151,29 @@ describe("job summaries", () => {
     );
   });
 
-  it("says a second conversion kept the converted file, never that it kept the original", () => {
+  it("puts the reason first for a second conversion that kept the converted file", () => {
     const skipped = job({ state: "skipped", output_size: 9.4e9, skip_reason: "Only 6% smaller — kept the original" });
-    expect(historyNote(skipped, 10, true)).toBe("Converting it again wasn't worth it: 6% smaller (needs at least 10%)");
-    expect(historyNote(job({ state: "failed", output_size: null, error: "x", problem: "disk_full" }), null, true)).toBe(
-      "Converting it again failed: the disk is full",
+    // The badge says "Kept as converted"; the note says why.
+    expect(historyNote(skipped, 10, "kept")).toBe("6% smaller (needs at least 10%)");
+    expect(historyNote(job({ state: "skipped", output_size: 9.4e9, skip_reason: null }), 10, "kept")).toBe(
+      "Not worth converting again",
     );
-    expect(historyNote(job({ state: "cancelled", output_size: null }), null, true)).toBe(
+    // A setup problem: the badge says "Needs a fix", so the note says the file is fine.
+    expect(historyNote(job({ state: "failed", output_size: null, error: "x", problem: "work_folder" }), null, "kept")).toBe(
+      "The work folder can't be used · converted file kept",
+    );
+    expect(historyNote(job({ state: "failed", output_size: null, error: "NVENC stopped.", problem: "encoder" }), null, "kept")).toBe(
+      "NVENC stopped.",
+    );
+    expect(historyNote(job({ state: "cancelled", output_size: null }), null, "kept")).toBe(
       "Stopped. The converted file is unchanged.",
     );
-    // Acronyms keep their capitals after the colon.
-    expect(historyNote(job({ state: "failed", output_size: null, error: "NVENC stopped.", problem: "encoder" }), null, true)).toBe(
-      "Converting it again failed: NVENC stopped.",
-    );
+  });
+
+  it("says when a file has moved past an old outcome", () => {
+    const failed = job({ state: "failed", output_size: null, error: "x", problem: "work_folder" });
+    expect(historyNote(failed, null, "converted")).toBe("The work folder can't be used · now converted");
+    expect(historyNote(failed, null, "queued")).toBe("The work folder can't be used · queued again");
+    expect(historyNote(job({ state: "cancelled", output_size: null }), null, "converted")).toBe("Stopped · now converted");
   });
 });

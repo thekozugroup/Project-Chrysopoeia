@@ -48,6 +48,7 @@ export function useJobActions() {
     onSuccess: (job) => {
       toast.success("Added to the queue", { description: job.file_name });
       refresh();
+      void client.invalidateQueries({ queryKey: keys.fileJobs(job.file_id) });
     },
     onError: fail("Couldn't add it to the queue"),
   });
@@ -125,6 +126,7 @@ export function useFileActions() {
     onSuccess: (job, { next }) => {
       toast.success(next ? "Converting next" : "Added to the queue", { description: job.file_name });
       refresh();
+      void client.invalidateQueries({ queryKey: keys.fileJobs(job.file_id) });
     },
     onError: fail("Couldn't add it to the queue"),
   });
@@ -195,5 +197,37 @@ export function useFileActions() {
     onError: fail("That didn't work"),
   });
 
-  return { queue, skip, ignore, convertAnyway, bulk };
+  /**
+   * "Try again" for everything one problem stopped, once it's fixed: failed
+   * files (by id, or all failed files when there are too many to list) and
+   * converted files whose second conversion it stopped, in one step with
+   * one message.
+   */
+  const retryAll = useMutation({
+    mutationFn: async ({ requests, forced = [] }: { requests: BulkRequest[]; forced?: string[] }) => {
+      let affected = 0;
+      let leftOut = 0;
+      for (const request of requests) {
+        const res = await api.bulk(request);
+        affected += res.affected;
+        leftOut += res.left_out ?? 0;
+      }
+      // "Convert anyway" conversions are queued the same way again.
+      for (const id of forced) {
+        await api.queueFile(id, { force: true });
+        affected += 1;
+      }
+      return { affected, leftOut };
+    },
+    onSuccess: ({ affected, leftOut }) => {
+      const left = serverLeftOutText(leftOut) ?? undefined;
+      if (affected === 0) {
+        toast("Nothing to do", { description: left ?? "Those files are already queued or were removed." });
+      } else toast.success(`Trying ${plural(affected, "file")} again`, { description: left });
+      refresh();
+    },
+    onError: fail("That didn't work"),
+  });
+
+  return { queue, skip, ignore, convertAnyway, bulk, retryAll };
 }

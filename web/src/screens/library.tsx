@@ -24,6 +24,7 @@ import {
   SlidersHorizontal,
   Trash2,
   TriangleAlert,
+  Wrench,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -42,7 +43,7 @@ import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { leftOutText, nothingToConvertText, planBulkConvert, settlingText } from "@/lib/convertible";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
-import { cantBeReadText, failedFilterLabel, type FailureCounts } from "@/lib/outcomes";
+import { SETUP_PROBLEMS, cantBeReadText, failedFilterLabel, reasonsFor, setupFix, type FailureCounts } from "@/lib/outcomes";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
 import {
@@ -312,12 +313,80 @@ function failedChip(counts: FailureCounts | undefined): { label: string; icon: R
   const icon =
     label === "Can't be read" ? (
       <FileWarning aria-hidden />
+    ) : label === "Needs a fix" ? (
+      <Wrench aria-hidden />
     ) : label === "Needs review" ? (
       <TriangleAlert aria-hidden />
     ) : (
       fileStatusIcon("failed")
     );
   return { label, icon };
+}
+
+/**
+ * Setup problems behind this library's failed files (the work folder, the
+ * destination, disk space, the chosen hardware), one callout each: the
+ * cause, the server's own sentence with the exact fix, and the setting
+ * where it's made. Without it the list would show "Needs a fix" badges and
+ * a "Try again" that fails the same way.
+ */
+function SetupNotice({ library }: { library: Library }) {
+  const failures = useFailures();
+  const settings = useSettings();
+  if (!failures.ready) return null;
+  const groups = SETUP_PROBLEMS.map((kind) => ({
+    kind,
+    files: (failures.setup[kind] ?? []).filter((f) => f.library_id === library.id),
+  })).filter((g) => g.files.length > 0);
+  if (!groups.length) return null;
+  const waiting = groups.reduce((sum, g) => sum + g.files.length, 0);
+  const one = waiting === 1;
+  return (
+    <section
+      aria-label="Needs a fix in the setup"
+      className="mt-4 overflow-hidden rounded-lg border border-warning/30 bg-warning-soft"
+    >
+      <ul className="divide-y divide-warning/20">
+        {groups.map(({ kind, files }) => {
+          const fix = setupFix(kind, settings.data?.output_mode);
+          const { reasons, rest } = reasonsFor(files, 2);
+          return (
+            <li key={kind} className="flex flex-wrap items-start gap-x-3 gap-y-3 px-4 py-3.5 sm:flex-nowrap">
+              <TriangleAlert className="mt-px size-[1.125rem] shrink-0 text-warning" aria-hidden />
+              <div className="min-w-0 flex-1 basis-[calc(100%-2rem)] sm:basis-auto">
+                <p className="text-sm font-semibold text-fg">{fix.title}</p>
+                {reasons.length === 0 ? (
+                  <p className="mt-1 max-w-[32rem] text-[0.8125rem] leading-relaxed text-fg/85">{fix.fix}</p>
+                ) : (
+                  // The server's own sentences: the exact cause and fix, each once.
+                  reasons.map((r) => (
+                    <p key={r.text} className="mt-1 max-w-[32rem] text-[0.8125rem] leading-relaxed break-words text-fg/85">
+                      {reasons.length > 1 ? `${plural(r.count, "file")}: ${r.text}` : r.text}
+                    </p>
+                  ))
+                )}
+                {rest > 0 ? (
+                  <p className="mt-1 text-[0.8125rem] text-fg/85">
+                    {`${plural(rest, "more file")} with other messages: open one to see why.`}
+                  </p>
+                ) : null}
+              </div>
+              <a
+                href={href(fix.setting.path)}
+                className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "max-sm:ml-[1.875rem]")}
+              >
+                <Wrench aria-hidden />
+                {fix.setting.label}
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+      <p className="border-t border-warning/20 px-4 py-2.5 text-[0.8125rem] text-fg/85">
+        {`${plural(waiting, "file")} in this library ${one ? "is" : "are"} waiting on ${groups.length > 1 ? "these" : "this"}. Once fixed, try ${one ? "it" : "them"} again below.`}
+      </p>
+    </section>
+  );
 }
 
 function StatusChips({ library, status }: { library: Library; status: FileStatus | null }) {
@@ -484,7 +553,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const failures = useFailures();
   // Damaged originals are left out: trying them again can't help. They get
   // their own "Ignore" instead.
-  const retryIds = failures.ready ? (failures.retryIds[library.id] ?? []) : [];
+  const retry = failures.ready ? (failures.retry[library.id] ?? null) : null;
   const unreadableIds = failures.ready
     ? failures.unreadable.filter((f) => f.library_id === library.id).map((f) => f.id)
     : [];
@@ -731,7 +800,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
           // row would be a blank gap, so it collapses to the spacing alone.
           selection.length === 0 &&
             stats.pending === 0 &&
-            retryIds.length === 0 &&
+            !retry &&
             unreadableIds.length === 0 &&
             "max-md:mb-0 max-md:min-h-0",
           // While files are selected the actions stay in view as the list scrolls.
@@ -785,16 +854,16 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                 Add {plural(stats.pending, "file")} to the queue
               </Button>
             ) : null}
-            {retryIds.length > 0 ? (
+            {retry ? (
               <Button
                 variant="secondary"
                 size="sm"
                 loading={bulk.isPending && bulk.variables?.action === "retry_failed"}
-                onClick={() => bulk.mutate({ action: "retry_failed", ids: retryIds })}
+                onClick={() => bulk.mutate(retry.request)}
                 needsServer
               >
                 <RotateCcw aria-hidden />
-                Try {plural(retryIds.length, "failed file")} again
+                Try {plural(retry.count, "failed file")} again
               </Button>
             ) : null}
             {unreadableIds.length > 0 ? (
@@ -1089,6 +1158,7 @@ export function LibraryScreen({ id, route }: { id: string; route: Route }) {
       ) : null}
       <Summary library={library} />
       <ScanBanner library={library} />
+      <SetupNotice library={library} />
       <NavTabs
         label="Library views"
         className="mt-8 mb-6"

@@ -38,18 +38,20 @@ import {
 } from "@/lib/format";
 import { HW_API_LABEL, HW_API_TECH, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
 import {
+  CHANGED_FALLBACK,
   CHANGED_TITLE,
   KEPT_CONVERTED,
   failureGroup,
   failureNote,
   isUnreadable,
-  keptAsConverted,
+  jobStanding,
   setupFix,
   setupProblem,
   skipNote,
   skipSummary,
   unreadableDetail,
   type Failure,
+  type JobStanding,
   type SetupProblem,
 } from "@/lib/outcomes";
 import { overallProgress } from "@/lib/progress";
@@ -270,26 +272,33 @@ export function lowerFirst(text: string): string {
 }
 
 /**
- * The second line of a finished job in a list: what came of it, briefly.
- * Its badge already says "Kept original" or "Skipped", so a skip says why:
- * "6% smaller (needs at least 10%)" (`minSavingsPct` is the
- * library's current minimum, to name the rule). `kept` marks a second
- * conversion that left the converted file as it was (its badge reads
- * "Kept as converted").
+ * The second line of a finished job in a list: what came of it, briefly,
+ * the reason first so a narrow column keeps the useful part. Its badge
+ * already says "Kept original" or "Skipped", so a skip says why: "6%
+ * smaller (needs at least 10%)" (`minSavingsPct` is the library's current
+ * minimum, to name the rule). `standing` (see `jobStanding`) adds what
+ * happened since: "· now converted", "· queued again", or, for a second
+ * conversion a setup problem stopped (its badge reads "Needs a fix"), "·
+ * converted file kept".
  */
-export function historyNote(job: Job, minSavingsPct?: number | null, kept = false): string {
+export function historyNote(job: Job, minSavingsPct?: number | null, standing: JobStanding = "current"): string {
+  const since = standing === "converted" ? " · now converted" : standing === "queued" ? " · queued again" : "";
   switch (job.state) {
     case "done":
       return savingsText(job.input_size, job.output_size)?.text ?? "Converted";
-    case "failed":
-      return kept ? `Converting it again failed: ${lowerFirst(failureNote(job))}` : failureNote(job);
+    case "failed": {
+      const note = failureNote(job);
+      if (standing === "kept") return setupProblem(job) ? `${note} · converted file kept` : note;
+      return `${note}${since}`;
+    }
     case "skipped": {
       const note = skipNote(job.skip_reason, minSavingsPct);
-      if (kept) return note ? `Converting it again wasn't worth it: ${lowerFirst(note)}` : "Converting it again wasn't worth it";
-      return note ?? (job.output_size !== null ? "Kept the original" : "No conversion needed");
+      if (standing === "kept") return note ?? "Not worth converting again";
+      return `${note ?? (job.output_size !== null ? "Kept the original" : "No conversion needed")}${since}`;
     }
     default:
-      return kept ? "Stopped. The converted file is unchanged." : "Stopped. The original was left as it is.";
+      if (standing === "kept") return "Stopped. The converted file is unchanged.";
+      return since ? `Stopped${since}` : "Stopped. The original was left as it is.";
   }
 }
 
@@ -439,11 +448,16 @@ export function CantBeReadCallout({ error }: { error: string | null }) {
 
 /**
  * A setup problem (work folder, destination, disk space, chosen hardware):
- * its cause, the server's sentence, the exact fix and a link to the setting.
+ * its cause as the title, the server's sentence (which names the exact
+ * cause and fix: a folder without write access, a file in the way, a full
+ * disk) and a link to the setting. A generic fix only when there's no
+ * sentence. `kept`: a second conversion it stopped, so the file is still
+ * the converted one.
  */
-function SetupCallout({ kind, error }: { kind: SetupProblem; error: string | null }) {
+function SetupCallout({ kind, error, kept = false }: { kind: SetupProblem; error: string | null; kept?: boolean }) {
   const settings = useSettings();
   const fix = setupFix(kind, settings.data?.output_mode);
+  const text = error?.trim();
   return (
     <Callout
       tone="warning"
@@ -455,18 +469,18 @@ function SetupCallout({ kind, error }: { kind: SetupProblem; error: string | nul
         </a>
       }
     >
-      {error ? <p>{error}</p> : null}
-      <p className={error ? "mt-1.5" : undefined}>
-        {fix.fix} Then try again. The original is untouched.
-      </p>
+      <p>{text || `${fix.fix} Then try again. The original is untouched.`}</p>
+      {kept ? (
+        <p className="mt-1.5">It was a second conversion, so the file stays as it was converted before. Nothing was lost.</p>
+      ) : null}
     </Callout>
   );
 }
 
 /**
  * Why a file or job failed, by cause (see `failureGroup`): a damaged
- * original, a setup problem with its fix, a file that changed meanwhile,
- * or a failed conversion under `title`.
+ * original, a setup problem with its fix, a file moved or replaced
+ * meanwhile, or a failed conversion under `title`.
  */
 export function FailureCallout({ failure, title }: { failure: Failure; title: string }) {
   switch (failureGroup(failure)) {
@@ -478,12 +492,10 @@ export function FailureCallout({ failure, title }: { failure: Failure; title: st
       break;
     }
     case "changed":
+      // The server's sentence says what happened (moved, deleted, replaced).
       return (
         <Callout tone="info" title={CHANGED_TITLE}>
-          <p>
-            It was being copied or replaced at the time, so nothing was replaced. Try again once it has finished
-            changing.
-          </p>
+          <p>{failure.error?.trim() || CHANGED_FALLBACK}</p>
         </Callout>
       );
     default:
@@ -497,8 +509,13 @@ export function FailureCallout({ failure, title }: { failure: Failure; title: st
   );
 }
 
-/** A second conversion that left the already converted file as it was. */
+/**
+ * A second conversion that left the already converted file as it was. One
+ * a setup problem stopped gets that problem's fix and setting instead.
+ */
 function KeptConvertedCallout({ job, minSavingsPct }: { job: Job; minSavingsPct?: number | null }) {
+  const setup = job.state === "failed" ? setupProblem(job) : null;
+  if (setup) return <SetupCallout kind={setup} error={job.error} kept />;
   const note = job.state === "skipped" ? skipNote(job.skip_reason, minSavingsPct) : null;
   const what =
     job.state === "failed"
@@ -516,11 +533,29 @@ function KeptConvertedCallout({ job, minSavingsPct }: { job: Job; minSavingsPct?
   );
 }
 
-function Outcome({ job, kept }: { job: Job; kept: boolean }) {
+/** "The file has been converted since…" / "…queued again": an old outcome the file has moved past. */
+function MovedOnCallout({ job, standing }: { job: Job; standing: "converted" | "queued" }) {
+  const after =
+    standing === "converted"
+      ? "The file has been converted since, so there's nothing to do here."
+      : "The file is queued to be converted again.";
+  return (
+    <Callout tone="info" title={job.state === "failed" ? "This attempt failed" : "Stopped"}>
+      {job.state === "failed" && job.error ? <p>{job.error}</p> : null}
+      <p className={job.state === "failed" && job.error ? "mt-1.5" : undefined}>{after}</p>
+    </Callout>
+  );
+}
+
+function Outcome({ job, standing }: { job: Job; standing: JobStanding }) {
   const settings = useSettings();
   const { library } = useLibrary(job.library_id);
   const forced = useLive((s) => Boolean(s.forced[job.id]));
-  if (kept) return <KeptConvertedCallout job={job} minSavingsPct={library?.profile.min_savings_pct} />;
+  if (standing === "unknown") return <Skeleton className="h-20 w-full rounded-lg" />;
+  if (standing === "kept") return <KeptConvertedCallout job={job} minSavingsPct={library?.profile.min_savings_pct} />;
+  if ((standing === "converted" || standing === "queued") && job.state !== "skipped") {
+    return <MovedOnCallout job={job} standing={standing} />;
+  }
   if (job.state === "failed") return <FailureCallout failure={job} title="This file couldn't be converted" />;
   if (job.state === "skipped") {
     // A new file was made and thrown away (the size rule), or the file never
@@ -529,6 +564,7 @@ function Outcome({ job, kept }: { job: Job; kept: boolean }) {
     return (
       <Callout tone="info" title={summary.title}>
         <p>{summary.body}</p>
+        {standing === "converted" ? <p className="mt-1.5">The file has been converted since.</p> : null}
         {forced ? (
           <p className="mt-1.5">
             Convert anyway didn&apos;t take effect: this server still applied the library&apos;s rules. Update the
@@ -613,23 +649,24 @@ function JobTechnical({ job }: { job: Job }) {
   );
 }
 
-/** Whether this job left an already converted file as it was (see `keptAsConverted`). */
-function useKept(job: Job): boolean {
-  const detail = useFile(job.file_id).data;
-  return keptAsConverted(job, detail);
+/** Where this job stands now (see `jobStanding`), from its file; a file that can't be read leaves the job as it is. */
+function useStanding(job: Job): JobStanding {
+  const file = useFile(job.file_id);
+  if (file.isError && !file.data) return "current";
+  return jobStanding(job, file.data);
 }
 
 function JobSheetBody({ job: baseJob }: { job: Job }) {
   const job = useLiveJob(baseJob);
   const libraries = useLibraries();
   const library = libraries.data?.find((l) => l.id === job.library_id);
-  const kept = useKept(job);
+  const standing = useStanding(job);
   const eta = formatEta(job.eta_secs);
   const overall = jobOverall(job);
   return (
     <>
       <div className="mb-6 flex flex-wrap items-center gap-2">
-        <JobStateBadge job={job} kept={kept} />
+        <JobStateBadge job={job} standing={standing} />
         <span className="text-[0.8125rem] text-muted">
           {job.finished_at
             ? `Finished ${formatRelative(job.finished_at)}`
@@ -650,7 +687,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
         </div>
       ) : null}
 
-      <Outcome job={job} kept={kept} />
+      <Outcome job={job} standing={standing} />
 
       {job.notes && job.notes.length > 0 ? (
         <SheetSection title="What changed">
@@ -812,7 +849,7 @@ function JobSheetActions({ job }: { job: Job }) {
   const { library } = useLibrary(job.library_id);
   // A plain link: the new address has no `?job=`, which closes this sheet.
   const fileLink = href(`/library/${job.library_id}`, { file: job.file_id });
-  const kept = useKept(job);
+  const standing = useStanding(job);
   const unreadable = job.state === "failed" && isUnreadable(job);
   const retryButton = (primary: boolean) => (
     <Button
@@ -826,6 +863,8 @@ function JobSheetActions({ job }: { job: Job }) {
       {job.state === "cancelled" ? "Queue again" : "Try again"}
     </Button>
   );
+  // Until the file is read, only the way to it: a converted file must never be queued again unasked.
+  const current = standing === "current";
   return (
     <>
       <a href={fileLink} className={cn(buttonVariants({ variant: "quiet", size: "sm" }), "mr-auto")}>
@@ -848,8 +887,8 @@ function JobSheetActions({ job }: { job: Job }) {
         </>
       ) : null}
       {job.state === "running" ? <StopJobButton job={job} variant="secondary" label="Stop converting" /> : null}
-      {kept && file ? (
-        // The file is still converted: converting it once more asks first.
+      {(standing === "kept" || standing === "converted") && file?.status === "done" ? (
+        // The file is converted: converting it once more asks first.
         <ConvertAgainAction
           file={file}
           profile={library?.profile}
@@ -857,15 +896,15 @@ function JobSheetActions({ job }: { job: Job }) {
           loading={retry.isPending}
         />
       ) : null}
-      {!kept && job.state === "failed" && unreadable ? (
+      {current && job.state === "failed" && unreadable ? (
         <>
           {retryButton(false)}
           {file?.status === "failed" ? <IgnoreFileButton file={file} /> : null}
         </>
       ) : null}
-      {!kept && job.state === "failed" && !unreadable ? retryButton(true) : null}
-      {!kept && job.state === "cancelled" ? retryButton(false) : null}
-      {!kept && job.state === "skipped" && file && skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null}
+      {current && job.state === "failed" && !unreadable ? retryButton(true) : null}
+      {current && job.state === "cancelled" ? retryButton(false) : null}
+      {current && job.state === "skipped" && file && skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null}
       {job.state === "done" && file ? (
         <ConvertAgainAction
           file={file}
