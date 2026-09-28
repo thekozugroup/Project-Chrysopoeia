@@ -1,0 +1,19 @@
+# Intel (Quick Sync / VA-API) and AMD (VA-API) GPU overlay.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d
+#
+# The host must have /dev/dri (run `ls -l /dev/dri`; you should see
+# renderD128). The container adds itself to the group that owns the render
+# node automatically, so no group_add is needed. If you run the container with
+# `user:` instead of PUID/PGID, add that group yourself:
+#
+#   group_add:
+#     - "105"   # the number shown by: stat -c %g /dev/dri/renderD128
+#
+# Check it worked: the Hardware page in the app lists QSV or VA-API encoders
+# as verified, and `docker exec chrysopoeia vainfo --display drm` prints
+# your GPU's profiles.
+services:
+  chrysopoeia:
+    devices:
+      - /dev/dri:/dev/dri

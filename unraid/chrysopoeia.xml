@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!--
+  Unraid Community Applications template for Chrysopoeia.
+  Setup guide: https://github.com/thekozugroup/Project-Chrysopoeia/blob/main/docs/UNRAID.md
+
+  Notes for maintainers:
+  - There is no TZ entry on purpose: Unraid passes the server's time zone to
+    every container, and a template TZ variable left empty would override it.
+  - Unraid falls back to a Config's Default when its value is empty, so a
+    Device entry can never be "off by default"; the /dev/dri entry must be
+    removed on servers without Intel/AMD graphics.
+-->
+<Container version="2">
+  <Name>Chrysopoeia</Name>
+  <Repository>ghcr.io/thekozugroup/chrysopoeia:latest</Repository>
+  <Registry>https://github.com/thekozugroup/Project-Chrysopoeia/pkgs/container/chrysopoeia</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/thekozugroup/Project-Chrysopoeia/issues</Support>
+  <Project>https://github.com/thekozugroup/Project-Chrysopoeia</Project>
+  <Overview>Chrysopoeia converts your movie and TV library to smaller or more compatible formats (AV1, HEVC, H.264 or VP9) in the background, and replaces an original only after the new file has been fully decoded and visually compared against it. Pick a folder and a goal in the web UI; hardware encoders and the number of jobs to run at once are detected automatically. Intel or AMD graphics: install the Intel GPU TOP or Radeon TOP plugin and keep the /dev/dri device below (remove that entry if your server has no /dev/dri, or the container will not start). NVIDIA: install the Nvidia-Driver plugin, add --runtime=nvidia to Extra Parameters, and set NVIDIA_VISIBLE_DEVICES (under Show more settings) to all or your GPU's UUID.</Overview>
+  <Category>MediaApp:Video Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/chrysopoeia.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/chrysopoeia.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Web UI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Config" Target="/config" Default="/mnt/user/appdata/chrysopoeia" Mode="rw" Description="Database and settings. Small; include it in your appdata backup." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/chrysopoeia</Config>
+  <Config Name="Media" Target="/media" Default="/mnt/user/" Mode="rw" Description="Your media. /mnt/user/ shows every share; narrow it to the share you want converted, e.g. /mnt/user/media/. Chrysopoeia needs write access to replace files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/</Config>
+  <Config Name="Transcode cache" Target="/temp" Default="" Mode="rw" Description="Optional: an SSD/cache-pool folder for in-progress files, e.g. /mnt/cache/chrysopoeia-temp/. Leave empty to write work files next to each original." Type="Path" Display="always" Required="false" Mask="false"/>
+  <Config Name="Intel/AMD GPU" Target="" Default="/dev/dri" Mode="" Description="Intel Quick Sync or AMD graphics for hardware encoding. Remove this entry if your server has no /dev/dri (NVIDIA-only or no GPU), otherwise the container will not start." Type="Device" Display="always" Required="false" Mask="false">/dev/dri</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User id files are written as. Unraid default: 99 (nobody)." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group id files are written as. Unraid default: 100 (users)." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="002" Mode="" Description="Permissions for new files. 002 lets the users group edit them." Type="Variable" Display="advanced" Required="false" Mask="false">002</Config>
+  <Config Name="HW_ACCEL" Target="HW_ACCEL" Default="auto" Mode="" Description="auto uses the best hardware encoder that passes a test encode, else the CPU. Or force one of: cpu, nvenc, qsv, vaapi, amf." Type="Variable" Display="advanced" Required="false" Mask="false">auto</Config>
+  <Config Name="MAX_JOBS" Target="MAX_JOBS" Default="" Mode="" Description="Files to convert at once. Empty = automatic, based on CPU cores, memory and GPU. You can also change this in the app." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="NVIDIA_VISIBLE_DEVICES" Target="NVIDIA_VISIBLE_DEVICES" Default="" Mode="" Description="NVIDIA only: all, or your GPU's UUID from the Nvidia-Driver plugin page. Also add --runtime=nvidia to Extra Parameters." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

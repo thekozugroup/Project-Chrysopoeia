@@ -1,0 +1,21 @@
+# NVIDIA GPU overlay. Needs the NVIDIA driver and the NVIDIA Container
+# Toolkit on the host (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+#
+# Check it worked: the Hardware page in the app lists NVENC encoders as
+# verified, and `docker exec chrysopoeia nvidia-smi` shows your GPU.
+services:
+  chrysopoeia:
+    environment:
+      # "all", or one GPU's UUID from `nvidia-smi -L` to pin a single card.
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      # The image already sets this; repeated here so it survives overrides.
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video, compute, utility]
