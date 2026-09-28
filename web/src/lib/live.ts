@@ -13,7 +13,7 @@
  */
 
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
-import { wsUrl } from "./api";
+import { onReachability, wsUrl } from "./api";
 import { keys } from "./queries";
 import { navigate, parseRoute } from "./router";
 import { useLive } from "./store";
@@ -21,6 +21,9 @@ import type {
   ActivityEntry,
   FileDetail,
   Job,
+  JobListState,
+  JobQuery,
+  JobState,
   Library,
   ListResponse,
   MediaFile,
@@ -30,7 +33,12 @@ import type {
 } from "./types";
 
 const MIN_BACKOFF_MS = 1000;
-const MAX_BACKOFF_MS = 30_000;
+/**
+ * Longest wait between reconnect attempts. Short, because the server is on
+ * the LAN and a restart should be picked up within seconds; a failed attempt
+ * costs one refused connection.
+ */
+export const MAX_BACKOFF_MS = 8000;
 /** How long the socket may be down before polling starts. */
 export const POLL_GRACE_MS = 4000;
 /** How often the live views refresh while polling. */
@@ -83,6 +91,39 @@ function replaceInList<T extends { id: string }>(
   return found ? { ...list, items } : list;
 }
 
+/** Whether a job in `state` belongs in a jobs list filtered by `filter`. */
+export function jobMatchesList(state: JobState, filter: JobListState | undefined): boolean {
+  switch (filter) {
+    case undefined:
+      return true;
+    case "active":
+      return state === "queued" || state === "running";
+    case "running":
+      return state === "running";
+    case "queued":
+      return state === "queued";
+    case "history":
+      return state !== "queued" && state !== "running";
+  }
+}
+
+/**
+ * Patch a jobs list with an updated job: replace it in place, or take it out
+ * when its new state no longer belongs in the list (a finished job leaves
+ * "Converting now" at once instead of lingering at 100% with a Cancel
+ * button until the next refetch). Jobs that newly belong are added by that
+ * refetch, which knows their position.
+ */
+export function patchJobList(
+  list: ListResponse<Job> | undefined,
+  job: Job,
+  filter: JobListState | undefined,
+): ListResponse<Job> | undefined {
+  if (!list || !list.items.some((j) => j.id === job.id)) return list;
+  if (jobMatchesList(job.state, filter)) return replaceInList(list, job);
+  return { ...list, items: list.items.filter((j) => j.id !== job.id), total: Math.max(0, list.total - 1) };
+}
+
 function upsertLibrary(list: Library[] | undefined, library: Library): Library[] | undefined {
   if (!list) return list;
   const index = list.findIndex((l) => l.id === library.id);
@@ -103,7 +144,11 @@ export function applyEvent(client: QueryClient, invalidate: Invalidator, event: 
     case "job.updated": {
       const job: Job = event.job;
       client.setQueryData<Job>(keys.job(job.id), job);
-      client.setQueriesData<ListResponse<Job>>({ queryKey: keys.jobs() }, (old) => replaceInList(old, job));
+      for (const [queryKey, list] of client.getQueriesData<ListResponse<Job>>({ queryKey: keys.jobs() })) {
+        const filter = (queryKey[1] as JobQuery | undefined)?.state;
+        const next = patchJobList(list, job, filter);
+        if (next !== list) client.setQueryData(queryKey, next);
+      }
       client.setQueryData<FileDetail>(keys.file(job.file_id), (old) => {
         if (!old) return old;
         const others = old.jobs.filter((j) => j.id !== job.id);
@@ -332,6 +377,7 @@ export function connectLive(client: QueryClient): () => void {
       attempts = 0;
       failures = 0;
       stopPolling();
+      live.setServerDown(false);
       live.setConnection("open");
       if (everOpened) {
         // Events sent while we were away are lost: refetch everything.
@@ -378,6 +424,14 @@ export function connectLive(client: QueryClient): () => void {
   };
   window.addEventListener("online", onOnline);
   document.addEventListener("visibilitychange", onVisible);
+  // Requests say whether the server is there. When one gets through again
+  // (it restarted), reconnect right away instead of waiting out the backoff.
+  let serverWasDown = false;
+  const stopReachability = onReachability((reachable) => {
+    useLive.getState().setServerDown(!reachable);
+    if (reachable && serverWasDown) reconnectNow();
+    serverWasDown = !reachable;
+  });
 
   open();
 
@@ -388,6 +442,7 @@ export function connectLive(client: QueryClient): () => void {
     stopPolling();
     window.removeEventListener("online", onOnline);
     document.removeEventListener("visibilitychange", onVisible);
+    stopReachability();
     if (socket) {
       retire(socket);
       socket = null;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   codecSpeedHint,
+  cpuOnlyNote,
   encoderCell,
   isDetecting,
   matrixApis,
@@ -56,6 +57,14 @@ describe("isDetecting", () => {
         }),
       ),
     ).toBe(false);
+  });
+
+  it("trusts the server's detecting flag over the look of the report", () => {
+    // Newer servers say so outright; a stand-in without the hint still counts.
+    expect(isDetecting({ ...placeholder, hints: [], detecting: true })).toBe(true);
+    // And a finished detection that happens to find nothing is real.
+    expect(isDetecting({ ...placeholder, detecting: false })).toBe(false);
+    expect(codecSpeedHint({ ...placeholder, detecting: false }, "hevc").tone).toBe("blocked");
   });
 
   it("never reports the stand-in as missing ffmpeg", () => {
@@ -129,5 +138,61 @@ describe("encoder matrix with a GPU present", () => {
     });
     expect(preferenceChoices(broken, "auto", HW_PREFERENCE_API)).toContainEqual({ value: "qsv", disabled: true });
     expect(encoderCell(broken, broken.encoders[1])).toBe("failed");
+  });
+});
+
+describe("goal advice on a CPU-only machine", () => {
+  const cpuOnly = hardware({
+    encoders: [
+      enc("libx264", "h264", "software", true),
+      enc("libx265", "hevc", "software", true),
+      enc("libsvtav1", "av1", "software", true),
+      enc("hevc_nvenc", "hevc", "nvenc", false, "No NVIDIA GPU is visible inside the container."),
+    ],
+  });
+
+  it("recommends Balanced, not the slowest goal", () => {
+    expect(recommendedGoal(cpuOnly)).toBe("balanced");
+    // Before detection has answered, too, so the choice doesn't flip.
+    expect(recommendedGoal(undefined)).toBe("balanced");
+    expect(recommendedGoal(placeholder)).toBe("balanced");
+  });
+
+  it("recommends Save space only when a GPU encodes AV1", () => {
+    const arc = hardware({
+      gpus: [{ vendor: "intel", name: "Intel Arc A380", driver: "i915", render_node: "/dev/dri/renderD128" }],
+      encoders: [enc("libsvtav1", "av1", "software", true), enc("av1_qsv", "av1", "qsv", true)],
+    });
+    expect(recommendedGoal(arc)).toBe("save_space");
+    expect(cpuOnlyNote(arc)).toBeNull();
+  });
+
+  it("says once that the CPU does the work, and compares formats on each choice", () => {
+    expect(cpuOnlyNote(cpuOnly)).toMatch(/No GPU was found/);
+    expect(codecSpeedHint(cpuOnly, "av1")).toEqual({ tone: "cpu", text: "Slowest to convert on the CPU." });
+    expect(codecSpeedHint(cpuOnly, "hevc").tone).toBe("cpu");
+    expect(codecSpeedHint(cpuOnly, "h264").text).toMatch(/^Quickest/);
+    // No card repeats "No GPU found".
+    for (const codec of ["h264", "hevc", "av1"] as const) {
+      expect(codecSpeedHint(cpuOnly, codec).text).not.toMatch(/GPU/);
+    }
+  });
+
+  it("treats a GPU whose encoders all failed, or CPU-only preference, the same way", () => {
+    const broken = hardware({
+      gpus: [{ vendor: "intel", name: "Intel UHD 630", driver: "i915", render_node: "/dev/dri/renderD128" }],
+      encoders: [enc("libx265", "hevc", "software", true), enc("hevc_qsv", "hevc", "qsv", false, "Error creating a MFX session")],
+    });
+    expect(cpuOnlyNote(broken)).toMatch(/Settings › Hardware/);
+    expect(codecSpeedHint(broken, "hevc").tone).toBe("cpu");
+    const nvidia = hardware({
+      gpus: [{ vendor: "nvidia", name: "NVIDIA GeForce RTX 3060", driver: "nvidia", render_node: null }],
+      encoders: [enc("libx265", "hevc", "software", true), enc("hevc_nvenc", "hevc", "nvenc", true)],
+    });
+    expect(cpuOnlyNote(nvidia, "cpu")).toMatch(/CPU only/);
+    expect(codecSpeedHint(nvidia, "hevc", "cpu").tone).toBe("cpu");
+    expect(cpuOnlyNote(nvidia)).toBeNull();
+    expect(cpuOnlyNote(placeholder)).toBeNull();
+    expect(cpuOnlyNote(undefined)).toBeNull();
   });
 });

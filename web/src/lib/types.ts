@@ -144,6 +144,12 @@ export interface HardwareInfo {
   recommended_jobs: JobRecommendation;
   hints: SetupHint[];
   in_container: boolean;
+  /**
+   * True only for the stand-in the server returns while its first detection
+   * runs; the other fields are placeholders until `hardware.updated` arrives.
+   * Older servers leave it out.
+   */
+  detecting?: boolean;
   detected_at: Timestamp;
 }
 
@@ -380,6 +386,12 @@ export interface Job {
   validation: ValidationReport | null;
   command: string | null;
   log_tail: string | null;
+  /**
+   * Plain-language compromises the conversion made, e.g. "Removed 2
+   * picture-based subtitles because MP4 can't hold them". Older servers
+   * leave it out.
+   */
+  notes?: string[];
   created_at: Timestamp;
   started_at: Timestamp | null;
   finished_at: Timestamp | null;
@@ -473,6 +485,23 @@ export interface Overview {
   savings_history: SavingsPoint[];
   projected_savings_bytes: number | null;
   queue: QueueState;
+}
+
+// ---------------------------------------------------------------------------
+// system.rs
+// ---------------------------------------------------------------------------
+
+/** `GET /api/system`: facts about the server the settings screens explain. */
+export interface SystemInfo {
+  version: string;
+  /**
+   * Scratch folder used when `Settings.temp_dir` is unset (`--temp-dir` /
+   * `TEMP_DIR`, e.g. `/temp` in Docker). `null` means next to each file.
+   */
+  default_temp_dir: string | null;
+  browse_roots: string[];
+  data_dir: string;
+  in_container: boolean;
 }
 
 // ---------------------------------------------------------------------------

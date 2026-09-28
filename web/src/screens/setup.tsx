@@ -177,6 +177,10 @@ export function SetupScreen({ settings }: { settings: Settings }) {
                   description: "Files appear in the library as they're found.",
                 });
                 navigate("/", { replace: true });
+                // The app replaces this screen: start it at the top, with
+                // focus on its content rather than lost on the page.
+                window.scrollTo({ top: 0 });
+                requestAnimationFrame(() => document.getElementById("main")?.focus({ preventScroll: true }));
               }}
               secondary={
                 <Button variant="quiet" onClick={() => goTo("folder")}>

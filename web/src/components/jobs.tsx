@@ -5,7 +5,7 @@
  * before/after, verification report, ffmpeg command and log.
  */
 
-import { ArrowRight, Check, CircleSlash, FileVideo, RotateCcw, ArrowUpToLine, X } from "lucide-react";
+import { ArrowRight, Check, CircleSlash, FileVideo, Info, RotateCcw, ArrowUpToLine, SlidersHorizontal, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
@@ -13,6 +13,7 @@ import { Button, buttonVariants } from "@/components/ui/button";
 import { Callout, CodeBlock, Detail, Meter, Skeleton } from "@/components/ui/display";
 import { ConfirmDialog, Sheet } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
+import { convertsAgain } from "@/lib/convertible";
 import {
   formatBytes,
   formatDateTime,
@@ -24,11 +25,11 @@ import {
 } from "@/lib/format";
 import { HW_API_LABEL, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
 import { overallProgress } from "@/lib/progress";
-import { useJob, useLibraries, useSettings } from "@/lib/queries";
+import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
 import { useLiveJob } from "@/lib/store";
-import type { Job, JobStage, ValidationCheck, ValidationReport } from "@/lib/types";
-import { cn } from "@/lib/utils";
+import type { Job, JobStage, MediaFile, TranscodeProfile, ValidationCheck, ValidationReport } from "@/lib/types";
+import { cn, useRetained } from "@/lib/utils";
 
 /** Where a job is in Preparing → Converting → Checking quality → Finishing. */
 function StageSteps({ stage }: { stage: JobStage }) {
@@ -69,7 +70,8 @@ function StageSteps({ stage }: { stage: JobStage }) {
 
 function speedText(job: Job): string | null {
   const parts = [
-    job.fps ? `${Math.round(job.fps)} fps` : null,
+    // Slow CPU encodes run below 10 fps; "0 fps" would read as stuck.
+    job.fps && job.fps >= 0.05 ? `${job.fps >= 10 ? Math.round(job.fps) : job.fps.toFixed(1)} fps` : null,
     job.speed ? `${job.speed >= 10 ? Math.round(job.speed) : job.speed.toFixed(1)}×` : null,
   ].filter(Boolean);
   return parts.length ? parts.join(" · ") : null;
@@ -150,6 +152,7 @@ export function JobCard({
   const speed = speedText(job);
   const stage = JOB_STAGE_LABEL[job.stage];
   const overall = jobOverall(job);
+  const showStage = eta !== null && job.stage !== "transcoding" && job.stage !== "waiting";
 
   useThrottledAnnouncement(
     announce ? `${job.file_name}: ${Math.round(overall)}% done, ${stage.toLowerCase()}${eta ? `, ${eta}` : ""}.` : null,
@@ -186,8 +189,9 @@ export function JobCard({
             <span className="text-muted"> · {eta ?? stage.toLowerCase()}</span>
           </p>
           <p className="text-xs text-muted tabular">
-            {job.stage === "transcoding" ? null : <span>{stageDetail(job)}</span>}
-            {speed ? <span className="font-mono">{job.stage === "transcoding" ? "" : " · "}{speed}</span> : null}
+            {/* Without a time estimate the left side already names the stage. */}
+            {showStage ? <span>{stageDetail(job)}</span> : null}
+            {speed ? <span className="font-mono">{showStage ? " · " : ""}{speed}</span> : null}
           </p>
         </div>
         {job.attempt > 1 ? (
@@ -337,7 +341,7 @@ function Verification({ job }: { job: Job }) {
         <dl className="grid grid-cols-3 divide-x divide-line border-b border-line">
           {metrics.map((m) => (
             <div key={m.label} className="min-w-0 px-3.5 py-2.5">
-              <dt className="truncate text-xs text-muted">{m.label}</dt>
+              <dt className="text-xs leading-snug text-muted">{m.label}</dt>
               <dd
                 className={cn(
                   "mt-0.5 font-mono text-sm font-medium tabular",
@@ -387,9 +391,17 @@ function Outcome({ job }: { job: Job }) {
     );
   }
   if (job.state === "skipped") {
+    // A new file was made and thrown away (the size rule), or the file never
+    // needed work under the library's settings.
+    const keptOriginal = job.output_size !== null;
     return (
-      <Callout tone="info" title="Kept the original">
-        {job.skip_reason ?? "The new file wasn't worth keeping."}
+      <Callout tone="info" title={keptOriginal ? "Kept the original" : "Skipped"}>
+        <p>{job.skip_reason ?? (keptOriginal ? "The new file wasn't worth keeping." : "No conversion needed.")}</p>
+        <p className="mt-1.5">
+          {keptOriginal
+            ? "That follows the library's settings, so converting it again would end the same way. To keep results like this, change the goal or the minimum savings in the library settings."
+            : "That follows the library's settings, so converting it again would end the same way. To convert files like this one, change the goal in the library settings."}
+        </p>
       </Callout>
     );
   }
@@ -448,13 +460,25 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
           <p className="mt-2 text-[0.8125rem] text-muted">
             <span className="font-semibold text-fg tabular">{Math.round(overall)}%</span>
             {eta ? ` · ${eta}` : ""}
-            {job.stage !== "transcoding" ? ` · ${stageDetail(job)}` : ""}
             {speedText(job) ? <span className="font-mono text-xs"> · {speedText(job)}</span> : null}
           </p>
         </div>
       ) : null}
 
       <Outcome job={job} />
+
+      {job.notes && job.notes.length > 0 ? (
+        <SheetSection title="What changed">
+          <ul className="divide-y divide-line overflow-hidden rounded-lg border border-line">
+            {job.notes.map((note, i) => (
+              <li key={`${i}-${note}`} className="flex gap-3 px-3.5 py-3 text-sm leading-snug text-fg">
+                <Info className="mt-0.5 size-4 shrink-0 text-info" aria-hidden />
+                <span className="min-w-0">{note}</span>
+              </li>
+            ))}
+          </ul>
+        </SheetSection>
+      ) : null}
 
       <SheetSection title="Size">
         <BeforeAfter job={job} />
@@ -472,7 +496,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
           </Detail>
           <Detail label="Done by">
             {job.hw_api ? HW_API_LABEL[job.hw_api] : "—"}
-            {job.encoder ? <span className="ml-1.5 font-mono text-xs text-muted">{job.encoder}</span> : null}
+            {job.encoder ? <span className="ml-1.5 font-mono text-xs text-muted"><span className="sr-only">, encoder </span>{job.encoder}</span> : null}
           </Detail>
           {job.attempt > 1 ? <Detail label="Attempts">{job.attempt}</Detail> : null}
           <Detail label="Added">{formatDateTime(job.created_at)}</Detail>
@@ -546,6 +570,61 @@ export function ConvertAgainButton({
   );
 }
 
+/**
+ * "Convert again" for a converted file, when it would do anything: the
+ * worker decides again and skips a file already in the library's format, so
+ * then the way forward is changing the library's goal instead.
+ */
+export function ConvertAgainAction({
+  file,
+  profile,
+  onConfirm,
+  loading,
+  explain = false,
+}: {
+  file: MediaFile;
+  profile: TranscodeProfile | undefined;
+  onConfirm: () => void;
+  loading: boolean;
+  /** Say why there's no "Convert again" (the file sheet); the job sheet stays quiet. */
+  explain?: boolean;
+}) {
+  if (convertsAgain(file, profile)) {
+    return <ConvertAgainButton fileName={file.file_name} onConfirm={onConfirm} loading={loading} />;
+  }
+  if (!explain) return null;
+  return (
+    <>
+      <p className="mr-auto min-w-0 flex-1 basis-48 text-[0.8125rem] leading-snug text-muted">
+        Already in this library&apos;s format. To convert it again, change the library&apos;s goal first.
+      </p>
+      <a
+        href={href(`/library/${file.library_id}/settings`)}
+        className={buttonVariants({ variant: "secondary", size: "sm" })}
+      >
+        <SlidersHorizontal aria-hidden />
+        Library settings
+      </a>
+    </>
+  );
+}
+
+/** "Convert again" in the job sheet, judged against the file as it is now. */
+function JobConvertAgain({ job }: { job: Job }) {
+  const { retry } = useJobActions();
+  const file = useFile(job.file_id);
+  const { library } = useLibrary(job.library_id);
+  if (!file.data) return null;
+  return (
+    <ConvertAgainAction
+      file={file.data.file}
+      profile={library?.profile}
+      onConfirm={() => retry.mutate(job)}
+      loading={retry.isPending}
+    />
+  );
+}
+
 function JobSheetActions({ job }: { job: Job }) {
   const { moveToTop, retry } = useJobActions();
   // A plain link: the new address has no `?job=`, which closes this sheet.
@@ -566,7 +645,7 @@ function JobSheetActions({ job }: { job: Job }) {
         </>
       ) : null}
       {job.state === "running" ? <CancelJobButton job={job} variant="secondary" /> : null}
-      {job.state === "failed" || job.state === "cancelled" || job.state === "skipped" ? (
+      {job.state === "failed" || job.state === "cancelled" ? (
         <Button
           variant={job.state === "failed" ? "primary" : "secondary"}
           size="sm"
@@ -574,19 +653,29 @@ function JobSheetActions({ job }: { job: Job }) {
           loading={retry.isPending}
         >
           <RotateCcw aria-hidden />
-          {job.state === "failed" ? "Try again" : job.state === "skipped" ? "Convert anyway" : "Queue again"}
+          {job.state === "failed" ? "Try again" : "Queue again"}
         </Button>
       ) : null}
-      {job.state === "done" ? (
-        <ConvertAgainButton fileName={job.file_name} onConfirm={() => retry.mutate(job)} loading={retry.isPending} />
+      {job.state === "skipped" ? (
+        // Queueing it again would reach the same verdict; the settings decide.
+        <a
+          href={href(`/library/${job.library_id}/settings`)}
+          className={buttonVariants({ variant: "secondary", size: "sm" })}
+        >
+          <SlidersHorizontal aria-hidden />
+          Library settings
+        </a>
       ) : null}
+      {job.state === "done" ? <JobConvertAgain job={job} /> : null}
     </>
   );
 }
 
 /** Detail sheet for one job, opened from the queue, overview or a file. */
 export function JobSheet({ jobId, onClose }: { jobId: string | null; onClose: () => void }) {
-  const query = useJob(jobId);
+  // Keep showing the last job while the sheet animates closed.
+  const shownId = useRetained(jobId);
+  const query = useJob(shownId, Boolean(jobId));
   const job = query.data;
   return (
     <Sheet

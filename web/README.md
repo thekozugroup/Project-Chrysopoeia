@@ -14,7 +14,8 @@ needs no Node at runtime. Everything talks to `/api` on the same origin; see
 | `pnpm build` | Static export to `web/out` (`out/index.html` plus `_next/` assets) |
 | `pnpm lint` | ESLint |
 | `pnpm typecheck` | `tsc --noEmit` |
-| `pnpm test` | Unit and component tests (Vitest + jsdom): live events, router and navigation guard, profiles, formatting |
+| `pnpm test` | Unit and component tests (Vitest + jsdom): API errors and their `field`, live events and reconnecting, router and navigation guard, profiles, formatting |
+| `pnpm e2e <url>` | Browser smoke test of the first-run flow against a running server with an empty data dir (`e2e/smoke.mjs`, needs Playwright; see the file for options) |
 | `pnpm mock` | Dev-only mock API with fake sample data on http://localhost:8787 |
 
 ## Working on the UI
@@ -39,8 +40,24 @@ NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 
 `scripts/mock-api.mjs` is never imported by the app and is not part of the
-exported bundle. `NEXT_PUBLIC_API_URL` is baked in at build time; production
+exported bundle. It follows the real server's error codes, messages and
+`field`s, and serves `/api/system`, `Job.notes` and `HardwareInfo.detecting`;
+keep it in step when the API changes. `NEXT_PUBLIC_API_URL` is baked in at build time; production
 builds leave it unset so the UI uses the same origin.
+
+## End-to-end smoke test
+
+```sh
+scripts/make-test-media.sh /tmp/media 8          # from the repository root
+target/release/chrysopoeia --port 8080 --data-dir "$(mktemp -d)" \
+  --web-dir web/out --browse-root /tmp/media &
+cd web && pnpm e2e http://127.0.0.1:8080 --folder /tmp/media --screenshots /tmp/smoke
+```
+
+It walks welcome → folder → goal → Start, waits for the scan and the
+conversions, checks that the overview shows the space saved without a
+reload, opens a verified job's checks and the hardware page, and fails on
+page errors or server errors.
 
 ## Layout
 

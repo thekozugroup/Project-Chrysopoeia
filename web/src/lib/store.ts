@@ -21,6 +21,8 @@ interface LiveState {
   connection: ConnectionState;
   /** True while live updates are replaced by refreshing every few seconds. */
   polling: boolean;
+  /** True while requests can't reach the server at all (stopped or restarting). */
+  serverDown: boolean;
   /** Live progress by job id, from `job.progress` events. */
   jobs: Record<string, JobProgress>;
   /** Scan progress by library id, from `scan.progress` events. */
@@ -29,6 +31,7 @@ interface LiveState {
   announcement: string;
   setConnection: (state: ConnectionState) => void;
   setPolling: (polling: boolean) => void;
+  setServerDown: (down: boolean) => void;
   setJobProgress: (progress: JobProgress) => void;
   clearJob: (jobId: string) => void;
   setScan: (scan: ScanProgress) => void;
@@ -41,11 +44,13 @@ interface LiveState {
 export const useLive = create<LiveState>((set) => ({
   connection: "connecting",
   polling: false,
+  serverDown: false,
   jobs: {},
   scans: {},
   announcement: "",
   setConnection: (connection) => set((s) => (s.connection === connection ? s : { connection })),
   setPolling: (polling) => set((s) => (s.polling === polling ? s : { polling })),
+  setServerDown: (serverDown) => set((s) => (s.serverDown === serverDown ? s : { serverDown })),
   setJobProgress: (progress) => set((s) => ({ jobs: { ...s.jobs, [progress.job_id]: progress } })),
   clearJob: (jobId) =>
     set((s) => {

@@ -61,8 +61,12 @@ const JOB_STATE_STYLE: Record<JobState, { tone: Tone; icon: ReactNode }> = {
   cancelled: { tone: "neutral", icon: <Ban aria-hidden /> },
 };
 
-/** Outcome of a job. Done and verified jobs read "Verified". */
-export function JobStateBadge({ job }: { job: Pick<Job, "state" | "stage" | "validation"> }) {
+/**
+ * Outcome of a job. Done and verified jobs read "Verified"; a skipped job
+ * reads "Kept original" when a new file was made and thrown away (the size
+ * rule), and "Skipped" when the file never needed work.
+ */
+export function JobStateBadge({ job }: { job: Pick<Job, "state" | "stage" | "validation" | "output_size"> }) {
   if (job.state === "done" && job.validation?.passed) {
     return (
       <Badge tone="success" icon={<ShieldCheck aria-hidden />}>
@@ -71,7 +75,12 @@ export function JobStateBadge({ job }: { job: Pick<Job, "state" | "stage" | "val
     );
   }
   const style = JOB_STATE_STYLE[job.state];
-  const label = job.state === "running" ? JOB_STAGE_LABEL[job.stage] : JOB_STATE_LABEL[job.state];
+  const label =
+    job.state === "running"
+      ? JOB_STAGE_LABEL[job.stage]
+      : job.state === "skipped" && job.output_size !== null
+        ? "Kept original"
+        : JOB_STATE_LABEL[job.state];
   return (
     <Badge tone={style.tone} icon={style.icon}>
       {label}
@@ -112,7 +121,7 @@ export function EncoderBadge({ api, encoder }: { api: HwApi | null; encoder: str
     >
       {hardware ? <MonitorPlay aria-hidden /> : <Cpu aria-hidden />}
       {text}
-      {encoder ? <span className="sr-only">, encoder {encoder}</span> : null}
+      {encoder ? <span className="sr-only"> (encoder {encoder})</span> : null}
     </span>
   );
   return encoder ? (

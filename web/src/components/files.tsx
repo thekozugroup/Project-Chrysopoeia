@@ -5,14 +5,15 @@
  * (from the probe), and its conversion history.
  */
 
-import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw } from "lucide-react";
+import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw, SlidersHorizontal } from "lucide-react";
 import type { ReactNode } from "react";
-import { ConvertAgainButton, SheetSection, savingsText } from "@/components/jobs";
+import { ConvertAgainAction, SheetSection, savingsText } from "@/components/jobs";
 import { FileStatusBadge, JobStateBadge } from "@/components/status";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Badge, Callout, Detail, Meter, Skeleton } from "@/components/ui/display";
 import { Sheet } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
+import { skipFollowsSettings } from "@/lib/convertible";
 import {
   formatBitrate,
   formatBytes,
@@ -21,11 +22,12 @@ import {
   formatRelative,
   middleTruncate,
 } from "@/lib/format";
-import { channelsLabel, HDR_LABEL, JOB_STAGE_LABEL, languageLabel, sourceCodecLabel } from "@/lib/labels";
-import { useFile } from "@/lib/queries";
-import { openSheet } from "@/lib/router";
+import { channelsLabel, HDR_LABEL, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
+import { useFile, useLibrary } from "@/lib/queries";
+import { href, openSheet } from "@/lib/router";
 import { useFileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo } from "@/lib/types";
+import { cn, useRetained } from "@/lib/utils";
 
 function StreamRow({ icon, title, meta, tags }: { icon: ReactNode; title: ReactNode; meta: ReactNode; tags?: ReactNode }) {
   return (
@@ -65,10 +67,23 @@ function audioMeta(s: StreamInfo): string {
     .join(" · ");
 }
 
+/** "English audio", or just "Audio" when the track has no language tag. */
+export function trackTitle(kind: "audio" | "subtitles", language: string | null, title: string | null): string {
+  const known = language && language.toLowerCase() !== "und" ? languageLabel(language) : null;
+  const noun = known ? `${known} ${kind}` : kind === "audio" ? "Audio" : "Subtitles";
+  return title ? `${noun} · ${title}` : noun;
+}
+
 function Streams({ detail }: { detail: FileDetail }) {
   const probe = detail.file.probe;
   if (!probe) {
-    return <p className="text-sm text-muted">This file hasn&apos;t been analysed yet.</p>;
+    return (
+      <p className="text-sm text-muted">
+        {detail.file.status === "failed"
+          ? "No tracks could be read from this file."
+          : "This file hasn't been analysed yet."}
+      </p>
+    );
   }
   const video = probe.streams.filter((s) => s.kind === "video" && !s.is_attached_pic);
   const audio = probe.streams.filter((s) => s.kind === "audio");
@@ -95,7 +110,7 @@ function Streams({ detail }: { detail: FileDetail }) {
           <StreamRow
             key={s.index}
             icon={<AudioLines aria-hidden />}
-            title={`${languageLabel(s.language)} audio${s.title ? ` · ${s.title}` : ""}`}
+            title={trackTitle("audio", s.language, s.title)}
             meta={audioMeta(s)}
             tags={s.is_default ? <Badge>Default</Badge> : null}
           />
@@ -104,7 +119,7 @@ function Streams({ detail }: { detail: FileDetail }) {
           <StreamRow
             key={s.index}
             icon={<Captions aria-hidden />}
-            title={`${languageLabel(s.language)} subtitles${s.title ? ` · ${s.title}` : ""}`}
+            title={trackTitle("subtitles", s.language, s.title)}
             meta={`${s.codec} · ${sourceCodecLabel(s.codec)}`}
             tags={
               <>
@@ -138,9 +153,19 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
     );
   }
   if (file.status === "skipped") {
+    // "Kept original" only when a new file was made and thrown away (the
+    // size rule); everything else never needed work.
+    const latest = jobs[0];
+    const keptOriginal = latest?.state === "skipped" && latest.output_size !== null;
     return (
-      <Callout tone="info" title="Left as it is">
-        {file.skip_reason ?? "No conversion needed."}
+      <Callout tone="info" title={keptOriginal ? "Kept the original" : "Skipped"}>
+        <p>{file.skip_reason ?? "No conversion needed."}</p>
+        {skipFollowsSettings(file) ? (
+          <p className="mt-1.5">
+            That follows this library&apos;s settings. To convert files like this one, change its goal or advanced
+            options in the library settings.
+          </p>
+        ) : null}
       </Callout>
     );
   }
@@ -181,20 +206,33 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
 
 function FileActions({ file }: { file: MediaFile }) {
   const { queue, skip } = useFileActions();
+  const { library } = useLibrary(file.library_id);
   const canQueue = file.status !== "queued" && file.status !== "processing";
   const canSkip = file.status === "pending" || file.status === "queued" || file.status === "failed";
   if (file.status === "done") {
-    // Already converted: re-converting is a second lossy pass, so it is a
-    // quiet, confirmed action rather than the primary one.
     return (
-      <ConvertAgainButton
-        fileName={file.file_name}
+      <ConvertAgainAction
+        file={file}
+        profile={library?.profile}
         onConfirm={() => queue.mutate({ file })}
         loading={queue.isPending}
+        explain
       />
     );
   }
-  const queueLabel = file.status === "failed" ? "Try again" : file.status === "skipped" ? "Convert anyway" : "Convert";
+  if (file.status === "skipped" && !skippedByUser(file.skip_reason)) {
+    // Queueing it again would reach the same verdict; the settings decide.
+    return skipFollowsSettings(file) ? (
+      <a
+        href={href(`/library/${file.library_id}/settings`)}
+        className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "ml-auto")}
+      >
+        <SlidersHorizontal aria-hidden />
+        Library settings
+      </a>
+    ) : null;
+  }
+  const queueLabel = file.status === "failed" ? "Try again" : "Convert";
   return (
     <>
       {canSkip ? (
@@ -232,7 +270,9 @@ function SheetStatus({ file }: { file: MediaFile }) {
 
 /** Detail sheet for one file. */
 export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose: () => void }) {
-  const query = useFile(fileId);
+  // Keep showing the last file while the sheet animates closed.
+  const shownId = useRetained(fileId);
+  const query = useFile(shownId, Boolean(fileId));
   const detail = query.data;
   const file = detail?.file;
   return (

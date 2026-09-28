@@ -17,6 +17,7 @@ import { JobStateBadge } from "@/components/status";
 import { buttonVariants } from "@/components/ui/button";
 import { Callout, EmptyState, SectionHeading, Skeleton } from "@/components/ui/display";
 import { errorMessage } from "@/lib/api";
+import { stillCopyingCount } from "@/lib/convertible";
 import { formatBytes, formatCount, formatPercent, formatRelative, plural, splitBytes } from "@/lib/format";
 import { sourceCodecLabel } from "@/lib/labels";
 import {
@@ -134,7 +135,14 @@ function NowConverting() {
 
   let empty: ReactNode = null;
   if (jobs.length === 0 && queue) {
-    if (queue.paused) {
+    if (queue.running > 0) {
+      // A job just started; its card arrives with the next list refresh.
+      empty = (
+        <div className="grid gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
+          <JobCardSkeleton />
+        </div>
+      );
+    } else if (queue.paused) {
       empty = (
         <EmptyState title="Paused" action={<QueueControls queue={queue} />}>
           {queue.queued
@@ -210,6 +218,8 @@ function NowConverting() {
 
 export function LibraryRow({ library }: { library: Library }) {
   const scan = useLive((s) => s.scans[library.id]);
+  const activity = useActivity();
+  const copying = stillCopyingCount(activity.data?.items, library.id);
   const stats = library.stats;
   const scanning = library.scanning || (scan && scan.phase !== "done");
   const left = remainingCount(stats);
@@ -230,7 +240,7 @@ export function LibraryRow({ library }: { library: Library }) {
       </span>
     );
   } else if (stats.file_count === 0) {
-    status = "No video files found";
+    status = copying > 0 ? `Waiting for ${plural(copying, "file")} to finish copying` : "No videos found yet";
   } else if (left > 0) {
     status = `${plural(left, "file")} to go`;
   } else if (stats.failed > 0) {
@@ -360,7 +370,7 @@ function RecentResults() {
                 : job.state === "failed"
                   ? (job.error ?? "Failed")
                   : job.state === "skipped"
-                    ? (job.skip_reason ?? "Kept the original")
+                    ? (job.skip_reason ?? (job.output_size !== null ? "Kept the original" : "No conversion needed"))
                     : "Cancelled";
             return (
               <li key={job.id}>

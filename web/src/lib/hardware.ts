@@ -36,11 +36,50 @@ function hardwareEncoder(hw: HardwareInfo, codec: VideoCodec, preference: HwPref
   );
 }
 
-export type SpeedTone = "fast" | "slow" | "blocked";
+/**
+ * `fast`: a GPU encodes it. `cpu`: the CPU does all the work anyway, so the
+ * text only compares formats. `slow`: a GPU is used for other formats but
+ * not this one. `blocked`: can't be encoded at all.
+ */
+export type SpeedTone = "fast" | "cpu" | "slow" | "blocked";
 
 export interface SpeedHint {
   tone: SpeedTone;
   text: string;
+}
+
+/**
+ * How long each format takes on the CPU with the encoders Chrysopoeia uses
+ * (x264, x265, libvpx-vp9, SVT-AV1), fastest first.
+ */
+const CPU_SPEED_TEXT: Record<VideoCodec, string> = {
+  h264: "Quickest to convert on the CPU.",
+  hevc: "Medium speed on the CPU.",
+  vp9: "Slow to convert on the CPU.",
+  av1: "Slowest to convert on the CPU.",
+};
+
+/**
+ * Whether the CPU does every conversion: set to CPU only, or no hardware
+ * encoder passed its test. Then speed is a comparison between formats.
+ */
+export function cpuDoesAllWork(hw: HardwareInfo, preference: HwPreference = "auto"): boolean {
+  if (isDetecting(hw) || !hw.ffmpeg.found) return false;
+  if (preference === "cpu") return true;
+  return !hw.encoders.some(
+    (e) => e.verified && e.api !== "software" && (preference === "auto" || e.api === preference),
+  );
+}
+
+/**
+ * One sentence for above the goal choices when the CPU does every
+ * conversion, so each choice can just compare speeds. `null` otherwise.
+ */
+export function cpuOnlyNote(hw: HardwareInfo | undefined, preference: HwPreference = "auto"): string | null {
+  if (!hw || !cpuDoesAllWork(hw, preference)) return null;
+  if (preference === "cpu") return "Set to use the CPU only, so the CPU does all the converting.";
+  if (hw.gpus.length === 0) return "No GPU was found, so the CPU does the converting. That works well; it just takes longer.";
+  return "Your GPU can't convert video here yet, so the CPU does the work. Settings › Hardware explains how to fix that.";
 }
 
 /** How quickly this machine can produce a codec, in one sentence. */
@@ -64,11 +103,10 @@ export function codecSpeedHint(
   if (!software) {
     return { tone: "blocked", text: `This ffmpeg build can't encode ${label}.` };
   }
-  if (preference === "cpu") {
-    return { tone: "slow", text: `Set to CPU only, and ${label} on the CPU is slower.` };
-  }
-  if (hw.gpus.length === 0) {
-    return { tone: "slow", text: `No GPU found. ${label} on the CPU is slower.` };
+  if (cpuDoesAllWork(hw, preference)) {
+    // Every format runs on the CPU here, so compare them rather than repeat
+    // "slower" on each (see `cpuOnlyNote`).
+    return { tone: "cpu", text: CPU_SPEED_TEXT[codec] };
   }
   return { tone: "slow", text: `Your GPU can't encode ${label}. The CPU will, which is slower.` };
 }
@@ -83,12 +121,15 @@ export function hasAnyHardware(hw: HardwareInfo): boolean {
   return hw.encoders.some((e) => e.verified && e.api !== "software");
 }
 
-/** The goal that suits this machine best. */
+/**
+ * The goal that suits this machine best: Save space (AV1) when a GPU encodes
+ * AV1, otherwise Balanced (HEVC), which a GPU encodes quickly or, on the CPU,
+ * finishes much sooner than AV1 (the hardware page's own advice). Balanced
+ * is also the answer until detection has finished.
+ */
 export function recommendedGoal(hw: HardwareInfo | undefined): Exclude<Goal, "custom"> {
-  if (!hw) return "save_space";
-  if (hasHardwareEncoder(hw, "av1")) return "save_space";
-  if (hasHardwareEncoder(hw, "hevc")) return "balanced";
-  return "save_space";
+  if (hw && !isDetecting(hw) && hasHardwareEncoder(hw, "av1")) return "save_space";
+  return "balanced";
 }
 
 /** Start of the hint title the server shows while its first detection runs. */
@@ -96,11 +137,14 @@ const DETECTING_HINT = "Checking your hardware";
 
 /**
  * Whether this report is the server's stand-in while the first detection is
- * still running (HTTP 200 with no encoders and a "Checking…" hint), rather
- * than real results. It must never be shown as "ffmpeg wasn't found".
+ * still running, rather than real results. It must never be shown as
+ * "ffmpeg wasn't found". The server says so with `detecting`; servers from
+ * before that flag are recognised by their stand-in (no encoders and a
+ * "Checking…" hint).
  */
 export function isDetecting(hw: HardwareInfo | undefined): boolean {
   if (!hw) return false;
+  if (typeof hw.detecting === "boolean") return hw.detecting;
   return hw.encoders.length === 0 && hw.hints.some((h) => h.title.startsWith(DETECTING_HINT));
 }
 

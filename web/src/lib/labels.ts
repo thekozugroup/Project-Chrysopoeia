@@ -36,7 +36,7 @@ export const FILE_STATUS_HELP: Record<FileStatus, string> = {
   queued: "Waiting in the queue.",
   processing: "Being converted right now.",
   done: "Converted and verified.",
-  skipped: "Left as it is. The reason is shown with the file.",
+  skipped: "Not converted, on purpose. The reason is shown with the file.",
   failed: "The last attempt failed. The original is untouched.",
 };
 
@@ -44,7 +44,7 @@ export const JOB_STATE_LABEL: Record<JobState, string> = {
   queued: "In queue",
   running: "Converting",
   done: "Done",
-  skipped: "Kept original",
+  skipped: "Skipped",
   failed: "Failed",
   cancelled: "Cancelled",
 };
@@ -357,4 +357,14 @@ const LANGUAGE_NAMES: Record<string, string> = {
 export function languageLabel(code: string | null | undefined): string {
   if (!code) return "No language";
   return LANGUAGE_NAMES[code.toLowerCase()] ?? code;
+}
+
+/**
+ * Whether a skip was the user's own choice ("Skipped by you"). Queueing such
+ * a file converts it. Every other skip follows the library's settings (already
+ * efficient, not enough smaller, audio only), and the worker would reach the
+ * same verdict again, so offering "Convert anyway" would do nothing.
+ */
+export function skippedByUser(reason: string | null | undefined): boolean {
+  return /^skipped by you\b/i.test(reason?.trim() ?? "");
 }

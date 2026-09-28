@@ -10,8 +10,10 @@ import { ChevronDown } from "lucide-react";
 import { createContext, useContext, useId, type ComponentProps, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
+// The border is what shows a field's edge (its fill is close to the page), so
+// it is full strength: 3:1 or more against both surfaces (WCAG 1.4.11).
 const fieldBase =
-  "w-full rounded-md border border-line-strong/70 bg-surface text-fg shadow-card transition-[border-color,box-shadow] duration-150 hover:border-line-strong focus-visible:border-accent-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-ink/40 disabled:cursor-not-allowed disabled:opacity-60 aria-invalid:border-danger aria-invalid:ring-2 aria-invalid:ring-danger/25";
+  "w-full rounded-md border border-line-strong bg-surface text-fg shadow-card transition-[border-color,box-shadow] duration-150 hover:border-muted focus-visible:border-accent-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-ink/40 disabled:cursor-not-allowed disabled:opacity-60 aria-invalid:border-danger aria-invalid:ring-2 aria-invalid:ring-danger/25";
 
 /** Single-line text input. */
 export function Input({ className, ...props }: ComponentProps<"input">) {

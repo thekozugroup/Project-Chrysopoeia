@@ -174,6 +174,19 @@ export function plural(n: number, singular: string, pluralForm = `${singular}s`)
   return `${formatCount(n)} ${n === 1 ? singular : pluralForm}`;
 }
 
+/**
+ * The first line of `ffmpeg -version` without its copyright notice:
+ * `ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers`
+ * → `ffmpeg 6.1.1-3ubuntu5`.
+ */
+export function ffmpegVersionLabel(line: string | null | undefined): string {
+  const text = (line ?? "").trim();
+  if (!text) return "Version unknown";
+  const match = /^ffmpeg version\s+(\S+)/i.exec(text);
+  if (match) return `ffmpeg ${match[1]}`;
+  return text.replace(/\s+Copyright\b.*$/i, "");
+}
+
 /** Shorten a long file name in the middle, keeping the extension visible. */
 export function middleTruncate(text: string, max = 48): string {
   if (text.length <= max) return text;

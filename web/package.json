@@ -8,6 +8,7 @@
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "e2e": "node e2e/smoke.mjs",
     "mock": "node scripts/mock-api.mjs"
   },
   "dependencies": {

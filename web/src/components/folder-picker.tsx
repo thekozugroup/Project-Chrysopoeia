@@ -22,11 +22,21 @@ interface Crumb {
   path: string;
 }
 
+/**
+ * The browse root a folder lives under: the longest root that is the folder
+ * itself or one of its parents (`/media` holds `/media/tv`, not `/media2`).
+ */
+export function rootOf(path: string, roots: string[]): string | null {
+  return (
+    [...roots]
+      .sort((a, b) => b.length - a.length)
+      .find((r) => path === r || path.startsWith(r.endsWith("/") ? r : `${r}/`)) ?? null
+  );
+}
+
 /** Breadcrumbs from the root that contains `path` down to `path`. */
 function crumbsFor(data: FsBrowse): Crumb[] {
-  const root =
-    [...data.roots].sort((a, b) => b.length - a.length).find((r) => data.path === r || data.path.startsWith(r.endsWith("/") ? r : `${r}/`)) ??
-    "/";
+  const root = rootOf(data.path, data.roots) ?? "/";
   const crumbs: Crumb[] = [{ label: root === "/" ? "Server" : root, path: root }];
   const rest = data.path.slice(root.length).split("/").filter(Boolean);
   let current = root.replace(/\/$/, "");
@@ -65,6 +75,7 @@ export function FolderPicker({
   const [showTyped, setShowTyped] = useState(false);
   const [focusIndex, setFocusIndex] = useState(0);
   const listRef = useRef<HTMLUListElement>(null);
+  const emptyRef = useRef<HTMLDivElement>(null);
   const shouldFocusList = useRef(false);
   const browse = useBrowse(path);
   // While a new folder loads, the previous listing stays on screen
@@ -85,18 +96,20 @@ export function FolderPicker({
     if (next) onNavigate?.(next);
   };
 
-  // After navigating with the keyboard, keep focus in the list.
+  // After navigating with the keyboard, keep focus in the list, or on the
+  // "No folders inside" note (where Backspace still goes up) when it's empty.
   useEffect(() => {
     if (!shouldFocusList.current || browse.isFetching || !data) return;
     shouldFocusList.current = false;
     const first = listRef.current?.querySelector<HTMLButtonElement>("button[data-index='0']");
-    first?.focus();
+    if (first) first.focus();
+    else emptyRef.current?.focus();
   }, [browse.isFetching, data]);
 
   const entries = data?.entries.filter((e) => e.is_dir) ?? [];
   const parent = shown?.parent ?? null;
 
-  const onKeyDown = (event: KeyboardEvent<HTMLUListElement>) => {
+  const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     const count = entries.length;
     const move = (index: number) => {
       const next = Math.max(0, Math.min(count - 1, index));
@@ -216,20 +229,24 @@ export function FolderPicker({
       ) : null}
 
       {shown && shown.roots.length > 1 ? (
-        <div className="flex flex-wrap gap-1.5 border-b border-line px-3 py-2" aria-label="Allowed folders">
-          {shown.roots.map((root) => (
-            <button
-              key={root}
-              type="button"
-              onClick={() => go(root, false)}
-              className={cn(
-                "rounded-full border px-2.5 py-0.5 font-mono text-xs",
-                current.startsWith(root) ? "border-accent-ink/50 text-accent-ink" : "border-line text-muted hover:text-fg",
-              )}
-            >
-              {root}
-            </button>
-          ))}
+        <div className="flex flex-wrap gap-1.5 border-b border-line px-3 py-2" role="group" aria-label="Allowed folders">
+          {shown.roots.map((root) => {
+            const active = rootOf(current, shown.roots) === root;
+            return (
+              <button
+                key={root}
+                type="button"
+                aria-pressed={active}
+                onClick={() => go(root, false)}
+                className={cn(
+                  "rounded-full border px-2.5 py-0.5 font-mono text-xs",
+                  active ? "border-accent-ink/50 text-accent-ink" : "border-line text-muted hover:text-fg",
+                )}
+              >
+                {root}
+              </button>
+            );
+          })}
         </div>
       ) : null}
 
@@ -265,7 +282,12 @@ export function FolderPicker({
             </Callout>
           </div>
         ) : entries.length === 0 ? (
-          <div className="flex h-full min-h-56 flex-col items-center justify-center gap-1 px-6 text-center">
+          <div
+            ref={emptyRef}
+            tabIndex={-1}
+            onKeyDown={onKeyDown}
+            className="flex h-full min-h-56 flex-col items-center justify-center gap-1 px-6 text-center outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-ink"
+          >
             <FolderOpen className="size-6 text-muted" aria-hidden />
             <p className="text-sm font-medium text-fg">No folders inside</p>
             <p className="text-[0.8125rem] text-muted">You can still use this folder.</p>
@@ -293,7 +315,7 @@ export function FolderPicker({
                   <Folder className="size-[1.125rem] shrink-0 text-accent-ink" aria-hidden />
                   <span className="min-w-0 flex-1 truncate text-fg">{entry.name}</span>
                   {entry.media_count ? (
-                    <span className="shrink-0 text-xs text-muted tabular">{plural(entry.media_count, "video")}</span>
+                    <span className="shrink-0 text-xs text-muted tabular">{plural(entry.media_count, "media file")}</span>
                   ) : null}
                   <ChevronRight className="size-4 shrink-0 text-muted" aria-hidden />
                 </button>

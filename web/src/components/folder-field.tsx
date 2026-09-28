@@ -34,7 +34,7 @@ export function FolderField({
       <div
         className={cn(
           "flex items-center gap-3 rounded-md border bg-surface py-1.5 pr-1.5 pl-3",
-          error ? "border-danger ring-2 ring-danger/25" : "border-line-strong/70",
+          error ? "border-danger ring-2 ring-danger/25" : "border-line-strong",
         )}
       >
         <Folder className="size-4 shrink-0 text-accent-ink" aria-hidden />

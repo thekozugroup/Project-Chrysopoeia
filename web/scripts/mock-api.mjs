@@ -14,8 +14,10 @@
  *   MOCK_WS=on              "off" refuses WebSocket upgrades, like a reverse proxy
  *                           without WebSocket support
  *
- * Error codes and messages follow the real server's, so the UI's error
- * handling is exercised the same way.
+ * Error codes, messages and the `field` of validation errors follow the
+ * real server (crates/chrysopoeia-server), so the UI's error handling is
+ * exercised the same way. Also served: `GET /api/system`, `Job.notes` and
+ * `HardwareInfo.detecting` (docs/ARCHITECTURE.md, "Contract additions").
  */
 
 import { randomUUID } from "node:crypto";
@@ -175,6 +177,7 @@ function makeHardware() {
           },
         ],
     in_container: true,
+    detecting: false,
     detected_at: iso(Date.now() - 3 * 3600 * 1000),
   };
 }
@@ -201,6 +204,7 @@ function detectingPlaceholder() {
       },
     ],
     in_container: true,
+    detecting: true,
     detected_at: iso(STARTED),
   };
 }
@@ -434,6 +438,7 @@ function makeJob(file, state, extra = {}) {
     validation: null,
     command: state === "queued" ? null : commandFor(file, encoder),
     log_tail: null,
+    notes: [],
     created_at: ago(between(600, 86400)),
     started_at: null,
     finished_at: null,
@@ -476,6 +481,19 @@ function makeFile(library, relative, opts) {
   return file;
 }
 
+/**
+ * Plain-language compromises a conversion made (the worker's
+ * `JobOutcome::Done.notes`), for a stable subset of files.
+ */
+function notesFor(file) {
+  const library = libraries.get(file.library_id);
+  if (file.file_name.length % 4 !== 0) return [];
+  if (library?.profile.container === "mp4") {
+    return ["Removed 2 picture-based subtitles because MP4 can't hold them"];
+  }
+  return ["Converted the MOV text subtitle to SRT so MKV can hold it"];
+}
+
 function markDone(file, ratio, finishedSecsAgo) {
   const original = file.size_bytes;
   const out = Math.round(original * ratio);
@@ -491,6 +509,7 @@ function markDone(file, ratio, finishedSecsAgo) {
     input_size: original,
     output_size: out,
     validation: validationReport(),
+    notes: notesFor(file),
     started_at: iso(finished - between(900, 3600) * 1000),
     finished_at: iso(finished),
   });
@@ -639,7 +658,7 @@ function seedDemo() {
   makeJob(cancelled, "cancelled", { stage: "transcoding", progress: 31, started_at: ago(20000), finished_at: ago(19000) });
   const skippedFile = pendingMovies[3];
   skippedFile.status = "skipped";
-  skippedFile.skip_reason = "Only 4% smaller, so the original was kept";
+  skippedFile.skip_reason = "Only 4% smaller — kept the original";
   makeJob(skippedFile, "skipped", {
     stage: "transcoding",
     progress: 100,
@@ -790,6 +809,35 @@ function queueFile(file, priority = 0) {
   return job;
 }
 
+const EFFICIENCY = { av1: 4, hevc: 3, h265: 3, vp9: 3, h264: 2, vp8: 2 };
+const TARGET_NAME = { av1: "AV1", hevc: "HEVC", h264: "H.264", vp9: "VP9" };
+
+/**
+ * The worker's own check when a job starts (`decide` in the worker): files
+ * the library's settings leave alone are skipped straight away, even when
+ * they were queued by hand. Returns the reason, or null to convert.
+ */
+function skipReasonFor(file, lib) {
+  if (!file.video_codec) return "Audio-only file — nothing to convert";
+  const profile = lib.profile;
+  const source = EFFICIENCY[file.video_codec] ?? 1;
+  const target = EFFICIENCY[profile.video_codec] ?? 3;
+  if (profile.skip_efficient && source >= target) {
+    const name = TARGET_NAME[file.video_codec] ?? file.video_codec.toUpperCase();
+    if (file.video_codec === profile.video_codec) return `Already ${name}`;
+    return `Already ${name}, which is ${source > target ? "more" : "as"} efficient ${source > target ? "than" : "as"} ${TARGET_NAME[profile.video_codec]}`;
+  }
+  return null;
+}
+
+function skipAtStart(job, file, reason) {
+  const now = iso(Date.now());
+  Object.assign(job, { state: "skipped", stage: "preparing", progress: 0, skip_reason: reason, started_at: now, finished_at: now });
+  Object.assign(file, { status: "skipped", skip_reason: reason, progress: null, updated_at: now });
+  broadcast({ type: "job.updated", job });
+  broadcast({ type: "file.updated", file: listFile(file) });
+}
+
 function startJobs() {
   if (paused || !inActiveHours()) return;
   const running = [...jobs.values()].filter((j) => j.state === "running").length;
@@ -803,6 +851,13 @@ function startJobs() {
     const file = files.get(job.file_id);
     const lib = libraries.get(job.library_id);
     if (!file || !lib) continue;
+    const reason = skipReasonFor(file, lib);
+    if (reason) {
+      skipAtStart(job, file, reason);
+      emitLibrary(lib);
+      emitStats();
+      continue;
+    }
     const { encoder, hw_api } = encoderFor(lib);
     Object.assign(job, { state: "running", stage: "preparing", progress: 0, encoder, hw_api, started_at: iso(Date.now()), command: commandFor(file, encoder) });
     file.status = "processing";
@@ -828,6 +883,7 @@ function finishJob(job) {
     eta_secs: null,
     output_size: out,
     validation: validationReport(),
+    notes: file ? notesFor(file) : [],
     finished_at: iso(Date.now()),
   });
   if (file) {
@@ -954,10 +1010,11 @@ function simulateScan(library, generate) {
 // ---------------------------------------------------------------------------
 
 class HttpError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, field = null) {
     super(message);
     this.status = status;
     this.code = code;
+    this.field = field;
   }
 }
 
@@ -985,17 +1042,17 @@ async function readBody(req) {
 
 function getFile(id) {
   const file = files.get(id);
-  if (!file) throw new HttpError(404, "file_not_found", "That file isn't in any library anymore.");
+  if (!file) throw new HttpError(404, "file_not_found", "There's no file with that id.");
   return file;
 }
 function getJob(id) {
   const job = jobs.get(id);
-  if (!job) throw new HttpError(404, "job_not_found", "That job no longer exists.");
+  if (!job) throw new HttpError(404, "job_not_found", "There's no job with that id.");
   return job;
 }
 function getLibrary(id) {
   const lib = libraries.get(id);
-  if (!lib) throw new HttpError(404, "library_not_found", "That library no longer exists.");
+  if (!lib) throw new HttpError(404, "library_not_found", "There's no library with that id.");
   return lib;
 }
 
@@ -1031,13 +1088,35 @@ route("GET", "/api/libraries/:id", ({ id }) => libraryView(getLibrary(id)));
 
 route("POST", "/api/libraries", async (_p, _q, req) => {
   const body = await readBody(req);
-  const path = String(body.path ?? "").replace(/\/+$/, "") || "/";
-  if (!(path in FS)) throw new HttpError(400, "path_not_found", `The folder ${path} doesn't exist inside the container.`);
+  const raw = String(body.path ?? "").trim();
+  if (!raw) throw new HttpError(400, "path_required", "Choose a folder for the library.");
+  if (!raw.startsWith("/")) throw new HttpError(400, "path_not_absolute", "Use the folder's full path, starting with /.");
+  const path = raw.replace(/\/+$/, "") || "/";
+  if (!(path in FS))
+    throw new HttpError(
+      400,
+      "path_not_found",
+      `The folder ${raw} doesn't exist on the server. In Docker, check that it is mounted into the container.`,
+    );
+  if (settings.output_mode === "folder" && settings.output_folder && (settings.output_folder === path || settings.output_folder.startsWith(`${path}/`)))
+    throw new HttpError(
+      400,
+      "contains_output_folder",
+      "The output folder is inside this folder, so Chrysopoeia would convert its own results. Pick another folder, or change the output folder in Settings.",
+    );
   for (const lib of libraries.values()) {
-    if (lib.path === path) throw new HttpError(409, "library_exists", `${lib.name} already uses this folder.`);
-    if (path.startsWith(lib.path + "/") || lib.path.startsWith(path + "/"))
-      throw new HttpError(409, "library_overlaps", `This folder overlaps with ${lib.name} (${lib.path}). Choose a folder that isn't inside another library.`);
+    if (lib.path === path) throw new HttpError(409, "library_exists", `That folder is already the library ${lib.name}.`);
+    if (path.startsWith(lib.path + "/"))
+      throw new HttpError(409, "library_overlaps", `That folder is inside ${lib.name}, which is already a library.`);
+    if (lib.path.startsWith(path + "/"))
+      throw new HttpError(
+        409,
+        "library_overlaps",
+        `That folder contains the library ${lib.name}. Pick a different folder, or remove ${lib.name} first.`,
+      );
   }
+  if (typeof body.name === "string" && body.name.trim().length > 100)
+    throw new HttpError(400, "invalid_name", "Library names can be at most 100 characters.", "name");
   const goal = body.goal ?? body.profile?.goal ?? "save_space";
   const library = {
     id: uuid(),
@@ -1061,7 +1140,9 @@ route("PATCH", "/api/libraries/:id", async ({ id }, _q, req) => {
   const lib = getLibrary(id);
   const body = await readBody(req);
   if (typeof body.name === "string") {
-    if (!body.name.trim()) throw new HttpError(400, "invalid_name", "Give the library a name.");
+    if (!body.name.trim()) throw new HttpError(400, "invalid_name", "Give the library a name.", "name");
+    if (body.name.trim().length > 100)
+      throw new HttpError(400, "invalid_name", "Library names can be at most 100 characters.", "name");
     lib.name = body.name.trim();
   }
   if (typeof body.enabled === "boolean") lib.enabled = body.enabled;
@@ -1083,7 +1164,8 @@ route("DELETE", "/api/libraries/:id", ({ id }) => {
 
 route("POST", "/api/libraries/:id/scan", ({ id }) => {
   const lib = getLibrary(id);
-  if (!simulateScan(lib, false)) throw new HttpError(409, "scan_running", `${lib.name} is already being scanned.`);
+  if (!lib.enabled) throw new HttpError(409, "library_disabled", "This library is turned off. Turn it on to scan it.");
+  if (!simulateScan(lib, false)) throw new HttpError(409, "scan_running", "This library is already being scanned.");
   return [202, { started: true }];
 });
 route("POST", "/api/scan", () => {
@@ -1115,7 +1197,7 @@ route("POST", "/api/files/:id/queue", async ({ id }, _q, req) => {
   const file = getFile(id);
   const body = await readBody(req);
   if (file.status === "queued" || file.status === "processing")
-    throw new HttpError(409, "already_queued", `${file.file_name} is already in the queue.`);
+    throw new HttpError(409, "already_queued", "This file is already in the queue.");
   const job = queueFile(file, Number(body.priority ?? 0));
   broadcast({ type: "file.updated", file: listFile(file) });
   broadcast({ type: "job.updated", job });
@@ -1126,8 +1208,13 @@ route("POST", "/api/files/:id/queue", async ({ id }, _q, req) => {
 
 route("POST", "/api/files/:id/skip", ({ id }) => {
   const file = getFile(id);
-  if (file.status === "processing") throw new HttpError(409, "processing", "That file is converting right now. Cancel it first.");
-  for (const j of jobs.values()) if (j.file_id === id && j.state === "queued") Object.assign(j, { state: "cancelled", finished_at: iso(Date.now()) });
+  // Like the server: a converting file is cancelled first, then skipped.
+  for (const j of jobs.values()) {
+    if (j.file_id === id && (j.state === "queued" || j.state === "running")) {
+      Object.assign(j, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
+      broadcast({ type: "job.updated", job: j });
+    }
+  }
   Object.assign(file, { status: "skipped", skip_reason: "Skipped by you", updated_at: iso(Date.now()) });
   broadcast({ type: "file.updated", file: listFile(file) });
   emitQueue();
@@ -1175,7 +1262,7 @@ route("GET", "/api/jobs/:id", ({ id }) => getJob(id));
 
 route("POST", "/api/jobs/:id/cancel", ({ id }) => {
   const job = getJob(id);
-  if (job.state !== "queued" && job.state !== "running") throw new HttpError(409, "not_active", "That job has already finished.");
+  if (job.state !== "queued" && job.state !== "running") throw new HttpError(409, "job_finished", "This job has already finished.");
   Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
   const file = files.get(job.file_id);
   if (file) {
@@ -1190,6 +1277,11 @@ route("POST", "/api/jobs/:id/cancel", ({ id }) => {
 route("POST", "/api/jobs/:id/priority", async ({ id }, _q, req) => {
   const job = getJob(id);
   const body = await readBody(req);
+  if (!["queued", "running"].includes(job.state)) throw new HttpError(409, "job_finished", "This job has already finished.");
+  if (body.move !== undefined && body.move !== "top")
+    throw new HttpError(400, "invalid_request", 'The only supported move is "top".');
+  if (body.move === undefined && typeof body.priority !== "number")
+    throw new HttpError(400, "invalid_request", 'Send a priority number or {"move": "top"}.');
   if (body.move === "top") job.priority = Math.max(0, ...[...jobs.values()].filter((j) => j.state === "queued").map((j) => j.priority)) + 1;
   else if (typeof body.priority === "number") job.priority = body.priority;
   broadcast({ type: "job.updated", job });
@@ -1236,26 +1328,50 @@ route("POST", "/api/queue/stop", () => {
 route("GET", "/api/settings", () => settings);
 route("PATCH", "/api/settings", async (_p, _q, req) => {
   const patch = await readBody(req);
+  if (!patch || typeof patch !== "object" || Array.isArray(patch))
+    throw new HttpError(400, "invalid_settings", "Send the settings to change as a JSON object.");
+  for (const key of Object.keys(patch)) {
+    if (!(key in settings)) throw new HttpError(400, "unknown_setting", `There's no setting called "${key}".`);
+  }
   const next = { ...settings, ...patch };
-  // Same code and wording as the server (services/settings.rs): one code,
-  // `invalid_settings`, for every validation failure.
-  const invalid = (message) => new HttpError(400, "invalid_settings", message);
-  if (next.max_jobs !== null && !(next.max_jobs >= 1 && next.max_jobs <= 32))
-    throw invalid("Jobs at once must be between 1 and 32.");
+  const blank = (v) => (typeof v === "string" && !v.trim() ? null : typeof v === "string" ? v.trim() : v);
+  next.temp_dir = blank(next.temp_dir);
+  next.output_folder = blank(next.output_folder);
+  // Same code, wording and `field` as the server (services/settings.rs):
+  // `invalid_settings` for every validation failure, naming the setting.
+  const invalid = (message, field) => new HttpError(400, "invalid_settings", message, field);
+  if (next.max_jobs !== null && !(Number.isInteger(next.max_jobs) && next.max_jobs >= 1 && next.max_jobs <= 32))
+    throw invalid("Jobs at once must be between 1 and 32.", "max_jobs");
+  if (next.active_hours && (next.active_hours.start > 23 || next.active_hours.end > 23))
+    throw invalid("Active hours must be whole hours from 0 to 23.", "active_hours");
+  for (const pattern of next.ignore_patterns ?? []) {
+    if (/\[[^\]]*$/.test(pattern))
+      throw invalid(`"${pattern}" isn't a valid ignore pattern: unclosed character class`, "ignore_patterns");
+  }
+  if (next.temp_dir && !next.temp_dir.startsWith("/"))
+    throw invalid("The temporary folder must be a full path starting with /.", "temp_dir");
   if (next.temp_dir && !(next.temp_dir in FS))
-    throw invalid(`The temporary folder ${next.temp_dir} doesn't exist on the server. In Docker, check that it is mounted.`);
+    throw invalid(
+      `The temporary folder ${next.temp_dir} doesn't exist on the server. In Docker, check that it is mounted.`,
+      "temp_dir",
+    );
   if (next.output_mode === "folder" && !next.output_folder)
-    throw invalid("Choose an output folder, or switch back to replacing the originals.");
+    throw invalid("Choose an output folder, or switch back to replacing the originals.", "output_folder");
+  if (next.output_mode === "folder" && !next.output_folder.startsWith("/"))
+    throw invalid("The output folder must be a full path starting with /.", "output_folder");
   if (next.output_mode === "folder" && !(next.output_folder in FS))
-    throw invalid(`The output folder ${next.output_folder} doesn't exist on the server. In Docker, check that it is mounted.`);
+    throw invalid(
+      `The output folder ${next.output_folder} doesn't exist on the server. In Docker, check that it is mounted.`,
+      "output_folder",
+    );
   if (next.output_mode === "folder") {
     for (const lib of libraries.values()) {
       if (next.output_folder === lib.path || next.output_folder.startsWith(`${lib.path}/`))
-        throw invalid(`The output folder can't be inside the library ${lib.name}, or Chrysopoeia would convert its own results.`);
+        throw invalid(
+          `The output folder can't be inside the library ${lib.name}, or Chrysopoeia would convert its own results.`,
+          "output_folder",
+        );
     }
-  }
-  for (const pattern of next.ignore_patterns ?? []) {
-    if (/\[[^\]]*$/.test(pattern)) throw invalid(`"${pattern}" isn't a valid ignore pattern: unclosed character class`);
   }
   if (patch.default_profile) next.default_profile = normalizeProfile(patch.default_profile);
   Object.assign(settings, next);
@@ -1275,11 +1391,21 @@ route("POST", "/api/hardware/detect", async () => {
 
 route("GET", "/api/presets", () => presets);
 
+route("GET", "/api/system", () => ({
+  version: "0.2.0-mock",
+  // The Docker image sets TEMP_DIR=/temp when that folder is mapped.
+  default_temp_dir: "/temp",
+  browse_roots: BROWSE_ROOTS,
+  data_dir: "/config",
+  in_container: true,
+}));
+
 route("GET", "/api/fs/browse", (_p, q) => {
-  const path = (q.get("path") || BROWSE_ROOTS[0]).replace(/(.)\/+$/, "$1");
+  const path = (q.get("path")?.trim() || BROWSE_ROOTS[0]).replace(/(.)\/+$/, "$1");
+  if (!path.startsWith("/")) throw new HttpError(400, "path_not_absolute", "Use a full folder path, starting with /.");
   if (!BROWSE_ROOTS.some((r) => r === "/" || path === r || path.startsWith(r + "/")))
-    throw new HttpError(403, "outside_roots", "That folder is outside the folders Chrysopoeia is allowed to show.");
-  if (!(path in FS)) throw new HttpError(404, "path_not_found", `The folder ${path} doesn't exist inside the container.`);
+    throw new HttpError(403, "outside_roots", "That folder is outside the folders Chrysopoeia may show.");
+  if (!(path in FS)) throw new HttpError(404, "path_not_found", "That folder doesn't exist.");
   const parent = path === "/" ? null : path.slice(0, path.lastIndexOf("/")) || "/";
   return {
     path,
@@ -1307,12 +1433,19 @@ const server = http.createServer(async (req, res) => {
       if (Array.isArray(result) && typeof result[0] === "number" && result.length === 2) return send(res, result[0], result[1]);
       return send(res, 200, result);
     } catch (err) {
-      if (err instanceof HttpError) return send(res, err.status, { error: err.message, code: err.code });
+      if (err instanceof HttpError) {
+        const body = { error: err.message, code: err.code };
+        if (err.field) body.field = err.field;
+        return send(res, err.status, body);
+      }
       console.error(err);
       return send(res, 500, { error: "The mock server hit a bug.", code: "internal" });
     }
   }
-  send(res, 404, { error: "There's nothing at this address.", code: "not_found" });
+  if (url.pathname.startsWith("/api/") && routes.some((r) => url.pathname.match(r.regex))) {
+    return send(res, 405, { error: "This API endpoint doesn't accept that kind of request.", code: "method_not_allowed" });
+  }
+  send(res, 404, { error: `There's no API endpoint at ${url.pathname}.`, code: "not_found" });
 });
 
 const wss = new WebSocketServer({ noServer: true });

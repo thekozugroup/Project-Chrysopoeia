@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from "clsx";
+import { useState } from "react";
 import { twMerge } from "tailwind-merge";
 
 /** Join class names and let later Tailwind utilities win over earlier ones. */
@@ -42,4 +43,14 @@ export function baseName(path: string): string {
 export function titleFromFolder(path: string): string {
   const name = baseName(path).replace(/[-_]+/g, " ").trim();
   return name ? name.charAt(0).toUpperCase() + name.slice(1) : path;
+}
+
+/**
+ * The value, or the last non-null one while it is `null`. Lets a sheet keep
+ * its content on screen while it animates closed after its id was cleared.
+ */
+export function useRetained<T>(value: T | null): T | null {
+  const [kept, setKept] = useState<T | null>(value);
+  if (value !== null && value !== kept) setKept(value);
+  return value ?? kept;
 }

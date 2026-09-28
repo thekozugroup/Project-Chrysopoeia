@@ -19,6 +19,12 @@ interface SaveBarProps {
   onDiscard: () => void;
   /** Plain-language reason saving is blocked or failed. */
   error?: string | null;
+  /**
+   * `alert` (default) announces the error at once. Use `status` when it only
+   * points at an error already announced next to its field, so screen
+   * readers don't read the same problem twice.
+   */
+  errorRole?: "alert" | "status";
   disabled?: boolean;
   /** Whether going to `target` would unmount this form (and lose the edits). */
   blocks: (target: Route) => boolean;
@@ -26,7 +32,17 @@ interface SaveBarProps {
   saveAndLeave: () => Promise<boolean>;
 }
 
-export function SaveBar({ dirty, saving, onSave, onDiscard, error, disabled, blocks, saveAndLeave }: SaveBarProps) {
+export function SaveBar({
+  dirty,
+  saving,
+  onSave,
+  onDiscard,
+  error,
+  errorRole = "alert",
+  disabled,
+  blocks,
+  saveAndLeave,
+}: SaveBarProps) {
   // Warn before closing the tab or reloading with unsaved changes.
   useEffect(() => {
     if (!dirty) return;
@@ -53,7 +69,7 @@ export function SaveBar({ dirty, saving, onSave, onDiscard, error, disabled, blo
       >
         <p
           className={cn("min-w-0 flex-1 text-sm", error ? "font-medium text-danger" : "text-fg")}
-          role={error ? "alert" : "status"}
+          role={error ? errorRole : "status"}
         >
           {error ?? "You have unsaved changes."}
         </p>

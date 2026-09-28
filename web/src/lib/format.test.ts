@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatClock, formatDuration, formatEta, formatRelative, plural } from "./format";
-import { sourceCodecLabel } from "./labels";
+import {
+  ffmpegVersionLabel,
+  formatBytes,
+  formatClock,
+  formatDuration,
+  formatEta,
+  formatRelative,
+  plural,
+} from "./format";
+import { languageLabel, skippedByUser, sourceCodecLabel } from "./labels";
 
 describe("formatBytes", () => {
   it("uses decimal units like Finder", () => {
@@ -61,6 +69,41 @@ describe("durations", () => {
     expect(plural(1, "file")).toBe("1 file");
     expect(plural(3, "file")).toBe("3 files");
     expect(plural(2, "library", "libraries")).toBe("2 libraries");
+  });
+});
+
+describe("ffmpegVersionLabel", () => {
+  it("drops the copyright notice from ffmpeg -version", () => {
+    expect(ffmpegVersionLabel("ffmpeg version 6.1.1-3ubuntu5 Copyright (c) 2000-2023 the FFmpeg developers")).toBe(
+      "ffmpeg 6.1.1-3ubuntu5",
+    );
+    expect(ffmpegVersionLabel("ffmpeg version 7.0.2-Jellyfin Copyright (c) 2000-2024 the FFmpeg developers")).toBe(
+      "ffmpeg 7.0.2-Jellyfin",
+    );
+  });
+
+  it("keeps unusual lines readable and says when nothing is known", () => {
+    expect(ffmpegVersionLabel("custom build 2024 Copyright (c) someone")).toBe("custom build 2024");
+    expect(ffmpegVersionLabel(null)).toBe("Version unknown");
+    expect(ffmpegVersionLabel("   ")).toBe("Version unknown");
+  });
+});
+
+describe("skippedByUser", () => {
+  it("tells the user's own skips from the settings' decisions", () => {
+    expect(skippedByUser("Skipped by you")).toBe(true);
+    expect(skippedByUser(" skipped by you ")).toBe(true);
+    expect(skippedByUser("Already HEVC")).toBe(false);
+    expect(skippedByUser("Only 6% smaller — kept the original")).toBe(false);
+    expect(skippedByUser(null)).toBe(false);
+  });
+});
+
+describe("languageLabel", () => {
+  it("names common codes and keeps unknown ones", () => {
+    expect(languageLabel("eng")).toBe("English");
+    expect(languageLabel("JPN")).toBe("Japanese");
+    expect(languageLabel("tlh")).toBe("tlh");
   });
 });
 
