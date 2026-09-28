@@ -10,8 +10,13 @@
 //! Additions beyond the fixed API: [`IgnoreRules`] and
 //! [`validate_ignore_pattern`] (the ignore-pattern matcher the walker uses,
 //! for filtering watcher events and validating settings),
-//! [`ScanOptions::from_settings`], and
-//! [`LibraryWatcher::watch_with_options`].
+//! [`ScanOptions::from_settings`], [`LibraryWatcher::watch_with_options`],
+//! and the disc-copy folder names [`DVD_FOLDERS`] and [`BLU_RAY_FOLDERS`].
+//!
+//! Safety rules shared by the walker and the watcher: DVD and Blu-ray disc
+//! copies are never listed (their files only work together), symbolic links
+//! are not followed unless asked, and Chrysopoeia's own temporary and backup
+//! files are reported separately, never as media.
 
 #![warn(missing_docs)]
 
@@ -25,7 +30,10 @@ pub mod probe;
 pub mod walk;
 pub mod watch;
 
-pub use walk::{AUDIO_EXTENSIONS, IgnoreRules, VIDEO_EXTENSIONS, validate_ignore_pattern};
+pub use walk::{
+    AUDIO_EXTENSIONS, BLU_RAY_FOLDERS, DVD_FOLDERS, IgnoreRules, VIDEO_EXTENSIONS,
+    validate_ignore_pattern,
+};
 pub use watch::{LibraryWatcher, WatchEvent};
 
 /// Options for [`walk_library`].
@@ -73,7 +81,10 @@ pub struct WalkResult {
     pub files: Vec<DiscoveredFile>,
     /// Chrysopoeia temp/backup files found (see `chrysopoeia_core::paths`).
     pub artifacts: Vec<PathBuf>,
-    /// Paths that could not be read, with the reason.
+    /// Paths that could not be read or were deliberately left alone (a DVD
+    /// or Blu-ray disc copy, a link), with a plain-language reason. Nothing
+    /// below these paths is listed, so their absence from `files` does not
+    /// mean they were deleted.
     pub errors: Vec<(PathBuf, String)>,
 }
 
@@ -99,7 +110,9 @@ pub enum ProbeError {
 /// Covers essentially every video container ffmpeg reads plus common audio
 /// containers (see [`VIDEO_EXTENSIONS`] and [`AUDIO_EXTENSIONS`]), ignoring
 /// case. Subtitles, images, text and Chrysopoeia's own temporary or backup
-/// files are never media.
+/// files are never media, and neither are the files of a DVD or Blu-ray disc
+/// copy (anything inside a [`DVD_FOLDERS`] or [`BLU_RAY_FOLDERS`] folder),
+/// which only play correctly together.
 pub fn is_media_path(path: &Path) -> bool {
     walk::is_media(path)
 }
@@ -108,7 +121,8 @@ pub fn is_media_path(path: &Path) -> bool {
 ///
 /// Blocking: call it from `spawn_blocking`. Nothing is probed, so large
 /// libraries are listed quickly. Problems with individual entries are
-/// collected in [`WalkResult::errors`].
+/// collected in [`WalkResult::errors`], together with notes on what was
+/// deliberately left alone (disc copies, links); see the [`walk`] module.
 pub fn walk_library(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
     walk::walk(root, opts)
 }

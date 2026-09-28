@@ -4,6 +4,19 @@
 //! between versions and containers (numbers as strings, optional fields,
 //! mkvmerge statistics tags), and one odd field must never make a whole file
 //! unprobeable.
+//!
+//! # HDR
+//!
+//! - HDR10 and HLG come from the transfer characteristics, Dolby Vision from
+//!   its configuration record or sample entry.
+//! - HDR10+ is carried per frame, so [`crate::probe_file`] decodes the first
+//!   few frames of an HDR10 video to look for it (a second, short ffprobe run
+//!   within the same timeout). [`crate::parse_ffprobe_json`] alone cannot see
+//!   it and reports such files as HDR10.
+//! - A Dolby Vision stream whose base layer is not a standard picture
+//!   (profile 5) is reported with no colour primaries, transfer or matrix:
+//!   `hdr == DolbyVision` without a PQ or HLG `color_transfer` means the video
+//!   cannot be re-encoded without ruining its colours.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -23,12 +36,114 @@ const MAX_FRAME_RATE: f64 = 1000.0;
 /// Longest ffprobe failure reason shown to users.
 const MAX_REASON_CHARS: usize = 200;
 
+/// Frames looked at when checking an HDR10 video for HDR10+ metadata.
+const HDR10_PLUS_FRAMES: u32 = 4;
+
 /// Implementation of [`crate::probe_file`].
+///
+/// `timeout` bounds the whole call: checking the file on disk (a hung
+/// network share can stall even that), running ffprobe, and the extra look
+/// at the first frames of an HDR10 video for HDR10+ metadata. When only that
+/// last look runs out of time, the file is reported as plain HDR10 rather
+/// than failing.
 pub(crate) async fn probe(
     ffprobe: &Path,
     path: &Path,
     timeout: Duration,
 ) -> Result<ProbeInfo, ProbeError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut info = tokio::time::timeout_at(deadline, probe_streams(ffprobe, path))
+        .await
+        .map_err(|_| ProbeError::Timeout(timeout))??;
+    refine_hdr10_plus(ffprobe, path, &mut info, deadline).await;
+    Ok(info)
+}
+
+/// ffprobe ships HDR10+ metadata per frame (HEVC SEI messages, Matroska
+/// block additions), never in the stream-level side data `-show_streams`
+/// prints. When the main video looks like plain HDR10, decode its first few
+/// frames and upgrade it to [`HdrFormat::Hdr10Plus`] when they carry
+/// SMPTE 2094-40 metadata.
+async fn refine_hdr10_plus(
+    ffprobe: &Path,
+    path: &Path,
+    info: &mut ProbeInfo,
+    deadline: tokio::time::Instant,
+) {
+    let Some(video) = info
+        .streams
+        .iter_mut()
+        .find(|s| s.kind == Some(StreamKind::Video) && !s.is_attached_pic)
+    else {
+        return;
+    };
+    if video.hdr != Some(HdrFormat::Hdr10) {
+        return;
+    }
+    let check = frames_have_hdr10_plus(ffprobe, path, video.index);
+    match tokio::time::timeout_at(deadline, check).await {
+        Ok(Some(true)) => video.hdr = Some(HdrFormat::Hdr10Plus),
+        Ok(Some(false)) => {}
+        Ok(None) => tracing::debug!(
+            path = %path.display(),
+            "could not look for HDR10+ metadata; reporting HDR10"
+        ),
+        Err(_) => tracing::debug!(
+            path = %path.display(),
+            "ran out of time looking for HDR10+ metadata; reporting HDR10"
+        ),
+    }
+}
+
+/// Whether the first frames of stream `index` carry HDR10+ metadata, or
+/// `None` when ffprobe could not tell.
+async fn frames_have_hdr10_plus(ffprobe: &Path, path: &Path, index: u32) -> Option<bool> {
+    let output = Command::new(ffprobe)
+        .args(["-v", "error", "-select_streams"])
+        .arg(index.to_string())
+        .arg("-read_intervals")
+        .arg(format!("%+#{HDR10_PLUS_FRAMES}"))
+        .args(["-show_frames", "-print_format", "json", "-i"])
+        .arg(input_argument(path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_hdr10_plus_frames(&output.stdout)
+}
+
+/// Whether ffprobe `-show_frames` JSON lists SMPTE 2094-40 (HDR10+) side
+/// data on any frame, or `None` when the output is not understood.
+pub(crate) fn parse_hdr10_plus_frames(json: &[u8]) -> Option<bool> {
+    let root: Value = serde_json::from_slice(json).ok()?;
+    let frames = root.get("frames")?.as_array()?;
+    Some(frames.iter().any(|frame| {
+        frame
+            .get("side_data_list")
+            .and_then(Value::as_array)
+            .is_some_and(|list| {
+                list.iter()
+                    .filter_map(|entry| str_field(entry, "side_data_type"))
+                    .any(is_hdr10_plus_side_data)
+            })
+    }))
+}
+
+/// Whether a side data type names HDR10+ dynamic metadata.
+fn is_hdr10_plus_side_data(side_data_type: &str) -> bool {
+    let lower = side_data_type.to_ascii_lowercase();
+    lower.contains("2094-40") || lower.contains("hdr10+")
+}
+
+/// Stat the file and run ffprobe on it (no timeout of its own: dropping the
+/// future kills ffprobe).
+async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeError> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|error| ProbeError::Unreadable(describe_open_error(&error)))?;
@@ -67,17 +182,12 @@ pub(crate) async fn probe(
         .spawn()
         .map_err(|error| ProbeError::Spawn(describe_spawn_error(ffprobe, &error)))?;
 
-    // On timeout the future (and with it the child) is dropped, which kills
-    // ffprobe thanks to `kill_on_drop`.
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(error)) => {
-            return Err(ProbeError::Spawn(format!(
-                "ffprobe stopped unexpectedly ({error})"
-            )));
-        }
-        Err(_) => return Err(ProbeError::Timeout(timeout)),
-    };
+    // When the caller's timeout drops this future, the child goes with it,
+    // which kills ffprobe thanks to `kill_on_drop`.
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|error| ProbeError::Spawn(format!("ffprobe stopped unexpectedly ({error})")))?;
 
     if !output.status.success() {
         let reason = describe_ffprobe_failure(&output.stderr, &input, output.status);
@@ -322,6 +432,13 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
             stream.color_space = known_str(raw, "color_space");
             stream.color_range = known_str(raw, "color_range");
             stream.hdr = detect_hdr(raw, stream.color_transfer.as_deref(), codec_tag);
+            if dolby_vision_without_standard_base_layer(raw) {
+                // The picture is in Dolby's own IPT colour space; whatever
+                // the colour tags claim, it is not a standard picture.
+                stream.color_primaries = None;
+                stream.color_transfer = None;
+                stream.color_space = None;
+            }
             stream.interlaced = str_field(raw, "field_order").is_some_and(|order| {
                 matches!(
                     order.to_ascii_lowercase().as_str(),
@@ -342,6 +459,10 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
 /// HDR signalling of a video stream. Dolby Vision and HDR10+ are recognised
 /// from side data (or Dolby Vision sample entries), HDR10 and HLG from the
 /// transfer characteristics.
+///
+/// Real ffprobe output never lists HDR10+ at stream level (it is carried per
+/// frame; see `refine_hdr10_plus`), but other tools and future versions may,
+/// so it is still recognised here.
 fn detect_hdr(raw: &Value, transfer: Option<&str>, codec_tag: Option<&str>) -> Option<HdrFormat> {
     let side_data_types: Vec<String> = raw
         .get("side_data_list")
@@ -371,6 +492,27 @@ fn detect_hdr(raw: &Value, transfer: Option<&str>, codec_tag: Option<&str>) -> O
         Some("arib-std-b67") => Some(HdrFormat::Hlg),
         _ => None,
     }
+}
+
+/// Whether the stream's Dolby Vision configuration record says the base
+/// layer is compatible with no standard picture (`dv_bl_signal_compatibility_id`
+/// 0: profile 5, and profile 10.0 for AV1). Such a base layer uses Dolby's IPT
+/// colour space and only looks right on a Dolby Vision display; re-encoding
+/// it without the Dolby Vision layer gives green and purple colours.
+///
+/// The core types have no field for this, so it is signalled by leaving the
+/// colour tags empty: a [`HdrFormat::DolbyVision`] stream without a PQ or HLG
+/// `color_transfer` has no usable base layer and must be left alone.
+fn dolby_vision_without_standard_base_layer(raw: &Value) -> bool {
+    raw.get("side_data_list")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            str_field(entry, "side_data_type")
+                .is_some_and(|t| t.to_ascii_lowercase().contains("dovi"))
+        })
+        .any(|record| u64_value(record.get("dv_bl_signal_compatibility_id")) == Some(0))
 }
 
 /// Bit depth implied by an ffmpeg pixel format name, when it is one we know.
@@ -728,6 +870,63 @@ mod tests {
         let timecode = &probe.streams[3];
         assert_eq!(timecode.kind, Some(StreamKind::Data));
         assert_eq!(timecode.codec, "tmcd");
+
+        // Profile 8.1 has an HDR10 base layer: its colour tags are kept.
+        assert_eq!(video.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(video.color_primaries.as_deref(), Some("bt2020"));
+    }
+
+    #[test]
+    fn dolby_vision_profile_5_has_no_usable_base_layer() {
+        let probe = parse(&fixture("hevc_dolby_vision_p5.json"), 11_797_442_560).unwrap();
+        assert_eq!(probe.hdr(), Some(HdrFormat::DolbyVision));
+        let video = probe.primary_video().unwrap();
+        assert_eq!(video.bit_depth, Some(10));
+        // The documented signal for "no standard base layer": Dolby Vision
+        // without a PQ or HLG transfer.
+        assert_eq!(video.color_transfer, None);
+        assert_eq!(video.color_primaries, None);
+        assert_eq!(video.color_space, None);
+        assert_eq!(video.color_range.as_deref(), Some("tv"));
+
+        // Even when the tags claim a standard picture, compatibility id 0
+        // wins.
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "av1",
+            "color_transfer": "smpte2084", "color_primaries": "bt2020",
+            "color_space": "bt2020nc", "side_data_list": [
+                {"side_data_type": "DOVI configuration record", "dv_profile": 10,
+                 "dv_bl_signal_compatibility_id": "0"}]}]}"#;
+        let video = parse(json, 1).unwrap().streams.remove(0);
+        assert_eq!(video.hdr, Some(HdrFormat::DolbyVision));
+        assert_eq!(video.color_transfer, None);
+        assert_eq!(video.color_primaries, None);
+
+        // Profile 8.4 (HLG base layer) keeps its tags.
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "hevc",
+            "color_transfer": "arib-std-b67", "side_data_list": [
+                {"side_data_type": "DOVI configuration record", "dv_profile": 8,
+                 "dv_bl_signal_compatibility_id": 4}]}]}"#;
+        let video = parse(json, 1).unwrap().streams.remove(0);
+        assert_eq!(video.hdr, Some(HdrFormat::DolbyVision));
+        assert_eq!(video.color_transfer.as_deref(), Some("arib-std-b67"));
+    }
+
+    #[test]
+    fn hdr10_plus_is_found_in_frame_side_data() {
+        // What ffprobe 6.1 prints for the first frame of an HDR10+ HEVC file.
+        let with = br#"{"frames": [{"media_type": "video", "side_data_list": [
+            {"side_data_type": "H.26[45] User Data Unregistered SEI message"},
+            {"side_data_type": "Mastering display metadata"},
+            {"side_data_type": "Content light level metadata"},
+            {"side_data_type": "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)",
+             "application version": 1, "num_windows": 1}]}]}"#;
+        assert_eq!(parse_hdr10_plus_frames(with), Some(true));
+        let without = br#"{"frames": [{"side_data_list": [
+            {"side_data_type": "Mastering display metadata"}]}, {"pict_type": "B"}]}"#;
+        assert_eq!(parse_hdr10_plus_frames(without), Some(false));
+        assert_eq!(parse_hdr10_plus_frames(br#"{"frames": []}"#), Some(false));
+        assert_eq!(parse_hdr10_plus_frames(br#"{}"#), None);
+        assert_eq!(parse_hdr10_plus_frames(b"garbage"), None);
     }
 
     #[test]
@@ -877,6 +1076,9 @@ mod tests {
             stream(r#", "color_transfer": "smpte2084""#),
             Some(HdrFormat::Hdr10)
         );
+        // Synthetic: real ffprobe only shows HDR10+ per frame (see
+        // `hdr10_plus_is_found_in_frame_side_data`), but stream-level side
+        // data from other tools is honoured too.
         assert_eq!(
             stream(
                 r#", "color_transfer": "smpte2084", "side_data_list": [
@@ -1215,6 +1417,185 @@ mod tests {
             "{result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    /// ffprobe JSON for a file whose only stream is HDR10 video.
+    #[cfg(unix)]
+    const HDR10_JSON: &str = r#"{"format":{"format_name":"matroska,webm"},"streams":[{"index":0,"codec_type":"video","codec_name":"hevc","color_transfer":"smpte2084"}]}"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hdr10_plus_check_looks_at_the_first_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("movie.mkv");
+        std::fs::write(&media, b"data").unwrap();
+        let script = fake_ffprobe(
+            dir.path(),
+            "ffprobe-hdr10plus",
+            &format!(
+                "case \"$*\" in\n\
+                 *'-select_streams 0 -read_intervals %+#{HDR10_PLUS_FRAMES} -show_frames'*) \
+                 echo '{{\"frames\":[{{\"side_data_list\":[{{\"side_data_type\":\"HDR Dynamic Metadata SMPTE2094-40 (HDR10+)\"}}]}}]}}' ;;\n\
+                 *-show_frames*) exit 1 ;;\n\
+                 *) echo '{HDR10_JSON}' ;;\n\
+                 esac"
+            ),
+        );
+        let probed = probe_with(&script, &media, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(probed.hdr(), Some(HdrFormat::Hdr10Plus));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_slow_hdr10_plus_check_stays_within_the_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("movie.mkv");
+        std::fs::write(&media, b"data").unwrap();
+        let script = fake_ffprobe(
+            dir.path(),
+            "ffprobe-slow-frames",
+            &format!(
+                "case \"$*\" in\n*-show_frames*) exec sleep 30 ;;\n*) echo '{HDR10_JSON}' ;;\nesac"
+            ),
+        );
+        let started = std::time::Instant::now();
+        let timeout = Duration::from_millis(1500);
+        let probed = probe_with(&script, &media, timeout).await.unwrap();
+        // The overall timeout ran out during the extra check: still a
+        // result, reported as plain HDR10.
+        assert_eq!(probed.hdr(), Some(HdrFormat::Hdr10));
+        assert!(started.elapsed() < timeout + Duration::from_secs(3));
+    }
+
+    /// A minimal HEVC SEI NAL unit carrying SMPTE 2094-40 (HDR10+) metadata,
+    /// as HDR10+ encoders write before each picture.
+    fn hdr10_plus_sei_nal() -> Vec<u8> {
+        fn put(bits: &mut Vec<bool>, value: u32, count: u32) {
+            bits.extend((0..count).rev().map(|i| (value >> i) & 1 == 1));
+        }
+        let mut bits = Vec::new();
+        put(&mut bits, 1, 8); // application_version
+        put(&mut bits, 1, 2); // num_windows
+        put(&mut bits, 400, 27); // targeted display maximum luminance
+        put(&mut bits, 0, 1); // no targeted display peak luminance
+        for _ in 0..3 {
+            put(&mut bits, 10_000, 17); // maxscl
+        }
+        put(&mut bits, 1_000, 17); // average_maxrgb
+        put(&mut bits, 9, 4); // distribution percentiles
+        for (percentage, percentile) in [1, 5, 10, 25, 50, 75, 90, 95, 99].into_iter().zip(0..) {
+            put(&mut bits, percentage, 7);
+            put(&mut bits, percentile, 17);
+        }
+        put(&mut bits, 0, 10); // fraction_bright_pixels
+        put(&mut bits, 0, 3); // no peak luminance, tone mapping or saturation
+        while bits.len() % 8 != 0 {
+            bits.push(false);
+        }
+        // ITU-T T.35: USA, SMPTE, provider-oriented code 1, application 4.
+        let mut payload = vec![0xB5, 0x00, 0x3C, 0x00, 0x01, 0x04];
+        payload.extend(
+            bits.chunks(8)
+                .map(|byte| byte.iter().fold(0u8, |acc, &bit| acc << 1 | u8::from(bit))),
+        );
+        let mut sei = vec![4, u8::try_from(payload.len()).unwrap()];
+        sei.extend(payload);
+        sei.push(0x80); // rbsp trailing bits
+        // Start code, prefix SEI NAL header, emulation-prevented payload.
+        let mut nal = vec![0, 0, 0, 1, 39 << 1, 1];
+        let mut zeros = 0;
+        for byte in sei {
+            if zeros >= 2 && byte <= 3 {
+                nal.push(3);
+                zeros = 0;
+            }
+            nal.push(byte);
+            zeros = if byte == 0 { zeros + 1 } else { 0 };
+        }
+        nal
+    }
+
+    /// Insert `nal` before every picture (VCL NAL unit) of an Annex B HEVC
+    /// stream.
+    fn insert_before_pictures(stream: &[u8], nal: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(stream.len() + nal.len() * 16);
+        let mut copied = 0;
+        let mut i = 0;
+        while i + 3 < stream.len() {
+            if stream[i..i + 3] == [0, 0, 1] {
+                let nal_type = (stream[i + 3] >> 1) & 0x3f;
+                if nal_type < 32 {
+                    let start = if i > 0 && stream[i - 1] == 0 {
+                        i - 1
+                    } else {
+                        i
+                    };
+                    out.extend_from_slice(&stream[copied..start]);
+                    out.extend_from_slice(nal);
+                    copied = start;
+                }
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        out.extend_from_slice(&stream[copied..]);
+        out
+    }
+
+    #[tokio::test]
+    async fn real_hdr10_plus_video_is_recognised() {
+        if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let hdr10 = dir.path().join("HDR10.hevc");
+        let encoded = std::process::Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+            ])
+            .arg("testsrc2=s=320x240:r=24:d=0.25")
+            .args(["-pix_fmt", "yuv420p10le", "-c:v", "libx265", "-x265-params"])
+            .arg(
+                "log-level=error:hdr10=1:colorprim=bt2020:transfer=smpte2084:\
+                 colormatrix=bt2020nc:master-display=G(13250,34500)B(7500,3000)\
+                 R(34000,16000)WP(15635,16450)L(10000000,1):max-cll=1000,400",
+            )
+            .arg(&hdr10)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        if !encoded.success() {
+            eprintln!("skipping: this ffmpeg cannot encode 10-bit HEVC with libx265");
+            return;
+        }
+        let hdr10_plus = dir.path().join("HDR10+.hevc");
+        let stream = std::fs::read(&hdr10).unwrap();
+        std::fs::write(
+            &hdr10_plus,
+            insert_before_pictures(&stream, &hdr10_plus_sei_nal()),
+        )
+        .unwrap();
+
+        let ffprobe = Path::new("ffprobe");
+        let timeout = Duration::from_secs(30);
+        let plain = probe(ffprobe, &hdr10, timeout).await.unwrap();
+        assert_eq!(plain.hdr(), Some(HdrFormat::Hdr10));
+        let plus = probe(ffprobe, &hdr10_plus, timeout).await.unwrap();
+        assert_eq!(plus.hdr(), Some(HdrFormat::Hdr10Plus));
+        let video = plus.primary_video().unwrap();
+        assert_eq!(video.color_transfer.as_deref(), Some("smpte2084"));
+        assert_eq!(video.bit_depth, Some(10));
     }
 
     #[cfg(unix)]

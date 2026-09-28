@@ -303,6 +303,7 @@ dependencies = [
  "chrono",
  "chrysopoeia-core",
  "globset",
+ "inotify",
  "notify",
  "serde",
  "serde_json",

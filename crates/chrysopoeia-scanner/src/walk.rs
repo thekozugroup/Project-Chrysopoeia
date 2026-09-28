@@ -19,13 +19,35 @@
 //! - A pattern that matches a folder excludes everything inside it, and the
 //!   folder is not even read (so large ignored trees cost nothing).
 //!
+//! Backslashes are not accepted (use `/` between folder names), and neither
+//! are gitignore-style exceptions starting with `!`: both would otherwise
+//! silently match nothing.
+//!
 //! Chrysopoeia's temporary and backup files are never listed as media, even
 //! when no pattern hides them; they are reported separately so the server can
 //! recover or clean them up after a crash.
+//!
+//! # Disc copies
+//!
+//! Folders named `VIDEO_TS`, `HVDVD_TS`, `BDMV` or `BDAV` (any letter case)
+//! hold a DVD, HD DVD or Blu-ray disc structure (AVCHD camcorder cards use
+//! `BDMV` too). Their files only play correctly together, through the disc's
+//! menus and playlists, so converting them one by one would break the copy.
+//! Such folders are never looked into; each one is noted in
+//! [`WalkResult::errors`](crate::WalkResult::errors) with a plain explanation
+//! so the user can see why nothing inside was listed.
+//!
+//! # Links
+//!
+//! Unless [`ScanOptions::follow_links`](crate::ScanOptions::follow_links) is
+//! set, symbolic links are never followed, so nothing outside the library can
+//! be changed through a link. Links to folders and links named like media
+//! files are noted in [`WalkResult::errors`](crate::WalkResult::errors) so a
+//! library made of links does not look empty without a reason.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::path::Path;
+use std::path::{Component, Path};
 
 use anyhow::{anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -112,12 +134,57 @@ pub(crate) const SIDECAR_EXTENSIONS: &[&str] = &[
     "ds_store",
 ];
 
+/// Names of the folders holding a DVD or HD DVD disc structure. Compared
+/// ignoring case.
+pub const DVD_FOLDERS: &[&str] = &["VIDEO_TS", "HVDVD_TS"];
+
+/// Names of the folders holding a Blu-ray disc structure (`BDMV` also covers
+/// AVCHD camcorder cards, `BDAV` Blu-ray recorder discs). Compared ignoring
+/// case.
+pub const BLU_RAY_FOLDERS: &[&str] = &["BDMV", "BDAV"];
+
+const DVD_NOTE: &str = "This folder is a DVD copy. Its files only play correctly together (menus \
+                        and chapters), so Chrysopoeia leaves them as they are";
+const BLU_RAY_NOTE: &str = "This folder is a Blu-ray copy. Its files only play correctly \
+                            together (menus and playlists), so Chrysopoeia leaves them as they are";
+const FILE_LINK_NOTE: &str = "This is a link to another file, so it was skipped. Chrysopoeia \
+                              only converts real files, so nothing is ever changed through a link";
+const FOLDER_LINK_NOTE: &str = "This is a link to another folder, so it was skipped. \
+                                Chrysopoeia only looks inside real folders, so nothing is ever \
+                                changed through a link";
+const BROKEN_LINK_NOTE: &str = "This is a link to something that no longer exists";
+
+/// When a folder called `name` holds a disc structure (see the [module
+/// documentation](self)), the plain-language reason it is left alone.
+pub(crate) fn disc_folder_note(name: &OsStr) -> Option<&'static str> {
+    let name = name.to_str()?;
+    let is = |list: &[&str]| list.iter().any(|known| known.eq_ignore_ascii_case(name));
+    if is(DVD_FOLDERS) {
+        Some(DVD_NOTE)
+    } else if is(BLU_RAY_FOLDERS) {
+        Some(BLU_RAY_NOTE)
+    } else {
+        None
+    }
+}
+
+/// The note for the first disc structure folder among the components of
+/// `path`, if it is (inside) one.
+pub(crate) fn disc_structure_note(path: &Path) -> Option<&'static str> {
+    path.components().find_map(|component| match component {
+        Component::Normal(name) => disc_folder_note(name),
+        _ => None,
+    })
+}
+
 /// Whether `path` names a media file: its extension is in
-/// [`VIDEO_EXTENSIONS`] or [`AUDIO_EXTENSIONS`] and it is not one of
-/// Chrysopoeia's temporary or backup files.
+/// [`VIDEO_EXTENSIONS`] or [`AUDIO_EXTENSIONS`], it is not one of
+/// Chrysopoeia's temporary or backup files, and it is not part of a DVD or
+/// Blu-ray disc structure.
 pub(crate) fn is_media(path: &Path) -> bool {
     (has_extension_in(path, VIDEO_EXTENSIONS) || has_extension_in(path, AUDIO_EXTENSIONS))
         && !is_artifact_path(path)
+        && disc_structure_note(path).is_none()
 }
 
 /// Whether the file name of `path` marks it as a Chrysopoeia temporary or
@@ -240,6 +307,20 @@ pub fn validate_ignore_pattern(pattern: &str) -> Result<(), String> {
 }
 
 fn compile_pattern(pattern: &str) -> Result<Glob, String> {
+    if pattern.contains('\\') {
+        return Err(format!(
+            "The ignore pattern \"{pattern}\" uses \\ between names, so it was not used. Use / \
+             instead, for example \"{}\"",
+            pattern.replace('\\', "/")
+        ));
+    }
+    if let Some(rest) = pattern.strip_prefix('!') {
+        return Err(format!(
+            "The ignore pattern \"{pattern}\" starts with !, but exceptions are not supported, so \
+             it was not used. List only what to skip; to skip a name that starts with !, write \
+             \"**/!{rest}\""
+        ));
+    }
     let normalized = normalize_pattern(pattern);
     if normalized.is_empty() {
         return Err(format!(
@@ -281,6 +362,11 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
     for problem in rules.invalid_patterns() {
         result.errors.push((root.to_path_buf(), problem.clone()));
     }
+    // A library folder that is itself (inside) a disc copy lists nothing.
+    if let Some(note) = disc_structure_note(root) {
+        result.errors.push((root.to_path_buf(), note.to_string()));
+        return Ok(result);
+    }
 
     let mut entries = WalkDir::new(root)
         .follow_links(opts.follow_links)
@@ -314,6 +400,9 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
         if file_type.is_dir() {
             if rules.is_ignored_dir(relative) {
                 entries.skip_current_dir();
+            } else if let Some(note) = disc_folder_note(entry.file_name()) {
+                result.errors.push((path.to_path_buf(), note.to_string()));
+                entries.skip_current_dir();
             } else if path.to_str().is_none() {
                 // Paths are stored as text, so nothing below can be tracked.
                 result.errors.push((
@@ -326,7 +415,14 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
             }
             continue;
         }
-        // Symlinks (when not followed), sockets, pipes and devices.
+        if file_type.is_symlink() {
+            // Only seen when links are not followed.
+            if let Some(note) = skipped_link_note(path, relative, &rules) {
+                result.errors.push((path.to_path_buf(), note.to_string()));
+            }
+            continue;
+        }
+        // Sockets, pipes and devices.
         if !file_type.is_file() {
             continue;
         }
@@ -375,6 +471,25 @@ pub(crate) fn walk(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult
     Ok(result)
 }
 
+/// Why a link that is not followed deserves a note, if it does: links to
+/// folders, and links named like media files. Ignored links and links to
+/// sidecar files are skipped quietly.
+fn skipped_link_note(path: &Path, relative: &Path, rules: &IgnoreRules) -> Option<&'static str> {
+    if is_artifact_path(path) {
+        return None;
+    }
+    match std::fs::metadata(path) {
+        Ok(target) if target.is_dir() => (!rules.is_ignored_dir(relative)
+            && path.file_name().and_then(disc_folder_note).is_none())
+        .then_some(FOLDER_LINK_NOTE),
+        Ok(target) if target.is_file() => {
+            (is_media(path) && !rules.is_ignored(relative)).then_some(FILE_LINK_NOTE)
+        }
+        Ok(_) => None,
+        Err(_) => (is_media(path) && !rules.is_ignored(relative)).then_some(BROKEN_LINK_NOTE),
+    }
+}
+
 /// Fail with a plain-language message unless `root` is a readable folder.
 fn check_root(root: &Path) -> anyhow::Result<()> {
     let shown = root.display();
@@ -421,7 +536,7 @@ fn describe_walk_error(error: &walkdir::Error) -> String {
                 std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
             });
             if is_broken_link {
-                "This is a link to something that no longer exists".to_string()
+                BROKEN_LINK_NOTE.to_string()
             } else {
                 "This disappeared while the library was being scanned".to_string()
             }
@@ -739,9 +854,143 @@ mod tests {
             "{messages:?}"
         );
 
+        // Not followed: only real files are listed, and each link is
+        // explained so a library of links does not look empty for no reason.
         let not_followed = walk(root, &ScanOptions::default()).unwrap();
         assert_eq!(relative_files(root, &not_followed), ["Movies/A.mkv"]);
-        assert!(not_followed.errors.is_empty(), "{:?}", not_followed.errors);
+        let notes: Vec<(String, &str)> = not_followed
+            .errors
+            .iter()
+            .map(|(path, note)| {
+                let relative = path.strip_prefix(root).unwrap().to_string_lossy();
+                (relative.into_owned(), note.as_str())
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                ("Broken.mkv".to_string(), BROKEN_LINK_NOTE),
+                ("Linked.mkv".to_string(), FILE_LINK_NOTE),
+                ("Movies/loop".to_string(), FOLDER_LINK_NOTE),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_interesting_links_are_noted() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("Movies/A.mkv"), 1);
+        touch(&root.join("Movies/A.srt"), 1);
+        symlink(root.join("Movies/A.srt"), root.join("Movies/B.srt")).unwrap();
+        symlink(root.join("Movies/A.mkv"), root.join("Movies/.hidden.mkv")).unwrap();
+        symlink(root.join("Movies"), root.join(".hidden-folder")).unwrap();
+        symlink(root.join("Movies"), root.join("#recycle")).unwrap();
+        let result = walk(root, &default_options()).unwrap();
+        assert_eq!(relative_files(root, &result), ["Movies/A.mkv"]);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+    }
+
+    #[test]
+    fn disc_copies_are_left_alone_and_explained() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let dvd = root.join("Movies/Movie A (1999)/VIDEO_TS");
+        for name in [
+            "VIDEO_TS.VOB",
+            "VTS_01_0.VOB",
+            "VTS_01_1.VOB",
+            "VTS_01_2.VOB",
+        ] {
+            touch(&dvd.join(name), 10);
+        }
+        touch(&dvd.join("VIDEO_TS.IFO"), 10);
+        let blu_ray = root.join("Movies/Movie B (2010)/bdmv");
+        touch(&blu_ray.join("STREAM/00000.m2ts"), 10);
+        touch(&blu_ray.join("STREAM/00001.m2ts"), 10);
+        touch(&blu_ray.join("PLAYLIST/00000.mpls"), 10);
+        touch(&blu_ray.join("index.bdmv"), 10);
+        let avchd = root.join("Camera/PRIVATE/AVCHD/BDMV");
+        touch(&avchd.join("STREAM/00000.MTS"), 10);
+        // Loose disc files outside a disc structure are ordinary media.
+        touch(&root.join("Movies/Loose/VTS_01_1.VOB"), 10);
+        touch(&root.join("Movies/Movie B (2010)/Movie B (2010).m2ts"), 10);
+        // A disc copy inside an ignored folder is not even mentioned.
+        touch(&root.join("#recycle/Old/VIDEO_TS/VTS_01_1.VOB"), 10);
+
+        let result = walk(root, &default_options()).unwrap();
+        assert_eq!(
+            relative_files(root, &result),
+            [
+                "Movies/Loose/VTS_01_1.VOB",
+                "Movies/Movie B (2010)/Movie B (2010).m2ts"
+            ]
+        );
+        let notes: Vec<(&Path, &str)> = result
+            .errors
+            .iter()
+            .map(|(path, note)| (path.strip_prefix(root).unwrap(), note.as_str()))
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                (Path::new("Camera/PRIVATE/AVCHD/BDMV"), BLU_RAY_NOTE),
+                (Path::new("Movies/Movie A (1999)/VIDEO_TS"), DVD_NOTE),
+                (Path::new("Movies/Movie B (2010)/bdmv"), BLU_RAY_NOTE),
+            ]
+        );
+
+        // A library whose root is (inside) a disc copy lists nothing.
+        let inside = walk(&dvd, &default_options()).unwrap();
+        assert!(inside.files.is_empty());
+        assert_eq!(inside.errors, [(dvd.clone(), DVD_NOTE.to_string())]);
+        let deeper = walk(&blu_ray.join("STREAM"), &default_options()).unwrap();
+        assert!(deeper.files.is_empty());
+        assert_eq!(deeper.errors.len(), 1);
+
+        assert!(!is_media(&dvd.join("VTS_01_1.VOB")));
+        assert!(!is_media(Path::new("x/Video_TS/VTS_01_1.vob")));
+        assert!(!is_media(&blu_ray.join("STREAM/00000.m2ts")));
+        assert!(is_media(Path::new("x/VIDEO_TS_backup/VTS_01_1.VOB")));
+        assert!(is_media(Path::new("BDMV.mkv")));
+    }
+
+    #[test]
+    fn backslashes_and_exceptions_are_rejected_with_advice() {
+        let problem = validate_ignore_pattern(r"**\Extras\**").unwrap_err();
+        assert!(problem.contains("Use / instead"), "{problem}");
+        assert!(problem.contains("\"**/Extras/**\""), "{problem}");
+        let problem = validate_ignore_pattern(r"Extras\").unwrap_err();
+        assert!(problem.contains("Use / instead"), "{problem}");
+        let problem = validate_ignore_pattern("!Movies").unwrap_err();
+        assert!(
+            problem.contains("exceptions are not supported"),
+            "{problem}"
+        );
+        assert!(problem.contains("\"**/!Movies\""), "{problem}");
+        assert!(validate_ignore_pattern("**/!Movies").is_ok());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("Movies/A/A.mkv"), 1);
+        touch(&root.join("Movies/A/Extras/x.mkv"), 1);
+        touch(&root.join("!Unsorted/B.mkv"), 1);
+        let opts = ScanOptions {
+            ignore_patterns: vec![
+                r"**\Extras\**".into(),
+                "!Movies".into(),
+                "**/!Unsorted".into(),
+            ],
+            ..ScanOptions::default()
+        };
+        let result = walk(root, &opts).unwrap();
+        assert_eq!(
+            relative_files(root, &result),
+            ["Movies/A/A.mkv", "Movies/A/Extras/x.mkv"]
+        );
+        assert_eq!(result.errors.len(), 2, "{:?}", result.errors);
     }
 
     #[cfg(target_os = "linux")]
