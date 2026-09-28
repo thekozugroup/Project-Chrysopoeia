@@ -18,7 +18,7 @@ const fieldBase =
 /** Single-line text input. */
 export function Input({ className, ...props }: ComponentProps<"input">) {
   const field = useField();
-  return <input {...field} className={cn(fieldBase, "h-9 px-3 text-sm", className)} {...props} />;
+  return <input {...field} className={cn(fieldBase, "h-9 px-3 text-sm pointer-coarse:h-11", className)} {...props} />;
 }
 
 /** Multi-line text input. */
@@ -40,7 +40,7 @@ export function Select({ className, children, ...props }: ComponentProps<"select
     <div className={cn("relative", className)}>
       <select
         {...field}
-        className={cn(fieldBase, "h-9 cursor-pointer appearance-none pr-9 pl-3 text-sm")}
+        className={cn(fieldBase, "h-9 cursor-pointer appearance-none pr-9 pl-3 text-sm pointer-coarse:h-11")}
         {...props}
       >
         {children}
@@ -250,6 +250,7 @@ export function Segmented<T extends string>({
               "relative flex min-w-0 flex-1 cursor-pointer items-center rounded-[5px] px-2 font-medium transition-[background-color,color,box-shadow] duration-150 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink",
               stackOnPhones ? "justify-start px-3 sm:justify-center sm:px-2 sm:text-center" : "justify-center text-center",
               size === "sm" ? "h-7 text-[0.8125rem]" : stackOnPhones ? "h-10 text-sm sm:h-8" : "h-8 text-sm",
+              "pointer-coarse:h-11",
               // The selected option carries a 1.5px gold ring (≥3:1 against the
               // track in both themes), like a selected choice card.
               selected

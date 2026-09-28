@@ -2,9 +2,10 @@
 
 /**
  * Edits a transcode profile: goal, quality and speed up front; formats,
- * resolution, tracks and thresholds behind "Advanced". Choices that a
- * container cannot hold are never offered, and when a change forces another
- * (e.g. WebM → MKV for HEVC) the editor says so.
+ * resolution, tracks and thresholds behind "More format options". Choices
+ * that a container cannot hold are never offered, and when a change forces
+ * another (e.g. WebM → MKV for HEVC) the editor says so. A saved value this
+ * machine can no longer produce stays visible as "(not available here)".
  */
 
 import { ChevronRight, Info } from "lucide-react";
@@ -47,7 +48,37 @@ import type {
   VideoCodec,
 } from "@/lib/types";
 import { QUALITY_LEVELS, SPEED_PRESETS } from "@/lib/types";
+import type { ProfileErrors } from "@/lib/settings-form";
 import { cn } from "@/lib/utils";
+
+/** Fields shown under "More format options", which opens to show their errors. */
+const MORE_FIELDS: readonly (keyof TranscodeProfile)[] = [
+  "video_codec",
+  "container",
+  "audio_codec",
+  "max_height",
+  "min_savings_pct",
+  "audio_languages",
+  "subtitle_languages",
+  "subtitles",
+  "quality_override",
+  "skip_efficient",
+];
+
+/** An error under a control that isn't a `Field` (choice rows, switches). */
+function FieldError({ message }: { message: string | undefined }) {
+  if (!message) return null;
+  return (
+    <p role="alert" className="mt-1.5 text-[0.8125rem] leading-snug font-medium text-danger">
+      {message}
+    </p>
+  );
+}
+
+/** The option for a saved value this machine doesn't offer any more. */
+function Unavailable({ value, label }: { value: string; label: string }) {
+  return <option value={value}>{label} (not available here)</option>;
+}
 
 interface ProfileEditorProps {
   profile: TranscodeProfile;
@@ -65,6 +96,8 @@ interface ProfileEditorProps {
   resetKey?: number;
   /** Heading level of the group titles, to fit the page's outline. */
   headingLevel?: 2 | 3;
+  /** Server errors by field (`profile.quality` → `quality`), shown under their control. */
+  errors?: ProfileErrors;
 }
 
 function Group({
@@ -107,12 +140,14 @@ function LanguageField({
   value,
   onChange,
   onValidity,
+  serverError,
 }: {
   label: string;
   description: string;
   value: string[];
   onChange: (codes: string[]) => void;
   onValidity: (valid: boolean) => void;
+  serverError?: string;
 }) {
   const joined = value.join(", ");
   const [text, setText] = useState(joined);
@@ -130,7 +165,7 @@ function LanguageField({
   useReportValidity(error === null, onValidity);
 
   return (
-    <Field label={label} description={description} error={error}>
+    <Field label={label} description={description} error={error ?? serverError}>
       <Input
         value={text}
         placeholder="All languages"
@@ -159,11 +194,13 @@ function QualityOverrideField({
   codec,
   onChange,
   onValidity,
+  serverError,
 }: {
   value: number | null;
   codec: VideoCodec;
   onChange: (value: number | null) => void;
   onValidity: (valid: boolean) => void;
+  serverError?: string;
 }) {
   const external = value === null ? "" : String(value);
   const [text, setText] = useState(external);
@@ -181,7 +218,7 @@ function QualityOverrideField({
     <Field
       label="Encoder quality value"
       description={`Raw CRF / CQ / QP, 0 to ${max} for ${VIDEO_CODEC_LABEL[codec]}. Overrides Quality. Lower means higher quality.`}
-      error={error}
+      error={error ?? serverError}
     >
       <Input
         type="text"
@@ -213,12 +250,20 @@ export function ProfileEditor({
   onValidityChange,
   resetKey = 0,
   headingLevel = 3,
+  errors = {},
 }: ProfileEditorProps) {
   const [notes, setNotes] = useState<string[]>([]);
   const [invalid, setInvalid] = useState<Record<string, boolean>>({});
   const [advancedOpen, setAdvancedOpen] = useState(profile.goal === "custom");
   const [lastReset, setLastReset] = useState(resetKey);
   const advancedId = useId();
+  // A server error about a field in "More format options" opens it.
+  const hiddenError = MORE_FIELDS.some((f) => errors[f]);
+  const [openedFor, setOpenedFor] = useState(false);
+  if (hiddenError !== openedFor) {
+    setOpenedFor(hiddenError);
+    if (hiddenError) setAdvancedOpen(true);
+  }
 
   // Discard: the free-text fields remount (below, keyed by resetKey) and
   // report themselves valid again; forget their old verdicts now.
@@ -266,6 +311,7 @@ export function ProfileEditor({
           preference={preference}
           profile={profile}
         />
+        <FieldError message={errors.goal} />
       </Group>
 
       <Group level={headingLevel} title="Quality" description="How closely the new file matches the original.">
@@ -281,6 +327,7 @@ export function ProfileEditor({
           <span>Closer to the original</span>
         </div>
         <p className="mt-2 text-[0.8125rem] text-fg/85">{QUALITY_HELP[profile.quality]}</p>
+        <FieldError message={errors.quality} />
       </Group>
 
       <Group level={headingLevel} title="Speed" description="Encoder effort. Slower settings squeeze files a little more.">
@@ -292,6 +339,7 @@ export function ProfileEditor({
           className="sm:max-w-md"
         />
         <p className="mt-2 text-[0.8125rem] text-fg/85">{SPEED_HELP[profile.speed]}</p>
+        <FieldError message={errors.speed} />
       </Group>
 
       <section className="border-t border-line pt-4">
@@ -306,7 +354,7 @@ export function ProfileEditor({
             className={cn("size-4 text-muted transition-transform duration-200", advancedOpen && "rotate-90")}
             aria-hidden
           />
-          Advanced
+          More format options
           <span className="hidden font-normal text-muted sm:inline">Formats, resolution, tracks and thresholds</span>
         </button>
 
@@ -331,11 +379,15 @@ export function ProfileEditor({
                   {hint ? <span className="mt-1 block">{hint.text}</span> : null}
                 </>
               }
+              error={errors.video_codec}
             >
               <Select
                 value={profile.video_codec}
                 onChange={(e) => update({ video_codec: e.target.value as VideoCodec }, true)}
               >
+                {videoCodecs.includes(profile.video_codec) ? null : (
+                  <Unavailable value={profile.video_codec} label={VIDEO_CODEC_LABEL[profile.video_codec]} />
+                )}
                 {videoCodecs.map((codec) => {
                   const preset = presets?.video_codecs.find((v) => v.codec === codec);
                   return (
@@ -347,11 +399,18 @@ export function ProfileEditor({
                 })}
               </Select>
             </Field>
-            <Field label="Container" description="MKV holds every kind of track. MP4 suits Apple devices.">
+            <Field
+              label="Container"
+              description="MKV holds every kind of track. MP4 suits Apple devices."
+              error={errors.container}
+            >
               <Select
                 value={profile.container}
                 onChange={(e) => update({ container: e.target.value as Container }, true)}
               >
+                {containers.includes(profile.container) ? null : (
+                  <Unavailable value={profile.container} label={CONTAINER_LABEL[profile.container]} />
+                )}
                 {containers.map((c) => (
                   <option key={c} value={c}>
                     {presets?.containers.find((p) => p.container === c)?.label ?? CONTAINER_LABEL[c]}
@@ -359,11 +418,18 @@ export function ProfileEditor({
                 ))}
               </Select>
             </Field>
-            <Field label="Audio" description="Keep original copies every track untouched where it fits.">
+            <Field
+              label="Audio"
+              description="Keep original copies every track untouched where it fits."
+              error={errors.audio_codec}
+            >
               <Select
                 value={profile.audio_codec}
                 onChange={(e) => update({ audio_codec: e.target.value as AudioCodec }, true)}
               >
+                {audioCodecs.includes(profile.audio_codec) ? null : (
+                  <Unavailable value={profile.audio_codec} label={AUDIO_CODEC_LABEL[profile.audio_codec]} />
+                )}
                 {audioCodecs.map((a) => (
                   <option key={a} value={a}>
                     {presets?.audio_codecs.find((p) => p.codec === a)?.label ?? AUDIO_CODEC_LABEL[a]}
@@ -374,7 +440,11 @@ export function ProfileEditor({
           </div>
 
           <div className="mt-6 grid gap-5 sm:grid-cols-2">
-            <Field label="Limit resolution" description="Larger videos are scaled down. Smaller ones are never scaled up.">
+            <Field
+              label="Limit resolution"
+              description="Larger videos are scaled down. Smaller ones are never scaled up."
+              error={errors.max_height}
+            >
               <Select
                 value={profile.max_height === null ? "" : String(profile.max_height)}
                 onChange={(e) => update({ max_height: e.target.value ? Number(e.target.value) : null })}
@@ -389,6 +459,7 @@ export function ProfileEditor({
             <Field
               label="Keep the result only if it's smaller"
               description="Otherwise the original stays and the file is marked skipped."
+              error={errors.min_savings_pct}
             >
               <Select
                 value={profile.min_savings_pct === null ? "" : String(profile.min_savings_pct)}
@@ -414,6 +485,7 @@ export function ProfileEditor({
               value={profile.audio_languages}
               onChange={(audio_languages) => update({ audio_languages })}
               onValidity={setValidity("audio_languages")}
+              serverError={errors.audio_languages}
             />
             <LanguageField
               key={`subs-${resetKey}`}
@@ -422,6 +494,7 @@ export function ProfileEditor({
               value={profile.subtitle_languages}
               onChange={(subtitle_languages) => update({ subtitle_languages })}
               onValidity={setValidity("subtitle_languages")}
+              serverError={errors.subtitle_languages}
             />
           </div>
 
@@ -444,6 +517,7 @@ export function ProfileEditor({
                   ? "Text subtitles are converted when the container needs it. Picture subtitles MP4 can't hold are dropped."
                   : "Every subtitle track is removed."}
               </p>
+              <FieldError message={errors.subtitles} />
             </div>
             <QualityOverrideField
               key={`quality-${resetKey}`}
@@ -451,6 +525,7 @@ export function ProfileEditor({
               codec={profile.video_codec}
               onChange={(quality_override) => update({ quality_override })}
               onValidity={setValidity("quality_override")}
+              serverError={errors.quality_override}
             />
           </div>
 
@@ -461,6 +536,7 @@ export function ProfileEditor({
             checked={profile.skip_efficient}
             onCheckedChange={(skip_efficient) => update({ skip_efficient })}
           />
+          <FieldError message={errors.skip_efficient} />
         </div>
       </section>
     </div>

@@ -37,7 +37,7 @@ export const FILE_STATUS_HELP: Record<FileStatus, string> = {
   processing: "Being converted right now.",
   done: "Converted and verified.",
   skipped: "Not converted, on purpose. The reason is shown with the file.",
-  failed: "The last attempt failed. The original is untouched.",
+  failed: "The last attempt failed, or the file can't be read. The original is untouched.",
 };
 
 export const JOB_STATE_LABEL: Record<JobState, string> = {
@@ -46,7 +46,7 @@ export const JOB_STATE_LABEL: Record<JobState, string> = {
   done: "Done",
   skipped: "Skipped",
   failed: "Failed",
-  cancelled: "Cancelled",
+  cancelled: "Stopped",
 };
 
 export const JOB_STAGE_LABEL: Record<JobStage, string> = {
@@ -75,11 +75,15 @@ export const GOAL_LABEL: Record<Goal, string> = {
   custom: "Custom",
 };
 
+/**
+ * What each goal gets you, in one line without format names (those are
+ * shown as secondary detail) or speed (which depends on this machine).
+ */
 export const GOAL_SUMMARY: Record<Goal, string> = {
-  save_space: "Smallest files. Takes longest without a recent GPU.",
-  balanced: "Good savings, quick with a GPU, plays on most TVs.",
-  compatible: "Plays on every device. Files may not get smaller.",
-  archive: "Near-original quality for keeping masters. Smaller savings.",
+  save_space: "Smallest files. Plays on recent TVs, phones and browsers.",
+  balanced: "Much smaller files that play on most TVs.",
+  compatible: "Works on every device. Files shrink less.",
+  archive: "Near-original quality in less space.",
   custom: "Your own combination of format and quality.",
 };
 
@@ -157,14 +161,17 @@ export const VALIDATION_LABEL: Record<ValidationLevel, string> = {
   thorough: "Thorough",
 };
 
+/** Each level adds to the one before it, so they read in order: Quick → Standard → Thorough. */
 export const VALIDATION_HELP: Record<ValidationLevel, string> = {
   off: "No checks. A damaged file could replace a good one. Not recommended.",
-  quick: "Checks that the new file opens, has every track, and is the right length. Takes seconds.",
+  quick: "Checks that the new file opens, has every track and is the right length. Takes seconds.",
   standard:
-    "Also plays the whole file and compares four moments against the original to catch corruption and visual glitches.",
-  thorough:
-    "Compares ten moments and makes sure no black or frozen frames were added. Slowest, most careful.",
+    "Quick, plus plays the whole file and compares four moments with the original to catch corruption and visual glitches.",
+  thorough: "Standard, plus compares ten moments and makes sure no black or frozen frames were added. Slowest.",
 };
+
+/** The check levels offered, lightest first. "Off" is a separate switch. */
+export const VALIDATION_LEVELS: readonly Exclude<ValidationLevel, "off">[] = ["quick", "standard", "thorough"];
 
 export const HW_API_LABEL: Record<HwApi, string> = {
   software: "CPU",

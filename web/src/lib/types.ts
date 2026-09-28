@@ -181,10 +181,41 @@ export interface StreamInfo {
   color_space: string | null;
   color_range: string | null;
   hdr: HdrFormat | null;
+  /**
+   * Dolby Vision without a standard base layer (profile 5, or compatibility
+   * id 0): it can't be converted without ruining its colours. Only sent
+   * when true.
+   */
+  dolby_vision_without_base_layer?: boolean;
   interlaced: boolean;
+  /** HDR10 static metadata: the mastering display. Only sent when known. */
+  mastering_display?: MasteringDisplay;
+  /** HDR10 static metadata: content light levels. Only sent when known. */
+  content_light?: ContentLight;
   channels: number | null;
   channel_layout: string | null;
   sample_rate: number | null;
+}
+
+/** The colour volume of the display an HDR video was mastered on (SMPTE ST 2086). */
+export interface MasteringDisplay {
+  /** CIE 1931 xy chromaticity of each primary and the white point. */
+  red: [number, number];
+  green: [number, number];
+  blue: [number, number];
+  white_point: [number, number];
+  /** Peak luminance in cd/m² (nits). */
+  max_luminance: number;
+  /** Black level in cd/m². */
+  min_luminance: number;
+}
+
+/** Content light levels of an HDR10 video (CTA-861.3), in cd/m². */
+export interface ContentLight {
+  /** Brightest pixel of the whole video (MaxCLL). */
+  max_cll: number;
+  /** Brightest frame on average (MaxFALL). */
+  max_fall: number;
 }
 
 export interface ProbeInfo {
@@ -317,6 +348,11 @@ export interface LibraryStats {
   skipped: number;
   failed: number;
   saved_bytes: number;
+  /**
+   * Files the last scan found still being copied (they are added once they
+   * stop changing). Older servers leave it out.
+   */
+  settling?: number;
 }
 
 export interface Library {
@@ -432,8 +468,16 @@ export interface QueueState {
   queued: number;
   max_jobs: number;
   max_jobs_auto: boolean;
+  /**
+   * Where `max_jobs` comes from: hardware detection, the container's
+   * `MAX_JOBS` variable, or a number saved in Settings. Older servers leave
+   * it out.
+   */
+  max_jobs_source?: MaxJobsSource;
   waiting_for_schedule: boolean;
 }
+
+export type MaxJobsSource = "auto" | "env" | "settings";
 
 export type ScanPhase = "discovering" | "analyzing" | "done";
 
@@ -494,6 +538,11 @@ export interface Overview {
 /** `GET /api/system`: facts about the server the settings screens explain. */
 export interface SystemInfo {
   version: string;
+  /**
+   * Image build label (`CHRYSOPOEIA_VERSION`, e.g. `edge-1a2b3c4`) when it
+   * differs from `version`. Older servers leave it out.
+   */
+  build?: string | null;
   /**
    * Scratch folder used when `Settings.temp_dir` is unset (`--temp-dir` /
    * `TEMP_DIR`, e.g. `/temp` in Docker). `null` means next to each file.
@@ -563,7 +612,10 @@ export interface FsEntry {
   name: string;
   path: string;
   is_dir: boolean;
+  /** Videos in this folder and the folders inside it (audio-only files aren't counted). */
   media_count?: number | null;
+  /** True when counting stopped early, so `media_count` is a lower bound ("1,000+"). */
+  media_count_capped?: boolean;
 }
 
 export interface FsBrowse {
@@ -584,6 +636,18 @@ export interface BulkRequest {
 
 export interface Affected {
   affected: number;
+  /**
+   * Bulk "queue" with explicit ids: files left out because the library's
+   * settings wouldn't convert them. Older servers leave it out.
+   */
+  left_out?: number;
+}
+
+/** Body of `POST /files/{id}/queue`. */
+export interface QueueFileRequest {
+  priority?: number;
+  /** Convert once without the library's skip rules ("Convert anyway"). Checks still run. */
+  force?: boolean;
 }
 
 export type JobListState = "active" | "running" | "queued" | "history";

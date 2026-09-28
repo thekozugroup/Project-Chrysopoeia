@@ -147,8 +147,47 @@ function BootScreen() {
   );
 }
 
+/**
+ * The server refused this address (its DNS-rebinding guard): the fix is the
+ * ALLOWED_HOSTS variable, or a reverse proxy passing the original Host
+ * header. Nothing else on the generic checklist applies.
+ */
+function HostNotAllowed({ retrying, onRetry }: { retrying: boolean; onRetry: () => void }) {
+  const host = typeof window === "undefined" ? "" : window.location.hostname;
+  return (
+    <div className="grid min-h-dvh place-items-center px-5 py-10">
+      <div className="w-full max-w-lg">
+        <Brand className="mb-10" />
+        <h1 className="font-display text-4xl leading-tight text-fg">Chrysopoeia doesn&apos;t know this address</h1>
+        <p className="mt-3 text-sm leading-relaxed text-muted">
+          To protect your library, it only answers to addresses it recognises. Add{" "}
+          <code className="font-mono text-[0.8125rem] text-fg">{host || "this name"}</code> to the container&apos;s{" "}
+          <code className="font-mono text-[0.8125rem] text-fg">ALLOWED_HOSTS</code> variable, then restart it.
+        </p>
+        <CodeBlock className="mt-5" code={`ALLOWED_HOSTS=${host || "media.example.com"}`} label="Container variable" />
+        <p className="mt-4 text-[0.8125rem] leading-relaxed text-muted">
+          Behind a reverse proxy? Make it pass the original Host header (in Nginx:{" "}
+          <code className="font-mono text-xs text-fg">proxy_set_header Host $host;</code>).
+        </p>
+        <div className="mt-8 flex items-center gap-3">
+          <Button variant="primary" onClick={onRetry} loading={retrying}>
+            <RefreshCw aria-hidden />
+            Try again
+          </Button>
+          <p role="status" className="text-[0.8125rem] text-muted">
+            {retrying ? "Checking…" : ""}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Unreachable({ error, retrying, onRetry }: { error: unknown; retrying: boolean; onRetry: () => void }) {
   const network = error instanceof ApiError && error.isUnavailable;
+  if (error instanceof ApiError && error.code === "host_not_allowed") {
+    return <HostNotAllowed retrying={retrying} onRetry={onRetry} />;
+  }
   return (
     <div className="grid min-h-dvh place-items-center px-5 py-10">
       <div className="w-full max-w-lg">
@@ -156,7 +195,7 @@ function Unreachable({ error, retrying, onRetry }: { error: unknown; retrying: b
         <h1 className="font-display text-4xl leading-tight text-fg">
           {network ? "Can't reach Chrysopoeia" : "Chrysopoeia couldn't load"}
         </h1>
-        <p className="mt-3 text-[0.9375rem] leading-relaxed text-muted">
+        <p className="mt-3 text-sm leading-relaxed text-muted">
           {network
             ? "The server isn't answering. It may be restarting or the container may have stopped. This page tries again every few seconds."
             : errorMessage(error)}

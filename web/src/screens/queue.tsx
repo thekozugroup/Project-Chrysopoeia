@@ -2,22 +2,36 @@
 
 /** Queue: Running / Up next / History, with queue controls and job actions. */
 
-import { ArrowUpToLine, CircleCheck, CirclePause, FolderPlus, History, ListVideo, RotateCcw, Trash2, X } from "lucide-react";
+import {
+  ArrowUpToLine,
+  CircleCheck,
+  CirclePause,
+  CircleX,
+  FolderPlus,
+  History,
+  ListVideo,
+  RotateCcw,
+  ScanSearch,
+  Trash2,
+  TriangleAlert,
+  X,
+} from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { JobCard, JobCardSkeleton, savingsText } from "@/components/jobs";
+import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
 import { QueueControls, queueSentence } from "@/components/queue-controls";
 import { PageHeader } from "@/components/shell";
 import { JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Callout, EmptyState, Skeleton } from "@/components/ui/display";
+import { Callout, Disclosure, EmptyState, Skeleton } from "@/components/ui/display";
 import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
-import { ConfirmDialog, Tooltip } from "@/components/ui/overlays";
+import { ConfirmDialog } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { formatBytes, formatRelative, plural } from "@/lib/format";
-import { useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
+import { isUnreadableSource } from "@/lib/outcomes";
+import { useActivity, useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, openSheet, updateParams, type Route } from "@/lib/router";
-import type { Job } from "@/lib/types";
+import type { ActivityEntry, ActivityLevel, Job } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE = 50;
@@ -29,6 +43,12 @@ function openJob(job: Job) {
 function useLibraryName() {
   const libraries = useLibraries();
   return (id: string) => libraries.data?.find((l) => l.id === id)?.name ?? "";
+}
+
+/** A library's current minimum saving, to name it when a result fell short of it. */
+function useMinSavings() {
+  const libraries = useLibraries();
+  return (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
 }
 
 function ListSkeleton() {
@@ -172,7 +192,7 @@ function UpNextTab({ offset }: { offset: number }) {
       <StaleNote show={Boolean(queued.error)} />
       <ol className="divide-y divide-line rounded-lg border border-line bg-surface">
         {items.map((job, i) => (
-          <li key={job.id} className="flex items-center gap-3 px-3 py-2.5 sm:gap-4 sm:px-4">
+          <li key={job.id} className="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-3 py-2.5 sm:flex-nowrap sm:gap-4 sm:px-4">
             <span className="w-7 shrink-0 text-right text-[0.8125rem] text-muted tabular">
               <span className="sr-only">Position </span>
               {offset + i + 1}
@@ -185,29 +205,32 @@ function UpNextTab({ offset }: { offset: number }) {
                   .join(" · ")}
               </span>
             </button>
-            <div className="flex shrink-0 gap-1">
-              <Tooltip content="Move to top">
+            {/* Words, not bare icons: a lone ✕ beside a file name reads as "delete the file". */}
+            <div className="flex w-full shrink-0 justify-end gap-1 sm:w-auto">
+              {offset + i > 0 ? (
                 <Button
                   variant="quiet"
-                  size="icon-sm"
+                  size="sm"
                   aria-label={`Move ${job.file_name} to the top`}
-                  disabled={offset + i === 0 || moveToTop.isPending}
+                  disabled={moveToTop.isPending}
                   onClick={() => moveToTop.mutate(job)}
+                  needsServer
                 >
-                  <ArrowUpToLine />
+                  <ArrowUpToLine aria-hidden />
+                  Move to top
                 </Button>
-              </Tooltip>
-              <Tooltip content="Remove from queue">
-                <Button
-                  variant="quiet"
-                  size="icon-sm"
-                  aria-label={`Remove ${job.file_name} from the queue`}
-                  disabled={cancel.isPending}
-                  onClick={() => cancel.mutate(job)}
-                >
-                  <X />
-                </Button>
-              </Tooltip>
+              ) : null}
+              <Button
+                variant="quiet"
+                size="sm"
+                aria-label={`Remove ${job.file_name} from the queue`}
+                disabled={cancel.isPending}
+                onClick={() => cancel.mutate(job)}
+                needsServer
+              >
+                <X aria-hidden />
+                Remove
+              </Button>
             </div>
           </li>
         ))}
@@ -226,6 +249,7 @@ function UpNextTab({ offset }: { offset: number }) {
 function HistoryTab({ offset }: { offset: number }) {
   const history = useJobs({ state: "history", limit: PAGE, offset });
   const libraryName = useLibraryName();
+  const minSavings = useMinSavings();
   const { retry, clearHistory } = useJobActions();
   const [confirmClear, setConfirmClear] = useState(false);
   useClampedOffset(offset, history.data?.total, PAGE);
@@ -244,22 +268,16 @@ function HistoryTab({ offset }: { offset: number }) {
     <>
       <StaleNote show={Boolean(history.error)} />
       <div className="mb-3 flex justify-end">
-        <Button variant="quiet" size="sm" onClick={() => setConfirmClear(true)}>
+        <Button variant="quiet" size="sm" onClick={() => setConfirmClear(true)} needsServer>
           <Trash2 aria-hidden />
           Clear history
         </Button>
       </div>
       <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
         {items.map((job) => {
-          const savings = savingsText(job.input_size, job.output_size);
-          const note =
-            job.state === "done" && savings
-              ? savings.text
-              : job.state === "failed"
-                ? (job.error ?? "Failed")
-                : job.state === "skipped"
-                  ? (job.skip_reason ?? (job.output_size !== null ? "Kept the original" : "No conversion needed"))
-                  : "Cancelled. The original was left as it is.";
+          // Retrying a damaged original can't help; its sheet offers the fix.
+          const retryable =
+            job.state === "cancelled" || (job.state === "failed" && !isUnreadableSource(job.error));
           return (
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">
               <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
@@ -269,25 +287,27 @@ function HistoryTab({ offset }: { offset: number }) {
                   </span>
                   <JobStateBadge job={job} />
                 </span>
-                <span className="mt-1 flex flex-wrap gap-x-1 text-[0.8125rem]">
-                  <span
-                    className={cn(
-                      "min-w-0",
-                      job.state === "failed" ? "text-danger" : job.state === "done" ? "text-fg/85" : "text-muted",
-                    )}
-                  >
-                    {note}
+                {/* When the note wraps, the library and time start their own line, with no stray "·". */}
+                <span className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
+                  <span className={cn("min-w-0 text-[0.8125rem]", job.state === "done" ? "text-fg/85" : "text-muted")}>
+                    {historyNote(job, minSavings(job.library_id))}
                   </span>
-                  <span className="text-muted">
-                    · {libraryName(job.library_id)} · {formatRelative(job.finished_at)}
+                  <span className="text-xs text-muted">
+                    {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
                   </span>
                 </span>
               </button>
-              {job.state === "failed" || job.state === "cancelled" ? (
-                <Button variant="secondary" size="sm" onClick={() => retry.mutate(job)} disabled={retry.isPending}>
+              {retryable ? (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => retry.mutate(job)}
+                  disabled={retry.isPending}
+                  aria-label={`${job.state === "failed" ? "Try again" : "Queue again"}: ${job.file_name}`}
+                  needsServer
+                >
                   <RotateCcw aria-hidden />
-                  <span className="hidden sm:inline">{job.state === "failed" ? "Try again" : "Queue again"}</span>
-                  <span className="sr-only sm:hidden">Try {job.file_name} again</span>
+                  {job.state === "failed" ? "Try again" : "Queue again"}
                 </Button>
               ) : null}
             </li>
@@ -317,18 +337,58 @@ function HistoryTab({ offset }: { offset: number }) {
   );
 }
 
+const LOG_ICON: Record<ActivityLevel, ReactNode> = {
+  info: <ScanSearch className="text-muted" aria-hidden />,
+  success: <CircleCheck className="text-success" aria-hidden />,
+  warning: <TriangleAlert className="text-warning" aria-hidden />,
+  error: <CircleX className="text-danger" aria-hidden />,
+};
+
+/**
+ * An entry's tone. A damaged original is the file's problem, not a failed
+ * conversion: amber, as everywhere else ("Can't be read").
+ */
+export function logLevel(entry: Pick<ActivityEntry, "level" | "message">): ActivityLevel {
+  return entry.level === "error" && isUnreadableSource(entry.message) ? "warning" : entry.level;
+}
+
+/** Scans, warnings and problems as they happened, closed until wanted. */
+function Log() {
+  const activity = useActivity();
+  const items = activity.data?.items.filter((e) => e.level !== "success").slice(0, 30) ?? [];
+  if (!items.length) return null;
+  return (
+    <Disclosure title="Log: scans, warnings and problems" className="mt-8">
+      <ol className="flex flex-col gap-2.5">
+        {items.map((entry) => (
+          <li key={entry.id} className="flex gap-2.5 text-[0.8125rem] [&_svg]:mt-0.5 [&_svg]:size-4 [&_svg]:shrink-0">
+            {LOG_ICON[logLevel(entry)]}
+            <span className="sr-only">{logLevel(entry)}:</span>
+            <span className="min-w-0 flex-1 text-fg/90">{entry.message}</span>
+            <span className="shrink-0 text-xs text-muted">{formatRelative(entry.at)}</span>
+          </li>
+        ))}
+      </ol>
+    </Disclosure>
+  );
+}
+
 export function QueueScreen({ route }: { route: Route }) {
   const tab = route.segments[1] === "next" ? "next" : route.segments[1] === "history" ? "history" : "running";
   const queue = useQueueState();
   const settings = useSettings();
   const history = useJobs({ state: "history", limit: 1 });
+  const noLibraries = useNoLibraries();
   const offset = Math.max(0, Number(route.params.get("offset")) || 0);
+  const q = queue.data;
+  // Pause and Stop only mean something while there's work, or while paused.
+  const controls = q && !noLibraries && (q.running > 0 || q.queued > 0 || q.paused);
   return (
     <div>
       <PageHeader
         title="Queue"
-        description={queue.data ? queueSentence(queue.data, settings.data) : " "}
-        actions={queue.data ? <QueueControls queue={queue.data} /> : null}
+        description={q ? (noLibraries ? "Add a library to start converting." : queueSentence(q, settings.data)) : " "}
+        actions={controls ? <QueueControls queue={q} /> : null}
       />
       <NavTabs
         label="Queue views"
@@ -341,7 +401,12 @@ export function QueueScreen({ route }: { route: Route }) {
       />
       {tab === "running" ? <RunningTab /> : null}
       {tab === "next" ? <UpNextTab offset={offset} /> : null}
-      {tab === "history" ? <HistoryTab offset={offset} /> : null}
+      {tab === "history" ? (
+        <>
+          <HistoryTab offset={offset} />
+          <Log />
+        </>
+      ) : null}
     </div>
   );
 }

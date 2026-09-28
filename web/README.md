@@ -36,13 +36,20 @@ MOCK_SCENARIO=nogpu pnpm mock    # no GPU, with setup hints
 MOCK_SCENARIO=empty pnpm mock    # set up, but no libraries yet
 MOCK_DETECT_MS=8000 pnpm mock    # "Checking your hardware…" for the first 8 s
 MOCK_WS=off pnpm mock            # no WebSocket, like a proxy without it: the app polls
+MOCK_MAX_JOBS=2 pnpm mock        # the job limit comes from the container's MAX_JOBS
+MOCK_FORCE=reject pnpm mock      # an older server refuses "Convert anyway" (=ignore: accepts it, still skips)
+MOCK_HOST=deny pnpm mock         # every request answers 403 host_not_allowed
+MOCK_SETTLE_MS=0 pnpm mock       # files still being copied never settle (default: after 60 s)
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 
 `scripts/mock-api.mjs` is never imported by the app and is not part of the
 exported bundle. It follows the real server's error codes, messages and
-`field`s, and serves `/api/system`, `Job.notes` and `HardwareInfo.detecting`;
-keep it in step when the API changes. `NEXT_PUBLIC_API_URL` is baked in at build time; production
+`field`s (nested ones such as `profile.max_height` too), serves `/api/system`,
+`Job.notes`, `HardwareInfo.detecting` and the round-3 additions
+(`max_jobs_source`, `settling`, `build`, HDR10 metadata, `force`, `left_out`,
+capped folder counts), and uses the server's own sentences for damaged
+originals; keep it in step when the API changes. `NEXT_PUBLIC_API_URL` is baked in at build time; production
 builds leave it unset so the UI uses the same origin.
 
 ## End-to-end smoke test

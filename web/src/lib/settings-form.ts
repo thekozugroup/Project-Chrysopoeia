@@ -5,18 +5,27 @@
 
 import { ApiError, errorMessage } from "./api";
 import { sameProfile } from "./profile";
-import type { Settings } from "./types";
+import type { Settings, TranscodeProfile } from "./types";
 
-/** The sections of the Settings screen. */
-export type SectionId = "processing" | "output" | "verification" | "hardware" | "advanced";
+/**
+ * The sections of the Settings screen. Verification lives in Output
+ * ("Checks before replacing"); old `#/settings/verification` links land
+ * there.
+ */
+export type SectionId = "processing" | "output" | "hardware" | "advanced";
 
 export const SECTION_LABEL: Record<SectionId, string> = {
   processing: "Processing",
   output: "Output",
-  verification: "Verification",
   hardware: "Hardware",
   advanced: "Advanced",
 };
+
+/** The section a `#/settings/<name>` address shows, including retired names. */
+export function sectionFor(name: string | undefined): SectionId {
+  if (name === "verification") return "output";
+  return name && name in SECTION_LABEL ? (name as SectionId) : "processing";
+}
 
 /** Which section shows each setting, to point at it from the save bar. */
 export const SECTION_OF: Partial<Record<keyof Settings, SectionId>> = {
@@ -30,7 +39,7 @@ export const SECTION_OF: Partial<Record<keyof Settings, SectionId>> = {
   output_folder: "output",
   keep_file_dates: "output",
   temp_dir: "output",
-  validation: "verification",
+  validation: "output",
   hardware: "hardware",
   cpu_fallback: "hardware",
   ignore_patterns: "advanced",
@@ -94,6 +103,40 @@ export function settingForField(field: string | null | undefined): keyof Setting
   return SETTING_KEYS.includes(top) ? top : null;
 }
 
+/** Every profile field, to recognise `profile.quality` or `default_profile.max_height`. */
+const PROFILE_KEYS: readonly (keyof TranscodeProfile)[] = [
+  "goal",
+  "video_codec",
+  "audio_codec",
+  "container",
+  "quality",
+  "speed",
+  "quality_override",
+  "max_height",
+  "subtitles",
+  "audio_languages",
+  "subtitle_languages",
+  "skip_efficient",
+  "min_savings_pct",
+];
+
+/**
+ * The profile control a server-named `field` is about, when it names one
+ * inside `prefix` (`profile` for a library, `default_profile` in Settings):
+ * `profile.quality` → `quality`. `null` otherwise.
+ */
+export function profileFieldOf(
+  field: string | null | undefined,
+  prefix: "profile" | "default_profile",
+): keyof TranscodeProfile | null {
+  if (!field?.startsWith(`${prefix}.`)) return null;
+  const key = field.slice(prefix.length + 1).split(/[.[]/, 1)[0] as keyof TranscodeProfile;
+  return PROFILE_KEYS.includes(key) ? key : null;
+}
+
+/** Errors for the profile editor's controls, by field. */
+export type ProfileErrors = Partial<Record<keyof TranscodeProfile, string>>;
+
 /**
  * Put an API error on the field it is about. Newer servers name it in the
  * error's `field`; otherwise (every validation failure is
@@ -128,8 +171,10 @@ export function errorsFrom(err: unknown, sent: (keyof Settings)[] = []): FieldEr
 }
 
 /** Settings whose section shows their error under the field itself. */
-function errorShownInline(field: keyof Settings, draft: Settings): boolean {
+function errorShownInline(field: keyof Settings, draft: Settings, profileFieldShown: boolean): boolean {
   switch (field) {
+    case "default_profile":
+      return profileFieldShown;
     case "max_jobs":
     case "active_hours":
     case "ignore_patterns":
@@ -156,11 +201,14 @@ export function saveBarMessage({
   draft,
   section,
   advancedValid,
+  profileFieldShown = false,
 }: {
   errors: FieldErrors;
   draft: Settings;
   section: SectionId;
   advancedValid: boolean;
+  /** The `default_profile` error names a control the editor shows it under. */
+  profileFieldShown?: boolean;
 }): { message: string | null; role: "alert" | "status"; blocked: boolean } {
   const outputMissing = draft.output_mode === "folder" && !draft.output_folder;
   const tempMissing = draft.temp_dir !== null && draft.temp_dir === "";
@@ -180,7 +228,7 @@ export function saveBarMessage({
   if (first) {
     const [field, message] = first;
     const fieldSection = SECTION_OF[field];
-    if (fieldSection === section && errorShownInline(field, draft)) {
+    if (fieldSection === section && errorShownInline(field, draft, profileFieldShown)) {
       return { message: "Fix the highlighted setting to save.", role: "status", blocked };
     }
     if (fieldSection && fieldSection !== section) {

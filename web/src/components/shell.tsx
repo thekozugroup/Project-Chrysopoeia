@@ -8,6 +8,7 @@
 
 import {
   TriangleAlert,
+  CircleCheck,
   CirclePause,
   Clock,
   FolderPlus,
@@ -22,14 +23,14 @@ import {
   Sun,
   WifiOff,
 } from "lucide-react";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { Brand } from "@/components/brand";
 import { finishedPercent } from "@/components/library-bar";
 import { Tooltip } from "@/components/ui/overlays";
 import { formatHour, formatPercent, plural } from "@/lib/format";
-import { useLibraries, useQueueState, useSettings } from "@/lib/queries";
+import { useFailures, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
-import { useLive, type ConnectionState } from "@/lib/store";
+import { useLive, useServerDown, type ConnectionState } from "@/lib/store";
 import { setTheme, useTheme, type ThemeChoice } from "@/lib/theme";
 import type { Library, QueueState, Settings } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -83,29 +84,40 @@ export function queueSummary(
   }
   if (queue.queued > 0) return { text: `${plural(queue.queued, "file")} waiting`, icon: <Clock aria-hidden />, tone: "waiting" };
   if (scanning) return { text: "Scanning", icon: <ScanSearch aria-hidden />, tone: "waiting" };
-  return { text: "Idle", icon: <Clock aria-hidden />, tone: "idle" };
+  return {
+    text: settings?.watch_folders === false ? "All caught up" : "Watching for new files",
+    icon: <CircleCheck aria-hidden />,
+    tone: "idle",
+  };
 }
 
 function QueuePill({ className }: { className?: string }) {
   const queue = useQueueState();
   const settings = useSettings();
+  const libraries = useLibraries();
   const scanning = useAnyScanning();
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
   const serverDown = useLive((s) => s.serverDown);
+  // The banner is up: the server can't be reached.
+  const away = useServerDown();
   const summary = queueSummary(queue.data, settings.data, scanning);
+  // No folder is watched yet: there's no queue state worth a pill.
+  if (libraries.data?.length === 0) return null;
   // Without live updates (and before polling catches up), or while the
   // server can't be reached, this is only the last known state.
   const stale = connection !== "open" && (serverDown || !polling);
+  const lastKnown = `Last known: ${summary.text.charAt(0).toLowerCase()}${summary.text.slice(1)}`;
   return (
     <a
       href={href("/queue")}
-      title={stale ? "Last known state" : undefined}
+      title={stale ? lastKnown : undefined}
       className={cn(
-        "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-[color,background-color,opacity] [&_svg]:size-4 [&_svg]:shrink-0",
-        // Stale: neutral colours and a still icon, so it doesn't look live.
+        "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-[color,background-color,opacity] pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
+        // Stale: an outline instead of a fill and a still icon, so it
+        // can't be mistaken for a live state.
         stale
-          ? "bg-raised text-muted hover:text-fg [&_.spin]:animate-none"
+          ? "border border-dashed border-line-strong/70 bg-transparent text-muted hover:text-fg [&_.spin]:animate-none"
           : summary.tone === "active"
             ? "bg-accent-soft text-accent-ink"
             : summary.tone === "paused"
@@ -114,9 +126,9 @@ function QueuePill({ className }: { className?: string }) {
         className,
       )}
     >
-      {summary.icon}
-      <span className="truncate">{summary.text}</span>
-      {stale ? <span className="sr-only"> (last known state)</span> : null}
+      {away ? <WifiOff aria-hidden /> : summary.icon}
+      <span className="truncate">{away ? "Not connected" : summary.text}</span>
+      {stale ? <span className="sr-only"> ({away ? lastKnown : "last known state"})</span> : null}
     </a>
   );
 }
@@ -135,7 +147,9 @@ function ConnectionNotice({ className, compact = false }: { className?: string; 
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
   const serverDown = useLive((s) => s.serverDown);
-  if (connection === "open") return null;
+  // The banner above every screen already says the server is away.
+  const bannerShown = useServerDown();
+  if (connection === "open" || bannerShown) return null;
   const text = serverDown ? "Server not answering" : CONNECTION_TEXT[connection];
   const detail = serverDown
     ? "Trying again every few seconds."
@@ -165,29 +179,13 @@ function ConnectionNotice({ className, compact = false }: { className?: string; 
   return compact ? <Tooltip content={detail ? `${text}. ${detail}` : text}>{body}</Tooltip> : body;
 }
 
-/** Whether `value` has been true for at least `ms` (false again at once). */
-function useSustained(value: boolean, ms: number): boolean {
-  const [sustained, setSustained] = useState(false);
-  useEffect(() => {
-    if (!value) return;
-    const timer = setTimeout(() => setSustained(true), ms);
-    return () => {
-      clearTimeout(timer);
-      setSustained(false);
-    };
-  }, [value, ms]);
-  return value && sustained;
-}
-
 /**
  * A calm note above every screen while the server can't be reached (the
  * container stopped or is restarting). What's on screen stays as it was, and
  * the app reconnects on its own; nothing needs reloading.
  */
 function ServerDownBanner() {
-  const down = useLive((s) => s.serverDown && s.connection !== "open");
-  // A single failed request during a blip shouldn't flash a banner.
-  const show = useSustained(down, 1500);
+  const show = useServerDown();
   return (
     <div role="status" aria-live="polite">
       {show ? (
@@ -196,7 +194,8 @@ function ServerDownBanner() {
           <div className="min-w-0 text-[0.8125rem] leading-relaxed">
             <p className="font-semibold text-fg">Can&apos;t reach Chrysopoeia right now</p>
             <p className="text-muted">
-              It may be restarting. You&apos;re seeing the last known state, and this page reconnects on its own.
+              It may be restarting. You&apos;re seeing the last known state; actions come back when it does, and this
+              page reconnects on its own.
             </p>
           </div>
         </div>
@@ -247,13 +246,11 @@ function NavLink({
   active,
   icon,
   children,
-  trailing,
 }: {
   to: string;
   active: boolean;
   icon: ReactNode;
   children: ReactNode;
-  trailing?: ReactNode;
 }) {
   return (
     <a
@@ -266,13 +263,14 @@ function NavLink({
     >
       <span className={cn(active ? "text-accent-ink" : "")}>{icon}</span>
       <span className="min-w-0 flex-1 truncate">{children}</span>
-      {trailing}
     </a>
   );
 }
 
 function LibraryLink({ library, active }: { library: Library; active: boolean }) {
   const scan = useLive((s) => s.scans[library.id]);
+  const failures = useFailures();
+  const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   const scanning = library.scanning || Boolean(scan && scan.phase !== "done");
   let detail: ReactNode;
   if (library.path_error) {
@@ -294,7 +292,7 @@ function LibraryLink({ library, active }: { library: Library; active: boolean })
   } else if (library.stats.file_count === 0) {
     detail = "No files yet";
   } else {
-    detail = `${formatPercent(finishedPercent(library.stats))} finished`;
+    detail = `${formatPercent(finishedPercent(library.stats, unreadable))} finished`;
   }
   return (
     <a
@@ -316,9 +314,7 @@ function LibraryLink({ library, active }: { library: Library; active: boolean })
 function Sidebar({ route }: { route: Route }) {
   const section = sectionOf(route);
   const libraries = useLibraries();
-  const queue = useQueueState();
   const activeLibrary = route.segments[0] === "library" ? route.segments[1] : undefined;
-  const running = queue.data?.running ?? 0;
   return (
     <aside
       aria-label="Main"
@@ -333,19 +329,8 @@ function Sidebar({ route }: { route: Route }) {
         <NavLink to={href("/")} active={section === "overview"} icon={<LayoutDashboard />}>
           Overview
         </NavLink>
-        <NavLink
-          to={href("/queue")}
-          active={section === "queue"}
-          icon={<ListVideo />}
-          trailing={
-            running > 0 ? (
-              <span className="rounded-full bg-accent-soft px-1.5 text-xs font-semibold text-accent-ink tabular">
-                {running}
-                <span className="sr-only"> converting</span>
-              </span>
-            ) : null
-          }
-        >
+        {/* The status pill at the bottom says how many are converting. */}
+        <NavLink to={href("/queue")} active={section === "queue"} icon={<ListVideo />}>
           Queue
         </NavLink>
       </nav>
@@ -486,14 +471,22 @@ export function PageHeader({
   description,
   actions,
   children,
+  inlineActions = false,
 }: {
   title: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
   children?: ReactNode;
+  /** Keep a small action (a "…" menu) beside the title on phones too. */
+  inlineActions?: boolean;
 }) {
   return (
-    <header className="mb-7 flex flex-col gap-4 md:mb-9 md:flex-row md:items-end md:justify-between">
+    <header
+      className={cn(
+        "mb-7 flex gap-4 md:mb-9 md:flex-row md:items-end md:justify-between",
+        inlineActions ? "flex-row items-start justify-between" : "flex-col",
+      )}
+    >
       <div className="min-w-0">
         <h1 className="font-display text-[2rem] leading-[1.1] text-fg md:text-[2.5rem]">{title}</h1>
         {description ? <div className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">{description}</div> : null}

@@ -1,9 +1,9 @@
 "use client";
 
 /**
- * Settings, in five plain sections. Edits collect in a draft shared by all
+ * Settings, in four plain sections. Edits collect in a draft shared by all
  * sections; the save bar sends only what changed, and API errors land on the
- * field they are about.
+ * field they are about (including one inside the default profile).
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -16,32 +16,66 @@ import { SaveBar } from "@/components/save-bar";
 import { PageHeader, ThemeSwitch } from "@/components/shell";
 import { Button } from "@/components/ui/button";
 import { ChoiceCard, Field, Input, Select, SwitchRow, Textarea } from "@/components/ui/controls";
-import { Badge, Callout, Skeleton } from "@/components/ui/display";
-import { NavTabs } from "@/components/ui/nav-tabs";
-import { api, errorMessage } from "@/lib/api";
+import { Badge, Callout, CopyButton, Skeleton } from "@/components/ui/display";
+import { ApiError, api, errorMessage } from "@/lib/api";
 import { formatHour } from "@/lib/format";
-import { VALIDATION_HELP, VALIDATION_LABEL } from "@/lib/labels";
-import { keys, useHardwareInfo, usePresets, useSettings, useSystem } from "@/lib/queries";
+import { bugReportText } from "@/lib/hardware";
+import { VALIDATION_HELP, VALIDATION_LABEL, VALIDATION_LEVELS } from "@/lib/labels";
+import { keys, useHardwareInfo, usePresets, useQueueState, useSettings, useSystem } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import {
   changedKeys,
   errorsFrom,
+  profileFieldOf,
   saveBarMessage,
   SECTION_LABEL,
+  sectionFor,
   type FieldErrors,
+  type ProfileErrors,
   type SectionId,
 } from "@/lib/settings-form";
-import type { Settings, SystemInfo, ValidationLevel } from "@/lib/types";
+import type { QueueState, Settings, SystemInfo, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
 
 const SECTIONS: { id: SectionId; label: string; description: string }[] = [
   { id: "processing", label: SECTION_LABEL.processing, description: "How many files at once, and when." },
-  { id: "output", label: SECTION_LABEL.output, description: "Where finished files go." },
-  { id: "verification", label: SECTION_LABEL.verification, description: "How carefully each result is checked." },
-  { id: "hardware", label: SECTION_LABEL.hardware, description: "Your CPU, GPU and which encoders work." },
+  { id: "output", label: SECTION_LABEL.output, description: "Where finished files go, and how they're checked first." },
+  { id: "hardware", label: SECTION_LABEL.hardware, description: "What does the converting on this machine." },
   { id: "advanced", label: SECTION_LABEL.advanced, description: "Ignored files and defaults for new libraries." },
 ];
+
+/**
+ * What "Automatic" means for files at once, so Settings and the queue
+ * never disagree: the queue's own number while the limit is automatic (the
+ * container's MAX_JOBS, or the hardware's recommendation), else the
+ * hardware's recommendation.
+ */
+export function automaticJobs(
+  queue: QueueState | undefined,
+  recommended: { total: number; reason: string } | undefined,
+): { count: number | null; fromEnv: boolean; description: string } {
+  const source = queue?.max_jobs_source ?? (queue?.max_jobs_auto ? "auto" : undefined);
+  if (queue && source === "env") {
+    return {
+      count: queue.max_jobs,
+      fromEnv: true,
+      description: "Set by the container's MAX_JOBS variable. A number you choose here wins.",
+    };
+  }
+  if (queue && source === "auto") {
+    return {
+      count: queue.max_jobs,
+      fromEnv: false,
+      description: recommended?.reason ?? "Chosen from your CPU cores, memory and GPU.",
+    };
+  }
+  return {
+    count: recommended?.total ?? null,
+    fromEnv: false,
+    description: recommended?.reason ?? "Chosen from your CPU cores, memory and GPU.",
+  };
+}
 
 function Block({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
   return (
@@ -106,8 +140,9 @@ const RESCAN: { value: number; label: string }[] = [
 function ProcessingSection({ draft, onChange, errors }: SectionProps) {
   // The recommendation is a guess until detection has finished.
   const { hw } = useHardwareInfo();
+  const queue = useQueueState();
   const name = useId();
-  const auto = hw?.recommended_jobs;
+  const auto = automaticJobs(queue.data, hw?.recommended_jobs);
   const hours = draft.active_hours;
   return (
     <>
@@ -119,23 +154,29 @@ function ProcessingSection({ draft, onChange, errors }: SectionProps) {
             value="auto"
             checked={draft.max_jobs === null}
             onChange={() => onChange({ max_jobs: null })}
-            title={auto ? `Automatic (${auto.total})` : "Automatic"}
-            description={auto ? auto.reason : "Chosen from your CPU cores, memory and GPU."}
+            title={
+              auto.count === null
+                ? "Automatic"
+                : auto.fromEnv
+                  ? `Automatic (${auto.count}, from MAX_JOBS)`
+                  : `Automatic (${auto.count})`
+            }
+            description={auto.description}
             badge={<Badge tone="accent">Recommended</Badge>}
           />
           <ChoiceCard
             name={name}
             value="manual"
             checked={draft.max_jobs !== null}
-            onChange={() => onChange({ max_jobs: draft.max_jobs ?? auto?.total ?? 2 })}
+            onChange={() => onChange({ max_jobs: draft.max_jobs ?? auto.count ?? 2 })}
             title="Choose a number"
             description="More isn't always faster: GPUs limit parallel sessions, and CPUs share their cores."
           >
             {draft.max_jobs !== null ? (
               <span className="mt-3 flex items-center gap-3">
                 <Stepper value={draft.max_jobs} onChange={(max_jobs) => onChange({ max_jobs })} min={1} max={32} label="Files at once" />
-                {auto && draft.max_jobs > auto.total * 2 ? (
-                  <span className="text-[0.8125rem] text-warning">Much more than recommended ({auto.total}).</span>
+                {auto.count !== null && draft.max_jobs > auto.count * 2 ? (
+                  <span className="text-[0.8125rem] text-warning">Much more than recommended ({auto.count}).</span>
                 ) : null}
               </span>
             ) : null}
@@ -295,6 +336,8 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
         />
       </Block>
 
+      <ChecksBlock draft={draft} onChange={onChange} />
+
       <Block
         title="Work folder"
         description="Where files are written while they're being converted. A fast SSD or cache pool speeds things up."
@@ -333,51 +376,88 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
   );
 }
 
-const LEVELS: ValidationLevel[] = ["standard", "thorough", "quick", "off"];
-
-function VerificationSection({ draft, onChange }: SectionProps) {
+/**
+ * How carefully each result is checked before it replaces the original:
+ * Quick → Standard → Thorough, each adding to the one before. "Off" is a
+ * separate switch with a warning, not a fourth choice.
+ */
+function ChecksBlock({ draft, onChange }: Pick<SectionProps, "draft" | "onChange">) {
   const name = useId();
+  const on = draft.validation !== "off";
+  // Turning checks back on returns to the level chosen before.
+  const [level, setLevel] = useState<Exclude<ValidationLevel, "off">>(
+    draft.validation === "off" ? "standard" : draft.validation,
+  );
+  if (draft.validation !== "off" && draft.validation !== level) setLevel(draft.validation);
   return (
     <Block
       title="Checks before replacing"
       description="Each finished file is compared with its original. If a check fails, the original is kept and you're told why."
     >
-      <fieldset className="flex flex-col gap-3">
-        <legend className="sr-only">Verification level</legend>
-        {LEVELS.map((level) => (
-          <ChoiceCard
-            key={level}
-            name={name}
-            value={level}
-            checked={draft.validation === level}
-            onChange={() => onChange({ validation: level })}
-            title={VALIDATION_LABEL[level]}
-            description={VALIDATION_HELP[level]}
-            badge={
-              level === "standard" ? (
-                <Badge tone="accent">Recommended</Badge>
-              ) : level === "off" ? (
-                <Badge tone="warning">Risky</Badge>
-              ) : null
-            }
-          />
-        ))}
-      </fieldset>
-      {draft.validation === "off" && draft.output_mode === "replace" ? (
+      <SwitchRow
+        label="Check new files before keeping them"
+        description="Recommended. Without checks, a damaged conversion could replace a good original."
+        checked={on}
+        onCheckedChange={(checked) => onChange({ validation: checked ? level : "off" })}
+      />
+      {on ? (
+        <fieldset className="flex flex-col gap-3">
+          <legend className="sr-only">How carefully to check</legend>
+          {VALIDATION_LEVELS.map((level) => (
+            <ChoiceCard
+              key={level}
+              name={name}
+              value={level}
+              checked={draft.validation === level}
+              onChange={() => onChange({ validation: level })}
+              title={VALIDATION_LABEL[level]}
+              description={VALIDATION_HELP[level]}
+              badge={level === "standard" ? <Badge tone="accent">Recommended</Badge> : null}
+            />
+          ))}
+        </fieldset>
+      ) : draft.output_mode === "replace" ? (
         <Callout tone="warning" title="Originals will be replaced without any checks">
-          A file damaged during conversion would replace a good one. Keep at least Quick unless you have backups.
+          A file damaged during conversion would replace a good one. Keep checks on unless you have backups.
         </Callout>
       ) : null}
     </Block>
   );
 }
 
-function AdvancedSection({ draft, onChange, errors, onValidity, resetKey }: SectionProps) {
+/**
+ * Ignore rules every install starts with. They stay out of the text box
+ * (so nobody deletes them by accident) and are described in words instead.
+ */
+const BUILT_IN_PATTERNS: Record<string, string> = {
+  "**/.*": "hidden files and folders",
+  "**/@eaDir/**": "Synology @eaDir folders",
+  "**/#recycle/**": "#recycle bins",
+  "**/*.partial~": "unfinished downloads (.partial~)",
+};
+
+/** Split saved patterns into the built-in ones and the user's own. */
+export function splitPatterns(patterns: string[]): { builtIn: string[]; own: string[] } {
+  return {
+    builtIn: patterns.filter((p) => p in BUILT_IN_PATTERNS),
+    own: patterns.filter((p) => !(p in BUILT_IN_PATTERNS)),
+  };
+}
+
+function builtInText(builtIn: string[]): string | null {
+  if (!builtIn.length) return null;
+  const names = builtIn.map((p) => BUILT_IN_PATTERNS[p]);
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return `Always ignored: ${list}.`;
+}
+
+function AdvancedSection({ draft, onChange, errors, onValidity, resetKey, profileErrors }: SectionProps) {
   const presets = usePresets();
   const hardware = useHardwareInfo();
-  const [patternsText, setPatternsText] = useState(draft.ignore_patterns.join("\n"));
-  const [lastPatterns, setLastPatterns] = useState(draft.ignore_patterns.join("\n"));
-  const joined = draft.ignore_patterns.join("\n");
+  const { builtIn, own } = splitPatterns(draft.ignore_patterns);
+  const [patternsText, setPatternsText] = useState(own.join("\n"));
+  const [lastPatterns, setLastPatterns] = useState(own.join("\n"));
+  const joined = own.join("\n");
   if (joined !== lastPatterns) {
     setLastPatterns(joined);
     setPatternsText(joined);
@@ -386,14 +466,20 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey }: Sect
     <>
       <Block title="Ignored files" description="Files matching these are never scanned or converted.">
         <Field
-          label="Ignore patterns"
-          description="One per line, relative to each library, e.g. **/Extras/** or **/*sample*. Hidden files and NAS system folders are ignored by default."
+          label="Your ignore patterns"
+          description={[
+            "One per line, relative to each library, e.g. **/Extras/** or **/*sample*.",
+            builtInText(builtIn),
+          ]
+            .filter(Boolean)
+            .join(" ")}
           error={errors.ignore_patterns}
         >
           <Textarea
             value={patternsText}
-            rows={6}
+            rows={4}
             spellCheck={false}
+            placeholder="**/Extras/**"
             className="font-mono text-[0.8125rem]"
             onChange={(e) => {
               setPatternsText(e.target.value);
@@ -402,13 +488,14 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey }: Sect
                 .map((p) => p.trim())
                 .filter(Boolean);
               setLastPatterns(patterns.join("\n"));
-              onChange({ ignore_patterns: patterns });
+              // The built-in rules are kept as they are.
+              onChange({ ignore_patterns: [...builtIn, ...patterns.filter((p) => !builtIn.includes(p))] });
             }}
           />
         </Field>
         <Field
           label="Ignore files smaller than"
-          description="Skips samples and trailers. 0 includes every file."
+          description="New files smaller than this are skipped (samples, trailers). Files already listed stay. 0 includes every file."
           error={errors.min_file_size_mb}
         >
           <div className="flex items-center gap-2">
@@ -437,6 +524,7 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey }: Sect
         <ProfileEditor
           profile={draft.default_profile}
           onChange={(default_profile) => onChange({ default_profile })}
+          errors={profileErrors}
           presets={presets.data}
           hardware={hardware.hw}
           hardwarePending={hardware.pending}
@@ -456,6 +544,8 @@ interface SectionProps {
   onValidity: (valid: boolean) => void;
   /** Bumped by Discard, to clear text typed into free-text fields. */
   resetKey: number;
+  /** A server error inside the default profile, under its control. */
+  profileErrors: ProfileErrors;
 }
 
 function SettingsForm({ settings, section }: { settings: Settings; section: SectionId }) {
@@ -463,6 +553,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   const [base, setBase] = useState(settings);
   const [draft, setDraft] = useState(settings);
   const [errors, setErrors] = useState<FieldErrors>({});
+  const [profileErrors, setProfileErrors] = useState<ProfileErrors>({});
   const [valid, setValid] = useState(true);
   const [resetKey, setResetKey] = useState(0);
   const changed = changedKeys(draft, base);
@@ -476,6 +567,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
 
   const onChange = (patch: Partial<Settings>) => {
     setDraft((d) => ({ ...d, ...patch }));
+    if ("default_profile" in patch) setProfileErrors({});
     setErrors((e) => {
       const next = { ...e };
       for (const key of Object.keys(patch)) delete next[key as keyof Settings];
@@ -497,19 +589,29 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
       setBase(next);
       setDraft(next);
       setErrors({});
+      setProfileErrors({});
       toast.success("Settings saved");
     },
-    onError: (err) => setErrors(errorsFrom(err, changed)),
+    onError: (err) => {
+      setErrors(errorsFrom(err, changed));
+      const field = err instanceof ApiError ? profileFieldOf(err.field, "default_profile") : null;
+      setProfileErrors(field ? { [field]: errorMessage(err) } : {});
+    },
   });
 
-  const sectionProps: SectionProps = { draft, onChange, errors, onValidity: setValid, resetKey };
-  const bar = saveBarMessage({ errors, draft, section, advancedValid: valid });
+  const sectionProps: SectionProps = { draft, onChange, errors, onValidity: setValid, resetKey, profileErrors };
+  const bar = saveBarMessage({
+    errors,
+    draft,
+    section,
+    advancedValid: valid,
+    profileFieldShown: Object.keys(profileErrors).length > 0,
+  });
 
   return (
     <>
       {section === "processing" ? <ProcessingSection {...sectionProps} /> : null}
       {section === "output" ? <OutputSection {...sectionProps} /> : null}
-      {section === "verification" ? <VerificationSection {...sectionProps} /> : null}
       {section === "hardware" ? <HardwareSection draft={draft} onChange={onChange} /> : null}
       {/* Kept mounted while hidden, so text typed there (valid or not) isn't
           lost on switching sections, and invalid text keeps blocking Save. */}
@@ -523,6 +625,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
         onDiscard={() => {
           setDraft(base);
           setErrors({});
+          setProfileErrors({});
           setResetKey((k) => k + 1);
         }}
         error={bar.message}
@@ -544,10 +647,42 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   );
 }
 
+/** Version and build, and a copy of the facts a bug report needs. */
+function About() {
+  const system = useSystem();
+  const { hw } = useHardwareInfo();
+  const queue = useQueueState();
+  const settings = useSettings();
+  const info = system.data;
+  if (!info) return null;
+  const text = bugReportText({ system: info, hw, queue: queue.data, settings: settings.data });
+  return (
+    <section
+      aria-labelledby="about-heading"
+      className="mt-12 flex flex-col gap-3 border-t border-line pt-6 sm:flex-row sm:items-center sm:justify-between"
+    >
+      <div className="min-w-0">
+        <h2 id="about-heading" className="text-sm font-semibold text-fg">
+          About
+        </h2>
+        <p className="mt-0.5 text-[0.8125rem] text-muted">
+          Chrysopoeia <span className="font-mono text-fg">{info.version}</span>
+          {info.build ? (
+            <>
+              {" "}
+              · build <span className="font-mono text-fg">{info.build}</span>
+            </>
+          ) : null}
+        </p>
+      </div>
+      <CopyButton text={text} label="Copy for a bug report" className="self-start sm:self-auto" />
+    </section>
+  );
+}
+
 export function SettingsScreen({ route }: { route: Route }) {
   const settings = useSettings();
-  const requested = route.segments[1] as SectionId | undefined;
-  const section: SectionId = SECTIONS.some((s) => s.id === requested) ? (requested as SectionId) : "processing";
+  const section = sectionFor(route.segments[1]);
   const current = SECTIONS.find((s) => s.id === section) ?? SECTIONS[0];
 
   return (
@@ -581,11 +716,27 @@ export function SettingsScreen({ route }: { route: Route }) {
             ))}
           </ul>
         </nav>
-        <NavTabs
-          label="Settings sections"
-          className="mb-7 lg:hidden"
-          tabs={SECTIONS.map((s) => ({ href: href(`/settings/${s.id}`), label: s.label, active: s.id === section }))}
-        />
+        {/* Narrow screens: every section visible at once, as wrapping pills. */}
+        <nav aria-label="Settings sections" className="mb-7 lg:hidden">
+          <ul className="flex flex-wrap gap-2">
+            {SECTIONS.map((s) => (
+              <li key={s.id}>
+                <a
+                  href={href(`/settings/${s.id}`)}
+                  aria-current={s.id === section ? "page" : undefined}
+                  className={cn(
+                    "inline-flex h-9 items-center rounded-full border px-4 text-sm font-medium no-underline transition-colors pointer-coarse:h-11",
+                    s.id === section
+                      ? "border-accent-ink bg-accent-soft text-fg"
+                      : "border-line-strong/50 bg-surface text-muted hover:border-line-strong hover:text-fg",
+                  )}
+                >
+                  {s.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </nav>
         <div className="min-w-0">
           {settings.data ? (
             <SettingsForm settings={settings.data} section={section} />
@@ -599,6 +750,7 @@ export function SettingsScreen({ route }: { route: Route }) {
               <Skeleton className="h-20 w-full max-w-2xl" />
             </div>
           )}
+          <About />
         </div>
       </div>
     </div>

@@ -8,7 +8,8 @@
 import { keepPreviousData, useQuery, type QueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
 import { isDetecting } from "./hardware";
-import type { FileQuery, HardwareInfo, JobQuery, Library, SystemInfo } from "./types";
+import { countFailures, isUnreadableSource, type FailureCounts } from "./outcomes";
+import type { FileQuery, HardwareInfo, JobQuery, Library, MediaFile, SystemInfo } from "./types";
 
 /** Query keys. Lists take their parameters as the last element. */
 export const keys = {
@@ -181,6 +182,57 @@ export function useBrowse(path: string | undefined, enabled = true) {
     staleTime: 30_000,
     placeholderData: keepPreviousData,
   });
+}
+
+/** The failed files of every library, to tell damaged originals from failed conversions. */
+const FAILED_QUERY: FileQuery = { status: "failed", limit: 500, sort: "name" };
+
+/** Failed files split by cause, overall and per library. */
+export interface Failures {
+  /** False until the failed files have loaded (counts are 0 meanwhile). */
+  ready: boolean;
+  total: FailureCounts;
+  byLibrary: Record<string, FailureCounts>;
+  /** Failed files whose original can't be read. */
+  unreadable: MediaFile[];
+  /** Ids of failed files worth trying again (not damaged originals), by library. */
+  retryIds: Record<string, string[]>;
+}
+
+/**
+ * Why files failed. `stats.failed` counts damaged originals and failed
+ * conversions alike; this reads the failed files themselves (only when some
+ * library has any) so each kind gets its own wording and action.
+ */
+export function useFailures(): Failures {
+  const libraries = useLibraries();
+  const anyFailed = Boolean(libraries.data?.some((l) => l.stats.failed > 0));
+  const query = useQuery({
+    queryKey: keys.files(FAILED_QUERY),
+    queryFn: ({ signal }) => api.files(FAILED_QUERY, signal),
+    enabled: anyFailed,
+  });
+  const items = anyFailed ? (query.data?.items ?? []) : [];
+  const byLibrary: Record<string, FailureCounts> = {};
+  const retryIds: Record<string, string[]> = {};
+  for (const library of libraries.data ?? []) {
+    const own = items.filter((f) => f.library_id === library.id);
+    // A cut-short list counts the rest as conversion failures.
+    const total = query.data && query.data.total > query.data.items.length ? library.stats.failed : own.length;
+    byLibrary[library.id] = countFailures(own, total);
+    retryIds[library.id] = own.filter((f) => !isUnreadableSource(f.error)).map((f) => f.id);
+  }
+  const total = Object.values(byLibrary).reduce(
+    (sum, c) => ({ unreadable: sum.unreadable + c.unreadable, conversion: sum.conversion + c.conversion }),
+    { unreadable: 0, conversion: 0 },
+  );
+  return {
+    ready: !anyFailed || Boolean(query.data),
+    total,
+    byLibrary,
+    unreadable: items.filter((f) => isUnreadableSource(f.error)),
+    retryIds,
+  };
 }
 
 export function useActivity() {

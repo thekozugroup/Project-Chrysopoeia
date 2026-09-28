@@ -2,7 +2,7 @@
 
 /** Small display building blocks shared by every screen. */
 
-import { Check, Copy, CircleAlert, Info, TriangleAlert, CircleCheck } from "lucide-react";
+import { Check, ChevronRight, Copy, CircleAlert, Info, TriangleAlert, CircleCheck } from "lucide-react";
 import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from "react";
 import { toast } from "sonner";
 import { cn, copyText } from "@/lib/utils";
@@ -277,8 +277,16 @@ export function SectionHeading({
    */
   quietAction?: boolean;
 }) {
+  // The action sits beside the heading at every width ("Libraries · Add
+  // library"); only a row of several controls that can't fit wraps below.
   return (
-    <div className={cn("mb-3 flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between sm:gap-4", className)}>
+    <div
+      className={cn(
+        "mb-3 flex flex-wrap justify-between gap-x-4 gap-y-2",
+        description ? "items-end" : "items-center",
+        className,
+      )}
+    >
       <div className="min-w-0">
         <h2 id={id} className="text-[1.0625rem] leading-snug font-semibold text-fg">
           {title}
@@ -286,9 +294,38 @@ export function SectionHeading({
         {description ? <p className="mt-0.5 text-[0.8125rem] text-muted">{description}</p> : null}
       </div>
       {action ? (
+        // Pulled left so a wrapped borderless button's text lines up with
+        // the heading; beside it, the margin only widens the gap.
         <div className={cn("flex shrink-0 flex-wrap items-center gap-2", quietAction && "-ml-2 sm:ml-0")}>{action}</div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The one place technical data lives: codecs, encoder names, similarity
+ * scores, ffmpeg commands and logs, behind a closed "Technical details".
+ */
+export function Disclosure({
+  title = "Technical details",
+  children,
+  className,
+}: {
+  title?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <details className={cn("group rounded-lg border border-line", className)}>
+      <summary className="flex cursor-pointer list-none items-center gap-2 rounded-lg px-4 py-3 text-sm font-medium text-fg select-none hover:text-accent-ink pointer-coarse:min-h-11 [&::-webkit-details-marker]:hidden">
+        <ChevronRight
+          className="size-4 shrink-0 text-muted transition-transform duration-200 group-open:rotate-90"
+          aria-hidden
+        />
+        {title}
+      </summary>
+      <div className="flex flex-col gap-4 border-t border-line px-4 py-4">{children}</div>
+    </details>
   );
 }
 

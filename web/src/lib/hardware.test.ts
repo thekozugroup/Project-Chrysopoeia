@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import {
+  bugReportText,
   codecSpeedHint,
-  cpuOnlyNote,
   encoderCell,
   isDetecting,
+  machineSummary,
   matrixApis,
   preferenceChoices,
   recommendedGoal,
+  speedWord,
 } from "./hardware";
 import { HW_PREFERENCE_API } from "./labels";
 import type { EncoderStatus, HardwareInfo } from "./types";
@@ -164,11 +166,17 @@ describe("goal advice on a CPU-only machine", () => {
       encoders: [enc("libsvtav1", "av1", "software", true), enc("av1_qsv", "av1", "qsv", true)],
     });
     expect(recommendedGoal(arc)).toBe("save_space");
-    expect(cpuOnlyNote(arc)).toBeNull();
+    expect(speedWord(arc, "av1")).toEqual({ tone: "fast", label: "Fast" });
+    expect(machineSummary(arc)).toBe("Intel Arc A380 converts AV1.");
   });
 
-  it("says once that the CPU does the work, and compares formats on each choice", () => {
-    expect(cpuOnlyNote(cpuOnly)).toMatch(/No GPU was found/);
+  it("compares formats by speed on the CPU, without repeating that there's no GPU", () => {
+    expect(machineSummary(cpuOnly)).toBe("Everything converts on the CPU.");
+    expect(speedWord(cpuOnly, "av1")).toEqual({ tone: "slow", label: "Slow here" });
+    expect(speedWord(cpuOnly, "hevc")?.label).toBe("Medium");
+    expect(speedWord(cpuOnly, "h264")?.label).toBe("Fast");
+    expect(speedWord(placeholder, "h264")).toBeNull();
+    expect(speedWord(undefined, "h264")).toBeNull();
     expect(codecSpeedHint(cpuOnly, "av1")).toEqual({ tone: "cpu", text: "Slowest to convert on the CPU." });
     expect(codecSpeedHint(cpuOnly, "hevc").tone).toBe("cpu");
     expect(codecSpeedHint(cpuOnly, "h264").text).toMatch(/^Quickest/);
@@ -183,16 +191,53 @@ describe("goal advice on a CPU-only machine", () => {
       gpus: [{ vendor: "intel", name: "Intel UHD 630", driver: "i915", render_node: "/dev/dri/renderD128" }],
       encoders: [enc("libx265", "hevc", "software", true), enc("hevc_qsv", "hevc", "qsv", false, "Error creating a MFX session")],
     });
-    expect(cpuOnlyNote(broken)).toMatch(/Settings › Hardware/);
+    expect(machineSummary(broken)).toBe("Everything converts on the CPU.");
     expect(codecSpeedHint(broken, "hevc").tone).toBe("cpu");
     const nvidia = hardware({
       gpus: [{ vendor: "nvidia", name: "NVIDIA GeForce RTX 3060", driver: "nvidia", render_node: null }],
       encoders: [enc("libx265", "hevc", "software", true), enc("hevc_nvenc", "hevc", "nvenc", true)],
     });
-    expect(cpuOnlyNote(nvidia, "cpu")).toMatch(/CPU only/);
+    expect(machineSummary(nvidia, "cpu")).toMatch(/CPU only/);
     expect(codecSpeedHint(nvidia, "hevc", "cpu").tone).toBe("cpu");
-    expect(cpuOnlyNote(nvidia)).toBeNull();
-    expect(cpuOnlyNote(placeholder)).toBeNull();
-    expect(cpuOnlyNote(undefined)).toBeNull();
+    expect(machineSummary(nvidia)).toBe("NVIDIA GeForce RTX 3060 converts HEVC.");
+    expect(speedWord(nvidia, "hevc")?.label).toBe("Fast");
+    // This test ffmpeg has no AV1 encoder at all.
+    expect(speedWord(nvidia, "av1")).toEqual({ tone: "blocked", label: "Not available here" });
+  });
+});
+
+describe("bugReportText", () => {
+  it("lists what a bug report needs, one fact per line", () => {
+    const hw = hardware({
+      gpus: [{ vendor: "nvidia", name: "NVIDIA GeForce RTX 3060", render_node: null, driver: "550.54" }],
+      encoders: [enc("hevc_nvenc", "hevc", "nvenc", true), enc("av1_nvenc", "av1", "nvenc", false), enc("libx265", "hevc", "software", true)],
+    });
+    const text = bugReportText({
+      system: { version: "0.2.0", build: "edge-1a2b3c4", in_container: true },
+      hw,
+      queue: { max_jobs: 3, max_jobs_auto: true, max_jobs_source: "env" },
+      settings: { hardware: "auto" },
+    });
+    expect(text.split("\n")).toEqual([
+      "Chrysopoeia 0.2.0 (build edge-1a2b3c4), in a container",
+      "ffmpeg: 6.1",
+      "CPU: Test CPU (8 threads)",
+      "GPUs: NVIDIA GeForce RTX 3060 (550.54)",
+      "Verified encoders: hevc_nvenc, libx265",
+      "Hardware preference: Automatic",
+      "Files at once: 3 (from MAX_JOBS)",
+    ]);
+  });
+
+  it("leaves out what hasn't loaded, and says when nothing was found", () => {
+    expect(bugReportText({ system: { version: "0.2.0", build: null, in_container: false } })).toBe("Chrysopoeia 0.2.0");
+    const bare = bugReportText({
+      system: { version: "0.2.0", in_container: false },
+      hw: hardware({ encoders: [] }),
+      queue: { max_jobs: 2, max_jobs_auto: true },
+    });
+    expect(bare).toContain("GPUs: none found");
+    expect(bare).toContain("Verified encoders: none");
+    expect(bare).toContain("Files at once: 2 (automatic)");
   });
 });

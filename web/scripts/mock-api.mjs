@@ -13,11 +13,26 @@
  *                           hardware…" stand-in for this long after start
  *   MOCK_WS=on              "off" refuses WebSocket upgrades, like a reverse proxy
  *                           without WebSocket support
+ *   MOCK_MAX_JOBS=          a number: the job limit comes from the container's
+ *                           MAX_JOBS (QueueState.max_jobs_source "env")
+ *   MOCK_FORCE=on           "Convert anyway": on (round-3 server), "ignore" (accepts
+ *                           force but skips the file again) or "reject" (an older
+ *                           server: 400 for the unknown field)
+ *   MOCK_HOST=allow         "deny" answers every request 403 host_not_allowed, like
+ *                           the real server reached under an unknown name
+ *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
+ *                           start, one every few seconds ("Found … in <library>"),
+ *                           and LibraryStats.settling goes down to 0 (0 = never)
  *
  * Error codes, messages and the `field` of validation errors follow the
  * real server (crates/chrysopoeia-server), so the UI's error handling is
- * exercised the same way. Also served: `GET /api/system`, `Job.notes` and
- * `HardwareInfo.detecting` (docs/ARCHITECTURE.md, "Contract additions").
+ * exercised the same way. Also served: `GET /api/system` (with `build`),
+ * `Job.notes`, `HardwareInfo.detecting`, and the round-3 additions:
+ * `QueueState.max_jobs_source`, `LibraryStats.settling`, HDR10 metadata on
+ * streams, `force` on queue, `left_out` on bulk queue, recursive video
+ * counts with `media_count_capped`, 415 `unsupported_media_type`, and
+ * nested error fields (`profile.max_height`). Failed files use the real
+ * server's sentences, including its "can't be read as a video" ones.
  */
 
 import { randomUUID } from "node:crypto";
@@ -29,6 +44,12 @@ const SCENARIO = process.env.MOCK_SCENARIO ?? "demo";
 const TICK_MS = Number(process.env.MOCK_TICK_MS ?? 1000);
 const DETECT_MS = Number(process.env.MOCK_DETECT_MS ?? 0);
 const WS_ON = (process.env.MOCK_WS ?? "on") !== "off";
+const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
+const FORCE = process.env.MOCK_FORCE ?? "on";
+const HOST_DENY = process.env.MOCK_HOST === "deny";
+const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
+/** Jobs queued with "Convert anyway" (force). */
+const forcedJobs = new Set();
 const STARTED = Date.now();
 
 // ---------------------------------------------------------------------------
@@ -100,6 +121,12 @@ const CONTAINERS = {
   mp4: { video: ["av1", "hevc", "h264", "vp9"], audio: ["copy", "aac", "ac3", "eac3", "opus", "mp3"] },
   webm: { video: ["av1", "vp9"], audio: ["copy", "opus", "vorbis"] },
 };
+
+/** The real server's `check_profile`: values normalizing can't fix, named by their nested field. */
+function checkProfile(p, field) {
+  if (p && p.max_height !== null && p.max_height !== undefined && p.max_height < 144)
+    throw new HttpError(400, "invalid_profile", "The largest picture height must be at least 144 lines.", `${field}.max_height`);
+}
 
 function normalizeProfile(p) {
   const out = { ...p };
@@ -276,8 +303,9 @@ const FS = {
   "/media/demo/home-videos": [],
   "/media/demo/music": [],
 };
+/** Videos in each folder and every folder inside it (audio-only files aren't counted). */
 const MEDIA_COUNT = {
-  "/media": 412,
+  "/media": 1000,
   "/media/demo": 412,
   "/media/demo/movies": 136,
   "/media/demo/tv": 248,
@@ -291,6 +319,8 @@ const MEDIA_COUNT = {
   "/media/demo/movies/Sintel (2010)": 1,
   "/media/demo/movies/Tears of Steel (2012)": 1,
 };
+/** Folders where the server stopped counting (so the count is "1,000+"). */
+const MEDIA_COUNT_CAPPED = new Set(["/media"]);
 
 // ---------------------------------------------------------------------------
 // Libraries, files, jobs
@@ -305,6 +335,8 @@ const jobs = new Map();
 const activity = [];
 let activityId = 1;
 const savingsByDay = new Map();
+/** Files each library's last scan found still being copied (LibraryStats.settling). */
+const settling = new Map();
 let paused = false;
 const scanning = new Set();
 
@@ -337,6 +369,16 @@ function makeProbe(file) {
       frame_rate: 23.976, color_primaries: file.hdr ? "bt2020" : "bt709", color_transfer: file.hdr ? "smpte2084" : "bt709",
       color_space: file.hdr ? "bt2020nc" : "bt709", color_range: "tv", hdr: file.hdr, interlaced: file.video_codec === "mpeg2video",
       channels: null, channel_layout: null, sample_rate: null,
+      ...(file.hdr === "hdr10"
+        ? {
+            mastering_display: {
+              red: [0.708, 0.292], green: [0.17, 0.797], blue: [0.131, 0.046], white_point: [0.3127, 0.329],
+              max_luminance: 1000, min_luminance: 0.005,
+            },
+            content_light: { max_cll: 1000, max_fall: 400 },
+          }
+        : {}),
+      ...(file.dvNoBaseLayer ? { dolby_vision_without_base_layer: true } : {}),
     },
     {
       index: 1, kind: "audio", codec: file.audio_codec, profile: null, language: "eng", title: "English 5.1", is_default: true,
@@ -562,7 +604,7 @@ function populateMovies(library, count, doneShare) {
     if (roll < doneShare) markDone(file, between(0.38, 0.62), between(60, 86400 * 29));
     else if (roll < doneShare + 0.08) {
       file.status = "skipped";
-      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller, so the original was kept";
+      file.skip_reason = codec === "hevc" && library.profile.video_codec === "hevc" ? "Already HEVC" : "Only 4% smaller — kept the original";
     }
   }
 }
@@ -587,7 +629,7 @@ function populateTv(library, shows) {
         if (s === 1 && roll < 0.85) markDone(file, between(0.32, 0.55), between(60, 86400 * 25));
         else if (roll < 0.1) {
           file.status = "skipped";
-          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC), nothing to gain" : "Only 6% smaller, so the original was kept";
+          file.skip_reason = file.video_codec === "hevc" ? "Already efficient (HEVC), nothing to gain" : "Only 6% smaller — kept the original";
         }
       }
     }
@@ -641,16 +683,38 @@ function seedDemo() {
     finished_at: ago(3100),
   });
   jobA.created_at = ago(9000);
+  // A damaged original: the worker's own sentence for a file that stops early.
   const failedB = pendingMovies[1];
   failedB.status = "failed";
-  failedB.error = "ffmpeg stopped: the source file ends early (it may be incomplete). The original was kept.";
+  failedB.error = "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.";
   makeJob(failedB, "failed", {
     stage: "transcoding",
     progress: 63,
     error: failedB.error,
-    log_tail: "[matroska,webm @ 0x5581] Read error at pos. 4829122560 (0x11fd84000)\n[in#0/matroska @ 0x5580] Error during demuxing: I/O error\nConversion failed!",
+    log_tail:
+      "Svt[info]: -------------------------------------------\nSvt[info]: SVT [version]:\tSVT-AV1 Encoder Lib v2.1.0\nSvt[info]: -------------------------------------------\n[matroska,webm @ 0x5581a2c0] Read error at pos. 4829122560 (0x11fd84000)\n[in#0/matroska @ 0x5580] Error during demuxing: I/O error\nConversion failed!",
     started_at: ago(12000),
     finished_at: ago(10000),
+  });
+  // Not a video at all: ffprobe couldn't read it when the folder was scanned.
+  const fake = makeFile(movies, "Extras/Fake.mp4", { size: 19, codec: null, resolution: null, duration: 1, audio: null });
+  Object.assign(fake, {
+    status: "failed",
+    unreadable: true,
+    container: null,
+    duration_secs: null,
+    bit_rate: null,
+    error: "This file can't be read as a video: it has no MP4 index, so it's incomplete or not really a video.",
+  });
+
+  // Dolby Vision profile 5: always left unchanged.
+  const dv = makeFile(movies, "Demo Dolby Vision (2021)/Demo Dolby Vision (2021).mkv", {
+    size: 21e9, codec: "hevc", resolution: "4K", duration: 7200, hdr: "dolby_vision", audio: "eac3",
+  });
+  Object.assign(dv, {
+    status: "skipped",
+    dvNoBaseLayer: true,
+    skip_reason: "Dolby Vision profile 5 can't be converted without losing its colours — left unchanged",
   });
 
   // A cancelled and a skipped job in history.
@@ -689,10 +753,28 @@ function seedDemo() {
     job.created_at = ago(4000 - i * 30);
   });
 
+  // A damaged episode in the TV library too: grouped problems span libraries.
+  const brokenEpisode = [...files.values()].find((f) => f.library_id === tv.id && f.status === "pending");
+  if (brokenEpisode) {
+    brokenEpisode.status = "failed";
+    brokenEpisode.error = "The original file appears damaged or incomplete (it stops after 2.4 s). It was left unchanged.";
+    makeJob(brokenEpisode, "failed", {
+      stage: "transcoding",
+      progress: 4,
+      error: brokenEpisode.error,
+      started_at: ago(7000),
+      finished_at: ago(6900),
+    });
+  }
+
+  settling.set(tv.id, 3);
+  addActivity("info", "Scanned Demo TV: 250 files, 3 still being copied (checked again when they're finished)", { library_id: tv.id });
   addActivity("info", "Scanned Demo Movies: 136 files, 2 new.", { library_id: movies.id });
   addActivity("success", "Converted Sintel (2010).mkv and saved 4.1 GB.", { library_id: movies.id });
   addActivity("warning", `Kept the original of ${skippedFile.file_name}: only 4% smaller.`, { library_id: movies.id });
   addActivity("error", `${failedA.file_name} failed its visual check. The original was kept.`, { library_id: movies.id });
+  // The real server's wording for a failed job ("Failed <name>: <error>"), here a damaged original.
+  addActivity("error", `Failed ${failedB.file_name}: ${failedB.error}`, { library_id: movies.id, file_id: failedB.id });
   addActivity("success", "Converted Demo Show - S01E04.mkv and saved 1.1 GB.", { library_id: tv.id });
   activity.forEach((e, i) => (e.at = ago(600 + i * 1900)));
 }
@@ -703,8 +785,11 @@ if (SCENARIO === "demo" || SCENARIO === "nogpu") seedDemo();
 // Derived views
 // ---------------------------------------------------------------------------
 
-function statsFor(list) {
-  const s = { file_count: 0, total_bytes: 0, pending: 0, queued: 0, processing: 0, done: 0, skipped: 0, failed: 0, saved_bytes: 0 };
+function statsFor(list, libraryId = null) {
+  const s = {
+    file_count: 0, total_bytes: 0, pending: 0, queued: 0, processing: 0, done: 0, skipped: 0, failed: 0, saved_bytes: 0,
+    settling: libraryId ? (settling.get(libraryId) ?? 0) : [...settling.values()].reduce((a, b) => a + b, 0),
+  };
   for (const f of list) {
     s.file_count += 1;
     s.total_bytes += f.size_bytes;
@@ -716,11 +801,15 @@ function statsFor(list) {
 
 function libraryView(library) {
   const own = [...files.values()].filter((f) => f.library_id === library.id);
-  return { ...library, stats: statsFor(own), scanning: scanning.has(library.id) };
+  return { ...library, stats: statsFor(own, library.id), scanning: scanning.has(library.id) };
 }
 
 function maxJobs() {
-  return settings.max_jobs ?? hardware.recommended_jobs.total;
+  return settings.max_jobs ?? ENV_MAX_JOBS ?? hardware.recommended_jobs.total;
+}
+
+function maxJobsSource() {
+  return settings.max_jobs !== null ? "settings" : ENV_MAX_JOBS ? "env" : "auto";
 }
 
 function inActiveHours() {
@@ -739,7 +828,8 @@ function queueState() {
     running: all.filter((j) => j.state === "running").length,
     queued,
     max_jobs: maxJobs(),
-    max_jobs_auto: settings.max_jobs === null,
+    max_jobs_auto: settings.max_jobs === null && !ENV_MAX_JOBS,
+    max_jobs_source: maxJobsSource(),
     waiting_for_schedule: !paused && queued > 0 && !inActiveHours(),
   };
 }
@@ -782,9 +872,12 @@ function overview() {
   };
 }
 
+/** A file as the API sends it (mock-only bookkeeping removed). */
 function listFile(f) {
   const out = { ...f };
   delete out.probe;
+  delete out.unreadable;
+  delete out.dvNoBaseLayer;
   return out;
 }
 
@@ -851,7 +944,8 @@ function startJobs() {
     const file = files.get(job.file_id);
     const lib = libraries.get(job.library_id);
     if (!file || !lib) continue;
-    const reason = skipReasonFor(file, lib);
+    // "Convert anyway" sets the skip rules aside (a server ignoring it doesn't).
+    const reason = forcedJobs.has(job.id) && FORCE === "on" ? null : skipReasonFor(file, lib);
     if (reason) {
       skipAtStart(job, file, reason);
       emitLibrary(lib);
@@ -960,6 +1054,37 @@ function tick() {
 }
 setInterval(tick, TICK_MS);
 
+/**
+ * Files still being copied settle like on the real server: each arrives as
+ * "Found <name> in <library>" (never as a new scan summary) and the
+ * library's `settling` count goes down to 0.
+ */
+if (SETTLE_MS > 0) {
+  setTimeout(() => {
+    const timer = setInterval(() => {
+      const next = [...settling.entries()].find(([, n]) => n > 0);
+      if (!next) {
+        clearInterval(timer);
+        return;
+      }
+      const [libraryId, n] = next;
+      const library = libraries.get(libraryId);
+      settling.set(libraryId, n - 1);
+      if (!library) return;
+      const file = makeFile(library, `Arrivals/New Episode ${String(4 - n).padStart(2, "0")}.mkv`, {
+        size: between(0.8e9, 2.4e9),
+        codec: "h264",
+        resolution: "1080p",
+        duration: between(21, 45) * 60,
+        audio: "aac",
+      });
+      emitActivity(addActivity("info", `Found ${file.file_name} in ${library.name}`, { library_id: library.id, file_id: file.id }));
+      emitLibrary(library);
+      broadcast({ type: "files.changed", library_id: library.id });
+    }, 4000);
+  }, SETTLE_MS);
+}
+
 function simulateScan(library, generate) {
   if (scanning.has(library.id)) return false;
   scanning.add(library.id);
@@ -1033,6 +1158,8 @@ async function readBody(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
   if (!chunks.length) return {};
+  if (!/^application\/json\b/i.test(req.headers["content-type"] ?? ""))
+    throw new HttpError(415, "unsupported_media_type", "Send the request body as JSON (Content-Type: application/json).");
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
@@ -1146,7 +1273,10 @@ route("PATCH", "/api/libraries/:id", async ({ id }, _q, req) => {
     lib.name = body.name.trim();
   }
   if (typeof body.enabled === "boolean") lib.enabled = body.enabled;
-  if (body.profile) lib.profile = normalizeProfile(body.profile);
+  if (body.profile) {
+    checkProfile(body.profile, "profile");
+    lib.profile = normalizeProfile(body.profile);
+  }
   emitLibrary(lib);
   return libraryView(lib);
 });
@@ -1190,15 +1320,27 @@ route("GET", "/api/files", (_p, q) => {
 route("GET", "/api/files/:id", ({ id }) => {
   const file = getFile(id);
   const fileJobs = [...jobs.values()].filter((j) => j.file_id === id).sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 10);
-  return { file: { ...file, probe: makeProbe(file) }, jobs: fileJobs };
+  // Files ffprobe couldn't read have no probe.
+  const out = listFile(file);
+  return { file: file.unreadable ? out : { ...out, probe: makeProbe(file) }, jobs: fileJobs };
 });
 
 route("POST", "/api/files/:id/queue", async ({ id }, _q, req) => {
   const file = getFile(id);
   const body = await readBody(req);
+  for (const key of Object.keys(body)) {
+    if (key === "priority" || (key === "force" && FORCE !== "reject")) continue;
+    // The real server's words for a field it doesn't know (an older one, for "force").
+    throw new HttpError(
+      400,
+      "invalid_json",
+      `The request body isn't valid (unknown field \`${key}\`, expected \`priority\` at line 1 column 8).`,
+    );
+  }
   if (file.status === "queued" || file.status === "processing")
     throw new HttpError(409, "already_queued", "This file is already in the queue.");
   const job = queueFile(file, Number(body.priority ?? 0));
+  if (body.force === true) forcedJobs.add(job.id);
   broadcast({ type: "file.updated", file: listFile(file) });
   broadcast({ type: "job.updated", job });
   emitQueue();
@@ -1227,7 +1369,16 @@ route("POST", "/api/files/bulk", async (_p, _q, req) => {
   if (body.library) list = list.filter((f) => f.library_id === body.library);
   if (body.status) list = list.filter((f) => f.status === body.status);
   let affected = 0;
+  let leftOut = 0;
   for (const file of list) {
+    // With explicit ids, only files the settings would convert (or failed ones) are queued.
+    if (body.action === "queue" && body.ids && file.status !== "failed" && !["queued", "processing"].includes(file.status)) {
+      const lib = libraries.get(file.library_id);
+      if (lib && skipReasonFor(file, lib)) {
+        leftOut++;
+        continue;
+      }
+    }
     if (body.action === "queue" && !["queued", "processing"].includes(file.status)) {
       queueFile(file);
       affected++;
@@ -1244,7 +1395,7 @@ route("POST", "/api/files/bulk", async (_p, _q, req) => {
   emitQueue();
   emitStats();
   startJobs();
-  return { affected };
+  return body.action === "queue" && body.ids ? { affected, left_out: leftOut } : { affected };
 });
 
 route("GET", "/api/jobs", (_p, q) => {
@@ -1373,7 +1524,10 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
         );
     }
   }
-  if (patch.default_profile) next.default_profile = normalizeProfile(patch.default_profile);
+  if (patch.default_profile) {
+    checkProfile(patch.default_profile, "default_profile");
+    next.default_profile = normalizeProfile(patch.default_profile);
+  }
   Object.assign(settings, next);
   broadcast({ type: "settings.updated", settings });
   emitQueue();
@@ -1393,6 +1547,7 @@ route("GET", "/api/presets", () => presets);
 
 route("GET", "/api/system", () => ({
   version: "0.2.0-mock",
+  build: "edge-mock",
   // The Docker image sets TEMP_DIR=/temp when that folder is mapped.
   default_temp_dir: "/temp",
   browse_roots: BROWSE_ROOTS,
@@ -1413,7 +1568,9 @@ route("GET", "/api/fs/browse", (_p, q) => {
     roots: BROWSE_ROOTS,
     entries: FS[path].map((name) => {
       const full = path === "/" ? `/${name}` : `${path}/${name}`;
-      return { name, path: full, is_dir: true, media_count: MEDIA_COUNT[full] ?? null };
+      const entry = { name, path: full, is_dir: true, media_count: MEDIA_COUNT[full] ?? null };
+      if (MEDIA_COUNT_CAPPED.has(full)) entry.media_count_capped = true;
+      return entry;
     }),
   };
 });
@@ -1422,6 +1579,12 @@ route("GET", "/api/activity", (_p, q) => ({ items: activity.slice(0, Math.min(50
 
 const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return send(res, 204);
+  if (HOST_DENY) {
+    return send(res, 403, {
+      error: `Chrysopoeia doesn't answer to the address "${req.headers.host ?? ""}". Add it to ALLOWED_HOSTS.`,
+      code: "host_not_allowed",
+    });
+  }
   const url = new URL(req.url ?? "/", "http://localhost");
   for (const r of routes) {
     if (r.method !== req.method) continue;

@@ -90,6 +90,12 @@ describe("skipFollowsSettings", () => {
     // Cover art is not real video.
     expect(skipFollowsSettings(file({ probe: probe([stream({ is_attached_pic: true }), stream({ kind: "audio" })]) }))).toBe(false);
     expect(skipFollowsSettings(file({ duration_secs: 0.4 }))).toBe(false);
+    // Safety skips always apply, whatever the settings.
+    expect(
+      skipFollowsSettings(file({ skip_reason: "Dolby Vision profile 5 can't be converted without losing its colours — left unchanged" })),
+    ).toBe(false);
+    expect(skipFollowsSettings(file({ skip_reason: "HDR video would lose its colours as H.264 — left unchanged" }))).toBe(false);
+    expect(skipFollowsSettings(file({ skip_reason: "The new file was 7% larger — kept the original" }))).toBe(true);
     expect(skipFollowsSettings(file({ status: "done" }))).toBe(false);
   });
 });

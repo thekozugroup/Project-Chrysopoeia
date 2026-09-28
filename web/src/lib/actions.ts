@@ -7,9 +7,11 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api, errorMessage } from "./api";
+import { ApiError, api, errorMessage } from "./api";
+import { serverLeftOutText } from "./convertible";
 import { plural } from "./format";
 import { invalidateWork, keys } from "./queries";
+import { useLive } from "./store";
 import type { BulkRequest, Job, MediaFile, QueueState } from "./types";
 
 function fail(prefix: string) {
@@ -24,12 +26,12 @@ export function useJobActions() {
   const cancel = useMutation({
     mutationFn: (job: Job) => api.cancelJob(job.id),
     onSuccess: (job) => {
-      toast(job.state === "cancelled" ? "Cancelled" : "Removed from the queue", {
+      toast(job.started_at ? "Stopped" : "Removed from the queue", {
         description: `${job.file_name} was left as it is.`,
       });
       refresh();
     },
-    onError: fail("Couldn't cancel"),
+    onError: fail("Couldn't stop it"),
   });
 
   const moveToTop = useMutation({
@@ -136,21 +138,62 @@ export function useFileActions() {
     onError: fail("Couldn't skip it"),
   });
 
+  /** "Ignore this file": a damaged original is left alone and marked "Skipped by you". */
+  const ignore = useMutation({
+    mutationFn: (file: MediaFile) => api.skipFile(file.id),
+    onSuccess: (file) => {
+      toast("Ignored", { description: `${file.file_name} is left as it is. A new copy is picked up automatically.` });
+      refresh();
+    },
+    onError: fail("Couldn't ignore it"),
+  });
+
+  /**
+   * "Convert anyway": one conversion without the library's skip rules
+   * (checks still run). A server from before this option refuses the
+   * unknown `force` field; say so plainly instead of a raw error.
+   */
+  const convertAnyway = useMutation({
+    mutationFn: (file: MediaFile) => api.queueFile(file.id, { force: true }),
+    onSuccess: (job) => {
+      useLive.getState().markForced(job.id);
+      toast.success("Converting anyway", { description: job.file_name });
+      refresh();
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 400 && (error.field === "force" || /\bforce\b/.test(error.message))) {
+        toast.error("This server can't convert skipped files anyway", {
+          description: "Update the Chrysopoeia container to use Convert anyway.",
+        });
+      } else toast.error("Couldn't add it to the queue", { description: errorMessage(error) });
+    },
+  });
+
   const bulk = useMutation({
-    // `note` says what the selection left out; it isn't sent.
-    mutationFn: ({ action, ids, library, status }: BulkRequest & { note?: string | null }) =>
+    // `note` says what the selection left out and `ignored` marks a skip of
+    // damaged originals ("Ignore"); neither is sent.
+    mutationFn: ({ action, ids, library, status }: BulkRequest & { note?: string | null; ignored?: boolean }) =>
       api.bulk({ action, ids, library, status }),
-    onSuccess: (res, { action, note }) => {
+    onSuccess: (res, { action, note, ignored }) => {
       const n = plural(res.affected, "file");
+      if (ignored && res.affected > 0) {
+        toast(`Ignored ${n}`, {
+          description: `${res.affected === 1 ? "It's" : "They're"} left as ${res.affected === 1 ? "it is" : "they are"}. A replaced copy is picked up automatically.`,
+        });
+        refresh();
+        return;
+      }
       const text =
-        action === "skip" ? `Skipped ${n}` : action === "retry_failed" ? `Retrying ${n}` : `Added ${n} to the queue`;
+        action === "skip" ? `Skipped ${n}` : action === "retry_failed" ? `Trying ${n} again` : `Added ${n} to the queue`;
+      // What the selection left out, then what the server left out on top.
+      const details = [note, action === "queue" ? serverLeftOutText(res.left_out) : null].filter(Boolean).join(" ");
       if (res.affected === 0) {
-        toast("Nothing to do", { description: note ?? "None of those files could take that action." });
-      } else toast.success(text, { description: note ?? undefined });
+        toast("Nothing to do", { description: details || "None of those files could take that action." });
+      } else toast.success(text, { description: details || undefined });
       refresh();
     },
     onError: fail("That didn't work"),
   });
 
-  return { queue, skip, bulk };
+  return { queue, skip, ignore, convertAnyway, bulk };
 }

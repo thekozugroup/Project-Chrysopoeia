@@ -3,8 +3,19 @@
  * work, whether a codec encodes quickly here, and which goal fits best.
  */
 
-import { GPU_VENDOR_LABEL, VIDEO_CODEC_LABEL } from "./labels";
-import type { EncoderStatus, Goal, GpuVendor, HardwareInfo, HwApi, HwPreference, VideoCodec } from "./types";
+import { GPU_VENDOR_LABEL, HW_PREFERENCE_LABEL, VIDEO_CODEC_LABEL } from "./labels";
+import type {
+  EncoderStatus,
+  Goal,
+  GpuVendor,
+  HardwareInfo,
+  HwApi,
+  HwPreference,
+  QueueState,
+  Settings,
+  SystemInfo,
+  VideoCodec,
+} from "./types";
 
 const API_VENDORS: Partial<Record<HwApi, GpuVendor[]>> = {
   nvenc: ["nvidia"],
@@ -71,15 +82,76 @@ export function cpuDoesAllWork(hw: HardwareInfo, preference: HwPreference = "aut
   );
 }
 
+/** How quickly a format converts on this machine, in one or two words. */
+export interface SpeedWord {
+  tone: "fast" | "medium" | "slow" | "blocked";
+  label: string;
+}
+
+/** CPU encoders from quickest to slowest (x264, x265, libvpx-vp9, SVT-AV1). */
+const CPU_SPEED: Record<VideoCodec, SpeedWord["tone"]> = {
+  h264: "fast",
+  hevc: "medium",
+  vp9: "slow",
+  av1: "slow",
+};
+
+const SPEED_LABEL: Record<SpeedWord["tone"], string> = {
+  fast: "Fast",
+  medium: "Medium",
+  slow: "Slow here",
+  blocked: "Not available here",
+};
+
 /**
- * One sentence for above the goal choices when the CPU does every
- * conversion, so each choice can just compare speeds. `null` otherwise.
+ * The speed of a format relative to this machine: "Fast" when a GPU does
+ * it, otherwise how the CPU encoders compare. `null` until detection has
+ * finished, so no guess is shown as a fact.
  */
-export function cpuOnlyNote(hw: HardwareInfo | undefined, preference: HwPreference = "auto"): string | null {
-  if (!hw || !cpuDoesAllWork(hw, preference)) return null;
-  if (preference === "cpu") return "Set to use the CPU only, so the CPU does all the converting.";
-  if (hw.gpus.length === 0) return "No GPU was found, so the CPU does the converting. That works well; it just takes longer.";
-  return "Your GPU can't convert video here yet, so the CPU does the work. Settings › Hardware explains how to fix that.";
+export function speedWord(
+  hw: HardwareInfo | undefined,
+  codec: VideoCodec,
+  preference: HwPreference = "auto",
+): SpeedWord | null {
+  if (!hw || isDetecting(hw)) return null;
+  const hint = codecSpeedHint(hw, codec, preference);
+  const tone: SpeedWord["tone"] =
+    hint.tone === "fast" ? "fast" : hint.tone === "blocked" ? "blocked" : hint.tone === "slow" ? "slow" : CPU_SPEED[codec];
+  return { tone, label: SPEED_LABEL[tone] };
+}
+
+/** Formats as a list for a sentence: "AV1, HEVC and H.264". */
+function formatList(codecs: VideoCodec[]): string {
+  const names = codecs.map((c) => VIDEO_CODEC_LABEL[c].replace(/ \(.*\)/, ""));
+  return names.length <= 1 ? (names[0] ?? "") : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+}
+
+/**
+ * What does the converting here, in one sentence: "Everything converts on
+ * the CPU." or "NVIDIA GeForce RTX 3060 converts HEVC and H.264. The rest
+ * converts on the CPU."
+ */
+export function machineSummary(hw: HardwareInfo, preference: HwPreference = "auto"): string {
+  if (!hw.ffmpeg.found) return "Nothing can be converted until ffmpeg is available.";
+  if (cpuDoesAllWork(hw, preference)) {
+    return preference === "cpu" ? "Set to use the CPU only, so everything converts on the CPU." : "Everything converts on the CPU.";
+  }
+  const byApi = new Map<HwApi, VideoCodec[]>();
+  for (const e of hw.encoders) {
+    if (!e.verified || e.api === "software" || (preference !== "auto" && e.api !== preference)) continue;
+    const list = byApi.get(e.api) ?? [];
+    if (!list.includes(e.codec)) list.push(e.codec);
+    byApi.set(e.api, list);
+  }
+  const parts = [...byApi.entries()].map(([api, codecs]) => {
+    const ordered = (["av1", "hevc", "h264", "vp9"] as VideoCodec[]).filter((c) => codecs.includes(c));
+    return `${deviceName(hw, api)} converts ${formatList(ordered)}`;
+  });
+  const covered = new Set([...byApi.values()].flat());
+  const rest = (["av1", "hevc", "h264", "vp9"] as VideoCodec[]).some(
+    (c) => !covered.has(c) && hw.encoders.some((e) => e.codec === c && e.verified),
+  );
+  return `${parts.join(". ")}.${rest ? " The rest converts on the CPU." : ""}`;
 }
 
 /** How quickly this machine can produce a codec, in one sentence. */
@@ -105,7 +177,7 @@ export function codecSpeedHint(
   }
   if (cpuDoesAllWork(hw, preference)) {
     // Every format runs on the CPU here, so compare them rather than repeat
-    // "slower" on each (see `cpuOnlyNote`).
+    // "slower" on each.
     return { tone: "cpu", text: CPU_SPEED_TEXT[codec] };
   }
   return { tone: "slow", text: `Your GPU can't encode ${label}. The CPU will, which is slower.` };
@@ -226,4 +298,42 @@ export function preferenceChoices(
   }
   if (!choices.some((c) => c.value === current)) choices.push({ value: current, disabled: false });
   return choices;
+}
+
+/**
+ * The facts a bug report needs, as plain lines to paste: version and build,
+ * container, ffmpeg, GPUs, verified encoders, hardware preference and files
+ * at once with where that number comes from. Parts not loaded yet are left
+ * out rather than guessed.
+ */
+export function bugReportText({
+  system,
+  hw,
+  queue,
+  settings,
+}: {
+  system: Pick<SystemInfo, "version" | "build" | "in_container">;
+  hw?: Pick<HardwareInfo, "ffmpeg" | "gpus" | "encoders" | "cpu"> | undefined;
+  queue?: Pick<QueueState, "max_jobs" | "max_jobs_auto" | "max_jobs_source"> | undefined;
+  settings?: Pick<Settings, "hardware"> | undefined;
+}): string {
+  const lines = [
+    `Chrysopoeia ${system.version}${system.build ? ` (build ${system.build})` : ""}${system.in_container ? ", in a container" : ""}`,
+  ];
+  if (hw) {
+    lines.push(`ffmpeg: ${hw.ffmpeg.found ? (hw.ffmpeg.version ?? "found, version unknown") : "not found"}`);
+    lines.push(`CPU: ${hw.cpu.model || "unknown"} (${hw.cpu.logical_cores} threads)`);
+    lines.push(
+      `GPUs: ${hw.gpus.length ? hw.gpus.map((g) => `${g.name || GPU_VENDOR_LABEL[g.vendor]}${g.driver ? ` (${g.driver})` : ""}`).join(", ") : "none found"}`,
+    );
+    const verified = hw.encoders.filter((e) => e.verified).map((e) => e.name);
+    lines.push(`Verified encoders: ${verified.length ? verified.join(", ") : "none"}`);
+  }
+  if (settings) lines.push(`Hardware preference: ${HW_PREFERENCE_LABEL[settings.hardware] ?? settings.hardware}`);
+  if (queue) {
+    const source = queue.max_jobs_source ?? (queue.max_jobs_auto ? "auto" : "settings");
+    const from = source === "env" ? "from MAX_JOBS" : source === "auto" ? "automatic" : "set in Settings";
+    lines.push(`Files at once: ${queue.max_jobs} (${from})`);
+  }
+  return lines.join("\n");
 }

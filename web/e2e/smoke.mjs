@@ -148,10 +148,11 @@ async function main() {
         throw new StepError(`The folder picker couldn't open ${wanted}${alert.length ? `: ${alert.join(" ")}` : ""}`);
       }
     }
-    const useFolder = page.getByRole("button", { name: "Use this folder" });
+    // The button names the folder it picks: Use “media” · 8 videos.
+    const useFolder = page.getByRole("button", { name: /^Use “/ });
     await useFolder.waitFor();
     await page.waitForFunction(
-      () => [...document.querySelectorAll("button")].some((b) => b.textContent?.trim() === "Use this folder" && !b.disabled),
+      () => [...document.querySelectorAll("button")].some((b) => b.textContent?.trim().startsWith("Use “") && !b.disabled),
       undefined,
       { timeout: 10_000 },
     );

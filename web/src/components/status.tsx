@@ -13,6 +13,7 @@ import {
   CircleX,
   Clock,
   Cpu,
+  FileWarning,
   LoaderCircle,
   MonitorPlay,
   ShieldCheck,
@@ -22,6 +23,7 @@ import type { ReactNode } from "react";
 import { Badge, type Tone } from "@/components/ui/display";
 import { Tooltip } from "@/components/ui/overlays";
 import { CHECK_STATUS_LABEL, FILE_STATUS_LABEL, HW_API_LABEL, JOB_STAGE_LABEL, JOB_STATE_LABEL } from "@/lib/labels";
+import { isUnreadableSource } from "@/lib/outcomes";
 import type { CheckStatus, FileStatus, HwApi, Job, JobState } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -39,7 +41,26 @@ export function fileStatusIcon(status: FileStatus): ReactNode {
   return FILE_STATUS_STYLE[status].icon;
 }
 
-export function FileStatusBadge({ status, progress }: { status: FileStatus; progress?: number | null }) {
+/** A failure that is the original's fault: amber, with the fix outside the app. */
+function CantBeReadBadge() {
+  return (
+    <Badge tone="warning" icon={<FileWarning aria-hidden />}>
+      Can&apos;t be read
+    </Badge>
+  );
+}
+
+export function FileStatusBadge({
+  status,
+  progress,
+  error,
+}: {
+  status: FileStatus;
+  progress?: number | null;
+  /** The file's error, to tell a damaged original from a failed conversion. */
+  error?: string | null;
+}) {
+  if (status === "failed" && isUnreadableSource(error)) return <CantBeReadBadge />;
   const style = FILE_STATUS_STYLE[status];
   const label =
     status === "processing" && progress !== null && progress !== undefined
@@ -66,7 +87,12 @@ const JOB_STATE_STYLE: Record<JobState, { tone: Tone; icon: ReactNode }> = {
  * reads "Kept original" when a new file was made and thrown away (the size
  * rule), and "Skipped" when the file never needed work.
  */
-export function JobStateBadge({ job }: { job: Pick<Job, "state" | "stage" | "validation" | "output_size"> }) {
+export function JobStateBadge({
+  job,
+}: {
+  job: Pick<Job, "state" | "stage" | "validation" | "output_size" | "error">;
+}) {
+  if (job.state === "failed" && isUnreadableSource(job.error)) return <CantBeReadBadge />;
   if (job.state === "done" && job.validation?.passed) {
     return (
       <Badge tone="success" icon={<ShieldCheck aria-hidden />}>

@@ -6,6 +6,7 @@ import {
   leftOutText,
   nothingToConvertText,
   planBulkConvert,
+  settlingCount,
   stillCopyingCount,
 } from "./convertible";
 import type { ActivityEntry, MediaFile, TranscodeProfile } from "./types";
@@ -133,28 +134,46 @@ describe("planBulkConvert", () => {
       balanced,
     );
     expect(plan.ids).toEqual([pending.id, failed.id, userSkipped.id, doneOld.id]);
-    expect(plan).toMatchObject({ again: 1, settings: 1, converted: 1, unconvertible: 1, busy: 1 });
+    expect(plan).toMatchObject({ again: 1, settings: 1, converted: 1, unconvertible: 1, damaged: 0, busy: 1 });
+  });
+
+  it("leaves out failed files whose original can't be read (trying again can't help)", () => {
+    const truncated = file({
+      status: "failed",
+      error: "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.",
+    });
+    const fake = file({ status: "failed", video_codec: null, error: "This file can't be read as a video: it has no MP4 index." });
+    const conversion = file({ status: "failed", error: "The new file didn't match the original." });
+    const kept = file({ status: "skipped", video_codec: "hevc", skip_reason: "Already HEVC" });
+    const plan = planBulkConvert([truncated, fake, conversion, kept], balanced);
+    expect(plan.ids).toEqual([conversion.id]);
+    expect(plan).toMatchObject({ damaged: 2, settings: 1 });
+    // Only damaged files selected: nothing to convert, and it says why.
+    const onlyDamaged = planBulkConvert([truncated], balanced);
+    expect(onlyDamaged.ids).toEqual([]);
+    expect(nothingToConvertText(onlyDamaged)).toBe("This file can't be read (it looks damaged or isn't a video).");
+    expect(leftOutText(plan)).toMatch(/2 files can't be read \(they look damaged or aren't videos\)\./);
   });
 
   it("describes what was left out", () => {
     const none = { settings: 0, converted: 0, unconvertible: 0, busy: 0 };
     expect(leftOutText(none)).toBeNull();
     expect(leftOutText({ ...none, settings: 1 })).toMatch(/^1 file was left out because this library's settings skip it\./);
-    expect(leftOutText({ ...none, settings: 2, unconvertible: 1 })).toMatch(/^2 files were left out .* 1 file has no video/);
+    expect(leftOutText({ ...none, settings: 2, unconvertible: 1 })).toMatch(/^2 files were left out .* 1 file can't be converted/);
     expect(leftOutText({ ...none, converted: 2 })).toBe("2 files are already converted to this library's format.");
   });
 
   it("explains a selection with nothing to convert", () => {
     const none = { settings: 0, converted: 0, unconvertible: 0, busy: 0 };
     expect(nothingToConvertText({ ...none, settings: 2 })).toBe(
-      "These files are skipped by this library's settings. To convert them, change the goal in the library's Settings tab first.",
+      "These files are skipped by this library's settings. To convert one anyway, open it and choose Convert anyway.",
     );
     expect(nothingToConvertText({ ...none, converted: 1 })).toBe(
-      "This file is already converted to this library's format. To convert it, change the goal in the library's Settings tab first.",
+      "This file is already converted to this library's format. To convert it again, change the library's goal first.",
     );
     expect(nothingToConvertText({ ...none, busy: 3 })).toBe("These files are already in the queue.");
     expect(nothingToConvertText({ ...none, converted: 1, unconvertible: 1 })).toBe(
-      "Nothing to convert: 1 file is already converted to this library's format, 1 file has no video to convert. To convert them, change the goal in the library's Settings tab first.",
+      "Nothing to convert: 1 file is already converted to this library's format, 1 file can't be converted. To convert them again, change the library's goal first.",
     );
   });
 });
@@ -184,5 +203,42 @@ describe("stillCopyingCount", () => {
     expect(stillCopyingCount([entry(2, "Scanned Fresh: 3 files, 3 need converting"), entry(1, "Scanned Fresh: 0 files, 0 need converting, 3 still being copied (checked again when they're finished)")], "lib")).toBe(0);
     expect(stillCopyingCount([], "lib")).toBe(0);
     expect(stillCopyingCount(undefined, "lib")).toBe(0);
+  });
+
+  it("takes off files found since the scan (they settled)", () => {
+    const feed = [
+      entry(9, "Found Clip 3.mkv in Big"),
+      entry(8, "Found Clip 1.mkv in Other", "other"),
+      entry(7, "Found Clip 2.mkv in Big"),
+      entry(6, "Scanned Big: 0 files, 0 need converting, 6 still being copied (checked again when they're finished)"),
+      entry(5, "Found Clip 0.mkv in Big"),
+    ];
+    expect(stillCopyingCount(feed, "lib")).toBe(4);
+    const settled = [...Array.from({ length: 6 }, (_, i) => entry(20 - i, `Found Clip ${i}.mkv in Big`)), ...feed.slice(3)];
+    expect(stillCopyingCount(settled, "lib")).toBe(0);
+  });
+});
+
+describe("settlingCount", () => {
+  const stale: ActivityEntry[] = [
+    {
+      id: 1,
+      at: "2026-09-28T05:10:00Z",
+      level: "info",
+      message: "Scanned Big: 0 files, 0 need converting, 6 still being copied (checked again when they're finished)",
+      file_id: null,
+      job_id: null,
+      library_id: "lib",
+    },
+  ];
+  const stats = { file_count: 6, total_bytes: 0, pending: 0, queued: 4, processing: 2, done: 0, skipped: 0, failed: 0, saved_bytes: 0 };
+
+  it("trusts the server's count, including 0, over an old scan summary", () => {
+    expect(settlingCount({ id: "lib", stats: { ...stats, settling: 0 } }, stale)).toBe(0);
+    expect(settlingCount({ id: "lib", stats: { ...stats, settling: 2 } }, stale)).toBe(2);
+  });
+
+  it("reads the activity feed only from servers without the field", () => {
+    expect(settlingCount({ id: "lib", stats }, stale)).toBe(6);
   });
 });

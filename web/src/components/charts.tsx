@@ -1,14 +1,14 @@
 "use client";
 
 /**
- * Two small, honest charts: daily space saved (columns) and a breakdown of
- * the library by codec or resolution (horizontal bars). One hue each, values
- * in text colours, a hover readout, and a table for screen readers.
+ * Daily space saved, as columns: one hue, values in text colours, a hover
+ * readout, and a table for screen readers. Shown once there are a few days
+ * of savings to compare.
  */
 
 import { useId, useState } from "react";
 import { formatBytes, formatCount, formatDay, percentOf, plural } from "@/lib/format";
-import type { CodecCount, SavingsPoint } from "@/lib/types";
+import type { SavingsPoint } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Round a byte maximum up to a clean axis value (1, 2, 5 × 10^n bytes). */
@@ -39,7 +39,7 @@ export function SavingsChart({ points, className }: { points: SavingsPoint[]; cl
         </span>
       </figcaption>
       <div className="mt-4 grid flex-1 grid-cols-[auto_1fr] gap-x-3" aria-hidden>
-        <div className="flex flex-col justify-between py-0 text-right text-[0.6875rem] text-muted tabular">
+        <div className="flex flex-col justify-between py-0 text-right text-xs text-muted tabular">
           <span className="-translate-y-1/2">{hasData ? formatBytes(max) : ""}</span>
           <span className="translate-y-1/2">0</span>
         </div>
@@ -69,7 +69,7 @@ export function SavingsChart({ points, className }: { points: SavingsPoint[]; cl
           </div>
         </div>
         <span />
-        <div className="mt-1.5 flex justify-between text-[0.6875rem] text-muted">
+        <div className="mt-1.5 flex justify-between text-xs text-muted">
           <span>{points[0] ? formatDay(points[0].date) : ""}</span>
           <span>Today</span>
         </div>
@@ -99,62 +99,7 @@ export function SavingsChart({ points, className }: { points: SavingsPoint[]; cl
   );
 }
 
-/** Horizontal bars: share of files per codec or resolution. */
-export function Breakdown({
-  title,
-  items,
-  labelFor = (name) => name,
-  limit = 5,
-}: {
-  title: string;
-  items: CodecCount[];
-  labelFor?: (name: string) => string;
-  limit?: number;
-}) {
-  const sorted = [...items].sort((a, b) => b.files - a.files);
-  // "Other" standing in for a single row would hide its name for nothing.
-  const shown = sorted.length > limit + 1 ? limit : sorted.length;
-  const top = sorted.slice(0, shown);
-  const rest = sorted.slice(shown);
-  const rows =
-    rest.length > 0
-      ? [
-          ...top,
-          {
-            name: "Other",
-            files: rest.reduce((s, r) => s + r.files, 0),
-            bytes: rest.reduce((s, r) => s + r.bytes, 0),
-          },
-        ]
-      : top;
-  const totalFiles = items.reduce((s, r) => s + r.files, 0);
-  return (
-    <section>
-      <h3 className="text-sm font-semibold text-fg">{title}</h3>
-      {rows.length === 0 ? (
-        <p className="mt-2 text-[0.8125rem] text-muted">Nothing scanned yet.</p>
-      ) : (
-        <ul className="mt-3 space-y-2.5">
-          {rows.map((row) => {
-            const pct = percentOf(row.files, totalFiles);
-            return (
-              <li key={row.name} title={`${plural(row.files, "file")} · ${formatBytes(row.bytes)}`}>
-                <div className="flex items-baseline justify-between gap-3 text-[0.8125rem]">
-                  <span className="truncate text-fg">{row.name === "Other" ? "Other" : labelFor(row.name)}</span>
-                  <span className="shrink-0 text-muted tabular">
-                    {formatCount(row.files)} <span className="sr-only">{row.files === 1 ? "file" : "files"}</span>
-                    <span aria-hidden> · </span>
-                    {Math.round(pct)}%
-                  </span>
-                </div>
-                <div className="mt-1 h-1.5 rounded-full bg-raised" aria-hidden>
-                  <div className="h-full rounded-full bg-meter/80" style={{ width: `${Math.max(pct, 1)}%` }} />
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </section>
-  );
+/** Whether the savings history has enough days with savings to be worth a chart. */
+export function worthCharting(points: SavingsPoint[], minDays = 3): boolean {
+  return points.filter((p) => p.saved_bytes > 0).length >= minDays;
 }
