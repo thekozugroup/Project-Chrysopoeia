@@ -90,8 +90,9 @@ while asking far less of you:
    example `/mnt/user/media/`, rather than all of `/mnt/user/`. Optionally set
    **Transcode cache** to a folder on your SSD pool. Intel or AMD: click *Add
    another Path, Port, Variable, Label or Device*, choose *Device* and enter
-   `/dev/dri`. NVIDIA: add `--runtime=nvidia` to *Extra Parameters* and set
-   `NVIDIA_VISIBLE_DEVICES` (under *Show more settings*) to `all`.
+   `/dev/dri`. NVIDIA: switch the editor to *Advanced View* (top right), add
+   `--runtime=nvidia` to *Extra Parameters*, and set `NVIDIA_VISIBLE_DEVICES`
+   (under *Show more settings*) to `all`.
 4. Click **Apply**, then open the web UI from the container's icon, choose a
    folder under `/media` and a goal.
 
@@ -169,7 +170,7 @@ variables; empty values count as not set.
 | `PUID` / `PGID` | `1000` / `1000` | User and group Chrysopoeia runs as and writes files as. Use the owner of your media (Unraid: `99` / `100`). |
 | `UMASK` | `002` | Permissions for new files (`002`: the group can edit them; `022`: only the owner). |
 | `TZ` | `UTC` | Time zone (e.g. `Europe/London`) for the *When to convert* schedule in Settings › Processing. Unraid sets it for you. Log lines are always stamped in UTC. |
-| `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
+| `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). A GPU choice uses only that kind of GPU; files go to the CPU when it is missing or cannot encode the chosen format (Settings › Hardware shows whether its encoders are *verified*). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
 | `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Stands in for the automatic count while *Files at once* is *Automatic* in Settings › Processing; a number chosen there wins. |
 | `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. |
 | `ALLOWED_HOSTS` | none | Domain names the web UI may be opened at, comma-separated, e.g. `transcode.example.com`. Only needed behind a reverse proxy; see [below](#behind-a-reverse-proxy). |
@@ -196,11 +197,30 @@ any other name must be listed in `ALLOWED_HOSTS`; until it is, the app shows
 
 - Set `ALLOWED_HOSTS=transcode.example.com` (several: separate with commas; a
   leading dot, `.example.com`, allows every name under that domain).
+- The proxy must pass on the address the browser used (the `Host` header),
+  because Chrysopoeia compares it with the page a change comes from. Nginx
+  Proxy Manager, SWAG, Traefik and Caddy do this already. Plain nginx and
+  Apache do not by default: without it the page opens, but every change and
+  the live updates are refused with *This request came from another website,
+  so Chrysopoeia refused it*.
 - Enable WebSocket support for the proxy host (Nginx Proxy Manager:
-  *Websockets Support*; nginx: forward `Upgrade` and `Connection` headers).
-  Live progress uses `/api/ws`.
+  *Websockets Support*). Live progress uses `/api/ws`.
 - There is no login yet: add authentication at the proxy (for example
   Authelia, Authentik or basic auth) before exposing it outside your network.
+
+A plain nginx `server` block needs these lines (Apache: `ProxyPreserveHost On`
+plus WebSocket proxying for `/api/ws`):
+
+```nginx
+location / {
+    proxy_pass http://192.168.1.10:8080;        # the server running Chrysopoeia
+    proxy_set_header Host $http_host;           # keep the address the browser used
+    proxy_http_version 1.1;                     # live updates (WebSocket)
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 1h;
+}
+```
 
 ## FAQ
 

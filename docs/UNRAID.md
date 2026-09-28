@@ -85,7 +85,7 @@ Under **Show more settings**:
 |---|---|---|
 | PUID / PGID | `99` / `100` | Unraid's `nobody` / `users`. Keep them unless your media is owned by someone else. |
 | UMASK | `002` | New files are readable by everyone and editable by the `users` group. |
-| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU; `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) forces one. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
+| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU. `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) uses only that kind of GPU; when it is missing or cannot encode the chosen format, files are still converted, on the CPU, so check Settings › Hardware that its encoders show as *verified*. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
 | MAX_JOBS | empty | Empty = automatic. A number here replaces the automatic count while *Files at once* is *Automatic* in the app (Settings › Processing); a number chosen in the app wins. |
 | ALLOWED_HOSTS | empty | Only behind a reverse proxy: the domain name you open Chrysopoeia at. See [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik). |
 | NVIDIA_VISIBLE_DEVICES | empty | NVIDIA: `all`, or one GPU UUID to use only that card. |
@@ -147,18 +147,25 @@ a reverse proxy:
 
 1. Point the proxy at `http://<server IP>:8080` (or the container name, when
    both are on the same custom Docker network).
-2. Turn on WebSocket support (Nginx Proxy Manager: *Websockets Support*;
+2. Make sure the proxy passes on the address the browser used (the `Host`
+   header). Nginx Proxy Manager, SWAG, Traefik and Caddy do this already. A
+   hand-written nginx config needs `proxy_set_header Host $http_host;` in the
+   `location` block, and Apache needs `ProxyPreserveHost On`. The README has
+   a [complete nginx example](../README.md#behind-a-reverse-proxy).
+3. Turn on WebSocket support (Nginx Proxy Manager: *Websockets Support*;
    SWAG and Traefik pass WebSockets through already). Live progress uses
    `/api/ws`.
-3. **Edit** the Chrysopoeia container, click **Show more settings**, set
+4. **Edit** the Chrysopoeia container, click **Show more settings**, set
    **ALLOWED_HOSTS** to the domain, e.g. `transcode.example.com` (several:
    separate with commas), and click **Apply**.
 
-Without step 3 the app shows *Chrysopoeia doesn't answer to the address
-"transcode.example.com"*. This check stops other websites from reaching
-Chrysopoeia through your browser. Chrysopoeia has no login of its own yet, so
-add authentication at the proxy (Authelia, Authentik or basic auth) before
-making it reachable from the internet.
+Without step 4 the app shows *Chrysopoeia doesn't answer to the address
+"transcode.example.com"*. Without step 2 the page opens, but saving anything
+fails with *This request came from another website, so Chrysopoeia refused
+it*, and progress does not update live. Both checks stop other websites from
+reaching Chrysopoeia through your browser. Chrysopoeia has no login of its own
+yet, so add authentication at the proxy (Authelia, Authentik or basic auth)
+before making it reachable from the internet.
 
 ## PUID, PGID and permissions
 
@@ -187,6 +194,12 @@ already efficient and skipped. Only history and statistics are lost.
 Your settings and libraries are kept. Jobs that were running are restarted
 from the beginning after the update; originals are never left half-replaced.
 
+The `latest` image follows the project's main branch, so every tested change
+arrives as an update. To stay on released versions only, **Edit** the
+container and set **Repository** to a version tag, for example
+`ghcr.io/thekozugroup/chrysopoeia:1` (the newest 1.x release) or `:1.2` (only
+fixes for 1.2).
+
 ## Trying a test build
 
 Builds that are not released yet (for example a branch before it is merged)
@@ -194,7 +207,12 @@ are published as `ghcr.io/thekozugroup/chrysopoeia:edge` when someone runs the
 *Release* workflow on that branch. To use one, **Edit** the container, set
 **Repository** to `ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**.
 Set it back to `ghcr.io/thekozugroup/chrysopoeia:latest` to return to the
-released version; your settings and libraries are kept either way.
+regular image; your settings and libraries are kept either way.
+
+If that run published the very first image, the package on GitHub is still
+private and Unraid's pull is refused (*denied* or *unauthorized* in the pull
+log). The repository owner makes it public once: on GitHub, **Packages** >
+**chrysopoeia** > **Package settings** > **Change visibility** > **Public**.
 
 Before the very first release there is no `latest` yet: install the template
 from the branch instead (replace `main` in the `wget` address of step 2 with
@@ -226,9 +244,12 @@ GPU device it can see.
 | NVIDIA encoders fail on the Hardware page | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
 | Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). The Hardware page shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
 | Log says *cannot write to /media* | See [PUID, PGID and permissions](#puid-pgid-and-permissions). |
+| Log says */media is mounted read-only* | The Media path's **Access Mode** is *Read Only*. **Edit** the container, click **Edit** next to Media, set Access Mode to *Read/Write* and click **Apply**. Read-only is fine only when Settings > Output writes new files to a separate output folder. |
+| Log says *No host folder is mounted at /config* | The Config path is empty, so settings and history would be lost on the next update. Set it to `/mnt/user/appdata/chrysopoeia`. |
 | New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or click **Scan now** on the library. |
 | The server feels slow while converting | Lower *Files at once* in Settings > Processing, or turn on *When to convert* there so conversions run overnight. |
 | Nothing converts at night / during the day as expected | *When to convert* uses the server's time zone. Unraid passes it automatically; check **Settings > Date and Time**. |
 | The app says *Chrysopoeia doesn't answer to the address …* | You opened it through a domain name. Add that name to ALLOWED_HOSTS (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). |
+| Through a reverse proxy the page opens, but saving says *This request came from another website, so Chrysopoeia refused it* | The proxy replaces the address the browser used. nginx: add `proxy_set_header Host $http_host;`; Apache: `ProxyPreserveHost On` (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). Opened directly (`http://<server IP>:8080`), this message means a page on another website really did try to change something. |
 | MAX_JOBS or HW_ACCEL seem to be ignored | A number chosen in the app under *Files at once* wins over MAX_JOBS; choose *Automatic* there to use MAX_JOBS. HW_ACCEL is applied when its value changes, so a later choice in Settings > Hardware stays until you change HW_ACCEL again. |
 | A job's ffmpeg log says `set_mempolicy: Operation not permitted` | Harmless: the HEVC (x265) encoder asks for a memory placement that Docker does not allow, and carries on normally. To silence it, add `--cap-add=SYS_NICE` to Extra Parameters. |

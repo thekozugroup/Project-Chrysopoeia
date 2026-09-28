@@ -72,6 +72,60 @@ fi
 # Some GPU runtimes cache compiled kernels under $HOME.
 export HOME="$DATA_DIR"
 
+# --- Mounts -------------------------------------------------------------------
+
+# The last /proc/self/mountinfo line for mount point $1 (empty when nothing is
+# mounted there). Fields: 4 = folder of the source filesystem that is
+# mounted, 5 = mount point, 6 = mount options, then after "-" the filesystem
+# type, source and superblock options.
+mount_info() {
+    awk -v target="$1" '$5 == target { line = $0 } END { if (line != "") print line }' \
+        /proc/self/mountinfo 2>/dev/null || true
+}
+
+# Whether $1 is mounted read-only (docker -v ...:ro, Unraid Access Mode
+# "Read Only", or a read-only filesystem).
+mounted_read_only() {
+    mount_info "$1" | awk '{
+        n = split($6, opts, ",")
+        for (i = 1; i <= n; i++) if (opts[i] == "ro") ro = 1
+        for (i = 7; i < NF; i++) if ($i == "-") {
+            n = split($(i + 3), opts, ",")
+            for (j = 1; j <= n; j++) if (opts[j] == "ro") ro = 1
+            break
+        }
+    } END { exit ro ? 0 : 1 }'
+}
+
+# Whether $1 is an anonymous Docker (or Podman) volume: Docker creates one for
+# the image's VOLUME when no folder is mounted there, named by 64 hex digits,
+# and it is not reused when the container is recreated.
+anonymous_volume() {
+    mount_info "$1" | grep -Eq '^[^ ]+ [^ ]+ [^ ]+ [^ ]*/volumes/[0-9a-f]{64}/_data '
+}
+
+# Warnings about missing or unusable mounts, printed when the server starts.
+# $1: a command prefix that runs a test as the app user (empty: as is).
+check_mounts() {
+    [ "$show_banner" = 1 ] || return 0
+    if ! mountpoint -q "$DATA_DIR" 2>/dev/null || anonymous_volume "$DATA_DIR"; then
+        warn "No host folder is mounted at $DATA_DIR, so libraries, settings and history are lost when the container is recreated (for example by an update). Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
+    fi
+    if [ "$media_mounted" = 0 ]; then
+        if [ -z "${BROWSE_ROOTS:-}" ] && [ -z "${LIBRARIES:-}" ]; then
+            warn "No media folder is mounted at /media. Mount the folder with your videos there (Unraid: the Media path; docker: -v /path/to/media:/media), or the folder picker will only show the container's own files."
+        fi
+    elif mounted_read_only /media; then
+        warn "/media is mounted read-only, so Chrysopoeia cannot replace files there. That only works with an Output folder elsewhere (Settings > Output). To replace originals, make it writable: on Unraid set the Media path's Access Mode to Read/Write; with docker, remove :ro."
+    elif ! "$@" test -w /media; then
+        if [ "$(id -u)" -eq 0 ]; then
+            warn "Chrysopoeia (uid $PUID) cannot write to /media, so it cannot replace files there. Set PUID/PGID to the owner of your media (Unraid: 99/100), or choose Output folder in Settings > Output."
+        else
+            warn "Chrysopoeia (uid $(id -u)) cannot write to /media, so it cannot replace files there. Run the container as the owner of your media, or choose Output folder in Settings > Output."
+        fi
+    fi
+}
+
 UMASK=${UMASK:-002}
 case $UMASK in
     '' | *[!0-7]*) die "UMASK must be an octal value such as 002 or 022 (got \"$UMASK\")." ;;
@@ -87,8 +141,17 @@ banner() {
     else
         temp_line="next to each file (mount /temp to use an SSD instead)"
     fi
+    # The server reports its own version (Cargo.toml) in the log and API; the
+    # image version (a release tag, or <branch>-<commit>) names the build.
+    image_version=${CHRYSOPOEIA_VERSION:-dev}
+    app_version=$(chrysopoeia --version 2>/dev/null | awk 'NR == 1 { print $NF }') || app_version=""
+    if [ -z "$app_version" ] || [ "$app_version" = "$image_version" ]; then
+        title="Chrysopoeia $image_version"
+    else
+        title="Chrysopoeia $app_version (image $image_version)"
+    fi
     log "------------------------------------------------------------"
-    log "Chrysopoeia ${CHRYSOPOEIA_VERSION:-dev}"
+    log "$title"
     log "Runs as      $1"
     log "Config       $DATA_DIR"
     log "Temp files   $temp_line"
@@ -156,6 +219,7 @@ if [ "$(id -u)" -ne 0 ]; then
     done
     finish_device_notes
     check_nvidia_runtime
+    check_mounts
     banner "uid $(id -u), gid $(id -g) (from --user; PUID/PGID are ignored), umask $UMASK"
     exec "$@"
 fi
@@ -243,6 +307,7 @@ fi
 # --- Drop privileges and start ----------------------------------------------------
 
 if [ "$PUID" -eq 0 ]; then
+    check_mounts
     banner "root (PUID=0), umask $UMASK"
     exec "$@"
 fi
@@ -254,9 +319,7 @@ as_app() {
 if ! as_app test -w "$DATA_DIR"; then
     die "Chrysopoeia (uid $PUID) cannot write to $DATA_DIR. Make the folder writable for PUID/PGID $PUID/$PGID, or set PUID/PGID to the folder's owner."
 fi
-if [ "$media_mounted" = 1 ] && ! as_app test -w /media; then
-    warn "Chrysopoeia (uid $PUID) cannot write to /media, so it cannot replace files there. Set PUID/PGID to the owner of your media (Unraid: 99/100) or use an output folder."
-fi
+check_mounts as_app
 
 banner "uid $PUID ($APP_USER), gid $PGID ($(getent group "$PGID" | cut -d: -f1)), umask $UMASK"
 exec setpriv --reuid="$APP_USER" --regid="$PGID" --init-groups --no-new-privs "$@"

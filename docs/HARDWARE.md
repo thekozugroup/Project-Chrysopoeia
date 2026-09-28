@@ -128,8 +128,10 @@ with a 64-bit OS and on other ARM64 boards.
   --device /dev/rga`. Support in Chrysopoeia is experimental.
 
 `HW_ACCEL=auto` picks these encoders on its own once their test encode
-passes. To insist on one, set `HW_ACCEL=v4l2m2m` (Pi 4) or `HW_ACCEL=rkmpp`
-(Rockchip); `HW_ACCEL=cpu` turns hardware encoding off.
+passes. To use only one, set `HW_ACCEL=v4l2m2m` (Pi 4) or `HW_ACCEL=rkmpp`
+(Rockchip); formats it cannot encode, or all files if its test encode fails,
+still go to the CPU, so check that Settings › Hardware shows it as
+*verified*. `HW_ACCEL=cpu` turns hardware encoding off.
 
 ## CPU only
 

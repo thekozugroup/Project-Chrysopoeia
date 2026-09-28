@@ -1,17 +1,21 @@
 name: Release
 
 # Publishes ghcr.io/<owner>/chrysopoeia for linux/amd64 and linux/arm64:
-#   push to main  -> :latest and :sha-<short>   (version main-<short sha>)
-#   tag v1.2.3    -> :1.2.3, :1.2, :1 and :sha-<short>   (version 1.2.3)
+#   push to main  -> :latest and :sha-<short>   (image version main-<short sha>)
+#   tag v1.2.3    -> :1.2.3, :1.2, :1 and :sha-<short>   (image version 1.2.3)
+#                    A tag never moves :latest, which always follows main.
+#                    The tag must match `version` in Cargo.toml
+#                    ([workspace.package]), which the server reports.
 #   manual run on any other branch (Actions -> Release -> Run workflow)
-#                 -> :edge and :sha-<short>   (version <branch>-<short sha>)
+#                 -> :edge and :sha-<short>   (image version <branch>-<short sha>)
 #     so an image can be tried (e.g. on Unraid, Repository set to :edge)
 #     before the branch is merged. It never moves :latest.
 # The amd64 image must pass the entrypoint and end-to-end tests before anything
 # is pushed.
-# First release: make the package public (GitHub -> Packages -> chrysopoeia ->
-# Package settings -> Change visibility) so Unraid and Docker can pull it
-# without logging in.
+# The first image ever published, including a first :edge from a manual run on
+# a branch, creates the package as private. Make it public once (GitHub ->
+# Packages -> chrysopoeia -> Package settings -> Change visibility) so Unraid
+# and Docker can pull it without logging in. The run's summary repeats this.
 
 on:
   push:
@@ -39,13 +43,20 @@ jobs:
         run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chrysopoeia" >> "$GITHUB_ENV"
 
       - name: Version string
-        # Shown in the startup banner, the app and the OCI version label.
-        # Tags: v1.2.3 -> 1.2.3. Branches: main-<short sha>, so a bug report
-        # from a :latest image names the exact commit.
+        # The image version: shown in the first line of the container log
+        # ("Chrysopoeia 0.2.0 (image main-1a2b3c4)") and in the OCI version
+        # label. Tags: v1.2.3 -> 1.2.3. Branches: <branch>-<short sha>, so a
+        # bug report from a :latest image names the exact commit. The server
+        # itself (API, "is running" log line) reports Cargo.toml's version.
         id: version
         run: |
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             version="${GITHUB_REF_NAME#v}"
+            cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml)
+            if [[ "$cargo_version" != "$version" ]]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match version = \"$cargo_version\" in Cargo.toml ([workspace.package]), which the server reports. Set it to \"$version\", commit, and move the tag to that commit."
+              exit 1
+            fi
           else
             branch="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
             version="${branch}-${GITHUB_SHA::7}"
@@ -71,6 +82,9 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ${{ env.IMAGE }}
+          # Only the explicit rule below sets :latest (pushes to main); by
+          # default a version tag would move it too, possibly backwards.
+          flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=edge,enable=${{ github.ref_type == 'branch' && github.ref_name != github.event.repository.default_branch }}
@@ -130,3 +144,20 @@ jobs:
             type=gha,scope=amd64
             type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          {
+            echo "## Published image version $VERSION"
+            echo
+            echo "Tags:"
+            echo
+            while IFS= read -r tag; do
+              if [ -n "$tag" ]; then echo "- \`$tag\`"; fi
+            done <<< "$TAGS"
+            echo
+            echo "If this is the first image ever published (including a first \`:edge\` from a branch), the package is private and Unraid and Docker are refused when pulling it. Make it public once: open https://github.com/${GITHUB_REPOSITORY}/pkgs/container/chrysopoeia, then **Package settings > Change visibility > Public**."
+          } >> "$GITHUB_STEP_SUMMARY"

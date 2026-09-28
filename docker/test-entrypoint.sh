@@ -5,7 +5,8 @@
 #
 # Covers PUID/PGID (including a gid that already exists, such as Unraid's 100
 # "users"), GPU device groups (never the root group), UMASK, the /temp and
-# empty-variable rules, /config ownership, the privilege drop and argument
+# empty-variable rules, the startup banner, warnings about missing, read-only
+# or unwritable mounts, /config ownership, the privilege drop and argument
 # pass-through. Fake GPU nodes are created inside the container with mknod
 # (Docker's default capabilities allow it), so no GPU and no sudo are needed.
 # Takes about 30 seconds; nothing is left behind.
@@ -25,6 +26,7 @@ command -v docker >/dev/null 2>&1 || {
 }
 
 VOLUME="chrysopoeia-entrypoint-test-$$"
+MEDIA_VOLUME="chrysopoeia-entrypoint-test-media-$$"
 CONTAINER="chrysopoeia-entrypoint-test-$$"
 FAILURES=0
 OUT=""
@@ -32,7 +34,7 @@ STATUS=0
 
 cleanup() {
     docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
-    docker volume rm -f "$VOLUME" >/dev/null 2>&1 || true
+    docker volume rm -f "$VOLUME" "$MEDIA_VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -82,6 +84,23 @@ mknod /dev/video11 c 1 3 && chgrp 100 /dev/video11 && chmod 660 /dev/video11
 exec /usr/local/bin/entrypoint.sh "$@"'
     STATUS=0
     OUT=$(docker run --rm --entrypoint /bin/sh "${opts[@]}" "$IMAGE" -c "$setup" sh "$@" 2>&1) || STATUS=$?
+}
+
+# server_log <docker run options...>
+# Starts the server detached through the normal entrypoint and puts its log,
+# up to the end of the startup banner, in $OUT. Warnings about mounts are
+# printed only when the server itself starts, before the banner.
+server_log() {
+    docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
+    STATUS=0
+    OUT=""
+    docker run -d --name "$CONTAINER" "$@" "$IMAGE" >/dev/null || STATUS=$?
+    for _ in $(seq 1 30); do
+        OUT=$(docker logs "$CONTAINER" 2>&1 || true)
+        case $OUT in *"Web UI"*) break ;; esac
+        sleep 0.5
+    done
+    docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
 }
 
 # expect <description> <extended regex that $OUT must match>
@@ -160,6 +179,34 @@ docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
 STATUS=0
 expect "the startup banner lists GPU devices" 'GPU devices +/dev/dri/renderD128 \(group gpu993\)'
 expect "the startup banner names the user" 'Runs as +uid 99 \(chrysopoeia\), gid 100 \(users\)'
+# The server's own version (Cargo.toml), plus the image version when it differs.
+expect "the startup banner shows the server version" 'Chrysopoeia [0-9]+\.[0-9]+\.[0-9]+( \(image [^)]+\))?$'
+
+# --- Mount warnings ---------------------------------------------------------------
+
+docker volume create "$VOLUME" >/dev/null
+docker volume create "$MEDIA_VOLUME" >/dev/null
+
+server_log -e PUID=99 -e PGID=100
+expect "warns when no host folder is mounted at /config" 'No host folder is mounted at /config'
+expect "warns when no media folder is mounted" 'No media folder is mounted at /media'
+
+server_log -e PUID=99 -e PGID=100 -v "$VOLUME:/config" --tmpfs /media:mode=1777
+expect_not "no mount warnings with /config and a writable /media" 'No host folder|No media folder|cannot write to /media|read-only'
+
+server_log -e PUID=99 -e PGID=100 -e BROWSE_ROOTS=/data -v "$VOLUME:/config"
+expect_not "no /media warning when other folders are configured" 'No media folder'
+
+# A fresh volume holds the image's empty /media: owned by root, mode 755.
+server_log -e PUID=99 -e PGID=100 -v "$VOLUME:/config" -v "$MEDIA_VOLUME:/media:ro"
+expect "explains a read-only /media" '/media is mounted read-only'
+expect_not "does not blame PUID/PGID for a read-only /media" 'cannot write to /media'
+
+server_log -e PUID=99 -e PGID=100 -v "$VOLUME:/config" -v "$MEDIA_VOLUME:/media"
+expect "warns when PUID/PGID cannot write to /media" 'Chrysopoeia \(uid 99\) cannot write to /media.*PUID/PGID'
+
+server_log --user 1234:1234 -v "$VOLUME:/config" -v "$MEDIA_VOLUME:/media"
+expect "with --user, warns that /media is not writable" 'Chrysopoeia \(uid 1234\) cannot write to /media'
 
 # --- Environment rules ----------------------------------------------------------
 

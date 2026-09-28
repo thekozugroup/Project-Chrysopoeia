@@ -7,7 +7,8 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 
 ## Prerequisites
 
-- **Rust** 1.85 or newer (edition 2024), via [rustup](https://rustup.rs).
+- **Rust** 1.88 or newer (edition 2024, `let` chains), via
+  [rustup](https://rustup.rs).
 - **Node.js** 22 and **pnpm** 10: `corepack enable pnpm` sets pnpm up.
 - **ffmpeg and ffprobe** 6 or newer on `PATH`, built with libx264, libx265,
   libsvtav1, libvpx and libopus (any Linux distribution's package or Homebrew
@@ -142,18 +143,31 @@ PNGs to keep the repository small.
 - `.github/workflows/release.yml` runs on pushes to `main` and on `v*` tags.
   It builds the amd64 image, runs the entrypoint and smoke tests, and only
   then pushes a multi-arch (amd64 + arm64) image to
-  `ghcr.io/<owner>/chrysopoeia` tagged `latest` (main), the version (`1.2.3`,
-  `1.2`, `1`) for tags, and `sha-<short>`. The version shown in the app and the
-  log is `1.2.3` for a tag and `main-<short sha>` for a build from `main`.
+  `ghcr.io/<owner>/chrysopoeia`: a push to `main` is tagged `latest` and
+  `sha-<short>`; a tag `v1.2.3` is tagged `1.2.3`, `1.2`, `1` and
+  `sha-<short>`. A version tag never moves `latest`, which always follows
+  `main`.
+- There are two version numbers. The server reports the `version` in
+  `Cargo.toml` (`[workspace.package]`) in `/api/health`, `/api/system` and its
+  "is running" log line. The image version is `1.2.3` for a tag,
+  `main-<short sha>` for a build from `main` and `<branch>-<short sha>` for a
+  manual run; it is in the OCI version label and the first line of the
+  container log, next to the server's (`Chrysopoeia 0.2.0 (image
+  main-1a2b3c4)`), so a bug report names the exact commit. To release, set
+  `version` in `Cargo.toml` to `1.2.3`, commit, then tag `v1.2.3`; the
+  workflow refuses a tag that does not match.
 - To publish an image from a branch before merging it (for example to try it
   on an Unraid server), open **Actions > Release > Run workflow** and pick the
   branch. The same tests run, and the image is pushed as `edge` and
-  `sha-<short>` (version `<branch>-<short sha>`); `latest` is not touched.
-  On Unraid, set the container's Repository to
+  `sha-<short>` (image version `<branch>-<short sha>`); `latest` is not
+  touched. On Unraid, set the container's Repository to
   `ghcr.io/<owner>/chrysopoeia:edge`.
-- After the first release, make the package public once on GitHub (Packages >
-  chrysopoeia > Package settings > Change visibility), or Unraid and Docker
-  will be refused when pulling it.
+- The first image ever published, including a first `edge` from a branch,
+  creates the package as **private** (GitHub copies the repository's access
+  rules to a new package, but not its visibility). Make it public once:
+  GitHub > Packages > chrysopoeia > Package settings > Change visibility >
+  Public. Until then Unraid and Docker are refused when pulling it. The
+  workflow run's summary repeats this.
 
 Run the workflow checks locally before pushing a change to `.github/`:
 
