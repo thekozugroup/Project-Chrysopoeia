@@ -9,9 +9,9 @@
 import { ArrowUpToLine, AudioLines, CircleMinus, Film, Captions, Play, RotateCcw } from "lucide-react";
 import type { ReactNode } from "react";
 import {
-  CantBeReadCallout,
   ConvertAgainAction,
   ConvertAnywayButton,
+  FailureCallout,
   IgnoreFileButton,
   SheetSection,
   savingsText,
@@ -31,7 +31,7 @@ import {
   middleTruncate,
 } from "@/lib/format";
 import { channelsLabel, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
-import { hdrSummary, hdrTechnical, isUnreadableSource, skipSummary } from "@/lib/outcomes";
+import { hdrSummary, hdrTechnical, isUnreadable, keptAsConverted, skipSummary } from "@/lib/outcomes";
 import { useFile, useLibrary } from "@/lib/queries";
 import { openSheet } from "@/lib/router";
 import { useFileLive, useLive } from "@/lib/store";
@@ -191,15 +191,7 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   const { library } = useLibrary(file.library_id);
   const latest = jobs[0];
   const forcedIgnored = useLive((s) => Boolean(latest && latest.state === "skipped" && s.forced[latest.id]));
-  if (file.status === "failed") {
-    if (isUnreadableSource(file.error)) return <CantBeReadCallout error={file.error} />;
-    return (
-      <Callout tone="danger" title="The last attempt failed">
-        <p>{file.error ?? "ffmpeg stopped with an error."}</p>
-        <p className="mt-1.5">The original is untouched.</p>
-      </Callout>
-    );
-  }
+  if (file.status === "failed") return <FailureCallout failure={file} title="The last attempt failed" />;
   if (file.status === "skipped") {
     // "Kept the original" when a new file was made and thrown away (the size
     // rule); everything else never needed work.
@@ -284,7 +276,7 @@ function FileActions({ file }: { file: MediaFile }) {
     // sets the library's rules aside for this one file.
     return skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null;
   }
-  if (file.status === "failed" && isUnreadableSource(file.error)) {
+  if (file.status === "failed" && isUnreadable(file)) {
     return (
       <>
         <Button
@@ -348,6 +340,7 @@ function SheetStatus({ file }: { file: MediaFile }) {
     <FileStatusBadge
       status={file.status}
       error={file.error}
+      problem={file.problem}
       progress={file.status === "processing" ? (live?.overall ?? null) : null}
     />
   );
@@ -412,7 +405,7 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
                         onClick={() => openSheet({ file: null, job: job.id })}
                         className="flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3.5 py-3 text-left hover:bg-raised pointer-coarse:min-h-11"
                       >
-                        <JobStateBadge job={job} />
+                        <JobStateBadge job={job} kept={keptAsConverted(job, detail)} />
                         <span className="text-[0.8125rem] text-muted">
                           {formatRelative(job.finished_at ?? job.started_at ?? job.created_at)}
                         </span>

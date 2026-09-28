@@ -28,13 +28,14 @@ import { ConfirmDialog } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { formatBytes, formatRelative, plural } from "@/lib/format";
-import { isUnreadableSource } from "@/lib/outcomes";
-import { useActivity, useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
+import { isUnreadable, isUnreadableSource } from "@/lib/outcomes";
+import { useActivity, useJobs, useKeptAsConverted, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, openSheet, updateParams, type Route } from "@/lib/router";
 import type { ActivityEntry, ActivityLevel, Job } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 const PAGE = 50;
+const EMPTY_JOBS: Job[] = [];
 
 function openJob(job: Job) {
   openSheet({ job: job.id });
@@ -252,10 +253,11 @@ function HistoryTab({ offset }: { offset: number }) {
   const minSavings = useMinSavings();
   const { retry, clearHistory } = useJobActions();
   const [confirmClear, setConfirmClear] = useState(false);
+  const items = history.data?.items ?? EMPTY_JOBS;
+  const kept = useKeptAsConverted(items);
   useClampedOffset(offset, history.data?.total, PAGE);
   if (history.isPending) return <ListSkeleton />;
   if (history.error && !history.data) return <LoadFailed error={history.error} onRetry={() => history.refetch()} />;
-  const items = history.data?.items ?? [];
   if (!items.length) {
     if (offset > 0 && (history.data?.total ?? 0) > 0) return <ListSkeleton />;
     return (
@@ -275,9 +277,12 @@ function HistoryTab({ offset }: { offset: number }) {
       </div>
       <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
         {items.map((job) => {
+          const isKept = kept.has(job.id);
           // Retrying a damaged original can't help; its sheet offers the fix.
+          // A file kept as converted is fine; converting it again asks first,
+          // in its sheet.
           const retryable =
-            job.state === "cancelled" || (job.state === "failed" && !isUnreadableSource(job.error));
+            !isKept && (job.state === "cancelled" || (job.state === "failed" && !isUnreadable(job)));
           return (
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">
               <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
@@ -285,12 +290,12 @@ function HistoryTab({ offset }: { offset: number }) {
                   <span className="min-w-0 truncate text-sm font-medium text-fg hover:text-accent-ink">
                     {job.file_name}
                   </span>
-                  <JobStateBadge job={job} />
+                  <JobStateBadge job={job} kept={isKept} />
                 </span>
                 {/* When the note wraps, the library and time start their own line, with no stray "·". */}
                 <span className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
                   <span className={cn("min-w-0 text-[0.8125rem]", job.state === "done" ? "text-fg/85" : "text-muted")}>
-                    {historyNote(job, minSavings(job.library_id))}
+                    {historyNote(job, minSavings(job.library_id), isKept)}
                   </span>
                   <span className="text-xs text-muted">
                     {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}

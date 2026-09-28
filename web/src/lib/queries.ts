@@ -5,11 +5,30 @@
  * WebSocket client uses to patch caches in place.
  */
 
-import { keepPreviousData, useQuery, type QueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useQueries, useQuery, type QueryClient } from "@tanstack/react-query";
 import { api, ApiError } from "./api";
+import { settlingCount } from "./convertible";
 import { isDetecting } from "./hardware";
-import { countFailures, isUnreadableSource, type FailureCounts } from "./outcomes";
-import type { FileQuery, HardwareInfo, JobQuery, Library, MediaFile, SystemInfo } from "./types";
+import {
+  NO_FAILURES,
+  countFailures,
+  failureGroup,
+  keptAsConverted,
+  setupProblem,
+  type FailureCounts,
+  type SetupProblem,
+} from "./outcomes";
+import type {
+  FileQuery,
+  FileStatus,
+  HardwareInfo,
+  Job,
+  JobQuery,
+  Library,
+  LibraryStats,
+  MediaFile,
+  SystemInfo,
+} from "./types";
 
 /** Query keys. Lists take their parameters as the last element. */
 export const keys = {
@@ -195,14 +214,57 @@ export interface Failures {
   byLibrary: Record<string, FailureCounts>;
   /** Failed files whose original can't be read. */
   unreadable: MediaFile[];
+  /**
+   * Failed files waiting on a fix in the setup, by cause, across every
+   * library: the work folder, the destination, free space or the chosen
+   * hardware. Fixed once, then all tried again.
+   */
+  setup: Partial<Record<SetupProblem, MediaFile[]>>;
+  /** Failed files that changed while they were being converted. */
+  changed: MediaFile[];
   /** Ids of failed files worth trying again (not damaged originals), by library. */
   retryIds: Record<string, string[]>;
 }
 
+/** Group failed files by cause (see `failureGroup`); `total` as for `countFailures`. */
+export function failuresFrom(libraries: Library[], items: MediaFile[], cutShort: boolean): Failures {
+  const byLibrary: Record<string, FailureCounts> = {};
+  const retryIds: Record<string, string[]> = {};
+  for (const library of libraries) {
+    const own = items.filter((f) => f.library_id === library.id);
+    // A cut-short list counts the rest as conversion failures.
+    byLibrary[library.id] = countFailures(own, cutShort ? Math.max(library.stats.failed, own.length) : own.length);
+    retryIds[library.id] = own.filter((f) => failureGroup(f) !== "unreadable").map((f) => f.id);
+  }
+  const total = Object.values(byLibrary).reduce(
+    (sum, c) => ({
+      unreadable: sum.unreadable + c.unreadable,
+      conversion: sum.conversion + c.conversion,
+      setup: sum.setup + c.setup,
+      changed: sum.changed + c.changed,
+    }),
+    NO_FAILURES,
+  );
+  const setup: Partial<Record<SetupProblem, MediaFile[]>> = {};
+  for (const file of items) {
+    const kind = setupProblem(file);
+    if (kind) (setup[kind] ??= []).push(file);
+  }
+  return {
+    ready: true,
+    total,
+    byLibrary,
+    unreadable: items.filter((f) => failureGroup(f) === "unreadable"),
+    setup,
+    changed: items.filter((f) => failureGroup(f) === "changed"),
+    retryIds,
+  };
+}
+
 /**
- * Why files failed. `stats.failed` counts damaged originals and failed
- * conversions alike; this reads the failed files themselves (only when some
- * library has any) so each kind gets its own wording and action.
+ * Why files failed. `stats.failed` counts every kind alike; this reads the
+ * failed files themselves (only when some library has any) so each cause
+ * gets its own wording and action.
  */
 export function useFailures(): Failures {
   const libraries = useLibraries();
@@ -213,30 +275,108 @@ export function useFailures(): Failures {
     enabled: anyFailed,
   });
   const items = anyFailed ? (query.data?.items ?? []) : [];
-  const byLibrary: Record<string, FailureCounts> = {};
-  const retryIds: Record<string, string[]> = {};
-  for (const library of libraries.data ?? []) {
-    const own = items.filter((f) => f.library_id === library.id);
-    // A cut-short list counts the rest as conversion failures.
-    const total = query.data && query.data.total > query.data.items.length ? library.stats.failed : own.length;
-    byLibrary[library.id] = countFailures(own, total);
-    retryIds[library.id] = own.filter((f) => !isUnreadableSource(f.error)).map((f) => f.id);
-  }
-  const total = Object.values(byLibrary).reduce(
-    (sum, c) => ({ unreadable: sum.unreadable + c.unreadable, conversion: sum.conversion + c.conversion }),
-    { unreadable: 0, conversion: 0 },
-  );
-  return {
-    ready: !anyFailed || Boolean(query.data),
-    total,
-    byLibrary,
-    unreadable: items.filter((f) => isUnreadableSource(f.error)),
-    retryIds,
-  };
+  const cutShort = Boolean(query.data && query.data.total > query.data.items.length);
+  return { ...failuresFrom(libraries.data ?? [], items, cutShort), ready: !anyFailed || Boolean(query.data) };
 }
 
-export function useActivity() {
-  return useQuery({ queryKey: keys.activity, queryFn: ({ signal }) => api.activity(30, signal) });
+export function useActivity(options: { enabled?: boolean } = {}) {
+  return useQuery({
+    queryKey: keys.activity,
+    queryFn: ({ signal }) => api.activity(30, signal),
+    enabled: options.enabled ?? true,
+  });
+}
+
+/**
+ * Files of a library still being copied in: the server's `stats.settling`,
+ * or, only from servers too old to send it, read from the latest scan
+ * summary in the activity feed (which is then fetched).
+ */
+export function useSettling(library: Pick<Library, "id" | "stats">): number {
+  const known = typeof library.stats.settling === "number";
+  const activity = useActivity({ enabled: !known });
+  return settlingCount(library, known ? undefined : activity.data?.items);
+}
+
+/**
+ * Which of these finished jobs were a second conversion that left an
+ * already converted file as it was (see `keptAsConverted`). Only skipped,
+ * failed and stopped jobs can be; their files are read (and cached with the
+ * file sheet's data) to tell.
+ */
+export function useKeptAsConverted(jobs: Job[]): Set<string> {
+  const candidates = jobs.filter((j) => j.state === "skipped" || j.state === "failed" || j.state === "cancelled");
+  const fileIds = [...new Set(candidates.map((j) => j.file_id))].slice(0, 50);
+  const details = useQueries({
+    queries: fileIds.map((id) => ({
+      queryKey: keys.file(id),
+      queryFn: ({ signal }: { signal: AbortSignal }) => api.file(id, signal),
+      staleTime: 60_000,
+    })),
+  });
+  const byFile = new Map(fileIds.map((id, i) => [id, details[i]?.data]));
+  return new Set(candidates.filter((j) => keptAsConverted(j, byFile.get(j.file_id))).map((j) => j.id));
+}
+
+/** Statuses a file that saved space can have: converted, or queued again after that. */
+const SAVED_STATUSES: FileStatus[] = ["done", "queued", "processing"];
+const SAVED_PAGE = 500;
+/** At most this many files are read per status to count them. */
+const SAVED_MAX_PER_STATUS = 5_000;
+
+/**
+ * Count the files that saved space (`saved_bytes > 0`): converted files,
+ * and converted files queued again (they keep their savings); files that
+ * came out larger ("Convert anyway") don't count. Converted files are read
+ * page by page (in a very large library, those past the first 5,000 are
+ * taken to have saved space, as nearly all do); queued ones only when the
+ * converted files don't account for all of `totals.saved_bytes`.
+ */
+export async function countSavedFiles(totals: LibraryStats, signal?: AbortSignal): Promise<number> {
+  let files = 0;
+  let savedSeen = 0;
+  for (const status of SAVED_STATUSES) {
+    // Nothing else holds savings once the converted files add up to the total.
+    if (status !== "done" && savedSeen >= totals.saved_bytes) break;
+    for (let offset = 0; ; offset += SAVED_PAGE) {
+      const page = await api.files({ status, limit: SAVED_PAGE, offset, sort: "name" }, signal);
+      for (const file of page.items) {
+        if (file.saved_bytes === null) continue;
+        savedSeen += file.saved_bytes;
+        if (file.saved_bytes > 0) files += 1;
+      }
+      const read = offset + page.items.length;
+      if (read >= page.total || page.items.length === 0) break;
+      if (read >= SAVED_MAX_PER_STATUS) {
+        if (status === "done") {
+          files += page.total - read;
+          savedSeen = totals.saved_bytes;
+        }
+        break;
+      }
+    }
+  }
+  return files;
+}
+
+/**
+ * How many files the space saved comes from (see `countSavedFiles`). Read
+ * again only when the totals change.
+ */
+export function useSavedFileCount(totals: LibraryStats | undefined) {
+  return useQuery({
+    queryKey: [
+      "saved-files",
+      totals?.done ?? 0,
+      totals?.queued ?? 0,
+      totals?.processing ?? 0,
+      totals?.saved_bytes ?? 0,
+    ] as const,
+    queryFn: ({ signal }) => countSavedFiles(totals as LibraryStats, signal),
+    enabled: Boolean(totals && totals.saved_bytes > 0),
+    staleTime: Infinity,
+    placeholderData: keepPreviousData,
+  });
 }
 
 /** Refresh everything that depends on files and jobs after a user action. */

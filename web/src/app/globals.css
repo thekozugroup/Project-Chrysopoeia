@@ -303,12 +303,19 @@
 }
 
 /*
- * Library bar: two textures only. Converted files are solid gold, files in
- * the queue gold stripes; the rest are plain neutrals, and every segment is
- * also listed in words.
+ * Library bar: converted files are solid gold, skipped ones a pale gold
+ * outlined in gold, files in the queue gold stripes, and files still to
+ * convert the empty track; every segment is also listed in words. The pale
+ * tint alone is too close to the light track, so the gold outline gives the
+ * skipped segment its 3:1 edge (WCAG 1.4.11) in both themes.
  */
 .bar-active {
   background-image: repeating-linear-gradient(-45deg, var(--meter) 0 3px, transparent 3px 6px);
+}
+
+.bar-skipped {
+  background-color: var(--bar-skipped);
+  box-shadow: inset 0 0 0 1px var(--meter);
 }
 
 .progress-live {

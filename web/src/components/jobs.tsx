@@ -17,6 +17,7 @@ import {
   Info,
   Play,
   RotateCcw,
+  Wrench,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useThrottledAnnouncement } from "@/components/providers";
@@ -36,7 +37,21 @@ import {
   percentOf,
 } from "@/lib/format";
 import { HW_API_LABEL, HW_API_TECH, JOB_STAGE_LABEL, JOB_STAGES, VALIDATION_LABEL } from "@/lib/labels";
-import { isUnreadableSource, skipNote, skipSummary, unreadableDetail } from "@/lib/outcomes";
+import {
+  CHANGED_TITLE,
+  KEPT_CONVERTED,
+  failureGroup,
+  failureNote,
+  isUnreadable,
+  keptAsConverted,
+  setupFix,
+  setupProblem,
+  skipNote,
+  skipSummary,
+  unreadableDetail,
+  type Failure,
+  type SetupProblem,
+} from "@/lib/outcomes";
 import { overallProgress } from "@/lib/progress";
 import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
@@ -248,24 +263,33 @@ export function savingsText(input: number, output: number | null): { text: strin
   return { text: `${formatBytes(-diff)} larger`, saved: false };
 }
 
+/** "The disk is full" → "the disk is full", to follow a colon; "NVENC …" and "HEVC" stay as they are. */
+export function lowerFirst(text: string): string {
+  if (/^[A-Z]{2}/.test(text)) return text;
+  return text.charAt(0).toLowerCase() + text.slice(1);
+}
+
 /**
  * The second line of a finished job in a list: what came of it, briefly.
  * Its badge already says "Kept original" or "Skipped", so a skip says why:
  * "6% smaller (needs at least 10%)" (`minSavingsPct` is the
- * library's current minimum, to name the rule).
+ * library's current minimum, to name the rule). `kept` marks a second
+ * conversion that left the converted file as it was (its badge reads
+ * "Kept as converted").
  */
-export function historyNote(job: Job, minSavingsPct?: number | null): string {
+export function historyNote(job: Job, minSavingsPct?: number | null, kept = false): string {
   switch (job.state) {
     case "done":
       return savingsText(job.input_size, job.output_size)?.text ?? "Converted";
     case "failed":
-      return isUnreadableSource(job.error) ? "Looks damaged or isn't a video" : (job.error ?? "Failed");
-    case "skipped":
-      return (
-        skipNote(job.skip_reason, minSavingsPct) ?? (job.output_size !== null ? "Kept the original" : "No conversion needed")
-      );
+      return kept ? `Converting it again failed: ${lowerFirst(failureNote(job))}` : failureNote(job);
+    case "skipped": {
+      const note = skipNote(job.skip_reason, minSavingsPct);
+      if (kept) return note ? `Converting it again wasn't worth it: ${lowerFirst(note)}` : "Converting it again wasn't worth it";
+      return note ?? (job.output_size !== null ? "Kept the original" : "No conversion needed");
+    }
     default:
-      return "Stopped. The original was left as it is.";
+      return kept ? "Stopped. The converted file is unchanged." : "Stopped. The original was left as it is.";
   }
 }
 
@@ -413,19 +437,91 @@ export function CantBeReadCallout({ error }: { error: string | null }) {
   );
 }
 
-function Outcome({ job }: { job: Job }) {
+/**
+ * A setup problem (work folder, destination, disk space, chosen hardware):
+ * its cause, the server's sentence, the exact fix and a link to the setting.
+ */
+function SetupCallout({ kind, error }: { kind: SetupProblem; error: string | null }) {
+  const settings = useSettings();
+  const fix = setupFix(kind, settings.data?.output_mode);
+  return (
+    <Callout
+      tone="warning"
+      title={fix.title}
+      action={
+        <a href={href(fix.setting.path)} className={buttonVariants({ variant: "secondary", size: "sm" })}>
+          <Wrench aria-hidden />
+          {fix.setting.label}
+        </a>
+      }
+    >
+      {error ? <p>{error}</p> : null}
+      <p className={error ? "mt-1.5" : undefined}>
+        {fix.fix} Then try again. The original is untouched.
+      </p>
+    </Callout>
+  );
+}
+
+/**
+ * Why a file or job failed, by cause (see `failureGroup`): a damaged
+ * original, a setup problem with its fix, a file that changed meanwhile,
+ * or a failed conversion under `title`.
+ */
+export function FailureCallout({ failure, title }: { failure: Failure; title: string }) {
+  switch (failureGroup(failure)) {
+    case "unreadable":
+      return <CantBeReadCallout error={failure.error} />;
+    case "setup": {
+      const kind = setupProblem(failure);
+      if (kind) return <SetupCallout kind={kind} error={failure.error} />;
+      break;
+    }
+    case "changed":
+      return (
+        <Callout tone="info" title={CHANGED_TITLE}>
+          <p>
+            It was being copied or replaced at the time, so nothing was replaced. Try again once it has finished
+            changing.
+          </p>
+        </Callout>
+      );
+    default:
+      break;
+  }
+  return (
+    <Callout tone="danger" title={title}>
+      <p>{failure.error ?? "ffmpeg stopped with an error."}</p>
+      {originalAffected(failure.error) ? null : <p className="mt-1.5">Your original file is untouched.</p>}
+    </Callout>
+  );
+}
+
+/** A second conversion that left the already converted file as it was. */
+function KeptConvertedCallout({ job, minSavingsPct }: { job: Job; minSavingsPct?: number | null }) {
+  const note = job.state === "skipped" ? skipNote(job.skip_reason, minSavingsPct) : null;
+  const what =
+    job.state === "failed"
+      ? "Converting it again failed."
+      : job.state === "cancelled"
+        ? "Converting it again was stopped."
+        : note
+          ? `Converting it again wasn't worth it: ${lowerFirst(note)}.`
+          : "Converting it again wasn't worth it.";
+  return (
+    <Callout tone="info" title={KEPT_CONVERTED}>
+      <p>{what} The file stays as it was converted before; nothing was lost.</p>
+      {job.state === "failed" && job.error ? <p className="mt-1.5">{job.error}</p> : null}
+    </Callout>
+  );
+}
+
+function Outcome({ job, kept }: { job: Job; kept: boolean }) {
   const settings = useSettings();
   const { library } = useLibrary(job.library_id);
   const forced = useLive((s) => Boolean(s.forced[job.id]));
-  if (job.state === "failed") {
-    if (isUnreadableSource(job.error)) return <CantBeReadCallout error={job.error} />;
-    return (
-      <Callout tone="danger" title="This file couldn't be converted">
-        <p>{job.error ?? "ffmpeg stopped with an error."}</p>
-        {originalAffected(job.error) ? null : <p className="mt-1.5">Your original file is untouched.</p>}
-      </Callout>
-    );
-  }
+  if (kept) return <KeptConvertedCallout job={job} minSavingsPct={library?.profile.min_savings_pct} />;
+  if (job.state === "failed") return <FailureCallout failure={job} title="This file couldn't be converted" />;
   if (job.state === "skipped") {
     // A new file was made and thrown away (the size rule), or the file never
     // needed work under the library's settings.
@@ -517,16 +613,23 @@ function JobTechnical({ job }: { job: Job }) {
   );
 }
 
+/** Whether this job left an already converted file as it was (see `keptAsConverted`). */
+function useKept(job: Job): boolean {
+  const detail = useFile(job.file_id).data;
+  return keptAsConverted(job, detail);
+}
+
 function JobSheetBody({ job: baseJob }: { job: Job }) {
   const job = useLiveJob(baseJob);
   const libraries = useLibraries();
   const library = libraries.data?.find((l) => l.id === job.library_id);
+  const kept = useKept(job);
   const eta = formatEta(job.eta_secs);
   const overall = jobOverall(job);
   return (
     <>
       <div className="mb-6 flex flex-wrap items-center gap-2">
-        <JobStateBadge job={job} />
+        <JobStateBadge job={job} kept={kept} />
         <span className="text-[0.8125rem] text-muted">
           {job.finished_at
             ? `Finished ${formatRelative(job.finished_at)}`
@@ -547,7 +650,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
         </div>
       ) : null}
 
-      <Outcome job={job} />
+      <Outcome job={job} kept={kept} />
 
       {job.notes && job.notes.length > 0 ? (
         <SheetSection title="What changed">
@@ -709,7 +812,8 @@ function JobSheetActions({ job }: { job: Job }) {
   const { library } = useLibrary(job.library_id);
   // A plain link: the new address has no `?job=`, which closes this sheet.
   const fileLink = href(`/library/${job.library_id}`, { file: job.file_id });
-  const unreadable = job.state === "failed" && isUnreadableSource(job.error);
+  const kept = useKept(job);
+  const unreadable = job.state === "failed" && isUnreadable(job);
   const retryButton = (primary: boolean) => (
     <Button
       variant={primary ? "primary" : "secondary"}
@@ -744,15 +848,24 @@ function JobSheetActions({ job }: { job: Job }) {
         </>
       ) : null}
       {job.state === "running" ? <StopJobButton job={job} variant="secondary" label="Stop converting" /> : null}
-      {job.state === "failed" && unreadable ? (
+      {kept && file ? (
+        // The file is still converted: converting it once more asks first.
+        <ConvertAgainAction
+          file={file}
+          profile={library?.profile}
+          onConfirm={() => retry.mutate(job)}
+          loading={retry.isPending}
+        />
+      ) : null}
+      {!kept && job.state === "failed" && unreadable ? (
         <>
           {retryButton(false)}
           {file?.status === "failed" ? <IgnoreFileButton file={file} /> : null}
         </>
       ) : null}
-      {job.state === "failed" && !unreadable ? retryButton(true) : null}
-      {job.state === "cancelled" ? retryButton(false) : null}
-      {job.state === "skipped" && file && skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null}
+      {!kept && job.state === "failed" && !unreadable ? retryButton(true) : null}
+      {!kept && job.state === "cancelled" ? retryButton(false) : null}
+      {!kept && job.state === "skipped" && file && skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null}
       {job.state === "done" && file ? (
         <ConvertAgainAction
           file={file}

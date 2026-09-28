@@ -3,7 +3,7 @@
 /**
  * Overview: a calm status page. The space saved and one sentence about what
  * is happening; "Needs your attention" only when something needs fixing,
- * grouped by cause with one action each; live cards only while files are
+ * grouped by cause with its fix; live cards only while files are
  * converting; then each library and the latest results.
  */
 
@@ -11,10 +11,15 @@ import {
   CircleCheck,
   CirclePause,
   Clock,
+  FileClock,
   FileWarning,
+  FolderLock,
   FolderX,
+  HardDrive,
+  Hourglass,
   LoaderCircle,
   MonitorCog,
+  RotateCcw,
   TriangleAlert,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -25,23 +30,36 @@ import { QueueControls } from "@/components/queue-controls";
 import { JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Callout, SectionHeading, Skeleton } from "@/components/ui/display";
-import { useQueueActions } from "@/lib/actions";
+import { useFileActions, useQueueActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
-import { settlingCount } from "@/lib/convertible";
+import { settlingText } from "@/lib/convertible";
 import { formatBytes, formatCount, formatHour, formatPercent, formatRelative, plural, splitBytes } from "@/lib/format";
+import { SETUP_PROBLEMS, setupFix, type SetupProblem } from "@/lib/outcomes";
 import {
-  useActivity,
   useFailures,
   useHardwareInfo,
   useJobs,
+  useKeptAsConverted,
   useLibraries,
   useOverview,
+  useSavedFileCount,
   useSettings,
+  useSettling,
   type Failures,
 } from "@/lib/queries";
 import { href, openSheet } from "@/lib/router";
 import { useLive, useServerDown } from "@/lib/store";
-import type { HardwareInfo, Job, JobQuery, Library, Overview, QueueState, ScanProgress, Settings } from "@/lib/types";
+import type {
+  HardwareInfo,
+  Job,
+  JobQuery,
+  Library,
+  LibraryStats,
+  Overview,
+  QueueState,
+  ScanProgress,
+  Settings,
+} from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareLine } from "./setup";
 
@@ -143,6 +161,19 @@ function StatusLine({ queue }: { queue: QueueState }) {
   );
 }
 
+/**
+ * "from 12 converted files": the files the space saved comes from (those
+ * with `saved_bytes > 0`, including converted files queued again), not
+ * every converted file, since one that came out larger saved nothing.
+ */
+function SavedFrom({ totals }: { totals: LibraryStats }) {
+  const count = useSavedFileCount(totals);
+  // Counting failed (an unusual server): the converted files are the closest answer.
+  const files = count.data ?? (count.error ? totals.done : null);
+  if (files === null) return <Skeleton className="inline-block h-3.5 w-36 align-middle" />;
+  return <>from {plural(files, "converted file")}</>;
+}
+
 function SavedHero({ overview }: { overview: Overview }) {
   const { totals, projected_savings_bytes: projected } = overview;
   const libraries = useLibraries();
@@ -157,7 +188,9 @@ function SavedHero({ overview }: { overview: Overview }) {
       </p>
     ) : null;
 
-  if (totals.done === 0 || saved === 0) {
+  // Savings, not the "converted" count, decide: a converted file queued
+  // again keeps its savings but isn't "done" meanwhile.
+  if (saved === 0) {
     // Nothing to report yet: say what is happening instead of a giant "0 GB".
     const scanning = scanSentence(libraries.data ?? [], scans) !== null;
     const title = scanning
@@ -195,7 +228,7 @@ function SavedHero({ overview }: { overview: Overview }) {
         <span className="text-lg font-medium text-muted">saved</span>
       </p>
       <p className="mt-3 max-w-md text-sm leading-relaxed text-muted">
-        from {plural(totals.done, "converted file")}
+        <SavedFrom totals={totals} />
         {projected && projected > 0 && remaining > 0 ? (
           <>
             . About <span className="font-semibold text-fg">{formatBytes(projected)}</span> more once the remaining{" "}
@@ -214,10 +247,13 @@ function SavedHero({ overview }: { overview: Overview }) {
 interface Problem {
   key: string;
   icon: ReactNode;
-  tone: "warning" | "danger";
+  tone: "warning" | "danger" | "info";
   title: string;
   detail: string;
-  action: { label: string; href: string };
+  /** Where to look or fix it. */
+  action?: { label: string; href: string };
+  /** Failed files to try again, once the cause is fixed. */
+  retry?: string[];
 }
 
 /**
@@ -243,23 +279,46 @@ function perLibrary(
   });
 }
 
-/** Problems the user can fix, one per cause, each with one action. */
+const SETUP_ICON: Record<SetupProblem, ReactNode> = {
+  hardware_unavailable: <MonitorCog aria-hidden />,
+  work_folder: <FolderX aria-hidden />,
+  disk_full: <HardDrive aria-hidden />,
+  destination: <FolderLock aria-hidden />,
+};
+
+/** "3 files couldn't be converted because of it." */
+function blockedText(n: number): string {
+  return `${plural(n, "file")} couldn't be converted because of it.`;
+}
+
+/**
+ * Problems the user can fix, one row per cause. Setup problems (work
+ * folder, destination, disk space, chosen hardware) are one row each
+ * across every library, with the exact fix, a link to the setting and
+ * "Try again" for all their files; damaged originals and failed
+ * conversions get a row per library with "Review".
+ */
 export function problemsFrom(
   libraries: Library[],
   failures: Failures,
   hw: HardwareInfo | undefined,
+  settings?: Pick<Settings, "output_mode">,
 ): Problem[] {
   const problems: Problem[] = [];
   const hints = hw?.hints.filter((h) => h.level !== "info") ?? [];
+  // Files the chosen hardware couldn't convert belong with the hardware tips.
+  const hardwareFailed = failures.ready ? (failures.setup.hardware_unavailable ?? []) : [];
   if (hints.length) {
     const blocking = hints.some((h) => h.level === "error");
+    const tips = hints.length > 1 ? `${hints[0].title}, and ${plural(hints.length - 1, "more tip")}.` : `${hints[0].title}.`;
     problems.push({
       key: "hardware",
       icon: <MonitorCog aria-hidden />,
       tone: blocking ? "danger" : "warning",
       title: blocking ? "Nothing can be converted until setup is fixed" : "Hardware setup needs a fix",
-      detail: hints.length > 1 ? `${hints[0].title}, and ${plural(hints.length - 1, "more tip")}.` : `${hints[0].title}.`,
+      detail: hardwareFailed.length ? `${tips} ${blockedText(hardwareFailed.length)}` : tips,
       action: { label: "Show me", href: href("/settings/hardware") },
+      retry: hardwareFailed.length ? hardwareFailed.map((f) => f.id) : undefined,
     });
   }
   for (const library of libraries.filter((l) => l.path_error)) {
@@ -273,6 +332,21 @@ export function problemsFrom(
     });
   }
   if (failures.ready) {
+    for (const kind of SETUP_PROBLEMS) {
+      const files = failures.setup[kind] ?? [];
+      // Already said with the hardware tips.
+      if (!files.length || (kind === "hardware_unavailable" && hints.length)) continue;
+      const fix = setupFix(kind, settings?.output_mode);
+      problems.push({
+        key: `setup-${kind}`,
+        icon: SETUP_ICON[kind],
+        tone: "warning",
+        title: fix.title,
+        detail: `${blockedText(files.length)} ${fix.fix}`,
+        action: { label: fix.setting.label, href: href(fix.setting.path) },
+        retry: files.map((f) => f.id),
+      });
+    }
     const count = (kind: "unreadable" | "conversion") =>
       Object.fromEntries(Object.entries(failures.byLibrary).map(([id, c]) => [id, c[kind]]));
     problems.push(
@@ -289,39 +363,85 @@ export function problemsFrom(
         detail: `The ${n === 1 ? "original is" : "originals are"} untouched. See why, then try again.`,
       })),
     );
+    const changed = failures.changed;
+    if (changed.length) {
+      const one = changed.length === 1;
+      problems.push({
+        key: "changed",
+        icon: <FileClock aria-hidden />,
+        tone: "info",
+        title: `${plural(changed.length, "file")} changed while ${one ? "it was" : "they were"} being converted`,
+        detail: `${one ? "It was" : "They were"} being copied or replaced at the time, so nothing was replaced. Try again once ${one ? "it has" : "they have"} finished changing.`,
+        retry: changed.map((f) => f.id),
+      });
+    }
   }
   return problems;
+}
+
+/** "Try again" for every file of one cause, once it's fixed. */
+function RetryAll({ ids }: { ids: string[] }) {
+  const { bulk } = useFileActions();
+  return (
+    <Button
+      variant="secondary"
+      size="sm"
+      onClick={() => bulk.mutate({ action: "retry_failed", ids })}
+      loading={bulk.isPending}
+      aria-label={ids.length === 1 ? "Try the file again" : `Try the ${formatCount(ids.length)} files again`}
+      needsServer
+    >
+      <RotateCcw aria-hidden />
+      Try again
+    </Button>
+  );
 }
 
 function NeedsAttention() {
   const libraries = useLibraries();
   const failures = useFailures();
+  const settings = useSettings();
   const { hw } = useHardwareInfo();
-  const problems = problemsFrom(libraries.data ?? [], failures, hw);
+  const problems = problemsFrom(libraries.data ?? [], failures, hw, settings.data);
   if (!problems.length) return null;
   return (
     <section aria-labelledby="attention-heading">
       <SectionHeading id="attention-heading" title="Needs your attention" />
       <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
-        {problems.map((p) => (
-          <li key={p.key} className="flex items-start gap-3 px-4 py-3.5 sm:items-center sm:px-5">
-            <span
+        {problems.map((p) => {
+          // Two actions go under the text on phones, lined up with it.
+          const two = Boolean(p.action && p.retry?.length);
+          return (
+            <li
+              key={p.key}
               className={cn(
-                "mt-0.5 shrink-0 sm:mt-0 [&_svg]:size-[1.125rem]",
-                p.tone === "danger" ? "text-danger" : "text-warning",
+                "flex items-start gap-x-3 gap-y-2.5 px-4 py-3.5 sm:items-center sm:px-5",
+                two && "max-sm:flex-wrap",
               )}
             >
-              {p.icon}
-            </span>
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium text-fg">{p.title}</p>
-              <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">{p.detail}</p>
-            </div>
-            <a href={p.action.href} className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "shrink-0")}>
-              {p.action.label}
-            </a>
-          </li>
-        ))}
+              <span
+                className={cn(
+                  "mt-0.5 shrink-0 sm:mt-0 [&_svg]:size-[1.125rem]",
+                  p.tone === "danger" ? "text-danger" : p.tone === "warning" ? "text-warning" : "text-info",
+                )}
+              >
+                {p.icon}
+              </span>
+              <div className={cn("min-w-0 flex-1", two && "max-sm:basis-[calc(100%-1.875rem)]")}>
+                <p className="text-sm font-medium text-fg">{p.title}</p>
+                <p className="mt-0.5 max-w-[30rem] text-[0.8125rem] leading-snug text-muted">{p.detail}</p>
+              </div>
+              <div className={cn("flex shrink-0 gap-2", two && "max-sm:ml-[1.875rem]")}>
+                {p.action ? (
+                  <a href={p.action.href} className={buttonVariants({ variant: "secondary", size: "sm" })}>
+                    {p.action.label}
+                  </a>
+                ) : null}
+                {p.retry?.length ? <RetryAll ids={p.retry} /> : null}
+              </div>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );
@@ -369,14 +489,15 @@ function NowConverting({ queue }: { queue: QueueState }) {
 
 export function LibraryRow({ library }: { library: Library }) {
   const scan = useLive((s) => s.scans[library.id]);
-  const activity = useActivity();
   const failures = useFailures();
-  const copying = settlingCount(library, activity.data?.items);
+  const copying = useSettling(library);
   const stats = library.stats;
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   const scanning = library.scanning || (scan && scan.phase !== "done");
   const left = remainingCount(stats);
   let status: ReactNode;
+  // Files being copied in get their own line, unless that's the whole story.
+  let settling = copying > 0 && Boolean(library.enabled && !library.path_error);
   if (library.path_error) {
     status = <span className="text-warning">{library.path_error}</span>;
   } else if (!library.enabled) {
@@ -392,12 +513,13 @@ export function LibraryRow({ library }: { library: Library }) {
           : "Scanning"}
       </span>
     );
-  } else if (stats.file_count === 0) {
-    status = copying > 0 ? `Waiting for ${plural(copying, "file")} to finish copying` : "No videos found yet";
   } else if (left > 0) {
-    status = `${plural(left, "file")} to go${copying > 0 ? ` · ${formatCount(copying)} still copying` : ""}`;
-  } else if (copying > 0) {
-    status = `Waiting for ${plural(copying, "file")} to finish copying`;
+    status = `${plural(left, "file")} to go`;
+  } else if (copying > 0 && stats.failed === 0) {
+    status = settlingText(copying);
+    settling = false;
+  } else if (stats.file_count === 0) {
+    status = "No videos found yet";
   } else {
     // Failed files aren't finished; "to review" follows.
     status = stats.failed > 0 ? "Everything else is finished" : "Everything is finished";
@@ -435,6 +557,12 @@ export function LibraryRow({ library }: { library: Library }) {
           <span className="shrink-0 tabular">{formatPercent(finishedPercent(stats, unreadable))} finished</span>
         ) : null}
       </div>
+      {settling ? (
+        <p className="mt-0.5 flex items-center gap-1.5 text-[0.8125rem] text-muted">
+          <Hourglass className="size-3.5 shrink-0 text-accent-ink" aria-hidden />
+          {settlingText(copying)}
+        </p>
+      ) : null}
       <LibraryBar stats={stats} unreadable={unreadable} className="mt-3" />
     </li>
   );
@@ -487,11 +615,13 @@ function Libraries() {
 
 /** The latest results (shared with the layout, which gives them a column only when there are some). */
 const RECENT_QUERY: JobQuery = { state: "history", limit: 6 };
+const EMPTY_JOBS: Job[] = [];
 
 function RecentResults() {
   const history = useJobs(RECENT_QUERY);
   const libraries = useLibraries();
-  const items = history.data?.items ?? [];
+  const items = history.data?.items ?? EMPTY_JOBS;
+  const kept = useKeptAsConverted(items);
   if (!history.isPending && items.length === 0) return null;
   const libraryName = (id: string) => libraries.data?.find((l) => l.id === id)?.name;
   const minSavings = (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
@@ -525,11 +655,11 @@ function RecentResults() {
               >
                 <span className="flex w-full items-center justify-between gap-3">
                   <span className="min-w-0 truncate text-sm font-medium text-fg">{job.file_name}</span>
-                  <JobStateBadge job={job} />
+                  <JobStateBadge job={job} kept={kept.has(job.id)} />
                 </span>
                 <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">
                   <span className={cn("min-w-0 truncate", job.state === "done" ? "text-fg/85" : "text-muted")}>
-                    {historyNote(job, minSavings(job.library_id))}
+                    {historyNote(job, minSavings(job.library_id), kept.has(job.id))}
                   </span>
                   <span className="shrink-0 text-xs text-muted">
                     {[libraryName(job.library_id), formatRelative(job.finished_at)].filter(Boolean).join(" · ")}
@@ -566,7 +696,8 @@ function Welcome() {
   const hardware = useHardwareInfo();
   const libraries = useLibraries();
   const failures = useFailures();
-  const problems = problemsFrom(libraries.data ?? [], failures, hardware.hw);
+  const settings = useSettings();
+  const problems = problemsFrom(libraries.data ?? [], failures, hardware.hw, settings.data);
   return (
     <div className="max-w-2xl">
       <h1 className="font-display text-[2.75rem] leading-[1.05] text-fg sm:text-[3.5rem]">

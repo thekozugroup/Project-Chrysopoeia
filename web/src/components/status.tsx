@@ -13,17 +13,19 @@ import {
   CircleX,
   Clock,
   Cpu,
+  FileClock,
   FileWarning,
   LoaderCircle,
   MonitorPlay,
   ShieldCheck,
   TriangleAlert,
+  Wrench,
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { Badge, type Tone } from "@/components/ui/display";
 import { Tooltip } from "@/components/ui/overlays";
 import { CHECK_STATUS_LABEL, FILE_STATUS_LABEL, HW_API_LABEL, JOB_STAGE_LABEL, JOB_STATE_LABEL } from "@/lib/labels";
-import { isUnreadableSource } from "@/lib/outcomes";
+import { KEPT_CONVERTED, failureGroup, type Failure } from "@/lib/outcomes";
 import type { CheckStatus, FileStatus, HwApi, Job, JobState } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -41,26 +43,47 @@ export function fileStatusIcon(status: FileStatus): ReactNode {
   return FILE_STATUS_STYLE[status].icon;
 }
 
-/** A failure that is the original's fault: amber, with the fix outside the app. */
-function CantBeReadBadge() {
-  return (
-    <Badge tone="warning" icon={<FileWarning aria-hidden />}>
-      Can&apos;t be read
-    </Badge>
-  );
+/**
+ * A failure that isn't a failed conversion gets its own badge: a damaged
+ * original is amber "Can't be read" (the fix is outside the app), a setup
+ * problem amber "Needs a fix", a file that changed meanwhile a neutral
+ * "File changed". `null` for a failed conversion, which reads "Failed".
+ */
+function FailureBadge({ failure }: { failure: Failure }) {
+  switch (failureGroup(failure)) {
+    case "unreadable":
+      return (
+        <Badge tone="warning" icon={<FileWarning aria-hidden />}>
+          Can&apos;t be read
+        </Badge>
+      );
+    case "setup":
+      return (
+        <Badge tone="warning" icon={<Wrench aria-hidden />}>
+          Needs a fix
+        </Badge>
+      );
+    case "changed":
+      return <Badge icon={<FileClock aria-hidden />}>File changed</Badge>;
+    default:
+      return null;
+  }
 }
 
 export function FileStatusBadge({
   status,
   progress,
   error,
+  problem,
 }: {
   status: FileStatus;
   progress?: number | null;
-  /** The file's error, to tell a damaged original from a failed conversion. */
+  /** The file's error and problem code, to tell the kinds of failure apart. */
   error?: string | null;
+  problem?: Failure["problem"];
 }) {
-  if (status === "failed" && isUnreadableSource(error)) return <CantBeReadBadge />;
+  const failure: Failure = { error: error ?? null, problem };
+  if (status === "failed" && failureGroup(failure) !== "conversion") return <FailureBadge failure={failure} />;
   const style = FILE_STATUS_STYLE[status];
   const label =
     status === "processing" && progress !== null && progress !== undefined
@@ -85,14 +108,26 @@ const JOB_STATE_STYLE: Record<JobState, { tone: Tone; icon: ReactNode }> = {
 /**
  * Outcome of a job. Done and verified jobs read "Verified"; a skipped job
  * reads "Kept original" when a new file was made and thrown away (the size
- * rule), and "Skipped" when the file never needed work.
+ * rule), and "Skipped" when the file never needed work. A second conversion
+ * that left an already converted file as it was reads "Kept as converted"
+ * (`kept`), whether it was skipped, failed or stopped.
  */
 export function JobStateBadge({
   job,
+  kept = false,
 }: {
-  job: Pick<Job, "state" | "stage" | "validation" | "output_size" | "error">;
+  job: Pick<Job, "state" | "stage" | "validation" | "output_size" | "error" | "problem">;
+  /** See `keptAsConverted`. */
+  kept?: boolean;
 }) {
-  if (job.state === "failed" && isUnreadableSource(job.error)) return <CantBeReadBadge />;
+  if (kept) {
+    return (
+      <Badge tone="neutral" icon={<CircleCheck aria-hidden />}>
+        {KEPT_CONVERTED}
+      </Badge>
+    );
+  }
+  if (job.state === "failed" && failureGroup(job) !== "conversion") return <FailureBadge failure={job} />;
   if (job.state === "done" && job.validation?.passed) {
     return (
       <Badge tone="success" icon={<ShieldCheck aria-hidden />}>

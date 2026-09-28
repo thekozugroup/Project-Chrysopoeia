@@ -40,7 +40,7 @@ import { NavTabs, Pager, useClampedOffset } from "@/components/ui/nav-tabs";
 import { ActionMenu, ConfirmDialog } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { leftOutText, nothingToConvertText, planBulkConvert, settlingCount } from "@/lib/convertible";
+import { leftOutText, nothingToConvertText, planBulkConvert, settlingText } from "@/lib/convertible";
 import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
 import { cantBeReadText, failedFilterLabel, type FailureCounts } from "@/lib/outcomes";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
@@ -54,6 +54,7 @@ import {
   useLibrary,
   usePresets,
   useSettings,
+  useSettling,
 } from "@/lib/queries";
 import { profileFieldOf, type ProfileErrors } from "@/lib/settings-form";
 import { href, navigate, openSheet, updateParams, type Route } from "@/lib/router";
@@ -165,7 +166,7 @@ function Header({ library }: { library: Library }) {
             {
               label: "Library settings",
               icon: <SlidersHorizontal aria-hidden />,
-              onSelect: () => navigate(`/library/${library.id}/settings`),
+              href: href(`/library/${library.id}/settings`),
             },
           ]}
         />
@@ -179,7 +180,20 @@ function Header({ library }: { library: Library }) {
           <span className="text-xs text-muted">Scanned {formatRelative(library.last_scan_at)}</span>
         ) : null}
       </div>
+      <SettlingLine library={library} />
     </PageHeader>
+  );
+}
+
+/** "Waiting for 3 files to finish copying": files copied in right now, added once they stop changing. */
+function SettlingLine({ library }: { library: Library }) {
+  const copying = useSettling(library);
+  if (copying <= 0) return null;
+  return (
+    <p className="mt-2.5 flex items-center gap-2 text-[0.8125rem] text-muted">
+      <Hourglass className="size-4 shrink-0 text-accent-ink" aria-hidden />
+      {settlingText(copying)}
+    </p>
   );
 }
 
@@ -383,6 +397,7 @@ function StatusCell({ file }: { file: MediaFile }) {
     <FileStatusBadge
       status={file.status}
       error={file.error}
+      problem={file.problem}
       progress={file.status === "processing" ? (live?.overall ?? null) : null}
     />
   );
@@ -425,14 +440,15 @@ function Checkbox({
  */
 function NoFilesYet({ library }: { library: Library }) {
   const activity = useActivity();
-  const copying = settlingCount(library, activity.data?.items);
+  const copying = useSettling(library);
   const latest = activity.data?.items.find((e) => e.library_id === library.id);
   if (copying > 0) {
+    // The header already says how many; this says what happens next.
     return (
-      <EmptyState icon={<Hourglass aria-hidden />} title="Waiting for files to finish copying">
-        {plural(copying, "file")} in this folder {copying === 1 ? "is" : "are"} still being copied.{" "}
-        {copying === 1 ? "It's" : "They're"} picked up automatically once {copying === 1 ? "it stops" : "they stop"}{" "}
-        changing.
+      <EmptyState icon={<Hourglass aria-hidden />} title="Files are on their way">
+        {copying === 1 ? "A file in this folder is" : `${plural(copying, "file")} in this folder are`} still being
+        copied. {copying === 1 ? "It's" : "They're"} added here automatically once{" "}
+        {copying === 1 ? "it stops" : "they stop"} changing.
       </EmptyState>
     );
   }

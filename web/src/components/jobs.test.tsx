@@ -133,4 +133,32 @@ describe("job summaries", () => {
     expect(historyNote(job({ state: "skipped", output_size: null, skip_reason: "Already HEVC" }))).toBe("Already HEVC");
     expect(historyNote(job({ state: "skipped", output_size: null, skip_reason: null }))).toBe("No conversion needed");
   });
+
+  it("names a failure by its code: the setup cause, a changed file, else the server's sentence", () => {
+    const failed = (problem: Job["problem"], error = "Not enough free space in /temp for the new file (needs about 4 GB)") =>
+      job({ state: "failed", output_size: null, error, problem });
+    expect(historyNote(failed("disk_full"))).toBe("The disk is full");
+    expect(historyNote(failed("work_folder"))).toBe("The work folder can't be used");
+    expect(historyNote(failed("source_changed"))).toBe("The file changed while it was being converted");
+    expect(historyNote(failed("verification", "Looked different."))).toBe("Looked different.");
+    // The code wins over a damaged-sounding sentence.
+    expect(historyNote(failed("encoder", "The original file appears damaged or incomplete."))).toBe(
+      "The original file appears damaged or incomplete.",
+    );
+  });
+
+  it("says a second conversion kept the converted file, never that it kept the original", () => {
+    const skipped = job({ state: "skipped", output_size: 9.4e9, skip_reason: "Only 6% smaller — kept the original" });
+    expect(historyNote(skipped, 10, true)).toBe("Converting it again wasn't worth it: 6% smaller (needs at least 10%)");
+    expect(historyNote(job({ state: "failed", output_size: null, error: "x", problem: "disk_full" }), null, true)).toBe(
+      "Converting it again failed: the disk is full",
+    );
+    expect(historyNote(job({ state: "cancelled", output_size: null }), null, true)).toBe(
+      "Stopped. The converted file is unchanged.",
+    );
+    // Acronyms keep their capitals after the colon.
+    expect(historyNote(job({ state: "failed", output_size: null, error: "NVENC stopped.", problem: "encoder" }), null, true)).toBe(
+      "Converting it again failed: NVENC stopped.",
+    );
+  });
 });

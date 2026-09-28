@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, api, errorFromBody, onReachability, request } from "./api";
-import { fetchSystem } from "./queries";
+import { countSavedFiles, fetchSystem } from "./queries";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(body === undefined ? null : JSON.stringify(body), {
@@ -106,5 +106,59 @@ describe("fetchSystem", () => {
   it("still fails when the server can't be reached", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
     await expect(fetchSystem()).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("countSavedFiles", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  const totals = (saved_bytes: number, done: number) => ({
+    file_count: 10,
+    total_bytes: 0,
+    pending: 0,
+    queued: 0,
+    processing: 0,
+    done,
+    skipped: 0,
+    failed: 0,
+    saved_bytes,
+  });
+
+  /** A server whose files have these statuses and savings. */
+  function serve(files: { status: string; saved_bytes: number | null }[]) {
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input), "http://localhost");
+      const status = url.searchParams.get("status");
+      const own = files.filter((f) => f.status === status);
+      const limit = Number(url.searchParams.get("limit"));
+      const offset = Number(url.searchParams.get("offset") ?? 0);
+      return jsonResponse(200, { items: own.slice(offset, offset + limit), total: own.length });
+    });
+    vi.stubGlobal("fetch", fetch);
+    return fetch;
+  }
+
+  it("counts only files that saved space, including converted files queued again", async () => {
+    serve([
+      { status: "done", saved_bytes: 100 },
+      { status: "done", saved_bytes: 50 },
+      // "Convert anyway" that came out larger: converted, but saved nothing.
+      { status: "done", saved_bytes: -20 },
+      // Converted, now queued again: it keeps its savings.
+      { status: "queued", saved_bytes: 70 },
+      { status: "queued", saved_bytes: null },
+    ]);
+    await expect(countSavedFiles(totals(200, 3))).resolves.toBe(3);
+  });
+
+  it("doesn't read the queue when the converted files hold every byte saved", async () => {
+    const fetch = serve([
+      { status: "done", saved_bytes: 100 },
+      { status: "queued", saved_bytes: null },
+    ]);
+    await expect(countSavedFiles(totals(100, 1))).resolves.toBe(1);
+    expect(fetch.mock.calls.map(([url]) => new URL(String(url), "http://localhost").searchParams.get("status"))).toEqual([
+      "done",
+    ]);
   });
 });

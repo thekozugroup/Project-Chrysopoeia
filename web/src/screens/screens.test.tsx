@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { videoCount } from "@/components/folder-picker";
+import { folderVideos, videoCount } from "@/components/folder-picker";
 import { limitText, queueSentence } from "@/components/queue-controls";
-import type { Failures } from "@/lib/queries";
-import type { HardwareInfo, Library, QueueState } from "@/lib/types";
+import { NO_FAILURES, type FailureCounts } from "@/lib/outcomes";
+import { failuresFrom, type Failures } from "@/lib/queries";
+import type { HardwareInfo, Library, MediaFile, ProblemKind, QueueState } from "@/lib/types";
 import { finishedPercent } from "@/components/library-bar";
 import { overviewStatus, problemsFrom } from "./overview";
 import { logLevel } from "./queue";
@@ -21,11 +22,20 @@ const queue = (partial: Partial<QueueState> = {}): QueueState => ({
 
 const noFailures: Failures = {
   ready: true,
-  total: { unreadable: 0, conversion: 0 },
+  total: NO_FAILURES,
   byLibrary: {},
   unreadable: [],
+  setup: {},
+  changed: [],
   retryIds: {},
 };
+
+const counts = (unreadable: number, conversion: number, setup = 0, changed = 0): FailureCounts => ({
+  unreadable,
+  conversion,
+  setup,
+  changed,
+});
 
 function library(partial: Partial<Library> = {}): Library {
   return {
@@ -93,26 +103,26 @@ describe("needs your attention", () => {
   it("groups failures by cause, each with one action to the filtered list", () => {
     const failures: Failures = {
       ...noFailures,
-      total: { unreadable: 4, conversion: 1 },
-      byLibrary: { "lib-a": { unreadable: 4, conversion: 1 } },
+      total: counts(4, 1),
+      byLibrary: { "lib-a": counts(4, 1) },
     };
     const problems = problemsFrom([library()], failures, undefined);
-    expect(problems.map((p) => [p.title, p.action.label])).toEqual([
+    expect(problems.map((p) => [p.title, p.action?.label])).toEqual([
       ["4 files can't be read", "Review"],
       ["1 file couldn't be converted", "Review"],
     ]);
     expect(problems[0].tone).toBe("warning");
-    expect(problems[0].action.href).toBe("#/library/lib-a?status=failed");
+    expect(problems[0].action?.href).toBe("#/library/lib-a?status=failed");
   });
 
   it("gives each library its own row when a cause spans libraries, so Review shows every file it counted", () => {
     const failures: Failures = {
       ...noFailures,
-      total: { unreadable: 3, conversion: 1 },
-      byLibrary: { "lib-a": { unreadable: 2, conversion: 1 }, "lib-b": { unreadable: 1, conversion: 0 } },
+      total: counts(3, 1),
+      byLibrary: { "lib-a": counts(2, 1), "lib-b": counts(1, 0) },
     };
     const problems = problemsFrom([library(), library({ id: "lib-b", name: "Shows" })], failures, undefined);
-    expect(problems.map((p) => [p.title, p.action.href])).toEqual([
+    expect(problems.map((p) => [p.title, p.action?.href])).toEqual([
       ["Movies: 2 files can't be read", "#/library/lib-a?status=failed"],
       ["Shows: 1 file can't be read", "#/library/lib-b?status=failed"],
       // One library only: no name needed.
@@ -130,6 +140,56 @@ describe("needs your attention", () => {
     } as unknown as HardwareInfo;
     const problems = problemsFrom([library({ path_error: "The folder is missing." })], { ...noFailures, ready: false }, hw);
     expect(problems.map((p) => p.title)).toEqual(["Hardware setup needs a fix", "Movies: the folder can't be read"]);
+  });
+
+  const failedFile = (id: string, libraryId: string, problem: ProblemKind | null, error = "It went wrong."): MediaFile =>
+    ({ id, library_id: libraryId, status: "failed", error, problem }) as MediaFile;
+
+  it("gives each setup problem one row across libraries, with its fix, its setting and Try again for all", () => {
+    const libs = [library(), library({ id: "lib-b", name: "Shows" })];
+    const files = [
+      failedFile("w1", "lib-a", "work_folder"),
+      failedFile("w2", "lib-b", "work_folder"),
+      failedFile("d1", "lib-b", "disk_full"),
+      failedFile("e1", "lib-a", "encoder"),
+      failedFile("c1", "lib-a", "source_changed"),
+    ];
+    const problems = problemsFrom(libs, failuresFrom(libs, files, false), undefined, { output_mode: "replace" });
+    expect(problems.map((p) => [p.title, p.action?.label ?? null, p.retry ?? null])).toEqual([
+      ["The work folder can't be used", "Work folder settings", ["w1", "w2"]],
+      ["The disk is full", "Work folder settings", ["d1"]],
+      ["1 file couldn't be converted", "Review", null],
+      ["1 file changed while it was being converted", null, ["c1"]],
+    ]);
+    expect(problems[0].detail).toMatch(/^2 files couldn't be converted because of it\. Make sure the work folder exists/);
+    expect(problems[0].action?.href).toBe("#/settings/output");
+    expect(problems[3].tone).toBe("info");
+  });
+
+  it("puts files the chosen hardware couldn't convert with the hardware tips", () => {
+    const libs = [library()];
+    const files = [failedFile("h1", "lib-a", "hardware_unavailable"), failedFile("h2", "lib-a", "hardware_unavailable")];
+    const failures = failuresFrom(libs, files, false);
+    const alone = problemsFrom(libs, failures, undefined);
+    expect(alone.map((p) => [p.title, p.action?.href, p.retry])).toEqual([
+      ["The hardware you chose isn't working", "#/settings/hardware", ["h1", "h2"]],
+    ]);
+    const hw = { hints: [{ level: "error", title: "No working NVIDIA encoder", detail: "", fix: null }] } as unknown as HardwareInfo;
+    const merged = problemsFrom(libs, failures, hw);
+    expect(merged).toHaveLength(1);
+    expect(merged[0].detail).toBe("No working NVIDIA encoder. 2 files couldn't be converted because of it.");
+    expect(merged[0].retry).toEqual(["h1", "h2"]);
+  });
+
+  it("reads damaged originals from their sentence when an older server sends no code", () => {
+    const libs = [library()];
+    const files = [
+      failedFile("u1", "lib-a", null, "The original file appears damaged or incomplete (it stops after 0.1 s)."),
+      failedFile("x1", "lib-a", null, "Could not use the temp folder /temp: Permission denied"),
+    ];
+    const failures = failuresFrom(libs, files, false);
+    expect(failures.byLibrary["lib-a"]).toEqual(counts(1, 1));
+    expect(failures.retryIds["lib-a"]).toEqual(["x1"]);
   });
 });
 
@@ -173,6 +233,12 @@ describe("folder picker counts", () => {
     expect(videoCount(1000, true)).toBe("1,000+ videos");
     expect(videoCount(0)).toBeNull();
     expect(videoCount(null)).toBeNull();
+  });
+
+  it("puts the chosen folder's own count on its button, including none", () => {
+    expect(folderVideos(1204)).toBe("1,204 videos");
+    expect(folderVideos(2000, true)).toBe("2,000+ videos");
+    expect(folderVideos(0)).toBe("no videos");
   });
 });
 

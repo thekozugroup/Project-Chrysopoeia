@@ -3,9 +3,10 @@
 /**
  * The library bar: one horizontal bar per library that fills from the left
  * as files finish. Finished files are one gold family (converted is solid
- * gold, skipped is a pale gold tint), so the filled length is the "%
- * finished" next to it; files on their way are gold stripes; files still
- * to convert are the plain track. Failed conversions are a thin amber mark
+ * gold, skipped a pale gold tint with a gold outline, which keeps it 3:1
+ * against the track), so the filled length is the "% finished" next to it;
+ * files on their way are gold stripes; files still to convert are the plain
+ * track. Failed conversions are a thin amber mark
  * at the end; originals that can't be read aren't drawn at all (they're
  * listed under "Needs your attention") and aren't counted in "% finished"
  * either. Every segment is also said in words.
@@ -25,7 +26,7 @@ interface Segment {
 function segments(stats: LibraryStats, unreadable: number): Segment[] {
   return [
     { key: "done", label: "Converted", count: stats.done, className: "bg-meter" },
-    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bg-bar-skipped" },
+    { key: "skipped", label: "Skipped", count: stats.skipped, className: "bar-skipped" },
     {
       key: "active",
       label: "In queue or converting",
@@ -138,8 +139,13 @@ export function LibraryLegend({
               aria-hidden
               className={cn(
                 "size-2.5 rounded-[3px] ring-1 ring-inset",
-                // "To convert" is the empty track: an outlined swatch.
-                s.key === "pending" ? "bg-raised ring-line-strong/60" : cn("ring-line", s.className),
+                // "To convert" is the empty track: an outlined swatch. "Skipped"
+                // draws its own gold outline, as in the bar.
+                s.key === "pending"
+                  ? "bg-raised ring-line-strong/60"
+                  : s.key === "skipped"
+                    ? s.className
+                    : cn("ring-line", s.className),
               )}
             />
             <span>
