@@ -211,7 +211,7 @@ async fn success_replaces_the_original_and_keeps_its_date() {
         ("libx264", HwApi::Software, 1)
     );
     assert!(
-        command.starts_with("ffmpeg -hide_banner -nostdin -y -i "),
+        command.starts_with("ffmpeg -loglevel level+warning -hide_banner -nostdin -y -i "),
         "{command}"
     );
     assert!(command.contains("'Show - S01E01.mkv'") || command.contains("Show - S01E01"));
@@ -400,6 +400,11 @@ async fn all_candidates_failing_reports_the_last_error() {
     };
     assert!(
         error.starts_with("h264_broken_hw stopped with exit code"),
+        "{error}"
+    );
+    // The cause, not ffmpeg's closing remarks or encoder statistics.
+    assert!(
+        error.ends_with("Unknown encoder 'chrysopoeia_no_such_encoder'"),
         "{error}"
     );
     assert!(log_tail.is_some_and(|t| t.contains("chrysopoeia_no_such_encoder")));
@@ -627,4 +632,130 @@ async fn planner_errors_move_on_to_the_next_candidate() {
         matches!(&outcome, JobOutcome::Done { encoder, attempt: 1, .. } if encoder == "libx264"),
         "{outcome:?}"
     );
+}
+
+/// Run `spec` with the real-time planner and call `during` once, as soon
+/// as the encode is visibly under way.
+async fn run_with_hook(
+    cfg: &RunConfig,
+    spec: &JobSpec,
+    during: impl FnOnce() + Send + 'static,
+) -> JobOutcome {
+    let (tx, mut rx) = mpsc::channel::<JobProgress>(1024);
+    let watcher = tokio::spawn(async move {
+        let mut during = Some(during);
+        while let Some(p) = rx.recv().await {
+            if p.stage == JobStage::Transcoding && p.progress > 0.0 {
+                if let Some(f) = during.take() {
+                    f();
+                }
+            }
+        }
+        during.is_none()
+    });
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(120),
+        run_job_with(
+            cfg,
+            spec,
+            &realtime_plan,
+            &transcode,
+            tx,
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("job finished");
+    assert!(watcher.await.unwrap(), "the hook ran during the encode");
+    outcome
+}
+
+#[tokio::test]
+async fn an_original_replaced_during_the_encode_is_left_alone() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, dir.path());
+    let spec = spec(&input, dir.path(), profile());
+    let cfg = config(ValidationLevel::Standard);
+
+    // Sonarr/Radarr upgrade: a newer release is renamed over the original
+    // while it is being converted.
+    let newer = support::test_media().join(support::MKV_HEVC_10BIT);
+    let newer_bytes = std::fs::read(&newer).unwrap();
+    let target = input.clone();
+    let staging = dir.path().join("import.partial");
+    let outcome = run_with_hook(&cfg, &spec, move || {
+        std::fs::copy(&newer, &staging).unwrap();
+        std::fs::rename(&staging, &target).unwrap();
+    })
+    .await;
+
+    match outcome {
+        JobOutcome::Skipped { reason, .. } => assert_eq!(
+            reason,
+            "The original changed while it was being converted, so it was left alone"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), newer_bytes);
+    assert_eq!(support::walk(dir.path()), [input]);
+}
+
+#[tokio::test]
+async fn folder_mode_without_a_temp_folder_encodes_into_the_output_folder() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &library);
+    let spec = spec(&input, &library, profile());
+    let mut cfg = config(ValidationLevel::Quick);
+    cfg.output_mode = OutputMode::Folder;
+    cfg.output_folder = Some(dir.path().join("converted"));
+    cfg.temp_dir = None;
+
+    // The library may be read-only: nothing is written there, the encode
+    // goes straight into the output folder.
+    let (library_seen, output_seen) = (library.clone(), dir.path().join("converted"));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let record = seen.clone();
+    let outcome = run_with_hook(&cfg, &spec, move || {
+        *record.lock().unwrap() = Some((
+            support::artifacts_in(&library_seen),
+            support::artifacts_in(&output_seen),
+        ));
+    })
+    .await;
+    let JobOutcome::Done { output_path, .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    let (in_library, in_output) = seen.lock().unwrap().take().unwrap();
+    assert!(in_library.is_empty(), "{in_library:?}");
+    assert_eq!(in_output.len(), 1, "{in_output:?}");
+    assert_eq!(
+        output_path,
+        dir.path().join("converted/Big Test (2020).mkv")
+    );
+    assert!(support::artifacts_in(dir.path()).is_empty());
+    assert_eq!(support::walk(&library), [input]);
+}
+
+#[tokio::test]
+async fn a_failed_folder_mode_job_leaves_no_empty_folders() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let season = library.join("TV/Show");
+    std::fs::create_dir_all(&season).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &season);
+    let mut spec = spec(&input, &library, profile());
+    spec.candidates = vec![candidate(BROKEN_HW, HwApi::Vaapi, false)];
+    let mut cfg = config(ValidationLevel::Quick);
+    cfg.output_mode = OutputMode::Folder;
+    cfg.output_folder = Some(dir.path().join("converted"));
+
+    let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    assert!(!dir.path().join("converted").exists());
+    assert_eq!(support::walk(dir.path()), [input]);
 }

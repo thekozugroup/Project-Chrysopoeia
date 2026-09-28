@@ -3,11 +3,16 @@
 //! [`run_job`] walks one file through the stages:
 //!
 //! 1. **Preparing** — the input still exists, `decide` agrees there is work,
-//!    the destination is free and the temp folder has room.
+//!    the destination is free, and the temp folder (and, when the new file
+//!    must be copied to another filesystem, the destination) has room once
+//!    the space promised to other running jobs is counted. A job whose room
+//!    is held by other jobs waits for them.
 //! 2. **Transcoding** — the attempt chain: each candidate encoder in order;
 //!    a hardware encoder that decodes on the GPU is retried with CPU
 //!    decoding before moving on. The first success wins.
-//! 3. The size rule (`min_savings_pct`) may discard the result.
+//! 3. The size rule (`min_savings_pct`) may discard the result. If the
+//!    original was replaced or modified while it was being encoded (e.g. a
+//!    Sonarr/Radarr upgrade), the result is discarded too.
 //! 4. **Verifying** — [`crate::validate_output`]. A hardware result that
 //!    fails verification moves on to the next attempt (GPU encoders can
 //!    produce corrupt output); any other failure fails the job.
@@ -18,6 +23,7 @@
 //! being dropped (a drop guard).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -33,7 +39,8 @@ use crate::ffmpeg::{
     DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, compute_progress, display_command, run_ffmpeg,
 };
 use crate::finalize::{
-    FinalizeRequest, destination_conflict, final_output_path, finalize, temp_output_path,
+    FileIdentity, FinalizeRequest, OriginalChanged, destination_conflict, final_output_path,
+    finalize, temp_output_path,
 };
 use crate::plan::{Decision, FfmpegPlan, PlanRequest};
 use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
@@ -143,6 +150,12 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
 /// How long a stage-change update may wait for room in the progress channel.
 const STAGE_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How often a job waiting for disk space held by other jobs looks again.
+const SPACE_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Verification progress needed before an ETA is estimated from its pace.
+const VERIFY_ETA_MIN_PERCENT: f32 = 2.0;
+
 /// Run one job to completion. Progress is sent at most ~2 times per second.
 /// Never panics on bad input; all problems become `Failed`.
 pub async fn run_job(
@@ -213,8 +226,20 @@ fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
 #[derive(Debug)]
 struct Prepared {
     original_size: u64,
+    /// The original as it was when the job started.
+    identity: FileIdentity,
     temp: PathBuf,
     final_path: PathBuf,
+    /// Folders created for the temp file, outermost first; removed again
+    /// (when empty) if the job does not finish.
+    created_dirs: Vec<PathBuf>,
+    /// Disk space promised to this job; released when the job ends.
+    _space: SpaceGuard,
+}
+
+/// The reason given when the original changed during the job.
+fn original_changed() -> String {
+    OriginalChanged.to_string()
 }
 
 /// A failed attempt, kept so the final error can describe it.
@@ -277,7 +302,10 @@ impl Job<'_> {
         let outcome = self.attempts(&prepared, &guard).await;
         match &outcome {
             JobOutcome::Done { .. } => guard.disarm(),
-            _ => guard.discard().await,
+            _ => {
+                guard.discard().await;
+                remove_empty_dirs(&prepared.created_dirs).await;
+            }
         }
         outcome
     }
@@ -313,7 +341,6 @@ impl Job<'_> {
         }
 
         let container = spec.profile.container;
-        let temp = temp_output_path(&spec.input, container, spec.job_id, cfg.temp_dir.as_deref());
         let final_path = final_output_path(
             &spec.input,
             container,
@@ -327,33 +354,116 @@ impl Job<'_> {
             return Err(failed(conflict));
         }
 
+        // Without a temp folder the encode is written next to where it ends
+        // up: beside the original, or (folder mode) in the output folder, so
+        // a read-only library works and no cross-disk copy is needed.
+        let temp_home = match (&cfg.temp_dir, cfg.output_mode) {
+            (Some(dir), _) => Some(dir.clone()),
+            (None, OutputMode::Folder) => final_path.parent().map(Path::to_path_buf),
+            (None, OutputMode::Replace) => None,
+        };
+        let temp = temp_output_path(&spec.input, container, spec.job_id, temp_home.as_deref());
         let temp_dir = temp
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-            return Err(failed(format!(
-                "Could not use the temp folder {}: {e}",
-                temp_dir.display()
-            )));
-        }
-        let size = input_meta.len();
-        let needed = size.saturating_add(size / 10);
-        if let Some(free) = free_space(&temp_dir).await {
-            if free < needed {
+        let created_dirs = match create_dirs(&temp_dir).await {
+            Ok(created) => created,
+            Err(e) => {
                 return Err(failed(format!(
-                    "Not enough free space in {} for this file (needs about {})",
-                    temp_dir.display(),
-                    human_bytes(needed)
+                    "Could not use the temp folder {}: {e}",
+                    temp_dir.display()
                 )));
             }
-        }
+        };
+        let size = input_meta.len();
+        let space = match self.reserve_space(size, &temp, &final_path).await {
+            Ok(space) => space,
+            Err(outcome) => {
+                remove_empty_dirs(&created_dirs).await;
+                return Err(outcome);
+            }
+        };
 
         Ok(Prepared {
             original_size: size,
+            identity: FileIdentity::of(&input_meta),
             temp,
             final_path,
+            created_dirs,
+            _space: space,
         })
+    }
+
+    /// Reserve room for the encode in the temp folder (about 1.1x the
+    /// original) and, when the result will be copied to another filesystem,
+    /// for the copy there. Waits while other running jobs hold the room.
+    ///
+    /// Only the temp folder can fail the job here: the new file's size is
+    /// unknown until it is made, and converting to save space on a nearly
+    /// full disk is exactly what the destination check must not refuse.
+    /// There the reservation (at most the largest result the size rule
+    /// keeps) only makes parallel jobs take turns, and `finalize` checks the
+    /// real size before copying.
+    async fn reserve_space(
+        &self,
+        input_size: u64,
+        temp: &Path,
+        final_path: &Path,
+    ) -> Result<SpaceGuard, JobOutcome> {
+        let needed = input_size.saturating_add(input_size / 10);
+        let largest_kept = match self.spec.profile.min_savings_pct {
+            Some(p) => input_size / 100 * u64::from(100u8.saturating_sub(p)),
+            None => input_size,
+        };
+        let temp_dir = temp.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let final_dir = final_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let needs = vec![
+            SpaceNeed {
+                dir: temp_dir,
+                bytes: needed,
+                file: Some(temp.to_path_buf()),
+                what: "this file",
+                strict: true,
+            },
+            SpaceNeed {
+                dir: final_dir,
+                bytes: largest_kept,
+                file: None,
+                what: "the new file",
+                strict: false,
+            },
+        ];
+        let mut waiting = false;
+        loop {
+            let attempt = needs.clone();
+            let result = tokio::task::spawn_blocking(move || try_reserve(&attempt))
+                .await
+                .unwrap_or(Ok(SpaceGuard::default()));
+            match result {
+                Ok(guard) => return Ok(guard),
+                Err(Shortfall::Never { dir, bytes, what }) => {
+                    return Err(failed(format!(
+                        "Not enough free space in {} for {what} (needs about {})",
+                        dir.display(),
+                        human_bytes(bytes)
+                    )));
+                }
+                Err(Shortfall::Busy { dir }) => {
+                    if !waiting {
+                        waiting = true;
+                        tracing::info!(
+                            job = %self.spec.job_id,
+                            "waiting for other jobs to free space in {}", dir.display()
+                        );
+                    }
+                    tokio::select! {
+                        () = self.cancel.cancelled() => return Err(JobOutcome::Cancelled),
+                        () = tokio::time::sleep(SPACE_RETRY_INTERVAL) => {}
+                    }
+                }
+            }
+        }
     }
 
     /// The attempt chain. Returns the job's outcome; the caller cleans up
@@ -457,10 +567,25 @@ impl Job<'_> {
                 };
             }
 
+            // The encode read the file that was here when the job started;
+            // if it has been replaced since, the result is of an old version.
+            match FileIdentity::read(&spec.input).await {
+                Ok(now) if now == prepared.identity => {}
+                Ok(_) => {
+                    return JobOutcome::Skipped {
+                        reason: original_changed(),
+                        encoder: Some(candidate.name.clone()),
+                        output_size: Some(output_size),
+                    };
+                }
+                Err(_) => return failed("The file no longer exists"),
+            }
+
             let validation = if cfg.validation == ValidationLevel::Off {
                 None
             } else {
                 self.reporter.stage(JobStage::Verifying, 0.0).await;
+                let verify_started = Instant::now();
                 let report = validate_output_at(
                     &ValidateRequest {
                         ffmpeg: &cfg.ffmpeg,
@@ -474,7 +599,10 @@ impl Job<'_> {
                     },
                     cfg.low_priority,
                     self.cancel,
-                    &|pct| self.reporter.tick(pct, None, None, None),
+                    &|pct| {
+                        let eta = verify_eta(pct, verify_started.elapsed());
+                        self.reporter.tick(pct, None, None, eta);
+                    },
                 )
                 .await;
                 if self.cancel.is_cancelled() {
@@ -510,20 +638,30 @@ impl Job<'_> {
                 mode: cfg.output_mode,
                 job_id: spec.job_id,
                 keep_dates: cfg.keep_file_dates,
+                original: Some(prepared.identity),
                 force_copy: false,
             })
             .await;
-            let output_size = match placed {
-                Ok(size) => size,
+            let placed = match placed {
+                Ok(placed) => placed,
+                Err(e) if e.is::<OriginalChanged>() => {
+                    return JobOutcome::Skipped {
+                        reason: original_changed(),
+                        encoder: Some(candidate.name.clone()),
+                        output_size: Some(output_size),
+                    };
+                }
                 Err(e) => {
                     let mut f = failure(format!("{e:#}"), None);
                     f.validation = validation;
                     return f.into_outcome();
                 }
             };
+            let output_size = placed.size;
             self.reporter.stage(JobStage::Finalizing, 100.0).await;
 
             let mut notes = plan.notes;
+            notes.extend(placed.notes);
             if let Some(first) = first.filter(|_| attempt > 1) {
                 notes.push(fallback_note(first, candidate));
             }
@@ -553,7 +691,12 @@ impl Job<'_> {
 
     /// Run ffmpeg for one attempt, reporting transcoding progress.
     async fn encode(&self, args: &[String]) -> FfmpegExit {
-        let duration = self.spec.probe.duration_secs;
+        let duration = self
+            .spec
+            .probe
+            .duration_secs
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .or_else(|| estimated_duration(&self.spec.probe));
         let started = Instant::now();
         let cmd = FfmpegCommand {
             program: &self.cfg.ffmpeg,
@@ -596,11 +739,25 @@ pub(crate) fn attempt_chain(candidates: &[EncoderCandidate]) -> Vec<EncoderCandi
     chain
 }
 
-/// Make sure the command hides the banner, ignores stdin and reports
-/// progress on stdout, whatever the planner produced.
+/// Make sure the command hides the banner, ignores stdin, reports progress
+/// on stdout and tags every log line with its level (so a failure can be
+/// told apart from warnings and statistics), whatever the planner produced.
 pub(crate) fn normalize_args(mut args: Vec<String>) -> Vec<String> {
     let has = |args: &[String], flag: &str| args.iter().any(|a| a == flag);
     let mut prefix: Vec<String> = Vec::new();
+    match args
+        .iter()
+        .position(|a| a == "-loglevel" || a == "-v")
+        .map(|i| i + 1)
+    {
+        Some(i) if i < args.len() => {
+            let level = &args[i];
+            if !level.split('+').any(|flag| flag == "level") {
+                args[i] = format!("level+{level}");
+            }
+        }
+        _ => prefix.extend(["-loglevel".into(), "level+warning".into()]),
+    }
     if !has(&args, "-hide_banner") {
         prefix.push("-hide_banner".into());
     }
@@ -646,6 +803,54 @@ pub(crate) fn size_rule(
     })
 }
 
+/// The length of a file whose container reports none (some damaged or
+/// raw streams), estimated from its size and bitrate, so encoding progress
+/// can still be shown.
+fn estimated_duration(probe: &ProbeInfo) -> Option<f64> {
+    let bits_per_sec = probe.bit_rate.filter(|b| *b > 0).or_else(|| {
+        let sum: u64 = probe.streams.iter().filter_map(|s| s.bit_rate).sum();
+        (sum > 0).then_some(sum)
+    })?;
+    let secs = probe.size_bytes as f64 * 8.0 / bits_per_sec as f64;
+    (secs.is_finite() && secs >= 1.0).then_some(secs)
+}
+
+/// Seconds left in verification, estimated from its pace so far.
+fn verify_eta(percent: f32, elapsed: Duration) -> Option<u64> {
+    if !(VERIFY_ETA_MIN_PERCENT..100.0).contains(&percent) || elapsed < Duration::from_secs(2) {
+        return None;
+    }
+    let secs = elapsed.as_secs_f64() * f64::from(100.0 - percent) / f64::from(percent);
+    (secs.is_finite() && secs >= 0.0).then(|| secs.round() as u64)
+}
+
+/// Create `dir` and any missing parents. Returns the folders that were
+/// created, outermost first.
+async fn create_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut missing = Vec::new();
+    let mut current = Some(dir);
+    while let Some(d) = current {
+        if d.as_os_str().is_empty() || tokio::fs::try_exists(d).await.unwrap_or(true) {
+            break;
+        }
+        missing.push(d.to_path_buf());
+        current = d.parent();
+    }
+    tokio::fs::create_dir_all(dir).await?;
+    missing.reverse();
+    Ok(missing)
+}
+
+/// Remove folders created by [`create_dirs`] again, innermost first, as
+/// long as they are empty.
+async fn remove_empty_dirs(created: &[PathBuf]) {
+    for dir in created.iter().rev() {
+        if tokio::fs::remove_dir(dir).await.is_err() {
+            break;
+        }
+    }
+}
+
 /// "Verification failed: <label> — <detail>".
 fn verification_error(report: &ValidationReport) -> String {
     match report.first_failure() {
@@ -669,25 +874,140 @@ fn fallback_note(first: &EncoderCandidate, used: &EncoderCandidate) -> String {
     }
 }
 
-/// Free bytes available to unprivileged users on the filesystem of `dir`.
-/// `None` when unknown (the check is then skipped).
-async fn free_space(dir: &Path) -> Option<u64> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || free_space_blocking(&dir))
-        .await
-        .ok()
-        .flatten()
+/// Disk space promised to running jobs, so parallel jobs on one filesystem
+/// do not all count the same free space.
+static RESERVATIONS: Mutex<Vec<Reservation>> = Mutex::new(Vec::new());
+
+/// Source of reservation ids.
+static NEXT_RESERVATION: AtomicU64 = AtomicU64::new(1);
+
+/// Space promised to one job on one filesystem.
+#[derive(Debug, Clone)]
+struct Reservation {
+    id: u64,
+    device: u64,
+    bytes: u64,
+    /// The file the job is writing there; what it already holds is no
+    /// longer free and so no longer outstanding.
+    file: Option<PathBuf>,
 }
 
-#[cfg(unix)]
-fn free_space_blocking(dir: &Path) -> Option<u64> {
-    let stat = rustix::fs::statvfs(dir).ok()?;
-    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+impl Reservation {
+    /// Bytes the job has written so far.
+    fn written(&self) -> u64 {
+        self.file
+            .as_ref()
+            .and_then(|f| std::fs::metadata(f).ok())
+            .map_or(0, |m| m.len())
+    }
 }
 
-#[cfg(not(unix))]
-fn free_space_blocking(_dir: &Path) -> Option<u64> {
-    None
+/// Room one job needs in one folder.
+#[derive(Debug, Clone)]
+struct SpaceNeed {
+    dir: PathBuf,
+    bytes: u64,
+    file: Option<PathBuf>,
+    /// "this file" / "the new file", for the error message.
+    what: &'static str,
+    /// Fail when the room can never be found. A non-strict need only waits
+    /// for other jobs, and is reserved as it is otherwise.
+    strict: bool,
+}
+
+/// Why room could not be reserved.
+#[derive(Debug)]
+enum Shortfall {
+    /// Not enough even if no other job were running.
+    Never {
+        dir: PathBuf,
+        bytes: u64,
+        what: &'static str,
+    },
+    /// Other running jobs hold the room; try again later.
+    Busy { dir: PathBuf },
+}
+
+/// Releases a job's reservations when dropped (the job ended).
+#[derive(Debug, Default)]
+struct SpaceGuard {
+    ids: Vec<u64>,
+}
+
+impl Drop for SpaceGuard {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let mut all = RESERVATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        all.retain(|r| !self.ids.contains(&r.id));
+    }
+}
+
+/// Reserve every need at once, or none. Needs on the same filesystem as an
+/// earlier one are merged into it (a temp file beside its destination needs
+/// the room only once). Blocking: stats files and filesystems.
+fn try_reserve(needs: &[SpaceNeed]) -> Result<SpaceGuard, Shortfall> {
+    try_reserve_with(needs, &crate::finalize::filesystem_of)
+}
+
+/// [`try_reserve`] with the filesystem lookup supplied (tests).
+fn try_reserve_with(
+    needs: &[SpaceNeed],
+    filesystem_of: &dyn Fn(&Path) -> Option<(u64, u64)>,
+) -> Result<SpaceGuard, Shortfall> {
+    // (device, need) with duplicates on one filesystem dropped.
+    let mut distinct: Vec<(u64, &SpaceNeed)> = Vec::with_capacity(needs.len());
+    for need in needs {
+        let Some((device, _)) = filesystem_of(&need.dir) else {
+            continue;
+        };
+        if !distinct.iter().any(|(d, _)| *d == device) {
+            distinct.push((device, need));
+        }
+    }
+    let mut all = RESERVATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    for (device, need) in &distinct {
+        let Some((_, free)) = filesystem_of(&need.dir) else {
+            continue;
+        };
+        let others: Vec<(u64, u64)> = all
+            .iter()
+            .filter(|r| r.device == *device)
+            .map(|r| (r.bytes, r.written()))
+            .collect();
+        let held: u64 = others.iter().map(|(b, w)| b.saturating_sub(*w)).sum();
+        let written: u64 = others.iter().map(|(_, w)| *w).sum();
+        if free.saturating_sub(held) >= need.bytes {
+            continue;
+        }
+        // Other jobs' promises (and the files they are writing) are released
+        // when they end, so wait for them if that would be enough.
+        if !others.is_empty() && (held > 0 || free.saturating_add(written) >= need.bytes) {
+            return Err(Shortfall::Busy {
+                dir: need.dir.clone(),
+            });
+        }
+        if need.strict {
+            return Err(Shortfall::Never {
+                dir: need.dir.clone(),
+                bytes: need.bytes,
+                what: need.what,
+            });
+        }
+    }
+    let mut guard = SpaceGuard::default();
+    for (device, need) in distinct {
+        let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
+        all.push(Reservation {
+            id,
+            device,
+            bytes: need.bytes,
+            file: need.file.clone(),
+        });
+        guard.ids.push(id);
+    }
+    Ok(guard)
 }
 
 /// Sends [`JobProgress`] updates, throttled to [`PROGRESS_INTERVAL`].
@@ -911,8 +1231,10 @@ mod tests {
         let args = vec!["-y".to_string(), "-i".into(), "in".into(), "out".into()];
         let normalized = normalize_args(args);
         assert_eq!(
-            normalized[..5],
+            normalized[..7],
             [
+                "-loglevel",
+                "level+warning",
                 "-hide_banner",
                 "-nostdin",
                 "-progress",
@@ -921,6 +1243,142 @@ mod tests {
             ]
         );
         assert_eq!(normalize_args(normalized.clone()), normalized);
+    }
+
+    #[test]
+    fn log_levels_get_tagged() {
+        let level_of = |args: &[&str]| {
+            let args = normalize_args(args.iter().map(|a| a.to_string()).collect());
+            let i = args
+                .iter()
+                .position(|a| a == "-loglevel" || a == "-v")
+                .unwrap();
+            args[i + 1].clone()
+        };
+        assert_eq!(
+            level_of(&["-loglevel", "warning", "-i", "x"]),
+            "level+warning"
+        );
+        assert_eq!(level_of(&["-v", "error", "-i", "x"]), "level+error");
+        assert_eq!(
+            level_of(&["-loglevel", "repeat+level+info"]),
+            "repeat+level+info"
+        );
+        assert_eq!(level_of(&["-loglevel", "level+error"]), "level+error");
+    }
+
+    #[test]
+    fn unknown_lengths_are_estimated_from_the_bitrate() {
+        let mut probe = ProbeInfo {
+            size_bytes: 10_000_000,
+            ..Default::default()
+        };
+        assert_eq!(estimated_duration(&probe), None);
+        probe.streams = vec![
+            chrysopoeia_core::StreamInfo {
+                bit_rate: Some(3_000_000),
+                ..Default::default()
+            },
+            chrysopoeia_core::StreamInfo {
+                bit_rate: Some(1_000_000),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(estimated_duration(&probe), Some(20.0));
+        probe.bit_rate = Some(8_000_000);
+        assert_eq!(estimated_duration(&probe), Some(10.0));
+    }
+
+    #[test]
+    fn verification_eta_follows_its_pace() {
+        assert_eq!(verify_eta(1.0, Duration::from_secs(10)), None);
+        assert_eq!(verify_eta(50.0, Duration::from_secs(1)), None);
+        assert_eq!(verify_eta(25.0, Duration::from_secs(60)), Some(180));
+        assert_eq!(verify_eta(100.0, Duration::from_secs(60)), None);
+    }
+
+    fn need(dir: &str, bytes: u64, file: Option<&Path>) -> SpaceNeed {
+        SpaceNeed {
+            dir: PathBuf::from(dir),
+            bytes,
+            file: file.map(Path::to_path_buf),
+            what: "this file",
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn space_reservations_account_for_other_jobs() {
+        // Two fake filesystems: /cache (device 901, 100 bytes free) and
+        // /array (device 902, 1000 bytes free). Unique devices keep this
+        // test independent of any other reservation in the process.
+        let fs = |dir: &Path| -> Option<(u64, u64)> {
+            if dir.starts_with("/cache") {
+                Some((901, 100))
+            } else if dir.starts_with("/array") {
+                Some((902, 1000))
+            } else {
+                None
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("partial.tmp");
+        std::fs::write(&partial, [0u8; 30]).unwrap();
+
+        // Temp and destination on different filesystems: both reserved.
+        let first = try_reserve_with(
+            &[
+                need("/cache/t", 80, Some(&partial)),
+                need("/array/m", 80, None),
+            ],
+            &fs,
+        )
+        .unwrap();
+        assert_eq!(first.ids.len(), 2);
+
+        // 100 free, 80 promised of which 30 written: only 50 left for others.
+        match try_reserve_with(&[need("/cache/u", 60, None)], &fs) {
+            Err(Shortfall::Busy { dir }) => assert_eq!(dir, Path::new("/cache/u")),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        assert!(try_reserve_with(&[need("/cache/u", 50, None)], &fs).is_ok());
+
+        // More than the disk can ever hold fails at once...
+        match try_reserve_with(&[need("/cache/v", 5000, None)], &fs) {
+            Err(Shortfall::Busy { .. }) => {}
+            other => panic!("expected Busy while /cache is in use, got {other:?}"),
+        }
+        // ...unless it is only an estimate (the destination of a copy).
+        let estimate = SpaceNeed {
+            strict: false,
+            ..need("/array/n", 5000, None)
+        };
+        match try_reserve_with(std::slice::from_ref(&estimate), &fs) {
+            // /array holds the first job's promise: take turns.
+            Err(Shortfall::Busy { .. }) => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
+
+        // Once the first job ends, its room is free again.
+        drop(first);
+        assert!(try_reserve_with(&[need("/cache/u", 60, None)], &fs).is_ok());
+        match try_reserve_with(&[need("/cache/v", 5000, None)], &fs) {
+            Err(Shortfall::Never { bytes, .. }) => assert_eq!(bytes, 5000),
+            other => panic!("expected Never, got {other:?}"),
+        }
+        assert!(try_reserve_with(&[estimate], &fs).is_ok());
+
+        // Unknown filesystems are not checked; one filesystem is reserved once.
+        let merged = try_reserve_with(
+            &[
+                need("/array/a", 10, None),
+                need("/array/b", 10, None),
+                need("/x", 1, None),
+            ],
+            &fs,
+        )
+        .unwrap();
+        assert_eq!(merged.ids.len(), 1);
     }
 
     #[test]

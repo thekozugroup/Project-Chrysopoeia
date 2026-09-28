@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 
 use chrysopoeia_core::OutputMode;
 use chrysopoeia_core::paths::{backup_file_name, temp_file_name};
-use chrysopoeia_worker::finalize::{FinalizeRequest, Recovery, finalize, recover_artifact};
+use chrysopoeia_worker::finalize::{
+    FileIdentity, FinalizeRequest, OriginalChanged, Recovery, finalize, recover_artifact,
+};
 use filetime::FileTime;
 use uuid::Uuid;
 
@@ -54,6 +56,8 @@ fn request<'a>(
         mode,
         job_id: job_id(),
         keep_dates: true,
+        // As a job does: the original as it was when the encode started.
+        original: std::fs::metadata(input).ok().map(|m| FileIdentity::of(&m)),
         force_copy: false,
     }
 }
@@ -75,10 +79,11 @@ async fn same_path_replace_swaps_in_the_new_file() {
     make_original(&input);
     let temp = make_temp(dir.path(), "Movie (2020)", "mkv");
 
-    let size = finalize(&request(&input, &temp, &input, OutputMode::Replace))
+    let placed = finalize(&request(&input, &temp, &input, OutputMode::Replace))
         .await
         .unwrap();
-    assert_eq!(size, NEW.len() as u64);
+    assert_eq!(placed.size, NEW.len() as u64);
+    assert!(placed.notes.is_empty());
     assert_eq!(std::fs::read(&input).unwrap(), NEW);
     assert!(!temp.exists());
     assert!(
@@ -181,8 +186,8 @@ async fn cross_device_copy_path_places_the_file_and_cleans_up() {
     let mut req = request(&input, &temp, &input, OutputMode::Replace);
     req.force_copy = true;
 
-    let size = finalize(&req).await.unwrap();
-    assert_eq!(size, NEW.len() as u64);
+    let placed = finalize(&req).await.unwrap();
+    assert_eq!(placed.size, NEW.len() as u64);
     assert_eq!(std::fs::read(&input).unwrap(), NEW);
     assert!(!temp.exists(), "the temp file is removed after copying");
     assert!(support::artifacts_in(dir.path()).is_empty());
@@ -310,4 +315,83 @@ async fn recovery_leaves_everything_else_alone() {
         Recovery::Untouched
     );
     assert!(folder.exists());
+}
+
+#[tokio::test]
+async fn a_failed_cross_device_copy_never_touches_the_original() {
+    // Something already occupies the hidden staging name, so the copy into
+    // the library folder fails before the original is moved at all.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("media/Movie.mkv");
+    make_original(&input);
+    let temp = make_temp(&dir.path().join("scratch"), "Movie", "mkv");
+    let staging = dir
+        .path()
+        .join("media")
+        .join(temp_file_name("Movie", job_id(), "part.mkv"));
+    std::fs::create_dir(&staging).unwrap();
+    let mut req = request(&input, &temp, &input, OutputMode::Replace);
+    req.force_copy = true;
+
+    let err = finalize(&req).await.unwrap_err();
+    assert!(
+        err.to_string()
+            .starts_with("Could not put the new file in place, so the original was kept"),
+        "{err:#}"
+    );
+    assert_eq!(std::fs::read(&input).unwrap(), OLD);
+    assert_eq!(mtime(&input), old_time());
+    assert!(temp.exists(), "the temp file is the caller's to delete");
+    // No backup was made.
+    assert_eq!(support::walk(&dir.path().join("media")), [input]);
+}
+
+#[tokio::test]
+async fn a_replaced_original_is_never_overwritten() {
+    // Sonarr/Radarr swapped in a newer release while the job was encoding.
+    for (final_name, mode) in [
+        ("Movie.mkv", OutputMode::Replace),
+        ("Movie.mp4", OutputMode::Replace),
+        ("out/Movie.mkv", OutputMode::Folder),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("Movie.mkv");
+        make_original(&input);
+        let temp = make_temp(&dir.path().join("scratch"), "Movie", "mkv");
+        let final_path = dir.path().join(final_name);
+        let req = request(&input, &temp, &final_path, mode);
+
+        let newer = dir.path().join("download.part");
+        std::fs::write(&newer, b"a newer release").unwrap();
+        std::fs::rename(&newer, &input).unwrap();
+
+        let err = finalize(&req).await.unwrap_err();
+        assert!(err.is::<OriginalChanged>(), "{final_name}: {err:#}");
+        assert_eq!(std::fs::read(&input).unwrap(), b"a newer release");
+        assert!(!dir.path().join("Movie.mp4").exists());
+        assert!(
+            !dir.path().join("out").exists() || support::walk(&dir.path().join("out")).is_empty()
+        );
+        assert!(
+            support::artifacts_in(dir.path()).iter().all(|p| p == &temp),
+            "only the caller's temp file remains"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unchanged_original_with_new_permissions_is_still_replaced() {
+    // chmod/chown (e.g. Unraid's "New Permissions") does not count as a change.
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("Movie.mkv");
+    make_original(&input);
+    let temp = make_temp(dir.path(), "Movie", "mkv");
+    let req = request(&input, &temp, &input, OutputMode::Replace);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o666)).unwrap();
+    }
+    finalize(&req).await.unwrap();
+    assert_eq!(std::fs::read(&input).unwrap(), NEW);
 }

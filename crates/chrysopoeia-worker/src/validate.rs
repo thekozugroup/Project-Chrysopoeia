@@ -18,13 +18,29 @@
 //! checks are reported as skipped), so a broken hardware encode falls back
 //! quickly.
 //!
-//! The visual comparison decodes the same short segment from the source and
-//! the output (seeking relative to each file's video start), scales the
-//! source to the output size (deinterlacing it with `bwdif` when the output
-//! was deinterlaced), puts both on the same frame grid and measures SSIM and
-//! PSNR per frame. Corruption (green or grey frames, heavy blocking, wrong
-//! content) shows up as very low SSIM.
+//! **Plays start to finish** decodes every picture and sound track. Any
+//! error, a "corrupt decoded frame" warning or an error-concealment notice
+//! counts as damage. Damage in a track that is the same codec in the
+//! original is compared with a decode of the original: if the original has
+//! the same damage (a copied track from an old recording), the check warns
+//! instead of failing.
+//!
+//! **Looks like the original** compares short segments (4 at standard, 10
+//! at thorough). Each segment is decoded from both files, the original is
+//! scaled to the new file's size (and deinterlaced with `bwdif` when the new
+//! file was), and both are reduced to about 640x360 before SSIM and PSNR are
+//! measured. The reduction averages film grain away (encoders remove grain
+//! by design, which full-resolution SSIM punishes) while green or grey
+//! frames, heavy blocking and wrong content still score very low. The new
+//! file is aligned on the shared timeline ffmpeg preserves (so frames padded
+//! in at the start of an MP4 do not shift the comparison) and the best match
+//! within a few frames is used. At thorough level every frame of both files
+//! is also compared at about 320x180, which catches short bursts of
+//! corruption between the segments, and black and frozen video are measured
+//! on the same reduced, lightly blurred pictures so grain cannot make a
+//! still shot look "moving" in the original only.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -34,6 +50,7 @@ use chrysopoeia_core::{
     ValidationLevel, ValidationReport, VideoCodec,
 };
 use serde::Deserialize;
+use tokio::io::AsyncBufReadExt as _;
 use tokio_util::sync::CancellationToken;
 
 use crate::ffmpeg::{
@@ -43,7 +60,8 @@ use crate::plan::StreamSummary;
 
 /// A frame below this SSIM means corruption.
 pub const FRAME_SSIM_FAIL: f64 = 0.60;
-/// A segment whose mean SSIM is below this does not match the source.
+/// A segment (or, in the full-length scan, any second) whose mean SSIM is
+/// below this does not match the source.
 pub const SEGMENT_SSIM_FAIL: f64 = 0.85;
 /// An overall mean SSIM below this is reported as a warning.
 pub const OVERALL_SSIM_WARN: f64 = 0.93;
@@ -63,11 +81,41 @@ const EDGE_FRACTION: f64 = 0.05;
 /// `trim`: seeking in MPEG-TS and similar files can land after the requested
 /// time, which would misalign the comparison.
 const SEEK_PREROLL_SECS: f64 = 5.0;
+/// Pictures are reduced to about this many pixels (640x360) for the segment
+/// comparison.
+const COMPARE_PIXELS: f64 = 640.0 * 360.0;
+/// Pictures are reduced to about this many pixels (320x180) for the
+/// full-length scan at thorough level.
+const SCAN_PIXELS: f64 = 320.0 * 180.0;
+/// Frames searched either side of the expected alignment in each segment.
+const ALIGN_SEARCH_FRAMES: i64 = 3;
+/// Frames searched either side in the full-length scan (local drift and
+/// frames that land either side of a scene cut).
+const SCAN_SEARCH_FRAMES: i64 = 1;
+/// In the full-length scan, this many consecutive frames below
+/// [`FRAME_SSIM_FAIL`] fail the check.
+const SCAN_MIN_BAD_FRAMES: usize = 3;
+/// In the full-length scan, frames this far below the file's typical
+/// similarity for [`SCAN_ANOMALY_SECS`] or longer are a burst of corruption.
+const SCAN_ANOMALY_DROP: f64 = 0.10;
+/// See [`SCAN_ANOMALY_DROP`].
+const SCAN_ANOMALY_SECS: f64 = 0.5;
+/// Black and frozen intervals of the original are widened by this much
+/// before they are subtracted from the new file's (boundaries jitter).
+const INTERVAL_SLACK_SECS: f64 = 0.25;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 const DECODE_STALL: Duration = Duration::from_secs(600);
 const SEGMENT_STALL: Duration = Duration::from_secs(180);
-const BLACKDETECT: &str = "blackdetect=d=0.5:pix_th=0.10";
-const FREEZEDETECT: &str = "freezedetect=n=-60dB:d=0.5";
+/// `blackdetect` options: at least 0.5 s where 90 % of the picture is near
+/// black.
+const BLACKDETECT_OPTS: &str = "d=0.5:pix_th=0.10";
+/// Blur applied before `freezedetect` (on the reduced picture).
+const FREEZE_BLUR: &str = "gblur=sigma=1";
+/// `freezedetect` options: at least 0.5 s where the reduced, blurred
+/// picture changes by less than about 0.6 % between frames. Measured the
+/// same way on both files, so grain the encoder removed does not turn a
+/// still shot into a freeze in the new file only.
+const FREEZEDETECT_OPTS: &str = "n=-45dB:d=0.5";
 /// PSNR reported for identical pictures (the true value is infinite).
 const PSNR_CAP: f64 = 100.0;
 
@@ -304,7 +352,7 @@ struct Weights {
     probe: (f32, f32),
     decode: (f32, f32),
     visual: (f32, f32),
-    source_scan: (f32, f32),
+    scan: (f32, f32),
 }
 
 impl Weights {
@@ -314,22 +362,29 @@ impl Weights {
                 probe: (0.0, 100.0),
                 decode: (100.0, 100.0),
                 visual: (100.0, 100.0),
-                source_scan: (100.0, 100.0),
+                scan: (100.0, 100.0),
             },
             ValidationLevel::Standard => Self {
                 probe: (0.0, 5.0),
                 decode: (5.0, 75.0),
                 visual: (75.0, 100.0),
-                source_scan: (100.0, 100.0),
+                scan: (100.0, 100.0),
             },
             ValidationLevel::Thorough => Self {
-                probe: (0.0, 3.0),
-                decode: (3.0, 40.0),
-                visual: (40.0, 55.0),
-                source_scan: (55.0, 100.0),
+                probe: (0.0, 2.0),
+                decode: (2.0, 35.0),
+                visual: (35.0, 45.0),
+                scan: (45.0, 100.0),
             },
         }
     }
+}
+
+/// Split a phase's share of the progress bar: the first `fraction` of it,
+/// and the rest.
+fn split_weight((start, end): (f32, f32), fraction: f32) -> ((f32, f32), (f32, f32)) {
+    let mid = start + (end - start) * fraction;
+    ((start, mid), (mid, end))
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +399,7 @@ struct Ctx<'r, 'a> {
     low_priority: bool,
 }
 
-impl Ctx<'_, '_> {
+impl<'a> Ctx<'_, 'a> {
     fn progress(&self, (start, end): (f32, f32), fraction: f32) {
         let pct = start + (end - start) * fraction.clamp(0.0, 1.0);
         (self.on_progress)(pct.clamp(0.0, 100.0));
@@ -355,6 +410,18 @@ impl Ctx<'_, '_> {
             Err(Stop::Cancelled)
         } else {
             Ok(())
+        }
+    }
+
+    fn command<'c>(&self, args: &'c [String], stall_timeout: Duration) -> FfmpegCommand<'c>
+    where
+        'a: 'c,
+    {
+        FfmpegCommand {
+            program: self.req.ffmpeg,
+            args,
+            low_priority: self.low_priority,
+            stall_timeout,
         }
     }
 
@@ -414,17 +481,30 @@ impl Ctx<'_, '_> {
         }
         self.check_cancel()?;
 
-        // Plays start to finish (and, when thorough, black/frozen totals of
-        // the output from the same decode pass). The decoded length is
-        // compared with what the output claims for its picture and sound, so
-        // a file cut short on disk fails even though its header looks fine.
+        // Plays start to finish. The decoded length is compared with what
+        // the output claims for its picture and sound, so a file cut short
+        // on disk fails even though its header looks fine.
         let thorough = req.level == ValidationLevel::Thorough;
         let expected_len = output
             .av_duration()
             .or(output.best_duration())
             .or(source_duration);
-        let decode = self.decode_output(&output, expected_len, thorough).await?;
-        state.record(CheckId::Decode, decode_check(&decode, expected_len))?;
+        let (decode_weight, recheck_weight) = split_weight(self.weights.decode, 0.85);
+        let decode = self
+            .decode_output(&output, expected_len, decode_weight)
+            .await?;
+        let inherited = match source.as_ref() {
+            Some(src) if !decode.damage.is_empty() => {
+                self.inherited_damage(&decode.damage, &output, src, recheck_weight)
+                    .await?
+            }
+            _ => Inherited::default(),
+        };
+        self.progress(self.weights.decode, 1.0);
+        state.record(
+            CheckId::Decode,
+            decode_check(&decode, expected_len, &inherited),
+        )?;
 
         // Looks like the original. Segments are placed within the source's
         // video, which may be shorter than its sound or subtitles.
@@ -440,66 +520,86 @@ impl Ctx<'_, '_> {
             .and_then(|v| v.duration)
             .filter(|d| *d > 0.0)
             .or(source_duration);
-        let visual = self
-            .visual(&output, source.as_ref(), video_len, segments)
-            .await?;
+        let Some(align) = Alignment::new(req.source_probe, source.as_ref(), &output) else {
+            return state.record(
+                CheckId::Visual,
+                CheckResult::fail("The video track could not be found for comparison", None),
+            );
+        };
+        let mut visual = self.visual(&align, video_len, segments).await?;
         state.ssim_min = visual.ssim_min;
         state.ssim_avg = visual.ssim_avg;
         state.psnr_avg = visual.psnr_avg;
-        state.record(CheckId::Visual, visual.result)?;
-
-        if !thorough {
-            return Ok(());
+        if !thorough || visual.result.status == CheckStatus::Fail {
+            return state.record(CheckId::Visual, visual.result);
         }
 
-        // No extra black / frozen frames.
+        // Thorough: every frame at low resolution, plus black and frozen
+        // video measured the same way on both files.
         self.check_cancel()?;
-        let source_totals = self.scan_source(source.as_ref(), video_len).await?;
-        let (black, frozen) = match (&decode.detect, source_totals) {
-            (Some(out), Some(src)) => (
-                added_time_check(src.black_secs, out.black_secs, "black"),
-                added_time_check(src.frozen_secs, out.frozen_secs, "frozen"),
-            ),
-            _ => (
+        let found = common_alignment(&visual.alignments).unwrap_or(SegmentAlignment {
+            shift: align.av_timeline_shift,
+            frames: 0,
+        });
+        let scan = self.scan(&align, found, video_len).await?;
+        let (black, frozen) = match &scan {
+            Some(scan) => {
+                visual.result = merge_scan(visual.result, scan, &align);
+                (
+                    added_time_check(&scan.source.black, &scan.output.black, "black"),
+                    added_time_check(&scan.source.frozen, &scan.output.frozen, "frozen"),
+                )
+            }
+            None => (
                 CheckResult::skipped("The black-frame scan could not run"),
                 CheckResult::skipped("The frozen-frame scan could not run"),
             ),
         };
+        state.record(CheckId::Visual, visual.result)?;
         state.record(CheckId::BlackFrames, black)?;
         state.record(CheckId::FrozenFrames, frozen)?;
-        self.progress(self.weights.source_scan, 1.0);
+        self.progress(self.weights.scan, 1.0);
         Ok(())
     }
 
-    /// Full decode of the output. With `detect`, also totals black and
-    /// frozen video in the same pass.
+    /// Full decode of the output's picture and sound, collecting damage.
     async fn decode_output(
         &self,
         output: &MediaProbe,
         expected_len: Option<f64>,
-        detect: bool,
+        weight: (f32, f32),
     ) -> Result<DecodeResult, Stop> {
         let req = self.req;
         let video_map = output
             .primary_video()
             .map_or_else(|| "0:v:0".to_string(), |v| format!("0:{}", v.index));
-        let mut args: Vec<String> = [
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            if detect { "level+info" } else { "level+error" },
-            "-i",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        args.push(req.output.to_string_lossy().into_owned());
-        args.extend(["-map".to_string(), video_map, "-map".into(), "0:a?".into()]);
-        if detect {
-            args.extend([
-                "-filter:v:0".to_string(),
-                format!("{BLACKDETECT},{FREEZEDETECT}"),
-            ]);
+        let maps = [video_map, "0:a?".to_string()];
+        let duration = output.best_duration().or(expected_len);
+        let (exit, damage, decoded_secs) = self
+            .decode_streams(req.output, &maps, duration, weight)
+            .await?;
+        Ok(DecodeResult {
+            exit,
+            damage,
+            decoded_secs,
+        })
+    }
+
+    /// Decode `maps` of `path` to nowhere at `level+info`, tallying damage.
+    async fn decode_streams(
+        &self,
+        path: &Path,
+        maps: &[String],
+        duration: Option<f64>,
+        weight: (f32, f32),
+    ) -> Result<(FfmpegExit, DamageLog, Option<f64>), Stop> {
+        let mut args: Vec<String> = ["-nostdin", "-hide_banner", "-loglevel", "level+info", "-i"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.push(path.to_string_lossy().into_owned());
+        for map in maps {
+            args.extend(["-map".to_string(), map.clone()]);
         }
         args.extend(
             ["-progress", "pipe:1", "-nostats", "-f", "null", "-"]
@@ -507,72 +607,82 @@ impl Ctx<'_, '_> {
                 .map(|s| s.to_string()),
         );
 
-        let mut errors = ErrorLines::default();
-        let mut totals = DetectTotals::default();
+        let mut damage = DamageLog::default();
         let mut decoded_secs: Option<f64> = None;
         let started = Instant::now();
-        let weights = self.weights.decode;
-        let duration = output.best_duration().or(expected_len);
-        let cmd = FfmpegCommand {
-            program: req.ffmpeg,
-            args: &args,
-            low_priority: self.low_priority,
-            stall_timeout: DECODE_STALL,
-        };
         let exit = run_ffmpeg(
-            &cmd,
+            &self.command(&args, DECODE_STALL),
             self.cancel,
             &mut |block: &ProgressBlock| {
                 if let Some(t) = block.out_time_secs {
                     decoded_secs = Some(decoded_secs.map_or(t, |d: f64| d.max(t)));
                 }
                 let p = compute_progress(block, duration, started.elapsed().as_secs_f64());
-                self.progress(weights, p.percent / 100.0);
+                self.progress(weight, p.percent / 100.0);
             },
-            &mut |line: &str| {
-                errors.push(line, !detect);
-                if detect {
-                    totals.push_line(line);
-                }
-            },
+            &mut |line: &str| damage.push(line),
         )
         .await;
         if exit == FfmpegExit::Cancelled {
             return Err(Stop::Cancelled);
         }
-        let video = output.primary_video();
-        let stream_end = video.and_then(|v| v.start_time).unwrap_or(0.0)
-            + video
-                .and_then(|v| v.duration)
-                .or(output.best_duration())
-                .unwrap_or(0.0);
-        Ok(DecodeResult {
-            exit,
-            first_error: errors.first,
-            error_count: errors.count,
-            decoded_secs,
-            detect: detect.then(|| totals.finish(stream_end)),
-        })
+        Ok((exit, damage, decoded_secs))
+    }
+
+    /// Which of the output's damaged tracks carry damage the original
+    /// already had. Tracks whose codec also appears in the original (copied
+    /// tracks) are decoded from the original and their damage counted.
+    async fn inherited_damage(
+        &self,
+        damage: &DamageLog,
+        output: &MediaProbe,
+        source: &MediaProbe,
+        weight: (f32, f32),
+    ) -> Result<Inherited, Stop> {
+        let candidates: Vec<&str> = damage
+            .by_decoder
+            .keys()
+            .map(String::as_str)
+            .filter(|key| output.has_codec(key) && source.has_codec(key))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Inherited::default());
+        }
+        let maps: Vec<String> = source
+            .streams
+            .iter()
+            .filter(|s| {
+                !s.attached_pic
+                    && matches!(s.kind, Some(StreamKind::Video | StreamKind::Audio))
+                    && candidates.contains(&s.codec.as_str())
+            })
+            .map(|s| format!("0:{}", s.index))
+            .collect();
+        let (_, source_damage, _) = self
+            .decode_streams(self.req.source, &maps, source.best_duration(), weight)
+            .await?;
+        let mut inherited = Inherited::default();
+        for key in candidates {
+            let out = damage.count(key);
+            let src = source_damage.count(key);
+            if src > 0 && out <= src + (src / 10).max(2) {
+                let kind = output.kind_of_codec(key).unwrap_or("track");
+                inherited.decoders.insert(key.to_string(), (kind, src));
+            }
+        }
+        Ok(inherited)
     }
 
     /// Compare pictures at `count` points spread over the file.
     async fn visual(
         &self,
-        output: &MediaProbe,
-        source: Option<&MediaProbe>,
+        align: &Alignment,
         source_duration: Option<f64>,
         count: usize,
     ) -> Result<VisualOutcome, Stop> {
-        let req = self.req;
         let Some(duration) = source_duration.filter(|d| *d >= 1.0) else {
             return Ok(VisualOutcome::only(CheckResult::skipped(
                 "The file is too short to compare pictures",
-            )));
-        };
-        let Some(align) = Alignment::new(req.source_probe, source, output) else {
-            return Ok(VisualOutcome::only(CheckResult::fail(
-                "The video track could not be found for comparison",
-                None,
             )));
         };
         let segments = segment_windows(duration, count);
@@ -594,10 +704,7 @@ impl Ctx<'_, '_> {
         let mut failure = None;
         for (i, &(start, len)) in segments.iter().enumerate() {
             self.progress(self.weights.visual, i as f32 / segments.len() as f32);
-            match self
-                .compare_segment(&align, dir.path(), i, start, len)
-                .await
-            {
+            match self.compare_segment(align, dir.path(), i, start, len).await {
                 Ok(seg) => measured.push(seg),
                 Err(SegmentError::Cancelled) => {
                     discard_dir(dir).await;
@@ -619,9 +726,10 @@ impl Ctx<'_, '_> {
         Ok(outcome)
     }
 
-    /// Compare one segment and parse its SSIM/PSNR statistics. If seeking
-    /// in the source overshot the segment (no frames compared), the segment
-    /// is compared once more reading the source from its start.
+    /// Compare one segment at the best alignment. The expected alignment
+    /// (the shared timeline) is searched first; if that matches poorly and
+    /// aligning on each file's first frame is a different guess, that is
+    /// searched too, and the better match wins.
     async fn compare_segment(
         &self,
         align: &Alignment,
@@ -630,26 +738,84 @@ impl Ctx<'_, '_> {
         start: f64,
         len: f64,
     ) -> Result<SegmentStats, SegmentError> {
+        let mut best: Option<SegmentStats> = None;
+        for (n, shift) in align.shift_candidates().into_iter().enumerate() {
+            let seg = self
+                .compare_segment_at(align, dir, index * 10 + n, start, len, shift)
+                .await?;
+            let good = seg.mean() >= OVERALL_SSIM_WARN;
+            if best.as_ref().is_none_or(|b| seg.mean() > b.mean()) {
+                best = Some(seg);
+            }
+            if good {
+                break;
+            }
+        }
+        best.ok_or_else(|| {
+            SegmentError::Failed(format!(
+                "No picture could be read from the new file at {}",
+                format_time(start)
+            ))
+        })
+    }
+
+    /// Compare one segment around one alignment guess. If seeking in the
+    /// source overshot the segment (no frames compared), the segment is
+    /// compared once more reading the source from its start.
+    async fn compare_segment_at(
+        &self,
+        align: &Alignment,
+        dir: &Path,
+        index: usize,
+        start: f64,
+        len: f64,
+        shift: f64,
+    ) -> Result<SegmentStats, SegmentError> {
         let at = align.seek_point(start);
-        let (ssim_path, psnr_path) = stats_paths(dir, index);
+        let before = align.search_before(at);
         for preroll in [Some(SEEK_PREROLL_SECS), None] {
             let window = SegmentWindow {
                 at,
                 len,
+                shift,
+                search_before: before,
+                search_after: ALIGN_SEARCH_FRAMES,
                 source_preroll: preroll,
             };
-            self.run_segment(align, &window, &ssim_path, &psnr_path, start)
-                .await?;
-            let ssim = tokio::fs::read_to_string(&ssim_path)
-                .await
-                .map(|t| parse_ssim_stats(&t))
-                .unwrap_or_default();
-            let mse = tokio::fs::read_to_string(&psnr_path)
-                .await
-                .map(|t| parse_psnr_stats(&t))
-                .unwrap_or_default();
-            if !ssim.is_empty() {
-                return Ok(SegmentStats { start, ssim, mse });
+            let paths = stats_paths(dir, index, window.offsets());
+            self.run_segment(align, &window, &paths, start).await?;
+            let mut best: Option<SegmentStats> = None;
+            for (j, ssim_path, psnr_path) in &paths {
+                let ssim = tokio::fs::read_to_string(ssim_path)
+                    .await
+                    .map(|t| parse_ssim_stats(&t))
+                    .unwrap_or_default();
+                let mse = tokio::fs::read_to_string(psnr_path)
+                    .await
+                    .map(|t| parse_psnr_stats(&t))
+                    .unwrap_or_default();
+                if ssim.is_empty() {
+                    continue;
+                }
+                let seg = SegmentStats {
+                    start,
+                    ssim,
+                    mse,
+                    alignment: SegmentAlignment { shift, frames: *j },
+                };
+                // Prefer the smallest offset among equally good matches (a
+                // still picture matches everywhere).
+                let better = best.as_ref().is_none_or(|b| {
+                    seg.mean() > b.mean() + 1e-4
+                        || ((seg.mean() - b.mean()).abs() <= 1e-4
+                            && seg.alignment.frames.abs() < b.alignment.frames.abs())
+                });
+                if better {
+                    best = Some(seg);
+                }
+            }
+            if let Some(seg) = best {
+                return Ok(seg);
             }
             tracing::debug!(
                 segment = index,
@@ -666,19 +832,18 @@ impl Ctx<'_, '_> {
         &self,
         align: &Alignment,
         window: &SegmentWindow,
-        ssim_path: &Path,
-        psnr_path: &Path,
+        paths: &[(i64, PathBuf, PathBuf)],
         start: f64,
     ) -> Result<(), SegmentError> {
-        let req = self.req;
-        let args = segment_args(req, align, window, ssim_path, psnr_path);
-        let cmd = FfmpegCommand {
-            program: req.ffmpeg,
-            args: &args,
-            low_priority: self.low_priority,
-            stall_timeout: SEGMENT_STALL,
-        };
-        match run_ffmpeg(&cmd, self.cancel, &mut |_| {}, &mut |_| {}).await {
+        let args = segment_args(self.req, align, window, paths);
+        match run_ffmpeg(
+            &self.command(&args, SEGMENT_STALL),
+            self.cancel,
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .await
+        {
             FfmpegExit::Success { .. } => Ok(()),
             FfmpegExit::Cancelled => Err(SegmentError::Cancelled),
             other => {
@@ -693,67 +858,88 @@ impl Ctx<'_, '_> {
         }
     }
 
-    /// Black/frozen totals of the source (thorough level).
-    async fn scan_source(
+    /// Thorough level: decode both files completely at low resolution,
+    /// compare every frame and measure black and frozen video on both.
+    /// `None` when the scan could not run (the checks are then skipped).
+    async fn scan(
         &self,
-        source: Option<&MediaProbe>,
+        align: &Alignment,
+        found: SegmentAlignment,
         source_duration: Option<f64>,
-    ) -> Result<Option<DetectTotals>, Stop> {
-        let req = self.req;
-        let video = source
-            .and_then(MediaProbe::primary_video)
-            .map(|v| (v.index, v.start_time))
-            .or_else(|| req.source_probe.primary_video().map(|v| (v.index, None)));
-        let Some((index, start)) = video else {
-            return Ok(None);
+    ) -> Result<Option<ScanOutcome>, Stop> {
+        let dir = match make_stats_dir().await {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::debug!("no scratch space for the full-length scan: {e}");
+                return Ok(None);
+            }
         };
-        let mut args: Vec<String> = ["-nostdin", "-hide_banner", "-loglevel", "level+info", "-i"]
-            .iter()
-            .map(|s| s.to_string())
+        let paths: Vec<PathBuf> = (-SCAN_SEARCH_FRAMES..=SCAN_SEARCH_FRAMES)
+            .map(|j| {
+                dir.path()
+                    .join(format!("scan{}.log", j + SCAN_SEARCH_FRAMES))
+            })
             .collect();
-        args.push(req.source.to_string_lossy().into_owned());
-        args.extend([
-            "-map".to_string(),
-            format!("0:{index}"),
-            "-vf".to_string(),
-            format!("{BLACKDETECT},{FREEZEDETECT}"),
-        ]);
-        args.extend(
-            ["-progress", "pipe:1", "-nostats", "-f", "null", "-"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
-        let mut totals = DetectTotals::default();
+        let plan = ScanPlan::new(align, found);
+        let args = scan_args(self.req, align, &plan, &paths);
+        let mut source_log = DetectLog::default();
+        let mut output_log = DetectLog::default();
         let started = Instant::now();
-        let weights = self.weights.source_scan;
-        let cmd = FfmpegCommand {
-            program: req.ffmpeg,
-            args: &args,
-            low_priority: self.low_priority,
-            stall_timeout: DECODE_STALL,
-        };
+        let weight = self.weights.scan;
         let exit = run_ffmpeg(
-            &cmd,
+            &self.command(&args, DECODE_STALL),
             self.cancel,
             &mut |block: &ProgressBlock| {
                 let p = compute_progress(block, source_duration, started.elapsed().as_secs_f64());
-                self.progress(weights, p.percent / 100.0);
+                self.progress(weight, p.percent / 100.0);
             },
-            &mut |line: &str| totals.push_line(line),
+            &mut |line: &str| {
+                let (context, _, message) = split_log_line(line);
+                match context {
+                    Some(c) if c.ends_with("@src") => source_log.push(message),
+                    Some(c) if c.ends_with("@out") => output_log.push(message),
+                    _ => {}
+                }
+            },
         )
         .await;
-        match exit {
+        let result = match exit {
             FfmpegExit::Cancelled => Err(Stop::Cancelled),
             FfmpegExit::Success { .. } => {
-                let end = start.unwrap_or(0.0) + source_duration.unwrap_or(0.0);
-                Ok(Some(totals.finish(end)))
+                let mut per_offset = Vec::with_capacity(paths.len());
+                for path in &paths {
+                    per_offset.push(read_ssim_file(path).await.unwrap_or_default());
+                }
+                let frames = best_per_frame(&per_offset);
+                // Timestamps inside the scan start at 0 on both sides; close
+                // intervals still open at the end of the compared video.
+                let end = frames.len() as f64 / align.rate + 1.0 / align.rate;
+                Ok((!frames.is_empty()).then(|| ScanOutcome {
+                    frames,
+                    rate: align.rate,
+                    start_offset: plan.start_offset,
+                    source: source_log.finish(end),
+                    output: output_log.finish(end),
+                }))
             }
             other => {
-                tracing::debug!("black/frozen scan of the source failed: {other:?}");
+                tracing::debug!("full-length scan failed: {other:?}");
                 Ok(None)
             }
-        }
+        };
+        discard_dir(dir).await;
+        result
     }
+}
+
+/// Median of `values` (`None` when empty).
+fn median(values: &[f64]) -> Option<f64> {
+    let mut sorted: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by(f64::total_cmp);
+    Some(sorted[sorted.len() / 2])
 }
 
 // ---------------------------------------------------------------------------
@@ -908,19 +1094,38 @@ fn size_check(source: u64, output: u64) -> CheckResult {
 #[derive(Debug)]
 struct DecodeResult {
     exit: FfmpegExit,
-    first_error: Option<String>,
-    error_count: usize,
+    damage: DamageLog,
     decoded_secs: Option<f64>,
-    detect: Option<DetectTotals>,
 }
 
-fn decode_check(decode: &DecodeResult, expected_len: Option<f64>) -> CheckResult {
-    if let Some(first) = &decode.first_error {
-        let more = match decode.error_count {
+/// Damaged tracks of the output whose damage the original already has:
+/// decoder name → (track kind, damage lines in the original).
+#[derive(Debug, Default)]
+struct Inherited {
+    decoders: BTreeMap<String, (&'static str, usize)>,
+}
+
+fn decode_check(
+    decode: &DecodeResult,
+    expected_len: Option<f64>,
+    inherited: &Inherited,
+) -> CheckResult {
+    let new_damage: Vec<(&String, &DecoderDamage)> = decode
+        .damage
+        .by_decoder
+        .iter()
+        .filter(|(key, _)| !inherited.decoders.contains_key(*key))
+        .collect();
+    if let Some((_, first)) = new_damage.first() {
+        let total: usize = new_damage.iter().map(|(_, d)| d.count).sum();
+        let more = match total {
             0 | 1 => String::new(),
             n => format!(" ({} more)", n - 1),
         };
-        return CheckResult::fail(format!("Found a playback error: {first}{more}"), None);
+        return CheckResult::fail(
+            format!("Found a playback error: {}{more}", first.first),
+            None,
+        );
     }
     match &decode.exit {
         FfmpegExit::Success { .. } => {}
@@ -947,6 +1152,20 @@ fn decode_check(decode: &DecodeResult, expected_len: Option<f64>) -> CheckResult
             );
         }
     }
+    if !inherited.decoders.is_empty() {
+        let tracks: Vec<String> = inherited
+            .decoders
+            .iter()
+            .map(|(codec, (kind, _))| format!("{kind} ({codec})"))
+            .collect();
+        return CheckResult::warn(
+            format!(
+                "The original's {} already had playback errors; the new file has the same ones and no new ones",
+                tracks.join(" and ")
+            ),
+            decoded,
+        );
+    }
     let length = decoded.or(expected_len).map(format_time);
     CheckResult::pass(
         match length {
@@ -957,22 +1176,64 @@ fn decode_check(decode: &DecodeResult, expected_len: Option<f64>) -> CheckResult
     )
 }
 
-fn added_time_check(source_secs: f64, output_secs: f64, what: &str) -> CheckResult {
-    let added = output_secs - source_secs;
-    let detail = format!(
-        "{} video: {:.1} s in the original, {:.1} s in the new file",
-        capitalize(what),
-        source_secs,
-        output_secs
-    );
-    if added > MAX_ADDED_SECS {
-        CheckResult::fail(
-            format!("The new file has {added:.1} s more {what} video than the original"),
-            Some(added),
-        )
-    } else {
-        CheckResult::pass(detail, Some(added.max(0.0)))
+/// Compare black or frozen intervals: the new file may add at most
+/// [`MAX_ADDED_SECS`] that the original does not have at the same place.
+fn added_time_check(source: &[(f64, f64)], output: &[(f64, f64)], what: &str) -> CheckResult {
+    // `Iterator::sum` of nothing is -0.0 for floats; fold from +0.0.
+    let total = |list: &[(f64, f64)]| list.iter().fold(0.0, |acc, (a, b)| acc + (b - a));
+    let widened: Vec<(f64, f64)> = source
+        .iter()
+        .map(|(a, b)| (a - INTERVAL_SLACK_SECS, b + INTERVAL_SLACK_SECS))
+        .collect();
+    let added = subtract_intervals(output, &widened);
+    let added_secs = total(&added);
+    if added_secs > MAX_ADDED_SECS {
+        let at = added
+            .iter()
+            .max_by(|x, y| (x.1 - x.0).total_cmp(&(y.1 - y.0)))
+            .map(|(a, _)| format!(", starting near {}", format_time(*a)))
+            .unwrap_or_default();
+        return CheckResult::fail(
+            format!("The new file has {added_secs:.1} s more {what} video than the original{at}"),
+            Some(added_secs),
+        );
     }
+    CheckResult::pass(
+        format!(
+            "{} video: {:.1} s in the original, {:.1} s in the new file",
+            capitalize(what),
+            total(source),
+            total(output)
+        ),
+        Some(added_secs),
+    )
+}
+
+/// The parts of `from` not covered by any interval in `remove`.
+fn subtract_intervals(from: &[(f64, f64)], remove: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut remove: Vec<(f64, f64)> = remove.to_vec();
+    remove.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out = Vec::new();
+    for &(start, end) in from {
+        let mut cursor = start;
+        for &(r0, r1) in &remove {
+            if r1 <= cursor || r0 >= end {
+                continue;
+            }
+            if r0 > cursor {
+                out.push((cursor, r0));
+            }
+            cursor = cursor.max(r1);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            out.push((cursor, end));
+        }
+    }
+    out.retain(|(a, b)| b > a);
+    out
 }
 
 fn capitalize(s: &str) -> String {
@@ -983,65 +1244,112 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// Decode-pass error lines.
-#[derive(Debug, Default)]
-struct ErrorLines {
-    first: Option<String>,
+/// Damage reported by one decoder (or the demuxer) during a decode pass.
+#[derive(Debug, Clone, PartialEq)]
+struct DecoderDamage {
     count: usize,
+    /// The first message, with the decoder in brackets.
+    first: String,
 }
 
-impl ErrorLines {
-    /// Count `line` if it is an error. With `untagged_are_errors` (ffmpeg
-    /// run at `-loglevel level+error`), lines without a level tag count too.
-    fn push(&mut self, line: &str, untagged_are_errors: bool) {
+/// Damage lines of a decode pass run at `-loglevel level+info`, by decoder.
+///
+/// Damage is any error-level line, the "corrupt decoded frame" warning
+/// ffmpeg prints for every frame a decoder had to patch up, and the
+/// error-concealment notices (`concealing N DC, N AC, N MV errors`). The
+/// last two appear without any error when a decoder hides corruption.
+#[derive(Debug, Default, Clone)]
+struct DamageLog {
+    by_decoder: BTreeMap<String, DecoderDamage>,
+}
+
+impl DamageLog {
+    fn push(&mut self, line: &str) {
         let (context, level, message) = split_log_line(line);
-        let is_error = match level {
-            Some(l) => matches!(l, "error" | "fatal" | "panic"),
-            None => untagged_are_errors,
+        let message = message.trim();
+        let damaged = match level {
+            Some("error" | "fatal" | "panic") => true,
+            Some("warning") => message.contains("corrupt decoded frame"),
+            Some("info") => message.starts_with("concealing "),
+            _ => false,
         };
-        if !is_error || message.trim().is_empty() {
+        if !damaged || message.is_empty() {
             return;
         }
-        self.count += 1;
-        if self.first.is_none() {
-            let message = message.trim();
-            self.first = Some(match context {
-                Some(c) => format!("{message} ({c})"),
-                None => message.to_string(),
+        let key = decoder_key(context);
+        let entry = self
+            .by_decoder
+            .entry(key.clone())
+            .or_insert_with(|| DecoderDamage {
+                count: 0,
+                first: if key.is_empty() {
+                    message.to_string()
+                } else {
+                    format!("{message} ({key})")
+                },
             });
-        }
+        entry.count += 1;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_decoder.is_empty()
+    }
+
+    fn count(&self, key: &str) -> usize {
+        self.by_decoder.get(key).map_or(0, |d| d.count)
     }
 }
 
-/// Totals from `blackdetect` and `freezedetect` log lines.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-struct DetectTotals {
-    black_secs: f64,
-    frozen_secs: f64,
+/// The decoder (codec name) or demuxer a log context belongs to:
+/// `vist#0:0/h264` and `h264` → `h264`, `in#0/matroska,webm` →
+/// `matroska,webm`.
+fn decoder_key(context: Option<&str>) -> String {
+    let Some(context) = context else {
+        return String::new();
+    };
+    match context.split_once('/') {
+        Some((_, name)) => name.to_string(),
+        None => context.to_string(),
+    }
+}
+
+/// Black and frozen intervals from `blackdetect`/`freezedetect` log lines
+/// of one side of the full-length scan (seconds from the scan's start).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct DetectLog {
+    black: Vec<(f64, f64)>,
+    frozen: Vec<(f64, f64)>,
     /// A freeze that started but has not ended yet.
     open_freeze: Option<f64>,
 }
 
-impl DetectTotals {
-    fn push_line(&mut self, line: &str) {
-        let (_, _, message) = split_log_line(line);
-        if let Some(d) = value_after(message, "black_duration:") {
-            self.black_secs += d.max(0.0);
+impl DetectLog {
+    /// Feed one log message (prefixes already removed).
+    fn push(&mut self, message: &str) {
+        if let (Some(start), Some(end)) = (
+            value_after(message, "black_start:"),
+            value_after(message, "black_end:"),
+        ) {
+            if end > start {
+                self.black.push((start, end));
+            }
         } else if let Some(start) = value_after(message, "lavfi.freezedetect.freeze_start:") {
             self.open_freeze = Some(start);
-        } else if let Some(d) = value_after(message, "lavfi.freezedetect.freeze_duration:") {
-            self.frozen_secs += d.max(0.0);
-            self.open_freeze = None;
-        } else if message.contains("lavfi.freezedetect.freeze_end:") {
-            self.open_freeze = None;
+        } else if let Some(end) = value_after(message, "lavfi.freezedetect.freeze_end:") {
+            if let Some(start) = self.open_freeze.take() {
+                if end > start {
+                    self.frozen.push((start, end));
+                }
+            }
         }
     }
 
-    /// Close a freeze still running at the end of the stream (`stream_end` in
-    /// the stream's timestamps).
-    fn finish(mut self, stream_end: f64) -> Self {
+    /// Close a freeze still running at `end`.
+    fn finish(mut self, end: f64) -> Self {
         if let Some(start) = self.open_freeze.take() {
-            self.frozen_secs += (stream_end - start).max(0.0);
+            if end > start {
+                self.frozen.push((start, end));
+            }
         }
         self
     }
@@ -1061,6 +1369,20 @@ fn parse_ssim_stats(text: &str) -> Vec<f64> {
         .collect()
 }
 
+/// Per-frame SSIM "All" values from a (possibly large) stats file, read
+/// line by line.
+async fn read_ssim_file(path: &Path) -> std::io::Result<Vec<f64>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut values = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        if let Some(v) = value_after(&line, "All:") {
+            values.push(v);
+        }
+    }
+    Ok(values)
+}
+
 /// Per-frame average MSE values from a `psnr` stats file.
 fn parse_psnr_stats(text: &str) -> Vec<f64> {
     text.lines()
@@ -1074,6 +1396,49 @@ struct SegmentStats {
     start: f64,
     ssim: Vec<f64>,
     mse: Vec<f64>,
+    /// The best match: the alignment guess that was searched (seconds, see
+    /// [`Alignment::timeline_shift`]) and the offset in frames from it.
+    alignment: SegmentAlignment,
+}
+
+/// Where a segment matched: output window trimmed at `at + shift`, each of
+/// its frames paired with the reference frame `frames` later.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SegmentAlignment {
+    shift: f64,
+    frames: i64,
+}
+
+/// The alignment most segments agree on: the most common guess, and the
+/// median frame offset of the segments that used it.
+fn common_alignment(found: &[SegmentAlignment]) -> Option<SegmentAlignment> {
+    let mut best: Option<(f64, usize)> = None;
+    for a in found {
+        let count = found.iter().filter(|b| b.shift == a.shift).count();
+        if best.is_none_or(|(_, c)| count > c) {
+            best = Some((a.shift, count));
+        }
+    }
+    let (shift, _) = best?;
+    let mut frames: Vec<i64> = found
+        .iter()
+        .filter(|a| a.shift == shift)
+        .map(|a| a.frames)
+        .collect();
+    frames.sort_unstable();
+    Some(SegmentAlignment {
+        shift,
+        frames: frames[frames.len() / 2],
+    })
+}
+
+impl SegmentStats {
+    fn mean(&self) -> f64 {
+        if self.ssim.is_empty() {
+            return 0.0;
+        }
+        self.ssim.iter().sum::<f64>() / self.ssim.len() as f64
+    }
 }
 
 #[derive(Debug)]
@@ -1088,6 +1453,8 @@ struct VisualOutcome {
     ssim_min: Option<f64>,
     ssim_avg: Option<f64>,
     psnr_avg: Option<f64>,
+    /// Alignment found in each measured segment.
+    alignments: Vec<SegmentAlignment>,
 }
 
 impl VisualOutcome {
@@ -1097,6 +1464,7 @@ impl VisualOutcome {
             ssim_min: None,
             ssim_avg: None,
             psnr_avg: None,
+            alignments: Vec::new(),
         }
     }
 }
@@ -1128,7 +1496,7 @@ fn summarize_segments(segments: &[SegmentStats]) -> VisualOutcome {
     let worst_segment = segments
         .iter()
         .filter(|s| !s.ssim.is_empty())
-        .map(|s| (s.start, s.ssim.iter().sum::<f64>() / s.ssim.len() as f64))
+        .map(|s| (s.start, s.mean()))
         .min_by(|a, b| a.1.total_cmp(&b.1));
 
     let result = match (worst_frame, worst_segment) {
@@ -1166,6 +1534,139 @@ fn summarize_segments(segments: &[SegmentStats]) -> VisualOutcome {
         ssim_min: Some(ssim_min),
         ssim_avg: Some(ssim_avg),
         psnr_avg,
+        alignments: segments.iter().map(|s| s.alignment).collect(),
+    }
+}
+
+/// Result of the full-length scan (thorough level).
+#[derive(Debug, Clone, PartialEq)]
+struct ScanOutcome {
+    /// Best SSIM per compared frame (low resolution).
+    frames: Vec<f64>,
+    /// Frame rate of the comparison grid.
+    rate: f64,
+    /// Where the scan starts, in seconds from the original's video start.
+    start_offset: f64,
+    source: DetectLog,
+    output: DetectLog,
+}
+
+/// For each frame, the best SSIM across the searched offsets.
+fn best_per_frame(per_offset: &[Vec<f64>]) -> Vec<f64> {
+    let len = per_offset.iter().map(Vec::len).max().unwrap_or(0);
+    (0..len)
+        .map(|i| {
+            per_offset
+                .iter()
+                .filter_map(|v| v.get(i).copied())
+                .fold(f64::NEG_INFINITY, f64::max)
+        })
+        .collect()
+}
+
+/// A stretch of frames that does not match: `(first frame, frame count,
+/// lowest similarity)`.
+type BadRun = (usize, usize, f64);
+
+/// Judge the full-length scan. `Some(fail)` when a stretch of frames does
+/// not match the original:
+/// - [`SCAN_MIN_BAD_FRAMES`] or more frames in a row below
+///   [`FRAME_SSIM_FAIL`] (garbage frames),
+/// - any second whose mean is below [`SEGMENT_SSIM_FAIL`], or
+/// - [`SCAN_ANOMALY_SECS`] or more where every frame is at least
+///   [`SCAN_ANOMALY_DROP`] below the file's typical similarity and below
+///   [`OVERALL_SSIM_WARN`] (a burst of green blocks or smearing in an
+///   otherwise clean file).
+fn judge_scan(scan: &ScanOutcome) -> Option<(BadRun, &'static str)> {
+    let frames = &scan.frames;
+    if frames.is_empty() {
+        return None;
+    }
+    let rate = if scan.rate.is_finite() && scan.rate > 0.0 {
+        scan.rate
+    } else {
+        25.0
+    };
+    if let Some(run) = longest_run(frames, |v| v < FRAME_SSIM_FAIL) {
+        if run.1 >= SCAN_MIN_BAD_FRAMES {
+            return Some((run, "garbage"));
+        }
+    }
+    let window = (rate.round() as usize).clamp(1, frames.len());
+    let mut sum: f64 = frames[..window].iter().sum();
+    let mut worst = (0usize, sum / window as f64);
+    for i in window..frames.len() {
+        sum += frames[i] - frames[i - window];
+        let mean = sum / window as f64;
+        if mean < worst.1 {
+            worst = (i + 1 - window, mean);
+        }
+    }
+    if worst.1 < SEGMENT_SSIM_FAIL {
+        let low = frames[worst.0..worst.0 + window]
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        return Some(((worst.0, window, low.min(worst.1)), "mismatch"));
+    }
+    let typical = median(frames)?;
+    let limit = (typical - SCAN_ANOMALY_DROP).min(OVERALL_SSIM_WARN);
+    let min_frames = ((SCAN_ANOMALY_SECS * rate).round() as usize).max(SCAN_MIN_BAD_FRAMES);
+    match longest_run(frames, |v| v < limit) {
+        Some(run) if run.1 >= min_frames => Some((run, "burst")),
+        _ => None,
+    }
+}
+
+/// The longest run of consecutive values matching `bad`.
+fn longest_run(values: &[f64], bad: impl Fn(f64) -> bool) -> Option<BadRun> {
+    let mut best: Option<BadRun> = None;
+    let mut current: Option<BadRun> = None;
+    for (i, &v) in values.iter().enumerate() {
+        if bad(v) {
+            let run = current.get_or_insert((i, 0, f64::INFINITY));
+            run.1 += 1;
+            run.2 = run.2.min(v);
+            if best.is_none_or(|b| run.1 > b.1) {
+                best = Some(*run);
+            }
+        } else {
+            current = None;
+        }
+    }
+    best
+}
+
+/// Fold the full-length scan into the segment result.
+fn merge_scan(segments: CheckResult, scan: &ScanOutcome, align: &Alignment) -> CheckResult {
+    let rate = if align.rate > 0.0 { align.rate } else { 25.0 };
+    match judge_scan(scan) {
+        Some(((first, count, low), kind)) => {
+            let from = scan.start_offset + first as f64 / rate;
+            let to = from + count as f64 / rate;
+            let what = match kind {
+                "garbage" => "is damaged",
+                "burst" => "suddenly looks different",
+                _ => "doesn't match the original",
+            };
+            CheckResult::fail(
+                format!(
+                    "The picture from {} to {} {what} (similarity {low:.2})",
+                    format_time(from),
+                    format_time(to)
+                ),
+                segments.value,
+            )
+        }
+        None if segments.status == CheckStatus::Pass => CheckResult::pass(
+            format!(
+                "{}, and all {} frames match at low resolution",
+                segments.detail,
+                scan.frames.len()
+            ),
+            segments.value,
+        ),
+        None => segments,
     }
 }
 
@@ -1196,14 +1697,22 @@ fn segment_windows(duration: f64, count: usize) -> Vec<(f64, f64)> {
 }
 
 // ---------------------------------------------------------------------------
-// Segment comparison command
+// Comparison commands
 
 /// How to line up source and output for a picture comparison.
 ///
-/// Comparisons run with `-copyts`, so frame timestamps inside the filter
-/// graph are each file's own timestamps. Each side is seeked a little early
-/// and then cut with `trim` at `video start + t`, which is exact even when
-/// seeking is not (MPEG-TS, AVI without index).
+/// Segment comparisons run with `-copyts`, so frame timestamps inside the
+/// filter graph are each file's own timestamps. Each side is seeked a
+/// little early and then cut with `trim`, which is exact even when seeking
+/// is not (MPEG-TS, AVI without index).
+///
+/// Where the matching picture is: ffmpeg moves every timestamp of the
+/// source by the source's container start, so a picture at `t` seconds
+/// after the source's first video frame is at about
+/// `output_video_start + t + timeline_shift` in the output. The shift is
+/// non-zero when the output's video was padded at the start (MP4 keeps a
+/// constant frame rate and fills the gap to the audio with repeated frames)
+/// or when the source's video starts after its audio.
 #[derive(Debug, Clone, PartialEq)]
 struct Alignment {
     source_index: u32,
@@ -1214,10 +1723,24 @@ struct Alignment {
     /// Container start time, per file (`-ss` is relative to it).
     source_format_start: f64,
     output_format_start: f64,
+    /// See the type's documentation.
+    timeline_shift: f64,
+    /// The same, measured from the earliest picture or sound track rather
+    /// than the container start (ffmpeg's shift ignores tracks it does not
+    /// use, such as subtitles that start early).
+    av_timeline_shift: f64,
+    /// Output picture size; the source is scaled to it.
     width: u32,
     height: u32,
-    /// Frame grid both sides are put on (`fps=` expression).
+    /// Whether the source's picture size differs from the output's.
+    scale_source: bool,
+    /// Size both sides are reduced to for the segment comparison.
+    compare_size: (u32, u32),
+    /// Size both sides are reduced to for the full-length scan.
+    scan_size: (u32, u32),
+    /// Frame grid both sides are put on (`fps=` expression) and its rate.
     rate_expr: String,
+    rate: f64,
     /// Source frame rate, for picking seek points between frames.
     source_fps: f64,
     /// `bwdif` mode for the source when the output was deinterlaced.
@@ -1233,23 +1756,43 @@ impl Alignment {
         let out_video = output.primary_video()?;
         let (width, height) = (out_video.width?, out_video.height?);
         let src_video = source.and_then(MediaProbe::primary_video);
+        let info_video = source_info.primary_video();
         let source_index = src_video
             .map(|v| v.index)
-            .or_else(|| source_info.primary_video().map(|v| v.index))?;
+            .or_else(|| info_video.map(|v| v.index))?;
+        let source_size = src_video
+            .and_then(|v| Some((v.width?, v.height?)))
+            .or_else(|| info_video.and_then(|v| Some((v.width?, v.height?))));
 
-        let source_format_start = source
-            .and_then(|s| s.start_time)
-            .or(source_info.start_time)
-            .unwrap_or(0.0);
+        let known_format_start = source.and_then(|s| s.start_time).or(source_info.start_time);
+        let source_format_start = known_format_start.unwrap_or(0.0);
         let source_video_start = src_video
             .and_then(|v| v.start_time)
             .unwrap_or(source_format_start);
         let output_format_start = output.start_time.unwrap_or(0.0);
         let output_video_start = out_video.start_time.unwrap_or(output_format_start);
+        let timeline_shift = match known_format_start {
+            Some(start) => (source_video_start - start) - output_video_start,
+            None => 0.0,
+        };
+        let av_start = source.and_then(|s| {
+            s.streams
+                .iter()
+                .filter(|st| {
+                    !st.attached_pic
+                        && matches!(st.kind, Some(StreamKind::Video | StreamKind::Audio))
+                })
+                .filter_map(|st| st.start_time)
+                .reduce(f64::min)
+        });
+        let av_timeline_shift = match av_start {
+            Some(start) => (source_video_start - start) - output_video_start,
+            None => timeline_shift,
+        };
 
         let source_fps = src_video
             .and_then(|v| v.frame_rate.as_ref().map(Rational::value))
-            .or_else(|| source_info.primary_video().and_then(|v| v.frame_rate))
+            .or_else(|| info_video.and_then(|v| v.frame_rate))
             .filter(|f| sane_fps(*f));
         let out_rate = out_video.frame_rate.filter(|r| sane_fps(r.value()));
         let rate_expr = out_rate
@@ -1258,9 +1801,10 @@ impl Alignment {
             .or_else(|| source_fps.map(|f| format!("{f:.6}")))
             .unwrap_or_else(|| "25".to_string());
         let out_fps = out_rate.as_ref().map(Rational::value);
+        let rate = out_fps.or(source_fps).unwrap_or(25.0);
 
-        let source_interlaced = src_video.is_some_and(|v| v.interlaced)
-            || source_info.primary_video().is_some_and(|v| v.interlaced);
+        let source_interlaced =
+            src_video.is_some_and(|v| v.interlaced) || info_video.is_some_and(|v| v.interlaced);
         // Field-rate output (50p from 50i fields) needs a field-rate reference.
         let mode = match (out_fps, source_fps) {
             (Some(o), Some(s)) if o > s * 1.5 => "send_field",
@@ -1274,9 +1818,15 @@ impl Alignment {
             output_video_start,
             source_format_start,
             output_format_start,
+            timeline_shift,
+            av_timeline_shift,
             width,
             height,
+            scale_source: source_size != Some((width, height)),
+            compare_size: reduced_size(width, height, COMPARE_PIXELS),
+            scan_size: reduced_size(width, height, SCAN_PIXELS),
             rate_expr,
+            rate,
             source_fps: source_fps.or(out_fps).unwrap_or(25.0),
             deinterlace,
         })
@@ -1290,34 +1840,83 @@ impl Alignment {
         let fps = self.source_fps;
         (((t * fps).round() - 0.25) / fps).max(0.0)
     }
+
+    /// Frames available before `at` for the alignment search.
+    fn search_before(&self, at: f64) -> i64 {
+        ((at * self.rate).floor() as i64).clamp(0, ALIGN_SEARCH_FRAMES)
+    }
+
+    /// Alignment guesses to search, best first: the shared timeline of the
+    /// picture and sound tracks, of the whole container, then each file's
+    /// first frame. Guesses within one search window of an earlier one are
+    /// left out.
+    fn shift_candidates(&self) -> Vec<f64> {
+        let reach = ALIGN_SEARCH_FRAMES as f64 / self.rate;
+        let mut shifts: Vec<f64> = Vec::with_capacity(3);
+        for shift in [self.av_timeline_shift, self.timeline_shift, 0.0] {
+            if shift.is_finite() && shifts.iter().all(|s| (s - shift).abs() > reach) {
+                shifts.push(shift);
+            }
+        }
+        shifts
+    }
+}
+
+/// `width`x`height` scaled down (never up) to about `pixels`, keeping the
+/// aspect ratio, with even sides of at least 16.
+fn reduced_size(width: u32, height: u32, pixels: f64) -> (u32, u32) {
+    let area = f64::from(width) * f64::from(height);
+    let factor = if area > pixels {
+        (pixels / area).sqrt()
+    } else {
+        1.0
+    };
+    let even = |v: u32| ((f64::from(v) * factor / 2.0).round() as u32 * 2).max(16);
+    (even(width), even(height))
 }
 
 fn sane_fps(f: f64) -> bool {
     f.is_finite() && (1.0..=300.0).contains(&f)
 }
 
-/// One comparison window, `at..at + len` seconds after the video start.
+/// One comparison window: `at..at + len` seconds after the source's video
+/// start, and the matching window of the output, `shift` seconds later on
+/// its timeline, searched from `search_before` frames earlier to
+/// `search_after` frames later.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct SegmentWindow {
     at: f64,
     len: f64,
+    shift: f64,
+    search_before: i64,
+    search_after: i64,
     /// Seek this many seconds early in the source (the output, which we
     /// wrote with an index, gets at most a second). `None` reads both files
     /// from the start.
     source_preroll: Option<f64>,
 }
 
-/// Input options that read `window` from one file: `-ss`/`-t` relative to
-/// the container start, reading from `preroll` seconds early.
+impl SegmentWindow {
+    /// The offsets searched, in frames: output frame `i` is compared with
+    /// the reference frame `offset` frames after the one at `at + i`.
+    fn offsets(&self) -> std::ops::RangeInclusive<i64> {
+        -self.search_before..=self.search_after
+    }
+}
+
+/// Input options that read `from..to` seconds after a file's video start:
+/// `-ss`/`-t` relative to the container start, reading from `preroll`
+/// seconds early.
 fn input_window(
     video_start: f64,
     format_start: f64,
-    window: &SegmentWindow,
+    from: f64,
+    to: f64,
     preroll: Option<f64>,
 ) -> Vec<String> {
     let offset = video_start - format_start;
-    let end = offset + window.at + window.len;
-    let seek = preroll.map_or(0.0, |p| (offset + window.at - p).max(0.0));
+    let end = offset + to;
+    let seek = preroll.map_or(0.0, |p| (offset + from - p).max(0.0));
     let mut args = Vec::with_capacity(4);
     if seek > 0.0 {
         args.extend(["-ss".to_string(), format!("{seek:.6}")]);
@@ -1326,37 +1925,77 @@ fn input_window(
     args
 }
 
-fn segment_args(
-    req: &ValidateRequest<'_>,
-    align: &Alignment,
-    window: &SegmentWindow,
-    ssim_path: &Path,
-    psnr_path: &Path,
-) -> Vec<String> {
+/// Filters that bring the source's primary video onto the output's frame
+/// grid and size, starting at `trim_start` (a timestamp).
+fn source_chain(align: &Alignment, trim: &str) -> String {
     let deinterlace = align
         .deinterlace
         .map(|mode| format!("bwdif=mode={mode},"))
         .unwrap_or_default();
-    let trim = |video_start: f64| {
-        let start = video_start + window.at;
-        format!("trim=start={start:.6}:end={:.6}", start + window.len)
+    let scale = if align.scale_source {
+        format!(",scale={}:{}:flags=bicubic", align.width, align.height)
+    } else {
+        String::new()
     };
-    let graph = format!(
-        "[1:{oi}]{out_trim},setpts=PTS-STARTPTS,fps={rate},format=yuv420p,split=2[d0][d1];\
-         [0:{si}]{deinterlace}{src_trim},setpts=PTS-STARTPTS,fps={rate},\
-         scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[r0][r1];\
-         [d0][r0]ssim=stats_file={ssim}:shortest=1[vs];\
-         [d1][r1]psnr=stats_file={psnr}:shortest=1[vp]",
-        oi = align.output_index,
+    format!(
+        "[0:{si}]{deinterlace}{trim},setpts=PTS-STARTPTS,fps={rate}{scale}",
         si = align.source_index,
-        out_trim = trim(align.output_video_start),
-        src_trim = trim(align.source_video_start),
         rate = align.rate_expr,
-        w = align.width,
-        h = align.height,
-        ssim = escape_filter_value(&ssim_path.to_string_lossy()),
-        psnr = escape_filter_value(&psnr_path.to_string_lossy()),
+    )
+}
+
+/// The ffmpeg command for one segment: the output window is compared with
+/// the reference at every offset in `paths` (offset in frames, SSIM stats
+/// file, PSNR stats file), all at [`Alignment::compare_size`].
+///
+/// The reference starts `search_before` frames before the output window
+/// and runs `search_after` frames past it; output frame `i` is compared
+/// with reference frame `i + search_before + offset`.
+fn segment_args(
+    req: &ValidateRequest<'_>,
+    align: &Alignment,
+    window: &SegmentWindow,
+    paths: &[(i64, PathBuf, PathBuf)],
+) -> Vec<String> {
+    let frame = 1.0 / align.rate;
+    let ref_from = window.at - window.search_before as f64 * frame;
+    let ref_to = window.at + window.len + window.search_after as f64 * frame;
+    let out_from = window.at + window.shift;
+    let out_to = out_from + window.len;
+    let (cw, ch) = align.compare_size;
+    let n = paths.len();
+    let src_trim = format!(
+        "trim=start={:.6}:end={:.6}",
+        align.source_video_start + ref_from,
+        align.source_video_start + ref_to + frame / 2.0
     );
+    let out_trim = format!(
+        "trim=start={:.6}:end={:.6}",
+        align.output_video_start + out_from,
+        align.output_video_start + out_to
+    );
+    let labels = |prefix: &str| (0..n).map(|k| format!("[{prefix}{k}]")).collect::<String>();
+    let mut graph = format!(
+        "{},scale={cw}:{ch}:flags=area,format=yuv420p,split={n}{};\
+         [1:{oi}]{out_trim},setpts=PTS-STARTPTS,fps={rate},scale={cw}:{ch}:flags=area,\
+         format=yuv420p,split={n}{}",
+        source_chain(align, &src_trim),
+        labels("r"),
+        labels("o"),
+        oi = align.output_index,
+        rate = align.rate_expr,
+    );
+    for (k, (offset, ssim, psnr)) in paths.iter().enumerate() {
+        let skip = window.search_before + offset;
+        graph.push_str(&format!(
+            ";[r{k}]trim=start_frame={skip},setpts=PTS-STARTPTS,split=2[ra{k}][rb{k}];\
+             [o{k}]split=2[oa{k}][ob{k}];\
+             [oa{k}][ra{k}]ssim=stats_file={ssim}:shortest=1[vs{k}];\
+             [ob{k}][rb{k}]psnr=stats_file={psnr}:shortest=1[vp{k}]",
+            ssim = escape_filter_value(&ssim.to_string_lossy()),
+            psnr = escape_filter_value(&psnr.to_string_lossy()),
+        ));
+    }
     let output_preroll = window.source_preroll.map(|p| p.min(1.0));
     // `-progress` keeps output flowing on slow machines so the stall watchdog
     // only fires for a real hang.
@@ -1376,32 +2015,140 @@ fn segment_args(
     args.extend(input_window(
         align.source_video_start,
         align.source_format_start,
-        window,
+        ref_from,
+        ref_to,
         window.source_preroll,
     ));
     args.extend(["-i".to_string(), req.source.to_string_lossy().into_owned()]);
     args.extend(input_window(
         align.output_video_start,
         align.output_format_start,
-        window,
+        out_from,
+        out_to,
         output_preroll,
     ));
     args.extend(["-i".to_string(), req.output.to_string_lossy().into_owned()]);
-    args.extend(
-        [
-            "-filter_complex",
-            &graph,
-            "-map",
-            "[vs]",
-            "-map",
-            "[vp]",
-            "-f",
-            "null",
-            "-",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
+    args.extend(["-filter_complex".to_string(), graph]);
+    for k in 0..n {
+        args.extend([
+            "-map".to_string(),
+            format!("[vs{k}]"),
+            "-map".to_string(),
+            format!("[vp{k}]"),
+        ]);
+    }
+    args.extend(["-f", "null", "-"].iter().map(|s| s.to_string()));
+    args
+}
+
+/// How the full-length scan lines the files up, using the alignment the
+/// segments found and the same trimming convention: both files are cut a
+/// quarter frame before the source frame `first_frame`, and output frame
+/// `output_skip + i` is paired with reference frame `reference_skip + i`
+/// (searched one frame either way).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScanPlan {
+    /// Trim point, seconds from the source's first video frame.
+    at: f64,
+    /// The alignment guess (seconds) added to `at` for the output.
+    shift: f64,
+    output_skip: i64,
+    reference_skip: i64,
+    /// Where scan frame 0 is, in seconds from the source's video start.
+    start_offset: f64,
+}
+
+impl ScanPlan {
+    fn new(align: &Alignment, found: SegmentAlignment) -> Self {
+        let fps = align.source_fps;
+        // Start where both files have pictures.
+        let first_frame = ((-found.shift).max(0.0) * fps).round();
+        let at = (first_frame - 0.25) / fps;
+        let output_skip = (SCAN_SEARCH_FRAMES - found.frames).max(0);
+        let reference_skip = output_skip + found.frames;
+        Self {
+            at,
+            shift: found.shift,
+            output_skip,
+            reference_skip,
+            start_offset: first_frame / fps + reference_skip as f64 / align.rate,
+        }
+    }
+}
+
+/// The ffmpeg command for the full-length scan (see [`ScanPlan`]): both
+/// files reduced to [`Alignment::scan_size`], SSIM of each output frame
+/// against the reference frames one before, at and one after its match
+/// into `paths`, and black/frozen detection on each side (filter instances
+/// named `@src` and `@out`).
+fn scan_args(
+    req: &ValidateRequest<'_>,
+    align: &Alignment,
+    plan: &ScanPlan,
+    paths: &[PathBuf],
+) -> Vec<String> {
+    let (sw, sh) = align.scan_size;
+    let n = paths.len();
+    let search = (n as i64 - 1) / 2;
+    // With -copyts the trims use each file's own timestamps, whatever
+    // tracks ffmpeg would otherwise measure its start from.
+    let src_start = align.source_video_start + plan.at;
+    let out_start = align.output_video_start + plan.at + plan.shift;
+    let detect = |side: &str| {
+        format!(
+            "blackdetect@{side}={BLACKDETECT_OPTS},{FREEZE_BLUR},\
+             freezedetect@{side}={FREEZEDETECT_OPTS},nullsink"
+        )
+    };
+    let labels = |prefix: &str| (0..n).map(|k| format!("[{prefix}{k}]")).collect::<String>();
+    let mut graph = format!(
+        "{},scale={sw}:{sh}:flags=area,format=yuv420p,split={}{}[sd];\
+         [sd]{};\
+         [1:{oi}]trim=start={out_start:.6},setpts=PTS-STARTPTS,fps={rate},\
+         scale={sw}:{sh}:flags=area,format=yuv420p,split={}{}[od];\
+         [od]{}",
+        source_chain(align, &format!("trim=start={src_start:.6}")),
+        n + 1,
+        labels("s"),
+        detect("src"),
+        n + 1,
+        labels("o"),
+        detect("out"),
+        oi = align.output_index,
+        rate = align.rate_expr,
     );
+    for (k, path) in paths.iter().enumerate() {
+        let reference_skip = (plan.reference_skip + k as i64 - search).max(0);
+        graph.push_str(&format!(
+            ";[s{k}]trim=start_frame={reference_skip},setpts=PTS-STARTPTS[ss{k}];\
+             [o{k}]trim=start_frame={},setpts=PTS-STARTPTS[oo{k}];\
+             [oo{k}][ss{k}]ssim=stats_file={}:shortest=1[v{k}]",
+            plan.output_skip,
+            escape_filter_value(&path.to_string_lossy()),
+        ));
+    }
+    let mut args: Vec<String> = [
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "level+info",
+        "-progress",
+        "pipe:1",
+        "-nostats",
+        "-copyts",
+        "-i",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    args.push(req.source.to_string_lossy().into_owned());
+    args.push("-i".to_string());
+    args.push(req.output.to_string_lossy().into_owned());
+    args.extend(["-filter_complex".to_string(), graph]);
+    for k in 0..n {
+        args.extend(["-map".to_string(), format!("[v{k}]")]);
+    }
+    args.extend(["-f", "null", "-"].iter().map(|s| s.to_string()));
     args
 }
 
@@ -1529,6 +2276,24 @@ impl MediaProbe {
             .filter_map(|s| s.duration)
             .filter(|d| d.is_finite() && *d > 0.0)
             .reduce(f64::max)
+    }
+
+    /// Whether a picture or sound track uses `codec`.
+    fn has_codec(&self, codec: &str) -> bool {
+        self.kind_of_codec(codec).is_some()
+    }
+
+    /// "video" or "audio" for the first picture or sound track using
+    /// `codec`.
+    fn kind_of_codec(&self, codec: &str) -> Option<&'static str> {
+        self.streams
+            .iter()
+            .filter(|s| !s.attached_pic && s.codec == codec)
+            .find_map(|s| match s.kind {
+                Some(StreamKind::Video) => Some("video"),
+                Some(StreamKind::Audio) => Some("audio"),
+                _ => None,
+            })
     }
 
     /// Container duration, else the longest stream.
@@ -1732,12 +2497,21 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// SSIM and PSNR statistics files for one segment.
-fn stats_paths(dir: &Path, index: usize) -> (PathBuf, PathBuf) {
-    (
-        dir.join(format!("seg{index}_ssim.log")),
-        dir.join(format!("seg{index}_psnr.log")),
-    )
+/// SSIM and PSNR statistics files for one segment, per searched offset.
+fn stats_paths(
+    dir: &Path,
+    index: usize,
+    offsets: std::ops::RangeInclusive<i64>,
+) -> Vec<(i64, PathBuf, PathBuf)> {
+    offsets
+        .map(|j| {
+            (
+                j,
+                dir.join(format!("seg{index}_{j}_ssim.log")),
+                dir.join(format!("seg{index}_{j}_psnr.log")),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1757,45 +2531,127 @@ mod tests {
     }
 
     #[test]
-    fn detect_totals_from_log_lines() {
+    fn detect_intervals_from_log_lines() {
         let lines = [
-            "[blackdetect @ 0x7f10d4000e40] [info] black_start:6 black_end:10.958 black_duration:4.958",
-            "[freezedetect @ 0x55] [info] lavfi.freezedetect.freeze_start: 3.065",
-            "[freezedetect @ 0x55] [info] lavfi.freezedetect.freeze_duration: 2",
-            "[freezedetect @ 0x55] [info] lavfi.freezedetect.freeze_end: 5.065",
-            "[freezedetect @ 0x55] [info] lavfi.freezedetect.freeze_start: 9",
+            "[blackdetect@out @ 0x7f10d4000e40] [info] black_start:6 black_end:10.958 black_duration:4.958",
+            "[freezedetect@out @ 0x55] [info] lavfi.freezedetect.freeze_start: 3.065",
+            "[freezedetect@out @ 0x55] [info] lavfi.freezedetect.freeze_duration: 2",
+            "[freezedetect@out @ 0x55] [info] lavfi.freezedetect.freeze_end: 5.065",
+            "[freezedetect@out @ 0x55] [info] lavfi.freezedetect.freeze_start: 9",
             "[info] unrelated line",
         ];
-        let mut totals = DetectTotals::default();
+        let mut log = DetectLog::default();
         for l in lines {
-            totals.push_line(l);
+            let (context, _, message) = split_log_line(l);
+            if context.is_some_and(|c| c.ends_with("@out")) {
+                log.push(message);
+            }
         }
-        let totals = totals.finish(11.0);
-        assert!((totals.black_secs - 4.958).abs() < 1e-9);
-        // 2 s closed freeze + 2 s still frozen at the end of the stream.
-        assert!((totals.frozen_secs - 4.0).abs() < 1e-9);
+        let log = log.finish(11.0);
+        assert_eq!(log.black, [(6.0, 10.958)]);
+        // A closed freeze, and one still frozen at the end of the stream.
+        assert_eq!(log.frozen, [(3.065, 5.065), (9.0, 11.0)]);
     }
 
     #[test]
-    fn error_lines_respect_levels() {
-        let mut errors = ErrorLines::default();
-        errors.push("[h264 @ 0x56] [info] concealing 3253 DC errors", false);
-        errors.push(
-            "[vist#0:0/h264 @ 0x56] [warning] corrupt decoded frame",
-            false,
-        );
-        assert_eq!(errors.count, 0);
-        errors.push("[h264 @ 0x56] [error] cbp too large (353) at 76 4", false);
-        errors.push("[h264 @ 0x56] [error] error while decoding MB 76 4", false);
-        assert_eq!(errors.count, 2);
+    fn added_time_counts_only_new_intervals() {
+        // Same black stretch in both (boundaries jitter): nothing added.
+        let pass = added_time_check(&[(10.0, 14.0)], &[(10.1, 14.2)], "black");
+        assert_eq!(pass.status, CheckStatus::Pass);
         assert_eq!(
-            errors.first.as_deref(),
-            Some("cbp too large (353) at 76 4 (h264)")
+            pass.detail,
+            "Black video: 4.0 s in the original, 4.1 s in the new file"
+        );
+        // Equal totals but at a different place: that is added freezing.
+        let moved = added_time_check(&[(10.0, 14.0)], &[(30.0, 34.0)], "frozen");
+        assert_eq!(moved.status, CheckStatus::Fail);
+        assert_eq!(
+            moved.detail,
+            "The new file has 4.0 s more frozen video than the original, starting near 30.0 s"
+        );
+        assert_eq!(
+            subtract_intervals(&[(0.0, 10.0)], &[(2.0, 3.0), (5.0, 6.0), (9.0, 12.0)]),
+            [(0.0, 2.0), (3.0, 5.0), (6.0, 9.0)]
+        );
+    }
+
+    #[test]
+    fn damage_includes_concealment_and_corrupt_frame_warnings() {
+        let mut damage = DamageLog::default();
+        damage.push("[h264 @ 0x56] [info] Some harmless notice");
+        damage.push("[aac @ 0x57] [warning] If you heard an audible artifact, there may be a bug");
+        assert!(damage.is_empty());
+        damage.push("[vist#0:0/h264 @ 0x56] [warning] corrupt decoded frame");
+        damage.push("[h264 @ 0x56] [info] concealing 451 DC, 451 AC, 451 MV errors in B frame");
+        damage.push("[h264 @ 0x56] [error] cbp too large (353) at 76 4");
+        damage.push("[aist#0:1/ac3 @ 0x58] [error] expacc 127 is out-of-range");
+        damage.push("[in#0/matroska,webm @ 0x59] [error] Invalid length 0x1ae2");
+        assert_eq!(damage.count("h264"), 3);
+        assert_eq!(damage.count("ac3"), 1);
+        assert_eq!(damage.count("matroska,webm"), 1);
+        assert_eq!(
+            damage.by_decoder["h264"].first,
+            "corrupt decoded frame (h264)"
+        );
+    }
+
+    fn decode_result(lines: &[&str]) -> DecodeResult {
+        let mut damage = DamageLog::default();
+        for l in lines {
+            damage.push(l);
+        }
+        DecodeResult {
+            exit: FfmpegExit::Success {
+                tail: String::new(),
+            },
+            damage,
+            decoded_secs: Some(10.0),
+        }
+    }
+
+    #[test]
+    fn inherited_damage_warns_and_new_damage_fails() {
+        let decode = decode_result(&[
+            "[aist#0:1/ac3 @ 0x58] [error] expacc 127 is out-of-range",
+            "[ac3 @ 0x58] [error] error decoding the audio block",
+        ]);
+        let mut inherited = Inherited::default();
+        let fail = decode_check(&decode, Some(10.0), &inherited);
+        assert_eq!(fail.status, CheckStatus::Fail);
+        assert_eq!(
+            fail.detail,
+            "Found a playback error: expacc 127 is out-of-range (ac3) (1 more)"
         );
 
-        let mut strict = ErrorLines::default();
-        strict.push("Invalid data found when processing input", true);
-        assert_eq!(strict.count, 1);
+        inherited.decoders.insert("ac3".into(), ("audio", 165));
+        let warn = decode_check(&decode, Some(10.0), &inherited);
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert_eq!(
+            warn.detail,
+            "The original's audio (ac3) already had playback errors; the new file has the same ones and no new ones"
+        );
+
+        // New damage in another track still fails.
+        let mixed = decode_result(&[
+            "[ac3 @ 0x58] [error] error decoding the audio block",
+            "[vist#0:0/h264 @ 0x56] [warning] corrupt decoded frame",
+        ]);
+        let fail = decode_check(&mixed, Some(10.0), &inherited);
+        assert_eq!(fail.status, CheckStatus::Fail);
+        assert!(fail.detail.contains("(h264)"), "{}", fail.detail);
+
+        let clean = decode_result(&[]);
+        let pass = decode_check(&clean, Some(10.0), &Inherited::default());
+        assert_eq!(pass.status, CheckStatus::Pass);
+        assert_eq!(pass.detail, "Decoded all 10.0 s without errors");
+    }
+
+    #[test]
+    fn decoder_keys() {
+        assert_eq!(decoder_key(Some("vist#0:0/h264")), "h264");
+        assert_eq!(decoder_key(Some("h264")), "h264");
+        assert_eq!(decoder_key(Some("in#0/matroska,webm")), "matroska,webm");
+        assert_eq!(decoder_key(None), "");
     }
 
     #[test]
@@ -1838,16 +2694,24 @@ mod tests {
         assert!(segment_windows(0.5, 10).is_empty());
     }
 
-    #[test]
-    fn ssim_thresholds() {
-        let seg = |start, ssim: Vec<f64>| SegmentStats {
+    fn seg(start: f64, ssim: Vec<f64>) -> SegmentStats {
+        SegmentStats {
             start,
             mse: vec![1.0; ssim.len()],
             ssim,
-        };
+            alignment: SegmentAlignment {
+                shift: 0.0,
+                frames: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn ssim_thresholds() {
         let good = summarize_segments(&[seg(1.0, vec![0.99, 0.98]), seg(5.0, vec![0.97])]);
         assert_eq!(good.result.status, CheckStatus::Pass);
         assert_eq!(good.ssim_min, Some(0.97));
+        assert_eq!(good.alignments.len(), 2);
 
         let corrupt_frame = summarize_segments(&[seg(1.0, vec![0.99, 0.55, 0.99])]);
         assert_eq!(corrupt_frame.result.status, CheckStatus::Fail);
@@ -1860,25 +2724,135 @@ mod tests {
         assert_eq!(soft.result.status, CheckStatus::Warn);
     }
 
+    fn scan(frames: Vec<f64>) -> ScanOutcome {
+        ScanOutcome {
+            frames,
+            rate: 24.0,
+            start_offset: 0.0,
+            source: DetectLog::default(),
+            output: DetectLog::default(),
+        }
+    }
+
     #[test]
-    fn seek_points_fall_between_frames() {
-        let align = Alignment {
+    fn full_length_scan_catches_bursts_but_not_single_frames() {
+        // Clean: a few isolated dips (scene cuts) are fine.
+        let mut clean = vec![0.99; 480];
+        clean[100] = 0.4;
+        clean[300] = 0.5;
+        clean[301] = 0.55;
+        assert_eq!(judge_scan(&scan(clean.clone())), None);
+
+        // Garbage frames in a row.
+        let mut garbage = clean.clone();
+        for v in &mut garbage[200..204] {
+            *v = 0.3;
+        }
+        let ((first, count, low), kind) = judge_scan(&scan(garbage)).unwrap();
+        assert_eq!((first, count, kind), (200, 4, "garbage"));
+        assert!((low - 0.3).abs() < 1e-9);
+
+        // A 1.4 s half-green burst: ~0.81 per frame at low resolution.
+        let mut burst = clean.clone();
+        for v in &mut burst[240..274] {
+            *v = 0.81;
+        }
+        let (_, kind) = judge_scan(&scan(burst)).unwrap();
+        assert_eq!(kind, "mismatch");
+
+        // A shorter, milder burst (0.6 s at 0.88) in an otherwise ~0.99 file.
+        let mut mild = clean.clone();
+        for v in &mut mild[240..255] {
+            *v = 0.88;
+        }
+        let ((first, count, _), kind) = judge_scan(&scan(mild)).unwrap();
+        assert_eq!((first, count, kind), (240, 15, "burst"));
+
+        // A uniformly softer (grainy, low-bitrate) file with ordinary dips.
+        let soft: Vec<f64> = (0..480)
+            .map(|i| if i % 50 < 10 { 0.90 } else { 0.95 })
+            .collect();
+        assert_eq!(judge_scan(&scan(soft)), None);
+    }
+
+    #[test]
+    fn scan_failures_name_the_time() {
+        let mut frames = vec![0.99; 480];
+        for v in &mut frames[240..280] {
+            *v = 0.2;
+        }
+        let align = test_alignment();
+        let result = merge_scan(
+            CheckResult::pass("Matches the original at 10 points", Some(0.99)),
+            &scan(frames),
+            &align,
+        );
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert_eq!(
+            result.detail,
+            "The picture from 10.0 s to 11.7 s is damaged (similarity 0.20)"
+        );
+        let result = merge_scan(
+            CheckResult::pass("Matches the original at 10 points", Some(0.99)),
+            &scan(vec![0.99; 100]),
+            &align,
+        );
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert_eq!(
+            result.detail,
+            "Matches the original at 10 points, and all 100 frames match at low resolution"
+        );
+    }
+
+    #[test]
+    fn best_frame_across_offsets() {
+        let per_offset = vec![vec![0.2, 0.9, 0.5], vec![0.8, 0.3], vec![0.1, 0.1, 0.95]];
+        assert_eq!(best_per_frame(&per_offset), [0.8, 0.9, 0.95]);
+        assert_eq!(median(&[3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&[]), None);
+    }
+
+    fn test_alignment() -> Alignment {
+        Alignment {
             source_index: 0,
             output_index: 0,
             source_video_start: 0.0,
             output_video_start: 0.0,
             source_format_start: 0.0,
             output_format_start: 0.0,
-            width: 2,
-            height: 2,
+            timeline_shift: 0.0,
+            av_timeline_shift: 0.0,
+            width: 1280,
+            height: 720,
+            scale_source: false,
+            compare_size: (640, 360),
+            scan_size: (320, 180),
             rate_expr: "24/1".into(),
+            rate: 24.0,
             source_fps: 24.0,
             deinterlace: None,
-        };
+        }
+    }
+
+    #[test]
+    fn seek_points_fall_between_frames() {
+        let align = test_alignment();
         let at = align.seek_point(1.35);
         // 1.35 s ≈ frame 32; seek a quarter frame before it.
         assert!((at - (32.0 - 0.25) / 24.0).abs() < 1e-9);
         assert_eq!(align.seek_point(0.0), 0.0);
+        assert_eq!(align.search_before(at), ALIGN_SEARCH_FRAMES);
+        assert_eq!(align.search_before(0.05), 1);
+    }
+
+    #[test]
+    fn reduced_sizes_keep_the_aspect_ratio() {
+        assert_eq!(reduced_size(1920, 1080, COMPARE_PIXELS), (640, 360));
+        assert_eq!(reduced_size(3840, 2160, SCAN_PIXELS), (320, 180));
+        assert_eq!(reduced_size(720, 576, COMPARE_PIXELS), (536, 430));
+        // Never scaled up; odd sizes become even.
+        assert_eq!(reduced_size(639, 359, COMPARE_PIXELS), (640, 360));
+        assert_eq!(reduced_size(320, 240, COMPARE_PIXELS), (320, 240));
     }
 
     #[test]
@@ -1966,72 +2940,207 @@ mod tests {
 
     #[test]
     fn input_windows_seek_early_and_read_past_the_end() {
-        let window = SegmentWindow {
-            at: 10.0,
-            len: 2.0,
-            source_preroll: Some(5.0),
-        };
         // MPEG-TS style: video starts 0.011 s after the container.
-        let args = input_window(1.483, 1.472, &window, Some(5.0));
+        let args = input_window(1.483, 1.472, 10.0, 12.0, Some(5.0));
         assert_eq!(args, ["-ss", "5.011000", "-t", "8.000000"]);
         // Near the start there is nothing to skip.
-        let early = SegmentWindow { at: 2.0, ..window };
         assert_eq!(
-            input_window(0.0, 0.0, &early, Some(5.0)),
+            input_window(0.0, 0.0, 2.0, 4.0, Some(5.0)),
             ["-t", "5.000000"]
         );
         // No preroll: read from the start.
         assert_eq!(
-            input_window(0.0, -0.023, &window, None),
+            input_window(0.0, -0.023, 10.0, 12.0, None),
             ["-t", "13.023000"]
         );
     }
 
-    #[test]
-    fn segment_commands_trim_on_absolute_timestamps() {
-        let probe = ProbeInfo::default();
-        let profile = TranscodeProfile::default();
-        let req = ValidateRequest {
+    fn request<'a>(probe: &'a ProbeInfo, profile: &'a TranscodeProfile) -> ValidateRequest<'a> {
+        ValidateRequest {
             ffmpeg: Path::new("ffmpeg"),
             ffprobe: Path::new("ffprobe"),
             source: Path::new("/m/in.ts"),
-            source_probe: &probe,
+            source_probe: probe,
             output: Path::new("/t/out.mkv"),
-            profile: &profile,
+            profile,
             level: ValidationLevel::Standard,
             expected: StreamSummary::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn segment_commands_search_offsets_at_low_resolution() {
+        let probe = ProbeInfo::default();
+        let profile = TranscodeProfile::default();
+        let req = request(&probe, &profile);
         let align = Alignment {
-            source_index: 0,
-            output_index: 0,
             source_video_start: 1.5,
-            output_video_start: 0.0,
             source_format_start: 1.4,
             output_format_start: -0.023,
+            timeline_shift: 0.1,
             width: 720,
             height: 576,
+            scale_source: true,
+            compare_size: (536, 428),
             rate_expr: "25/1".into(),
+            rate: 25.0,
             source_fps: 25.0,
             deinterlace: Some("send_frame"),
+            ..test_alignment()
         };
         let window = SegmentWindow {
             at: 10.0,
             len: 2.0,
+            shift: 0.1,
+            search_before: 3,
+            search_after: 3,
             source_preroll: Some(SEEK_PREROLL_SECS),
         };
-        let args = segment_args(
-            &req,
-            &align,
-            &window,
-            Path::new("/tmp/s.log"),
-            Path::new("/tmp/p.log"),
-        );
+        let paths = stats_paths(Path::new("/tmp"), 0, window.offsets());
+        assert_eq!(paths.len(), 7);
+        let args = segment_args(&req, &align, &window, &paths);
         assert!(args.contains(&"-copyts".to_string()));
         let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
-        assert!(graph.contains("[1:0]trim=start=10.000000:end=12.000000,setpts=PTS-STARTPTS"));
-        assert!(graph.contains("[0:0]bwdif=mode=send_frame,trim=start=11.500000:end=13.500000"));
-        assert!(graph.contains("scale=720:576"));
-        assert!(graph.contains("ssim=stats_file=/tmp/s.log:shortest=1"));
+        // Reference: 3 frames (0.12 s) either side of the segment.
+        assert!(
+            graph.contains("[0:0]bwdif=mode=send_frame,trim=start=11.380000:end=13.640000"),
+            "{graph}"
+        );
+        assert!(graph.contains("scale=720:576:flags=bicubic,scale=536:428:flags=area"));
+        // Output: the same pictures 0.1 s later on its timeline.
+        assert!(graph.contains("[1:0]trim=start=10.100000:end=12.100000,setpts=PTS-STARTPTS"));
+        assert!(graph.contains("[r0]trim=start_frame=0,"));
+        assert!(graph.contains("[r6]trim=start_frame=6,"));
+        assert!(graph.contains("ssim=stats_file=/tmp/seg0_-3_ssim.log:shortest=1[vs0]"));
+        assert!(graph.contains("psnr=stats_file=/tmp/seg0_3_psnr.log:shortest=1[vp6]"));
+        assert_eq!(args.iter().filter(|a| *a == "-map").count(), 14);
+    }
+
+    #[test]
+    fn scan_commands_align_and_detect_on_both_sides() {
+        let probe = ProbeInfo::default();
+        let profile = TranscodeProfile::default();
+        let req = request(&probe, &profile);
+        let align = Alignment {
+            source_video_start: 2.1,
+            source_format_start: 1.4,
+            ..test_alignment()
+        };
+        let paths: Vec<PathBuf> = (0..3)
+            .map(|k| PathBuf::from(format!("/tmp/scan{k}.log")))
+            .collect();
+        // Segments matched 0.7 s later, one frame further on.
+        let plan = ScanPlan::new(
+            &align,
+            SegmentAlignment {
+                shift: 0.7,
+                frames: 1,
+            },
+        );
+        assert_eq!((plan.output_skip, plan.reference_skip), (0, 1));
+        let args = scan_args(&req, &align, &plan, &paths);
+        assert!(args.contains(&"-copyts".to_string()));
+        let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        // Both cut a quarter frame before the first source frame; the
+        // output 0.7 s later, past the frames padded in front of it.
+        assert!(graph.contains("[0:0]trim=start=2.089583,"), "{graph}");
+        assert!(graph.contains("[1:0]trim=start=0.689583,"), "{graph}");
+        assert!(graph.contains("scale=320:180:flags=area"));
+        assert!(graph.contains(
+            "blackdetect@src=d=0.5:pix_th=0.10,gblur=sigma=1,freezedetect@src=n=-45dB:d=0.5,nullsink"
+        ));
+        assert!(graph.contains("freezedetect@out="));
+        assert!(graph.contains("[s0]trim=start_frame=0,"));
+        assert!(graph.contains("[s2]trim=start_frame=2,"));
+        assert!(graph.contains("[o2]trim=start_frame=0,"));
+        assert!(graph.contains("ssim=stats_file=/tmp/scan2.log:shortest=1[v2]"));
+
+        // Matched a frame earlier: the output skips a frame instead.
+        let plan = ScanPlan::new(
+            &align,
+            SegmentAlignment {
+                shift: 0.0,
+                frames: -2,
+            },
+        );
+        assert_eq!((plan.output_skip, plan.reference_skip), (3, 1));
+        assert_eq!(
+            common_alignment(&[
+                SegmentAlignment {
+                    shift: 0.7,
+                    frames: 1
+                },
+                SegmentAlignment {
+                    shift: 0.0,
+                    frames: 0
+                },
+                SegmentAlignment {
+                    shift: 0.7,
+                    frames: 2
+                },
+                SegmentAlignment {
+                    shift: 0.7,
+                    frames: 1
+                },
+            ]),
+            Some(SegmentAlignment {
+                shift: 0.7,
+                frames: 1
+            })
+        );
+    }
+
+    #[test]
+    fn alignment_follows_the_shared_timeline() {
+        let probe = |json: &[u8]| parse_probe_json(json).unwrap();
+        // Broadcast recording: audio from 36001.389, video from 36002.080.
+        let source = probe(
+            br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"mpeg2video","width":1280,"height":720,
+             "avg_frame_rate":"25/1","start_time":"36002.080000"},
+            {"index":1,"codec_type":"audio","codec_name":"mp2","start_time":"36001.389089"}],
+            "format":{"start_time":"36001.389089"}}"#,
+        );
+        // MP4 output: video padded to start with the audio at 0.
+        let output = probe(
+            br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,
+             "avg_frame_rate":"25/1","start_time":"0.000000"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","start_time":"0.000000"}],
+            "format":{"start_time":"0.000000"}}"#,
+        );
+        let align = Alignment::new(&ProbeInfo::default(), Some(&source), &output).unwrap();
+        assert!((align.timeline_shift - 0.690911).abs() < 1e-6);
+        assert!((align.av_timeline_shift - 0.690911).abs() < 1e-6);
+        assert!(!align.scale_source);
+        // Far from the per-file guess, so both are searched.
+        assert_eq!(align.shift_candidates().len(), 2);
+
+        // A subtitle track that starts early does not move the picture.
+        let with_subs = probe(
+            br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,
+             "avg_frame_rate":"25/1","start_time":"10.000000"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","start_time":"10.000000"},
+            {"index":2,"codec_type":"subtitle","codec_name":"subrip","start_time":"0.000000"}],
+            "format":{"start_time":"0.000000"}}"#,
+        );
+        let align = Alignment::new(&ProbeInfo::default(), Some(&with_subs), &output).unwrap();
+        assert_eq!(align.av_timeline_shift, 0.0);
+        assert_eq!(align.timeline_shift, 10.0);
+        assert_eq!(align.shift_candidates(), [0.0, 10.0]);
+
+        // Matroska keeps the timestamps: no shift.
+        let kept = probe(
+            br#"{"streams":[
+            {"index":0,"codec_type":"video","codec_name":"h264","width":1280,"height":720,
+             "avg_frame_rate":"25/1","start_time":"0.691000"},
+            {"index":1,"codec_type":"audio","codec_name":"aac","start_time":"0.000000"}],
+            "format":{"start_time":"0.000000"}}"#,
+        );
+        let align = Alignment::new(&ProbeInfo::default(), Some(&source), &kept).unwrap();
+        assert!(align.timeline_shift.abs() < 1e-3);
+        assert_eq!(align.shift_candidates(), [align.timeline_shift]);
     }
 
     #[test]
@@ -2081,10 +3190,12 @@ mod tests {
     }
 
     #[test]
-    fn stats_paths_are_per_segment() {
-        let (s, p) = stats_paths(Path::new("/tmp/x"), 3);
-        assert_eq!(s, Path::new("/tmp/x/seg3_ssim.log"));
-        assert_eq!(p, Path::new("/tmp/x/seg3_psnr.log"));
+    fn stats_paths_are_per_segment_and_offset() {
+        let paths = stats_paths(Path::new("/tmp/x"), 3, -1..=1);
+        assert_eq!(paths.len(), 3);
+        assert_eq!(paths[0].0, -1);
+        assert_eq!(paths[0].1, Path::new("/tmp/x/seg3_-1_ssim.log"));
+        assert_eq!(paths[2].2, Path::new("/tmp/x/seg3_1_psnr.log"));
     }
 
     #[tokio::test]

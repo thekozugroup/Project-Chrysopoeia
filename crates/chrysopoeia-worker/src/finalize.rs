@@ -2,21 +2,25 @@
 //!
 //! The encoder writes to a hidden temp file ([`temp_output_path`]). Only after
 //! verification does [`finalize`] move it to its final place
-//! ([`final_output_path`]):
+//! ([`final_output_path`]). The new file is first staged under a hidden name
+//! in the destination folder (a rename, or, across filesystems, a copy that is
+//! flushed to disk), so the original stays in the library until the new file
+//! is completely there. Then:
 //!
 //! - Replace mode, same path: the original is renamed to a hidden backup in
-//!   its own folder, the new file is moved in, and the backup is deleted. Any
-//!   failure puts the backup back.
+//!   its own folder, the new file is renamed in, and the backup is deleted.
+//!   Any failure puts the backup back.
 //! - Replace mode, new extension: refuses to overwrite an unrelated file,
-//!   moves the new file in, then deletes the original.
+//!   renames the new file in, then deletes the original.
 //! - Folder mode: creates the folders, refuses to overwrite anything and never
 //!   touches the original.
 //!
-//! Moves across filesystems copy into a hidden file next to the destination,
-//! flush it to disk, then rename it, so a half-copied file is never visible
-//! under the final name. The new file gets the original's permission bits
-//! (and owner, where allowed) and, when asked, its modification/access times.
-//! [`recover_artifact`] cleans up whatever a crash left behind.
+//! If the original no longer matches the [`FileIdentity`] recorded when the
+//! job started (a Sonarr/Radarr upgrade replaced it mid-encode), nothing is
+//! replaced and [`OriginalChanged`] is returned. The new file gets the
+//! original's permission bits (and owner, where allowed) and, when asked, its
+//! modification/access times. [`recover_artifact`] cleans up whatever a crash
+//! left behind.
 
 use std::fs;
 use std::io;
@@ -35,6 +39,9 @@ const MAX_TEMP_STEM_BYTES: usize = 200;
 
 /// Most filesystems limit a single file name to 255 bytes.
 const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// Free space left over after a cross-filesystem copy, on top of 1 %.
+const COPY_MARGIN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Where the finished file will live.
 ///
@@ -102,6 +109,58 @@ fn truncate_to_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// What identifies one version of a file: its size and modification time.
+///
+/// Recorded when a job starts and compared before the original is replaced,
+/// so a file that was swapped for a newer release mid-encode (Sonarr/Radarr
+/// upgrades) is never overwritten with a conversion of the old one. Inode
+/// numbers are deliberately left out: Unraid's user shares (FUSE) may hand
+/// out new ones for the same file, and the mover keeps size and dates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    len: u64,
+    modified: filetime::FileTime,
+}
+
+impl FileIdentity {
+    /// The identity of a file from its metadata.
+    pub fn of(meta: &fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            modified: filetime::FileTime::from_last_modification_time(meta),
+        }
+    }
+
+    /// The identity of the file at `path` now.
+    pub async fn read(path: &Path) -> io::Result<Self> {
+        tokio::fs::metadata(path).await.map(|m| Self::of(&m))
+    }
+
+    /// Size in bytes.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    /// Whether the file is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+/// The original was replaced or modified while the job ran, so it was left
+/// alone. [`finalize`] returns this (inside its `anyhow::Error`) so callers
+/// can report a skip rather than a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginalChanged;
+
+impl std::fmt::Display for OriginalChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The original changed while it was being converted, so it was left alone")
+    }
+}
+
+impl std::error::Error for OriginalChanged {}
+
 /// Inputs for [`finalize`].
 #[derive(Debug, Clone, Copy)]
 pub struct FinalizeRequest<'a> {
@@ -117,17 +176,44 @@ pub struct FinalizeRequest<'a> {
     pub job_id: Uuid,
     /// Copy the original's modification and access times onto the result.
     pub keep_dates: bool,
+    /// The original as it was when the encode started. When set, finalize
+    /// refuses with [`OriginalChanged`] if the file no longer matches.
+    pub original: Option<FileIdentity>,
     /// Copy instead of renaming even on the same filesystem, exactly as a
     /// cross-device move does. Used by tests; normally false.
     pub force_copy: bool,
 }
 
-/// Move a verified encode into place. Returns the size of the final file.
+/// What [`finalize`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finalized {
+    /// Size of the file now at the final path, in bytes.
+    pub size: u64,
+    /// Plain-language notes about anything that did not go fully to plan
+    /// but did not stop the job, e.g. an original that could not be deleted.
+    pub notes: Vec<String>,
+}
+
+/// Move a verified encode into place.
+///
+/// The new file is first staged beside its destination (renamed there, or
+/// copied and flushed when the temp folder is on another filesystem); the
+/// original is only touched after that, so it never disappears from the
+/// library during a long copy. Then, per mode:
+///
+/// - Replace, same path: original → hidden backup, staged → final, backup
+///   deleted. A failure puts the backup back.
+/// - Replace, new extension: staged → final (never over an unrelated file),
+///   then the original is deleted.
+/// - Folder: staged → final (never over an existing file); the original is
+///   left alone.
 ///
 /// On error the original is where it was (restored from the backup if
-/// needed) and nothing has been written under the final name; the temp file
-/// may still exist and is the caller's to delete.
-pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<u64> {
+/// needed), nothing has been written under the final name, and no staged
+/// copy is left behind; the temp file may still exist and is the caller's to
+/// delete. If the original no longer matches `req.original` the error is
+/// [`OriginalChanged`].
+pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<Finalized> {
     let owned = OwnedRequest {
         input: req.input.to_path_buf(),
         temp: req.temp.to_path_buf(),
@@ -135,6 +221,7 @@ pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<u64> {
         mode: req.mode,
         job_id: req.job_id,
         keep_dates: req.keep_dates,
+        original: req.original,
         force_copy: req.force_copy,
     };
     tokio::task::spawn_blocking(move || finalize_blocking(&owned))
@@ -150,10 +237,29 @@ struct OwnedRequest {
     mode: OutputMode,
     job_id: Uuid,
     keep_dates: bool,
+    original: Option<FileIdentity>,
     force_copy: bool,
 }
 
-fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<u64> {
+impl OwnedRequest {
+    /// Fail with [`OriginalChanged`] when the input no longer matches the
+    /// identity recorded at the start of the job.
+    fn check_original(&self) -> anyhow::Result<()> {
+        let Some(expected) = self.original else {
+            return Ok(());
+        };
+        match fs::metadata(&self.input) {
+            Ok(meta) if FileIdentity::of(&meta) == expected => Ok(()),
+            Ok(_) => Err(OriginalChanged.into()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(anyhow::anyhow!("The original file is no longer there"))
+            }
+            Err(e) => Err(anyhow::anyhow!("Could not read the original file: {e}")),
+        }
+    }
+}
+
+fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
     let original = fs::metadata(&req.input).map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             anyhow::anyhow!("The original file is no longer there")
@@ -161,6 +267,12 @@ fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<u64> {
             anyhow::anyhow!("Could not read the original file: {e}")
         }
     })?;
+    if req
+        .original
+        .is_some_and(|expected| FileIdentity::of(&original) != expected)
+    {
+        return Err(OriginalChanged.into());
+    }
     let temp_meta = fs::metadata(&req.temp).map_err(|e| {
         anyhow::anyhow!(
             "The converted file is missing ({}): {e}",
@@ -182,34 +294,52 @@ fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<u64> {
         force_copy: req.force_copy,
         original: &original,
         keep_dates: req.keep_dates,
+        #[cfg(test)]
+        hooks: TestHooks::default(),
     };
 
+    let mut notes = Vec::new();
     match req.mode {
         OutputMode::Replace if is_same_file(&req.input, &req.final_path) => {
             replace_in_place(req, &mover)?
         }
-        OutputMode::Replace => replace_with_new_name(req, &mover)?,
+        OutputMode::Replace => replace_with_new_name(req, &mover, &mut notes)?,
         OutputMode::Folder => place_in_folder(req, &mover)?,
     }
 
     // The file is in place at this point; never report a failure from here.
-    Ok(fs::metadata(&req.final_path)
+    let size = fs::metadata(&req.final_path)
         .map(|m| m.len())
-        .unwrap_or(temp_meta.len()))
+        .unwrap_or(temp_meta.len());
+    Ok(Finalized { size, notes })
 }
 
-/// Same path: original → backup, new → final, delete backup.
+/// Same path: stage beside the original, then original → backup,
+/// staged → final, delete backup.
 fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> {
     let dir = parent_dir(&req.final_path);
+    let staged = mover
+        .stage(&req.temp, &req.final_path)
+        .context("Could not put the new file in place, so the original was kept")?;
+    let result = swap_in(req, mover, &staged, &dir);
+    if result.is_err() {
+        mover.discard(&staged, &req.temp);
+    }
+    result
+}
+
+fn swap_in(req: &OwnedRequest, mover: &Mover<'_>, staged: &Path, dir: &Path) -> anyhow::Result<()> {
+    // A cross-device copy can take minutes; look again right before the swap.
+    req.check_original()?;
     let file_name = file_name_lossy(&req.input);
     let backup_name = backup_file_name(&file_name, req.job_id);
     if backup_name.len() > MAX_FILE_NAME_BYTES {
         // The backup name would be too long for the filesystem. A rename over
         // the original is atomic, so the original is never missing either way.
         mover
-            .move_file(&req.temp, &req.final_path)
-            .context("Could not put the new file in place")?;
-        sync_dir(&dir);
+            .commit(staged, &req.final_path, &req.temp)
+            .context("Could not put the new file in place, so the original was kept")?;
+        sync_dir(dir);
         return Ok(());
     }
     let backup = dir.join(backup_name);
@@ -217,20 +347,28 @@ fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()>
     fs::rename(&req.input, &backup)
         .map_err(|e| anyhow::anyhow!("Could not move the original aside to replace it: {e}"))?;
 
-    if let Err(move_err) = mover.move_file(&req.temp, &req.final_path) {
-        return match fs::rename(&backup, &req.input) {
-            Ok(()) => Err(anyhow::anyhow!(
-                "Could not put the new file in place, so the original was kept: {move_err}"
-            )),
-            Err(restore_err) => Err(anyhow::anyhow!(
-                "Could not put the new file in place ({move_err}), and the original could not be \
-                 moved back ({restore_err}). The original is safe at {}",
-                backup.display()
-            )),
-        };
+    // What was moved aside must be the file the job read. Checked on the
+    // backup itself, so a replacement that raced the rename is caught too.
+    if let Some(expected) = req.original {
+        let moved = fs::metadata(&backup).map(|m| FileIdentity::of(&m));
+        if moved.as_ref().ok() != Some(&expected) {
+            restore_backup(&backup, &req.input).map_err(|e| {
+                anyhow::anyhow!("The original changed while it was being converted, and {e:#}")
+            })?;
+            return Err(OriginalChanged.into());
+        }
     }
 
-    sync_dir(&dir);
+    if let Err(move_err) = mover.commit(staged, &req.final_path, &req.temp) {
+        restore_backup(&backup, &req.input).map_err(|restore_err| {
+            anyhow::anyhow!("Could not put the new file in place ({move_err}), and {restore_err:#}")
+        })?;
+        return Err(anyhow::anyhow!(
+            "Could not put the new file in place, so the original was kept: {move_err}"
+        ));
+    }
+
+    sync_dir(dir);
     if let Err(e) = fs::remove_file(&backup) {
         // Harmless: the new file is in place, and startup recovery deletes
         // backups whose original exists.
@@ -239,23 +377,70 @@ fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()>
     Ok(())
 }
 
-/// New extension: refuse to clobber, move in, then delete the original.
-fn replace_with_new_name(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> {
-    if exists(&req.final_path)? {
-        anyhow::bail!(
+/// Put a backup back under the original name.
+fn restore_backup(backup: &Path, original: &Path) -> anyhow::Result<()> {
+    fs::rename(backup, original).map_err(|e| {
+        anyhow::anyhow!(
+            "the original could not be moved back ({e}). The original is safe at {}",
+            backup.display()
+        )
+    })?;
+    sync_dir(&parent_dir(original));
+    Ok(())
+}
+
+/// New extension: refuse to clobber, stage, move in, then delete the original.
+fn replace_with_new_name(
+    req: &OwnedRequest,
+    mover: &Mover<'_>,
+    notes: &mut Vec<String>,
+) -> anyhow::Result<()> {
+    let conflict = || {
+        anyhow::anyhow!(
             "A file named \"{}\" already exists next to the original",
             file_name_lossy(&req.final_path)
-        );
+        )
+    };
+    if exists(&req.final_path)? {
+        return Err(conflict());
     }
-    mover
-        .move_file(&req.temp, &req.final_path)
+    let staged = mover
+        .stage(&req.temp, &req.final_path)
         .context("Could not put the new file in place")?;
+    let placed = (|| {
+        req.check_original()?;
+        if exists(&req.final_path)? {
+            return Err(conflict());
+        }
+        mover
+            .commit(&staged, &req.final_path, &req.temp)
+            .context("Could not put the new file in place")
+    })();
+    if let Err(e) = placed {
+        mover.discard(&staged, &req.temp);
+        return Err(e);
+    }
     sync_dir(&parent_dir(&req.final_path));
+
+    // The original changed after the new file went in: the new file is a
+    // conversion of the old version, so take it out again.
+    if let Err(e) = req.check_original() {
+        if e.is::<OriginalChanged>() {
+            if let Err(remove) = fs::remove_file(&req.final_path) {
+                tracing::warn!(path = %req.final_path.display(), "could not remove an outdated conversion: {remove}");
+            }
+            return Err(e);
+        }
+    }
     if let Err(e) = fs::remove_file(&req.input) {
         tracing::warn!(
             input = %req.input.display(),
             "the new file is in place, but the original could not be deleted: {e}"
         );
+        notes.push(format!(
+            "The new file is in place, but the original \"{}\" could not be deleted ({e})",
+            file_name_lossy(&req.input)
+        ));
     }
     Ok(())
 }
@@ -265,46 +450,58 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
     let dir = parent_dir(&req.final_path);
     fs::create_dir_all(&dir)
         .with_context(|| format!("Could not create the folder {}", dir.display()))?;
-    if exists(&req.final_path)? {
-        anyhow::bail!(
+    let conflict = || {
+        anyhow::anyhow!(
             "A file named \"{}\" already exists in the output folder",
             file_name_lossy(&req.final_path)
-        );
+        )
+    };
+    if exists(&req.final_path)? {
+        return Err(conflict());
     }
-    mover
-        .move_file(&req.temp, &req.final_path)
+    let staged = mover
+        .stage(&req.temp, &req.final_path)
         .context("Could not put the new file in the output folder")?;
+    let placed = (|| {
+        req.check_original()?;
+        if exists(&req.final_path)? {
+            return Err(conflict());
+        }
+        mover
+            .commit(&staged, &req.final_path, &req.temp)
+            .context("Could not put the new file in the output folder")
+    })();
+    if let Err(e) = placed {
+        mover.discard(&staged, &req.temp);
+        return Err(e);
+    }
     sync_dir(&dir);
     Ok(())
 }
 
-/// Moves files, falling back to copy + rename across filesystems.
+/// Moves files into their destination folder, copying across filesystems.
 struct Mover<'a> {
     job_id: Uuid,
     force_copy: bool,
     original: &'a fs::Metadata,
     keep_dates: bool,
+    #[cfg(test)]
+    hooks: TestHooks<'a>,
+}
+
+/// Fault injection and observation points for the unit tests.
+#[cfg(test)]
+#[derive(Default)]
+struct TestHooks<'a> {
+    /// Called once the new file is staged, before the original is touched.
+    after_stage: Option<&'a dyn Fn(&Path)>,
+    /// Make the final rename fail.
+    fail_commit: bool,
 }
 
 impl Mover<'_> {
-    /// Move `src` to `dst` (replacing `dst` if it exists). On error `dst` is
-    /// unchanged and `src` still exists.
-    fn move_file(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        if !self.force_copy {
-            match fs::rename(src, dst) {
-                Ok(()) => return Ok(()),
-                Err(e) if is_cross_device(&e) => {
-                    tracing::debug!("{} is on another filesystem; copying", dst.display());
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        self.copy_then_rename(src, dst)
-    }
-
-    /// Cross-device move: copy to a hidden name beside `dst`, flush, rename.
-    fn copy_then_rename(&self, src: &Path, dst: &Path) -> io::Result<()> {
-        let dir = parent_dir(dst);
+    /// Hidden name for the new file in `dst`'s folder while it is staged.
+    fn staged_path(&self, dst: &Path) -> PathBuf {
         let stem = dst
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -313,32 +510,127 @@ impl Mover<'_> {
             .extension()
             .map(|e| e.to_string_lossy().into_owned())
             .unwrap_or_else(|| "bin".to_string());
-        let staged = dir.join(temp_file_name(
+        parent_dir(dst).join(temp_file_name(
             truncate_to_bytes(&stem, MAX_TEMP_STEM_BYTES),
             self.job_id,
             &format!("part.{ext}"),
-        ));
+        ))
+    }
 
-        let result = (|| {
-            fs::copy(src, &staged)?;
-            fs::File::open(&staged)?.sync_all()?;
-            apply_metadata(&staged, self.original, self.keep_dates);
-            fs::rename(&staged, dst)
-        })();
-        if let Err(e) = result {
-            if let Err(cleanup) = fs::remove_file(&staged) {
-                if cleanup.kind() != io::ErrorKind::NotFound {
-                    tracing::warn!(path = %staged.display(), "could not delete a partial copy: {cleanup}");
+    /// Bring `src` into `dst`'s folder under a hidden name, so the final step
+    /// is a rename within one folder. A temp file already in that folder is
+    /// used as it is; one elsewhere is renamed over, or copied and flushed
+    /// to disk when it is on another filesystem. Nothing visible changes.
+    fn stage(&self, src: &Path, dst: &Path) -> io::Result<PathBuf> {
+        let staged = if parent_dir(src) == parent_dir(dst) && !self.force_copy {
+            src.to_path_buf()
+        } else {
+            let staged = self.staged_path(dst);
+            let renamed = if self.force_copy {
+                false
+            } else {
+                match fs::rename(src, &staged) {
+                    Ok(()) => true,
+                    Err(e) if is_cross_device(&e) => {
+                        tracing::debug!("{} is on another filesystem; copying", dst.display());
+                        false
+                    }
+                    Err(e) => return Err(e),
                 }
+            };
+            if !renamed {
+                self.copy_to(src, &staged)?;
             }
-            return Err(e);
+            staged
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.hooks.after_stage {
+            hook(&staged);
         }
-        sync_dir(&dir);
-        if let Err(e) = fs::remove_file(src) {
-            tracing::warn!(path = %src.display(), "could not delete the temp file after copying: {e}");
+        Ok(staged)
+    }
+
+    /// Copy `src` to `staged` and flush it; on failure nothing is left.
+    /// Refuses up front when the destination cannot hold the copy, rather
+    /// than filling the disk.
+    fn copy_to(&self, src: &Path, staged: &Path) -> io::Result<()> {
+        let size = fs::metadata(src)?.len();
+        let needed = size
+            .saturating_add(size / 100)
+            .saturating_add(COPY_MARGIN_BYTES);
+        let dir = parent_dir(staged);
+        if let Some((_, free)) = filesystem_of(&dir) {
+            if free < needed {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "there is not enough free space in {} (needs about {})",
+                        dir.display(),
+                        crate::validate::human_bytes(needed)
+                    ),
+                ));
+            }
+        }
+        let result = (|| {
+            fs::copy(src, staged)?;
+            fs::File::open(staged)?.sync_all()?;
+            apply_metadata(staged, self.original, self.keep_dates);
+            Ok(())
+        })();
+        if result.is_err() {
+            remove_quietly(staged);
+        }
+        result
+    }
+
+    /// Rename the staged file to its final name (same folder), then remove
+    /// the temp file if the staged file was a copy of it.
+    fn commit(&self, staged: &Path, dst: &Path, temp: &Path) -> io::Result<()> {
+        #[cfg(test)]
+        if self.hooks.fail_commit {
+            return Err(io::Error::other("injected failure"));
+        }
+        fs::rename(staged, dst)?;
+        if staged != temp {
+            remove_quietly(temp);
         }
         Ok(())
     }
+
+    /// Remove a staged file after a failure (a temp file used in place is
+    /// left for the caller, like any other temp file).
+    fn discard(&self, staged: &Path, temp: &Path) {
+        if staged != temp {
+            remove_quietly(staged);
+        }
+    }
+}
+
+/// Delete a file, logging anything but "already gone".
+fn remove_quietly(path: &Path) {
+    if let Err(e) = fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), "could not delete a leftover file: {e}");
+        }
+    }
+}
+
+/// Device id and free bytes (for unprivileged users) of the filesystem
+/// holding `dir`, or of its nearest existing parent. `None` when unknown
+/// (space checks are then skipped).
+#[cfg(unix)]
+pub(crate) fn filesystem_of(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let existing = dir.ancestors().find(|d| d.exists())?;
+    let device = fs::metadata(existing).ok()?.dev();
+    let stat = rustix::fs::statvfs(existing).ok()?;
+    Some((device, stat.f_bavail.saturating_mul(stat.f_frsize)))
+}
+
+/// See the Unix version; not available elsewhere.
+#[cfg(not(unix))]
+pub(crate) fn filesystem_of(_dir: &Path) -> Option<(u64, u64)> {
+    None
 }
 
 fn is_cross_device(e: &io::Error) -> bool {
@@ -626,5 +918,168 @@ mod tests {
     fn cross_device_errors_are_recognised() {
         assert!(is_cross_device(&io::Error::from_raw_os_error(EXDEV)));
         assert!(!is_cross_device(&io::Error::from(io::ErrorKind::NotFound)));
+    }
+
+    const OLD: &[u8] = b"original contents";
+    const NEW: &[u8] = b"new, verified contents";
+    const NEWER: &[u8] = b"a newer release that replaced the original";
+
+    /// An original in `library/`, a temp file in `scratch/` (another folder,
+    /// as with a separate temp folder) and a replace-in-place request.
+    fn setup(dir: &Path, final_name: &str) -> (OwnedRequest, fs::Metadata) {
+        let input = dir.join("library/Movie.mkv");
+        fs::create_dir_all(input.parent().unwrap()).unwrap();
+        fs::write(&input, OLD).unwrap();
+        let temp = dir
+            .join("scratch")
+            .join(temp_file_name("Movie", id(), "mkv"));
+        fs::create_dir_all(temp.parent().unwrap()).unwrap();
+        fs::write(&temp, NEW).unwrap();
+        let meta = fs::metadata(&input).unwrap();
+        let req = OwnedRequest {
+            final_path: dir.join("library").join(final_name),
+            input,
+            temp,
+            mode: OutputMode::Replace,
+            job_id: id(),
+            keep_dates: true,
+            original: Some(FileIdentity::of(&meta)),
+            force_copy: true,
+        };
+        (req, meta)
+    }
+
+    fn mover<'a>(meta: &'a fs::Metadata, hooks: TestHooks<'a>) -> Mover<'a> {
+        Mover {
+            job_id: id(),
+            force_copy: true,
+            original: meta,
+            keep_dates: true,
+            hooks,
+        }
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Replace a file the way Sonarr/Radarr do: a new file renamed over it.
+    fn swap_in_newer(path: &Path) {
+        let newer = path.with_file_name("incoming.tmp");
+        fs::write(&newer, NEWER).unwrap();
+        fs::rename(&newer, path).unwrap();
+    }
+
+    #[test]
+    fn cross_device_copy_finishes_before_the_original_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mkv");
+        let seen = std::cell::Cell::new(false);
+        let check = |staged: &Path| {
+            // The copy is complete and beside the original, which is untouched.
+            assert_eq!(fs::read(staged).unwrap(), NEW);
+            assert_eq!(parent_dir(staged), dir.path().join("library"));
+            assert_eq!(fs::read(&req.input).unwrap(), OLD);
+            seen.set(true);
+        };
+        let hooks = TestHooks {
+            after_stage: Some(&check),
+            fail_commit: false,
+        };
+        replace_in_place(&req, &mover(&meta, hooks)).unwrap();
+        assert!(seen.get());
+        assert_eq!(fs::read(&req.input).unwrap(), NEW);
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+        assert!(!req.temp.exists(), "the temp file is removed after copying");
+    }
+
+    #[test]
+    fn a_failed_final_rename_restores_the_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mkv");
+        let hooks = TestHooks {
+            after_stage: None,
+            fail_commit: true,
+        };
+        let err = replace_in_place(&req, &mover(&meta, hooks)).unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Could not put the new file in place, so the original was kept"),
+            "{err:#}"
+        );
+        assert_eq!(fs::read(&req.input).unwrap(), OLD);
+        // No backup and no staged copy left behind; the temp is the caller's.
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+        assert!(req.temp.exists());
+    }
+
+    #[test]
+    fn an_original_replaced_during_the_copy_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mkv");
+        let swap = |_: &Path| swap_in_newer(&req.input);
+        let hooks = TestHooks {
+            after_stage: Some(&swap),
+            fail_commit: false,
+        };
+        let err = replace_in_place(&req, &mover(&meta, hooks)).unwrap_err();
+        assert!(err.is::<OriginalChanged>(), "{err:#}");
+        assert_eq!(fs::read(&req.input).unwrap(), NEWER);
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+    }
+
+    #[test]
+    fn an_original_replaced_before_finalize_is_left_alone() {
+        for final_name in ["Movie.mkv", "Movie.mp4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (req, _) = setup(dir.path(), final_name);
+            swap_in_newer(&req.input);
+            let err = finalize_blocking(&req).unwrap_err();
+            assert!(err.is::<OriginalChanged>(), "{err:#}");
+            assert_eq!(
+                err.to_string(),
+                "The original changed while it was being converted, so it was left alone"
+            );
+            assert_eq!(fs::read(&req.input).unwrap(), NEWER);
+            assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+        }
+    }
+
+    #[test]
+    fn an_original_changed_after_an_extension_change_keeps_the_newer_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (req, meta) = setup(dir.path(), "Movie.mp4");
+        let swap = |_: &Path| swap_in_newer(&req.input);
+        let hooks = TestHooks {
+            after_stage: Some(&swap),
+            fail_commit: false,
+        };
+        let mut notes = Vec::new();
+        let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
+        assert!(err.is::<OriginalChanged>(), "{err:#}");
+        assert_eq!(fs::read(&req.input).unwrap(), NEWER);
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+    }
+
+    #[test]
+    fn identity_ignores_everything_but_size_and_modification_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.mkv");
+        fs::write(&path, OLD).unwrap();
+        let before = FileIdentity::of(&fs::metadata(&path).unwrap());
+        assert_eq!(before.len(), OLD.len() as u64);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(FileIdentity::of(&fs::metadata(&path).unwrap()), before);
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        assert_ne!(FileIdentity::of(&fs::metadata(&path).unwrap()), before);
     }
 }

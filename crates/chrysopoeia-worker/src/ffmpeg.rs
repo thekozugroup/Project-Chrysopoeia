@@ -229,25 +229,184 @@ impl StderrTail {
         self.lines().collect::<Vec<_>>().join("\n")
     }
 
-    /// The most useful line for an error message: the last line that is not
-    /// ffmpeg's generic closing remark, without the `[codec @ 0x…]` prefix.
+    /// The most useful line for an error message (see [`failure_reason`]).
     pub fn last_meaningful(&self) -> Option<String> {
-        last_meaningful_line(self.lines())
+        failure_reason(self.lines())
     }
 }
 
-/// See [`StderrTail::last_meaningful`].
-pub fn last_meaningful_line<'a>(lines: impl DoubleEndedIterator<Item = &'a str>) -> Option<String> {
-    const NOISE: &[&str] = &[
-        "Conversion failed!",
-        "Exiting normally, received signal",
-        "Error closing file",
-    ];
-    lines
+/// Messages ffmpeg prints as a consequence of an earlier error. They name
+/// no cause, so they are used only when nothing better is available.
+const CONSEQUENCES: &[&str] = &[
+    "Conversion failed!",
+    "Exiting normally, received signal",
+    "Nothing was written into output file",
+    "Error while filtering",
+    "Error sending frames to consumers",
+    "Error muxing a packet",
+    "Error closing file",
+    "Task finished with error code",
+    "Terminating thread with return code",
+    "Could not open encoder before EOF",
+    "Error while processing the decoded data",
+];
+
+/// Statistics encoders print when they close, even after a failure (the AAC
+/// encoder's `Qavg`, libx264's frame-type summary, the final `frame=` line).
+const STATISTICS: &[&str] = &[
+    "Qavg:",
+    "kb/s:",
+    "frame I:",
+    "frame P:",
+    "frame B:",
+    "mb I ",
+    "mb P ",
+    "mb B ",
+    "Avg QP",
+    "coded y,",
+    "i16 v,h,dc,p",
+    "i8 v,h,dc",
+    "i4 v,h,dc",
+    "i8c dc,h,v,p",
+    "ref P L0",
+    "ref B L0",
+    "ref B L1",
+    "Weighted P-Frames",
+    "consecutive B-frames",
+    "8x8 transform",
+    "direct mvs",
+    "frame=",
+    "video:",
+    "encoded ",
+    "x265 [info]",
+    "Svt[info]",
+];
+
+/// Decoder messages about damaged input. A failed encode of a damaged
+/// source usually has a more specific cause, so these rank below other
+/// errors.
+const DAMAGE: &[&str] = &[
+    "error while decoding",
+    "concealing",
+    "corrupt",
+    "decode_slice_header error",
+    "Invalid NAL unit",
+    "missing picture",
+    "no frame!",
+    "Error submitting packet to decoder",
+];
+
+/// Words that mark an untagged line (ffmpeg run without `level+`) as an
+/// error rather than a notice.
+const ERROR_WORDS: &[&str] = &[
+    "error",
+    "cannot",
+    "could not",
+    "failed",
+    "invalid",
+    "unknown",
+    "unrecognized",
+    "unsupported",
+    "not found",
+    "no such",
+    "denied",
+    "no space",
+    "out of memory",
+    "not permitted",
+    "read-only",
+];
+
+/// The most useful line of a failed run's stderr for an error message,
+/// without its `[codec @ 0x…]`/`[level]` prefixes.
+///
+/// ffmpeg reports the cause first and its consequences after it, and
+/// encoders print statistics even when the run failed. So: the first
+/// error-level line that names a cause, then the first decoder-damage or
+/// consequence line, then (for untagged output) the first line that reads
+/// like an error, and only then the last line that is not statistics.
+pub fn failure_reason<'a>(lines: impl Iterator<Item = &'a str>) -> Option<String> {
+    let parsed: Vec<(Option<&str>, &str)> = lines
+        .map(|l| {
+            let (_, level, message) = split_log_line(l);
+            (level, message.trim())
+        })
+        .filter(|(_, m)| !m.is_empty())
+        .collect();
+    let starts = |m: &str, list: &[&str]| list.iter().any(|p| m.starts_with(p));
+    let contains = |m: &str, list: &[&str]| {
+        let lower = m.to_ascii_lowercase();
+        list.iter().any(|p| lower.contains(&p.to_ascii_lowercase()))
+    };
+    let is_error = |level: Option<&str>| matches!(level, Some("error" | "fatal" | "panic"));
+    let tagged = parsed.iter().any(|(level, _)| level.is_some());
+
+    let errors: Vec<&str> = parsed
+        .iter()
+        .filter(|(level, m)| {
+            if tagged {
+                is_error(*level)
+            } else {
+                contains(m, ERROR_WORDS) && !starts(m, STATISTICS)
+            }
+        })
+        .map(|(_, m)| *m)
+        .collect();
+    let pick = errors
+        .iter()
+        .find(|m| !starts(m, CONSEQUENCES) && !contains(m, DAMAGE))
+        .or_else(|| errors.iter().find(|m| !starts(m, CONSEQUENCES)))
+        .or_else(|| errors.first());
+    if let Some(m) = pick {
+        return Some((*m).to_string());
+    }
+    parsed
+        .iter()
         .rev()
-        .map(|l| strip_log_prefix(l).trim())
-        .find(|l| !l.is_empty() && !NOISE.iter().any(|n| l.starts_with(n)))
+        .map(|(_, m)| *m)
+        .find(|m| !starts(m, STATISTICS) && !starts(m, CONSEQUENCES))
         .map(str::to_string)
+}
+
+/// A plain-language explanation for well-known failure messages, e.g. a
+/// full disk or a missing GPU driver.
+pub fn explain_failure(message: &str) -> Option<&'static str> {
+    const HINTS: &[(&str, &str)] = &[
+        (
+            "no space left on device",
+            "The disk ran out of space while writing the new file",
+        ),
+        (
+            "disk quota exceeded",
+            "The disk quota ran out while writing the new file",
+        ),
+        (
+            "read-only file system",
+            "The folder the new file is written to is read-only",
+        ),
+        (
+            "cannot load libcuda",
+            "The NVIDIA driver could not be loaded. Check that the GPU is passed through to the container",
+        ),
+        (
+            "cannot load libnvidia-encode",
+            "The NVIDIA encoder library could not be loaded. Check that the GPU is passed through to the container",
+        ),
+        (
+            "failed to initialise vaapi connection",
+            "The Intel/AMD GPU could not be opened. Check that /dev/dri is passed through to the container",
+        ),
+        (
+            "no va display found",
+            "The Intel/AMD GPU could not be opened. Check that /dev/dri is passed through to the container",
+        ),
+        ("cannot allocate memory", "The system ran out of memory"),
+        ("out of memory", "The system ran out of memory"),
+    ];
+    let lower = message.to_ascii_lowercase();
+    HINTS
+        .iter()
+        .find(|(needle, _)| lower.contains(needle))
+        .map(|(_, hint)| *hint)
 }
 
 /// Remove a leading `[context @ 0x…] ` and `[level] ` from an ffmpeg log line.
@@ -343,7 +502,10 @@ impl FfmpegExit {
         match self {
             Self::Success { .. } | Self::Cancelled => None,
             Self::Failed { code, tail } => {
-                let reason = last_meaningful_line(tail.lines());
+                let reason = failure_reason(tail.lines()).map(|r| match explain_failure(&r) {
+                    Some(hint) => format!("{hint} ({r})"),
+                    None => r,
+                });
                 let status = match code {
                     Some(c) => format!("stopped with exit code {c}"),
                     None => "was stopped by the system".to_string(),
@@ -719,9 +881,114 @@ out_time=N/A\ntotal_size=N/A\nspeed=N/A\nprogress=continue\n";
         tail.push("Conversion failed!");
         assert_eq!(
             tail.last_meaningful().as_deref(),
-            Some("Error initializing output stream: Error while opening encoder")
+            Some("OpenEncodeSessionEx failed: unsupported device (2): (no details)")
         );
         assert_eq!(StderrTail::default().last_meaningful(), None);
+    }
+
+    /// Real tail of an NVENC encode in a container without a GPU, as printed
+    /// at the default log level (the AAC encoder's statistics come last).
+    const NVENC_TAIL_INFO: &str = "\
+[h264_nvenc @ 0x564f63ea1780] Cannot load libcuda.so.1
+[vost#0:0/h264_nvenc @ 0x564f63ea14c0] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+Error while filtering: Operation not permitted
+[out#0/matroska @ 0x564f63e9f6c0] Nothing was written into output file, because at least one of its streams received no packets.
+frame=    0 fps=0.0 q=0.0 Lsize=       0kB time=00:00:00.16 bitrate=   0.0kbits/s speed= 1.8x
+[aac @ 0x564f63e97a40] Qavg: 326.719
+[aac @ 0x564f63f14d40] Qavg: 326.008
+Conversion failed!";
+
+    /// The same failure with `-loglevel level+warning`.
+    const NVENC_TAIL_TAGGED: &str = "\
+[h264_nvenc @ 0x559164be8e40] [error] Cannot load libcuda.so.1
+[vost#0:0/h264_nvenc @ 0x559164cda600] [error] Error while opening encoder - maybe incorrect parameters such as bit_rate, rate, width or height.
+[error] Error while filtering: Operation not permitted
+[out#0/matroska @ 0x559164bd0ec0] [error] Nothing was written into output file, because at least one of its streams received no packets.";
+
+    /// Real tail of an encode whose temp disk filled up (default log level).
+    const DISK_FULL_TAIL_INFO: &str = "\
+[out#0/matroska @ 0x561cc0924300] Error writing trailer: No space left on device
+[out#0/matroska @ 0x561cc0924300] Error closing file: No space left on device
+[out#0/matroska @ 0x561cc0924300] video:5232kB audio:105kB subtitle:0kB other streams:0kB global headers:0kB muxing overhead: unknown
+frame=   43 fps=0.0 q=-1.0 Lsize=    3072kB time=00:00:02.34 bitrate=10729.9kbits/s speed=2.88x
+[libx264 @ 0x561cc09605c0] frame I:1     Avg QP: 7.00  size:156097
+[libx264 @ 0x561cc09605c0] frame P:52    Avg QP: 6.46  size:124802
+[libx264 @ 0x561cc09605c0] mb I  I16..4: 100.0%  0.0%  0.0%
+[libx264 @ 0x561cc09605c0] mb P  I16..4:  4.2%  0.0%  0.0%  P16..4:  9.7%  0.0%  0.0%  0.0%  0.0%    skip:86.1%
+[libx264 @ 0x561cc09605c0] coded y,uvDC,uvAC intra: 11.8% 18.0% 17.4% inter: 8.1% 9.3% 9.2%
+[libx264 @ 0x561cc09605c0] i16 v,h,dc,p: 91%  5%  3%  0%
+[libx264 @ 0x561cc09605c0] i8c dc,h,v,p: 79%  8% 13%  0%
+[libx264 @ 0x561cc09605c0] kb/s:24075.42
+[aac @ 0x561cc090bf40] Qavg: 156.151
+Conversion failed!";
+
+    /// The same failure with `-loglevel level+warning`.
+    const DISK_FULL_TAIL_TAGGED: &str = "\
+[vost#0:0/libx264 @ 0x55a55acc1180] [error] Error submitting a packet to the muxer: No space left on device
+[out#0/matroska @ 0x55a55ac84f00] [error] Error muxing a packet
+[out#0/matroska @ 0x55a55ac84f00] [error] Error writing trailer: No space left on device
+[out#0/matroska @ 0x55a55ac84f00] [error] Error closing file: No space left on device";
+
+    #[test]
+    fn failure_reasons_from_real_tails() {
+        for tail in [NVENC_TAIL_INFO, NVENC_TAIL_TAGGED] {
+            assert_eq!(
+                failure_reason(tail.lines()).as_deref(),
+                Some("Cannot load libcuda.so.1")
+            );
+            let exit = FfmpegExit::Failed {
+                code: Some(255),
+                tail: tail.into(),
+            };
+            assert_eq!(
+                exit.describe_failure("h264_nvenc").as_deref(),
+                Some(
+                    "h264_nvenc stopped with exit code 255: The NVIDIA driver could not be loaded. \
+                     Check that the GPU is passed through to the container (Cannot load libcuda.so.1)"
+                )
+            );
+        }
+        assert_eq!(
+            failure_reason(DISK_FULL_TAIL_INFO.lines()).as_deref(),
+            Some("Error writing trailer: No space left on device")
+        );
+        assert_eq!(
+            failure_reason(DISK_FULL_TAIL_TAGGED.lines()).as_deref(),
+            Some("Error submitting a packet to the muxer: No space left on device")
+        );
+        let exit = FfmpegExit::Failed {
+            code: Some(228),
+            tail: DISK_FULL_TAIL_TAGGED.into(),
+        };
+        let message = exit.describe_failure("libx264").unwrap();
+        assert!(
+            message.starts_with(
+                "libx264 stopped with exit code 228: The disk ran out of space while writing the new file"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn decoder_damage_ranks_below_the_real_cause() {
+        let tail = "[h264 @ 0x1] [error] error while decoding MB 76 4\n\
+                    [h264_vaapi @ 0x2] [error] Failed to upload frame: Input/output error\n\
+                    [error] Conversion failed!";
+        assert_eq!(
+            failure_reason(tail.lines()).as_deref(),
+            Some("Failed to upload frame: Input/output error")
+        );
+        // Only damage and consequences: damage it is.
+        let tail = "[h264 @ 0x1] [error] error while decoding MB 76 4\nConversion failed!";
+        assert_eq!(
+            failure_reason(tail.lines()).as_deref(),
+            Some("error while decoding MB 76 4")
+        );
+        // Untagged notices are not errors; the last non-statistics line is used.
+        assert_eq!(
+            failure_reason("Some notice\n[aac @ 0x1] Qavg: 1.0".lines()).as_deref(),
+            Some("Some notice")
+        );
     }
 
     #[test]
