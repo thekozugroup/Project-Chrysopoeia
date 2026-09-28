@@ -32,7 +32,8 @@ use anyhow::Context as _;
 use chrysopoeia_core::paths::{
     backup_file_name, is_artifact, is_backup, original_name_from_backup, temp_file_name,
 };
-use chrysopoeia_core::{Container, OutputMode};
+use chrysopoeia_core::plain::io_reason;
+use chrysopoeia_core::{Container, OutputMode, ProblemKind};
 use uuid::Uuid;
 
 /// Longest file-name stem used for temp files, in bytes. Keeps temp names
@@ -163,6 +164,119 @@ impl std::fmt::Display for OriginalChanged {
 
 impl std::error::Error for OriginalChanged {}
 
+/// Why [`finalize`] couldn't put the new file in place: one or two plain
+/// sentences saying what happened and what to do, and what kind of problem
+/// it is. [`finalize`] returns this inside its `anyhow::Error`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceError {
+    /// What kind of problem it is.
+    pub problem: ProblemKind,
+    /// What happened and what to do.
+    pub message: String,
+}
+
+impl PlaceError {
+    fn error(problem: ProblemKind, message: impl Into<String>) -> anyhow::Error {
+        Self {
+            problem,
+            message: message.into(),
+        }
+        .into()
+    }
+}
+
+impl std::fmt::Display for PlaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PlaceError {}
+
+/// The error for a file operation that failed while the new file was being
+/// put into `dir`. The original is where it was.
+fn placing_failed(e: &io::Error, dir: &Path) -> anyhow::Error {
+    use io::ErrorKind as K;
+    let shown = dir.display();
+    match e.kind() {
+        K::StorageFull | K::QuotaExceeded => {
+            // A copy refused up front says how much room it needs.
+            let needs = e
+                .get_ref()
+                .map(|inner| format!(" ({inner})"))
+                .unwrap_or_default();
+            PlaceError::error(
+                ProblemKind::DiskFull,
+                format!(
+                    "There isn't enough free space in {shown} for the new file{needs}, so the \
+                     original was kept. Free up some space there, then try again."
+                ),
+            )
+        }
+        K::PermissionDenied => PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "Chrysopoeia doesn't have permission to write in {shown}, so the new file \
+                 couldn't be put there and the original was kept. Check the folder's \
+                 permissions (in Docker, the PUID/PGID user needs write access)."
+            ),
+        ),
+        K::ReadOnlyFilesystem => PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "The folder {shown} is on a read-only drive, so the new file couldn't be put \
+                 there and the original was kept. Make the drive writable, or save converted \
+                 files to a separate folder in Settings > Output."
+            ),
+        ),
+        _ => PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "The new file couldn't be put in {shown} because {}, so the original was kept.",
+                io_reason(e)
+            ),
+        ),
+    }
+}
+
+/// The error when the original is gone or can't be read right before it
+/// would be replaced.
+fn original_unavailable(e: &io::Error) -> anyhow::Error {
+    if e.kind() == io::ErrorKind::NotFound {
+        PlaceError::error(
+            ProblemKind::SourceChanged,
+            "The original is no longer there, so the new file wasn't put in place. It may have \
+             been moved or deleted while it was being converted.",
+        )
+    } else {
+        PlaceError::error(
+            ProblemKind::UnreadableSource,
+            format!(
+                "The original couldn't be checked before replacing it because {}, so nothing \
+                 was changed.",
+                io_reason(e)
+            ),
+        )
+    }
+}
+
+/// The error when the new file couldn't take the original's place and the
+/// original couldn't be moved back from its backup either.
+fn restore_failed(backup: &Path, original: &Path, e: &io::Error) -> anyhow::Error {
+    PlaceError::error(
+        ProblemKind::Destination,
+        format!(
+            "The new file couldn't be put in place, and the original couldn't be moved back to \
+             its name because {}. The original is safe as the hidden file \"{}\" in {}: rename \
+             it back to \"{}\".",
+            io_reason(e),
+            file_name_lossy(backup),
+            parent_dir(backup).display(),
+            file_name_lossy(original)
+        ),
+    )
+}
+
 /// Inputs for [`finalize`].
 #[derive(Debug, Clone, Copy)]
 pub struct FinalizeRequest<'a> {
@@ -229,7 +343,14 @@ pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<Finalized> {
     };
     tokio::task::spawn_blocking(move || finalize_blocking(&owned))
         .await
-        .context("The file move was interrupted")?
+        .map_err(|e| {
+            tracing::warn!("putting a new file in place stopped unexpectedly: {e}");
+            PlaceError::error(
+                ProblemKind::Other,
+                "Putting the new file in place stopped unexpectedly. The details are in the \
+                 server log.",
+            )
+        })?
 }
 
 #[derive(Debug)]
@@ -254,22 +375,13 @@ impl OwnedRequest {
         match fs::metadata(&self.input) {
             Ok(meta) if FileIdentity::of(&meta) == expected => Ok(()),
             Ok(_) => Err(OriginalChanged.into()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                Err(anyhow::anyhow!("The original file is no longer there"))
-            }
-            Err(e) => Err(anyhow::anyhow!("Could not read the original file: {e}")),
+            Err(e) => Err(original_unavailable(&e)),
         }
     }
 }
 
 fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
-    let original = fs::metadata(&req.input).map_err(|e| {
-        if e.kind() == io::ErrorKind::NotFound {
-            anyhow::anyhow!("The original file is no longer there")
-        } else {
-            anyhow::anyhow!("Could not read the original file: {e}")
-        }
-    })?;
+    let original = fs::metadata(&req.input).map_err(|e| original_unavailable(&e))?;
     if req
         .original
         .is_some_and(|expected| FileIdentity::of(&original) != expected)
@@ -277,13 +389,18 @@ fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
         return Err(OriginalChanged.into());
     }
     let temp_meta = fs::metadata(&req.temp).map_err(|e| {
-        anyhow::anyhow!(
-            "The converted file is missing ({}): {e}",
-            req.temp.display()
+        tracing::warn!(temp = %req.temp.display(), "the converted file is gone: {e}");
+        PlaceError::error(
+            ProblemKind::Other,
+            "The converted file disappeared before it could be put in place, so the original \
+             was kept. Try again.",
         )
     })?;
     if !temp_meta.is_file() || temp_meta.len() == 0 {
-        anyhow::bail!("The converted file is empty");
+        return Err(PlaceError::error(
+            ProblemKind::Other,
+            "The converted file turned out empty, so the original was kept. Try again.",
+        ));
     }
 
     // Make sure the encode is on disk before any name points at it, and give
@@ -323,7 +440,7 @@ fn replace_in_place(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()>
     let dir = parent_dir(&req.final_path);
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .context("Could not put the new file in place, so the original was kept")?;
+        .map_err(|e| placing_failed(&e, &dir))?;
     let result = swap_in(req, mover, &staged, &dir, None, &mut Vec::new());
     if result.is_err() {
         mover.discard(&staged, &req.temp);
@@ -363,37 +480,28 @@ fn swap_in(
     }
     let backup = dir.join(backup_name);
 
-    fs::rename(&req.input, &backup)
-        .map_err(|e| anyhow::anyhow!("Could not move the original aside to replace it: {e}"))?;
+    fs::rename(&req.input, &backup).map_err(|e| placing_failed(&e, dir))?;
 
     // What was moved aside must be the file the job read. Checked on the
     // backup itself, so a replacement that raced the rename is caught too.
     if let Some(expected) = req.original {
         let moved = fs::metadata(&backup).map(|m| FileIdentity::of(&m));
         if moved.as_ref().ok() != Some(&expected) {
-            restore_backup(&backup, &req.input).map_err(|e| {
-                anyhow::anyhow!("The original changed while it was being converted, and {e:#}")
-            })?;
+            restore_backup(&backup, &req.input)
+                .map_err(|e| restore_failed(&backup, &req.input, &e))?;
             return Err(OriginalChanged.into());
         }
     }
 
     let committed = match taken() {
-        Err(e) => Err((e, true)),
+        Err(conflict) => Err(conflict),
         Ok(()) => mover
             .commit(staged, &req.final_path, &req.temp)
-            .map_err(|e| (anyhow::Error::from(e), false)),
+            .map_err(|e| placing_failed(&e, dir)),
     };
-    if let Err((move_err, is_conflict)) = committed {
-        restore_backup(&backup, &req.input).map_err(|restore_err| {
-            anyhow::anyhow!("Could not put the new file in place ({move_err}), and {restore_err:#}")
-        })?;
-        if is_conflict {
-            return Err(move_err);
-        }
-        return Err(anyhow::anyhow!(
-            "Could not put the new file in place, so the original was kept: {move_err}"
-        ));
+    if let Err(problem) = committed {
+        restore_backup(&backup, &req.input).map_err(|e| restore_failed(&backup, &req.input, &e))?;
+        return Err(problem);
     }
     sync_dir(dir);
 
@@ -413,8 +521,9 @@ fn swap_in(
         tracing::warn!(backup = %backup.display(), "could not delete the backup: {e}");
         if conflict.is_some() {
             notes.push(format!(
-                "The new file is in place, but the original \"{file_name}\" could not be \
-                 deleted ({e}). It is kept as the hidden file \"{}\"",
+                "The new file is in place, but the original \"{file_name}\" couldn't be \
+                 deleted because {}. It is kept as the hidden file \"{}\"",
+                io_reason(&e),
                 file_name_lossy(&backup)
             ));
         }
@@ -435,7 +544,7 @@ fn commit_without_backup(
 ) -> anyhow::Result<()> {
     mover
         .commit(staged, &req.final_path, &req.temp)
-        .context("Could not put the new file in place, so the original was kept")?;
+        .map_err(|e| placing_failed(&e, dir))?;
     sync_dir(dir);
     if req.input == req.final_path || is_same_file(&req.input, &req.final_path) {
         return Ok(());
@@ -454,21 +563,17 @@ fn commit_without_backup(
             "the new file is in place, but the original could not be deleted: {e}"
         );
         notes.push(format!(
-            "The new file is in place, but the original \"{}\" could not be deleted ({e})",
-            file_name_lossy(&req.input)
+            "The new file is in place, but the original \"{}\" couldn't be deleted because {}",
+            file_name_lossy(&req.input),
+            io_reason(&e)
         ));
     }
     Ok(())
 }
 
 /// Put a backup back under the original name.
-fn restore_backup(backup: &Path, original: &Path) -> anyhow::Result<()> {
-    fs::rename(backup, original).map_err(|e| {
-        anyhow::anyhow!(
-            "the original could not be moved back ({e}). The original is safe at {}",
-            backup.display()
-        )
-    })?;
+fn restore_backup(backup: &Path, original: &Path) -> io::Result<()> {
+    fs::rename(backup, original)?;
     sync_dir(&parent_dir(original));
     Ok(())
 }
@@ -481,9 +586,14 @@ fn replace_with_new_name(
     notes: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     let conflict = || {
-        anyhow::anyhow!(
-            "A file named \"{}\" already exists next to the original",
-            file_name_lossy(&req.final_path)
+        PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "A file named \"{}\" appeared next to the original while it was being \
+                 converted, so the new file wasn't put in place. Move or rename that file, then \
+                 convert this one again.",
+                file_name_lossy(&req.final_path)
+            ),
         )
     };
     if exists(&req.final_path)? {
@@ -492,7 +602,7 @@ fn replace_with_new_name(
     let dir = parent_dir(&req.final_path);
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .context("Could not put the new file in place")?;
+        .map_err(|e| placing_failed(&e, &dir))?;
     let result = swap_in(req, mover, &staged, &dir, Some(&conflict), notes);
     if result.is_err() {
         mover.discard(&staged, &req.temp);
@@ -503,12 +613,16 @@ fn replace_with_new_name(
 /// Folder mode: create folders, refuse to clobber, never touch the input.
 fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> {
     let dir = parent_dir(&req.final_path);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("Could not create the folder {}", dir.display()))?;
+    fs::create_dir_all(&dir).map_err(|e| placing_failed(&e, &dir))?;
     let conflict = || {
-        anyhow::anyhow!(
-            "A file named \"{}\" already exists in the output folder",
-            file_name_lossy(&req.final_path)
+        PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "A file named \"{}\" appeared in the output folder while this file was being \
+                 converted, so it wasn't overwritten. Move or delete it, then convert this file \
+                 again.",
+                file_name_lossy(&req.final_path)
+            ),
         )
     };
     if exists(&req.final_path)? {
@@ -516,7 +630,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
     }
     let staged = mover
         .stage(&req.temp, &req.final_path)
-        .context("Could not put the new file in the output folder")?;
+        .map_err(|e| placing_failed(&e, &dir))?;
     let placed = (|| {
         req.check_original()?;
         if exists(&req.final_path)? {
@@ -524,7 +638,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
         }
         mover
             .commit(&staged, &req.final_path, &req.temp)
-            .context("Could not put the new file in the output folder")
+            .map_err(|e| placing_failed(&e, &dir))
     })();
     if let Err(e) = placed {
         mover.discard(&staged, &req.temp);
@@ -621,11 +735,7 @@ impl Mover<'_> {
         {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
-                format!(
-                    "there is not enough free space in {} (needs about {})",
-                    dir.display(),
-                    crate::validate::human_bytes(needed)
-                ),
+                format!("it needs about {}", crate::validate::human_bytes(needed)),
             ));
         }
         let result = (|| {
@@ -764,7 +874,14 @@ fn exists(path: &Path) -> anyhow::Result<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(anyhow::anyhow!("Could not check {}: {e}", path.display())),
+        Err(e) => Err(PlaceError::error(
+            ProblemKind::Destination,
+            format!(
+                "Chrysopoeia couldn't check {} because {}, so nothing was changed.",
+                path.display(),
+                io_reason(&e)
+            ),
+        )),
     }
 }
 
@@ -806,11 +923,13 @@ pub async fn destination_conflict(
         let taken = exists(&final_path).unwrap_or(false);
         match mode {
             OutputMode::Replace if taken && !is_same_file(&input, &final_path) => Some(format!(
-                "A file named \"{}\" already exists next to the original",
+                "A file named \"{}\" is already next to the original, so the new file can't \
+                 take its name. Move or rename that file, then try again.",
                 file_name_lossy(&final_path)
             )),
             OutputMode::Folder if taken => Some(format!(
-                "A file named \"{}\" already exists in the output folder",
+                "A file named \"{}\" is already in the output folder, so it wasn't \
+                 overwritten. Move or delete it, then try again.",
                 file_name_lossy(&final_path)
             )),
             _ => None,
@@ -1142,11 +1261,16 @@ mod tests {
             before_commit: None,
         };
         let err = replace_in_place(&req, &mover(&meta, hooks)).unwrap_err();
+        let placing = err.downcast_ref::<PlaceError>().expect("a PlaceError");
+        assert_eq!(placing.problem, ProblemKind::Destination);
         assert!(
-            err.to_string()
-                .starts_with("Could not put the new file in place, so the original was kept"),
+            placing
+                .message
+                .starts_with("The new file couldn't be put in ")
+                && placing.message.ends_with(", so the original was kept."),
             "{err:#}"
         );
+        assert!(!placing.message.contains("os error"), "{err:#}");
         assert_eq!(fs::read(&req.input).unwrap(), OLD);
         // No backup and no staged copy left behind; the temp is the caller's.
         assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
@@ -1256,9 +1380,10 @@ mod tests {
         };
         let mut notes = Vec::new();
         let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
+        let placing = err.downcast_ref::<PlaceError>().expect("a PlaceError");
+        assert_eq!(placing.problem, ProblemKind::Destination);
         assert!(
-            err.to_string()
-                .starts_with("Could not put the new file in place, so the original was kept"),
+            placing.message.ends_with(", so the original was kept."),
             "{err:#}"
         );
         assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
@@ -1276,7 +1401,16 @@ mod tests {
         };
         let mut notes = Vec::new();
         let err = replace_with_new_name(&req, &mover(&meta, hooks), &mut notes).unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err:#}");
+        assert_eq!(
+            err.to_string(),
+            "A file named \"Movie.mp4\" appeared next to the original while it was being \
+             converted, so the new file wasn't put in place. Move or rename that file, then \
+             convert this one again."
+        );
+        assert_eq!(
+            err.downcast_ref::<PlaceError>().map(|e| e.problem),
+            Some(ProblemKind::Destination)
+        );
         assert_eq!(fs::read(&req.input).unwrap(), OLD);
         assert_eq!(fs::read(&req.final_path).unwrap(), NEWER);
         assert_eq!(

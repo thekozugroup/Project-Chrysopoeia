@@ -66,6 +66,21 @@ pub fn watched_roots(state: &AppState) -> Vec<PathBuf> {
     roots
 }
 
+/// The watcher's own explanation (a sentence with its fix), without error
+/// numbers, and saying that rescans still find new files.
+fn with_rescan_note(reason: &str) -> String {
+    let reason = chrysopoeia_core::plain::strip_os_error(reason);
+    let reason = reason.trim();
+    let mut out = reason.to_string();
+    if !out.ends_with(['.', '!', '?']) {
+        out.push('.');
+    }
+    if !reason.contains("rescans") {
+        out.push_str(" New files will still be found by the regular rescans.");
+    }
+    out
+}
+
 /// Start the watcher (on a blocking thread) and the task that applies its
 /// events. Returns a problem to report when watching isn't available.
 async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
@@ -76,15 +91,17 @@ async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
         Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
             return Err(format!(
-                "Folder watching isn't available ({e:#}). New files will still be found by the \
-                 regular rescans."
+                "Folder watching isn't available. {}",
+                with_rescan_note(&format!("{e:#}"))
             ));
         }
         Err(e) => {
-            return Err(format!(
-                "Folder watching isn't available ({e}). New files will still be found by the \
-                 regular rescans."
-            ));
+            tracing::warn!("the folder watcher could not start: {e}");
+            return Err(
+                "Folder watching isn't available because it stopped unexpectedly. New \
+                        files will still be found by the regular rescans."
+                    .to_string(),
+            );
         }
     };
     let consumer = state.clone();
@@ -226,9 +243,8 @@ pub async fn sync(state: &AppState) {
                 for (_, name, result) in added {
                     if let Err(e) = result {
                         problems.push(format!(
-                            "Chrysopoeia can't watch {name} for new files ({e}). New files will \
-                             still be found by the regular rescans. On Linux, raising \
-                             fs.inotify.max_user_watches on the host usually fixes this."
+                            "Chrysopoeia can't watch {name} for new files. {}",
+                            with_rescan_note(&e)
                         ));
                     }
                 }

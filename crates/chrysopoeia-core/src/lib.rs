@@ -14,6 +14,7 @@ pub mod job;
 pub mod library;
 pub mod media;
 pub mod paths;
+pub mod plain;
 pub mod process;
 pub mod profile;
 pub mod settings;

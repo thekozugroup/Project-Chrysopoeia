@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use chrysopoeia_core::{
-    ActivityLevel, Event, FileStatus, Library, LibraryStats, ProbeInfo, ScanPhase, ScanProgress,
-    TranscodeProfile,
+    ActivityLevel, Event, FileStatus, Library, LibraryStats, ProbeInfo, ProblemKind, ScanPhase,
+    ScanProgress, TranscodeProfile,
 };
 use chrysopoeia_scanner::{DiscoveredFile, IgnoreRules, ProbeError, ScanOptions, WatchEvent};
 use chrysopoeia_worker::Decision;
@@ -233,6 +233,7 @@ async fn store_moved(
         probe: None,
         skip_reason: None,
         error: None,
+        problem: None,
     };
     let mut tx = state.db.write_tx().await?;
     let id = db::files::insert_moved(&mut tx, &upsert, from).await?;
@@ -349,17 +350,37 @@ fn scan_failure(e: &anyhow::Error) -> String {
 /// unreadable files are already sentences for users.
 pub fn probe_error_message(e: &ProbeError) -> String {
     match e {
-        ProbeError::Spawn(msg) => format!(
-            "ffprobe couldn't be started, so this file wasn't checked. {}",
-            sentence(msg)
-        ),
+        // The reason may start with a program name ("ffprobe was not
+        // found …"), which keeps its lower case.
+        ProbeError::Spawn(msg) => {
+            let msg = msg.trim();
+            let end = if msg.ends_with(['.', '!', '?']) {
+                ""
+            } else {
+                "."
+            };
+            format!("ffprobe couldn't be started, so this file wasn't checked. {msg}{end}")
+        }
         ProbeError::Timeout(_) => "Reading this file took longer than 60 seconds. It may be \
             damaged, or the drive may be very slow."
             .to_string(),
         ProbeError::Unreadable(msg) => sentence(msg),
         ProbeError::Parse(msg) => {
-            format!("ffprobe's answer about this file couldn't be understood ({msg}).")
+            tracing::debug!("ffprobe's answer could not be read: {msg}");
+            "Chrysopoeia couldn't make sense of what ffprobe said about this file, so it wasn't \
+             checked. Scan the library again; if it keeps happening, the file may be damaged."
+                .to_string()
         }
+    }
+}
+
+/// What kind of problem a probe failure is: a file that can't be read (or
+/// takes too long to) is the file's problem; ffprobe not starting or
+/// answering nonsense is not.
+pub fn probe_problem(e: &ProbeError) -> ProblemKind {
+    match e {
+        ProbeError::Unreadable(_) | ProbeError::Timeout(_) => ProblemKind::UnreadableSource,
+        ProbeError::Spawn(_) | ProbeError::Parse(_) => ProblemKind::Other,
     }
 }
 
@@ -368,7 +389,8 @@ pub fn probe_error_message(e: &ProbeError) -> String {
 pub enum Verdict {
     Transcode,
     Skip(String),
-    Broken(String),
+    /// It can't be converted: why, and what kind of problem that is.
+    Broken(ProblemKind, String),
 }
 
 /// Decide what a file needs, turning tool failures into a `Broken` verdict.
@@ -378,11 +400,12 @@ pub fn verdict(
     profile: &TranscodeProfile,
 ) -> Verdict {
     match probe {
-        Err(e) => Verdict::Broken(probe_error_message(e)),
+        Err(e) => Verdict::Broken(probe_problem(e), probe_error_message(e)),
         Ok(p) => match state.toolkit.decide(p, profile) {
             Ok(Decision::Transcode) => Verdict::Transcode,
             Ok(Decision::Skip { reason }) => Verdict::Skip(reason),
             Err(_) => Verdict::Broken(
+                ProblemKind::Other,
                 "Chrysopoeia couldn't work out what this file needs. The details are in the \
                  server log."
                     .to_string(),
@@ -426,11 +449,11 @@ fn build_upsert(
     auto_queue: bool,
 ) -> Option<FileUpsert> {
     let (path, relative_path, file_name) = row_names(root, file)?;
-    let (status, skip_reason, error) = match verdict {
-        Verdict::Transcode if auto_queue => (FileStatus::Queued, None, None),
-        Verdict::Transcode => (FileStatus::Pending, None, None),
-        Verdict::Skip(reason) => (FileStatus::Skipped, Some(reason), None),
-        Verdict::Broken(error) => (FileStatus::Failed, None, Some(error)),
+    let (status, skip_reason, error, problem) = match verdict {
+        Verdict::Transcode if auto_queue => (FileStatus::Queued, None, None, None),
+        Verdict::Transcode => (FileStatus::Pending, None, None, None),
+        Verdict::Skip(reason) => (FileStatus::Skipped, Some(reason), None, None),
+        Verdict::Broken(problem, error) => (FileStatus::Failed, None, Some(error), Some(problem)),
     };
     Some(FileUpsert {
         library_id,
@@ -443,6 +466,7 @@ fn build_upsert(
         probe: probe.ok(),
         skip_reason,
         error,
+        problem,
     })
 }
 
@@ -710,7 +734,7 @@ async fn flush(
     let mut analyzed = Vec::with_capacity(batch.len());
     for p in batch {
         let v = verdict(state, &p.probe, &profile);
-        if matches!(v, Verdict::Broken(_)) {
+        if matches!(v, Verdict::Broken(..)) {
             broken += 1;
         }
         if let Some(upsert) = build_upsert(lib.id, root, &p.file, p.probe, v, auto_queue) {
@@ -1452,7 +1476,11 @@ async fn check_path(path: &str) -> Option<String> {
             "Chrysopoeia doesn't have permission to open {path}. Check the folder's permissions \
              (and PUID/PGID in Docker)."
         )),
-        Err(e) => Some(format!("Chrysopoeia can't open {path}: {e}")),
+        Err(e) => Some(format!(
+            "Chrysopoeia can't open the folder {path} because {}. If it's on a drive or network \
+             share, check that it's connected.",
+            chrysopoeia_core::plain::io_reason(&e)
+        )),
         Ok(m) if !m.is_dir() => Some(format!("{path} is not a folder.")),
         Ok(_) => match tokio::fs::read_dir(path).await {
             Ok(_) => None,
@@ -1460,7 +1488,11 @@ async fn check_path(path: &str) -> Option<String> {
                 "Chrysopoeia doesn't have permission to read {path}. Check the folder's \
                  permissions (and PUID/PGID in Docker)."
             )),
-            Err(e) => Some(format!("Chrysopoeia can't read {path}: {e}")),
+            Err(e) => Some(format!(
+                "Chrysopoeia can't read the folder {path} because {}. If it's on a drive or \
+                 network share, check that it's connected.",
+                chrysopoeia_core::plain::io_reason(&e)
+            )),
         },
     }
 }

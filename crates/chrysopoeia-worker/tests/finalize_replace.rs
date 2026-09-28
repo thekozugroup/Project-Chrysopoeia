@@ -4,13 +4,20 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
-use chrysopoeia_core::OutputMode;
 use chrysopoeia_core::paths::{backup_file_name, temp_file_name};
+use chrysopoeia_core::{OutputMode, ProblemKind};
 use chrysopoeia_worker::finalize::{
     FileIdentity, FinalizeRequest, OriginalChanged, Recovery, finalize, recover_artifact,
 };
 use filetime::FileTime;
 use uuid::Uuid;
+
+/// The kind of problem a failed `finalize` reports.
+fn problem_of(err: &anyhow::Error) -> ProblemKind {
+    err.downcast_ref::<chrysopoeia_worker::finalize::PlaceError>()
+        .map(|e| e.problem)
+        .expect("finalize explains its failures")
+}
 
 const OLD: &[u8] = b"original contents";
 const NEW: &[u8] = b"new, verified contents that are longer";
@@ -126,8 +133,11 @@ async fn refuses_to_overwrite_an_unrelated_file() {
         .unwrap_err();
     assert_eq!(
         err.to_string(),
-        "A file named \"Film.mkv\" already exists next to the original"
+        "A file named \"Film.mkv\" appeared next to the original while it was being converted, \
+         so the new file wasn't put in place. Move or rename that file, then convert this one \
+         again."
     );
+    assert_eq!(problem_of(&err), ProblemKind::Destination);
     assert_eq!(std::fs::read(&input).unwrap(), OLD);
     assert_eq!(std::fs::read(&final_path).unwrap(), b"someone else's file");
     // The temp file is the caller's to delete.
@@ -158,8 +168,10 @@ async fn folder_mode_mirrors_and_never_touches_the_original() {
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("already exists in the output folder")
+            .starts_with("A file named \"S01E01.mkv\" appeared in the output folder"),
+        "{err:#}"
     );
+    assert_eq!(problem_of(&err), ProblemKind::Destination);
     assert_eq!(std::fs::read(&input).unwrap(), OLD);
 }
 
@@ -217,13 +229,20 @@ async fn missing_or_empty_temp_leaves_the_original_alone() {
     let err = finalize(&request(&input, &temp, &input, OutputMode::Replace))
         .await
         .unwrap_err();
-    assert!(err.to_string().starts_with("The converted file is missing"));
+    assert_eq!(
+        err.to_string(),
+        "The converted file disappeared before it could be put in place, so the original was \
+         kept. Try again."
+    );
 
     std::fs::write(&temp, b"").unwrap();
     let err = finalize(&request(&input, &temp, &input, OutputMode::Replace))
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "The converted file is empty");
+    assert_eq!(
+        err.to_string(),
+        "The converted file turned out empty, so the original was kept. Try again."
+    );
     assert_eq!(std::fs::read(&input).unwrap(), OLD);
     assert!(
         support::artifacts_in(dir.path()).len() == 1,
@@ -239,7 +258,12 @@ async fn missing_original_is_reported() {
     let err = finalize(&request(&input, &temp, &input, OutputMode::Replace))
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "The original file is no longer there");
+    assert_eq!(
+        err.to_string(),
+        "The original is no longer there, so the new file wasn't put in place. It may have been \
+         moved or deleted while it was being converted."
+    );
+    assert_eq!(problem_of(&err), ProblemKind::SourceChanged);
 }
 
 #[tokio::test]
@@ -334,11 +358,15 @@ async fn a_failed_cross_device_copy_never_touches_the_original() {
     req.force_copy = true;
 
     let err = finalize(&req).await.unwrap_err();
-    assert!(
-        err.to_string()
-            .starts_with("Could not put the new file in place, so the original was kept"),
-        "{err:#}"
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "The new file couldn't be put in {} because a folder is in the way where a file \
+             should be, so the original was kept.",
+            dir.path().join("media").display()
+        )
     );
+    assert_eq!(problem_of(&err), ProblemKind::Destination);
     assert_eq!(std::fs::read(&input).unwrap(), OLD);
     assert_eq!(mtime(&input), old_time());
     assert!(temp.exists(), "the temp file is the caller's to delete");

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use chrysopoeia_core::{
     CheckStatus, Container, EncoderCandidate, Goal, HwApi, JobProgress, JobStage, OutputMode,
-    ProbeInfo, TranscodeProfile, ValidationLevel, VideoCodec,
+    ProbeInfo, ProblemKind, TranscodeProfile, ValidationLevel, VideoCodec,
 };
 use chrysopoeia_worker::run::{JobOutcome, JobSpec, RunConfig, run_job_with};
 use chrysopoeia_worker::{Decision, FfmpegPlan, PlanRequest};
@@ -397,7 +397,7 @@ async fn failing_first_candidate_falls_back_to_the_next() {
     assert!(
         notes
             .iter()
-            .any(|n| n.contains("h264_broken_hw (NVIDIA NVENC) didn't work")),
+            .any(|n| n == "Converting on the NVIDIA GPU didn't work for this file, so it was converted on the CPU"),
         "{notes:?}"
     );
     let attempts: Vec<_> = updates
@@ -429,6 +429,7 @@ async fn all_candidates_failing_reports_the_last_error() {
     let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
     let JobOutcome::Failed {
         error,
+        problem,
         log_tail,
         command,
         encoder,
@@ -438,15 +439,22 @@ async fn all_candidates_failing_reports_the_last_error() {
     else {
         panic!("expected Failed, got {outcome:?}");
     };
+    // Plain words first, no encoder name.
     assert!(
-        error.starts_with("h264_broken_hw stopped with exit code"),
+        error.starts_with(
+            "Converting on the GPU (VA-API) stopped with an error, so the original was left \
+             unchanged."
+        ),
         "{error}"
     );
+    assert!(!error.contains(BROKEN_HW), "{error}");
+    assert!(!error.contains("exit code"), "{error}");
     // The cause, not ffmpeg's closing remarks or encoder statistics.
     assert!(
-        error.ends_with("Unknown encoder 'chrysopoeia_no_such_encoder'"),
+        error.ends_with("ffmpeg said: \"Unknown encoder 'chrysopoeia_no_such_encoder'\"."),
         "{error}"
     );
+    assert_eq!(problem, ProblemKind::Encoder);
     assert!(log_tail.is_some_and(|t| t.contains("chrysopoeia_no_such_encoder")));
     assert!(command.is_some_and(|c| c.contains("chrysopoeia_no_such_encoder")));
     assert_eq!(encoder.as_deref(), Some(BROKEN_HW));
@@ -498,11 +506,15 @@ async fn verification_failure_on_the_last_attempt_fails_the_job() {
 
     let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
     let JobOutcome::Failed {
-        error, validation, ..
+        error,
+        validation,
+        problem,
+        ..
     } = outcome
     else {
         panic!("expected Failed, got {outcome:?}");
     };
+    assert_eq!(problem, ProblemKind::Verification);
     // Phrased as the failure it is, not with the check's pass-form label.
     assert!(
         error.starts_with("The new file doesn't look like the original. "),
@@ -615,10 +627,14 @@ async fn preparing_checks_fail_fast() {
     std::fs::write(&blocker, b"unrelated").unwrap();
     let (outcome, _) = run(&cfg, &spec_ok, &fake_plan).await;
     match outcome {
-        JobOutcome::Failed { error, .. } => assert_eq!(
-            error,
-            "A file named \"Big Test (2020).mkv\" already exists next to the original"
-        ),
+        JobOutcome::Failed { error, problem, .. } => {
+            assert_eq!(
+                error,
+                "A file named \"Big Test (2020).mkv\" is already next to the original, so the \
+                 new file can't take its name. Move or rename that file, then try again."
+            );
+            assert_eq!(problem, ProblemKind::Destination);
+        }
         other => panic!("expected Failed, got {other:?}"),
     }
     assert_eq!(std::fs::read(&blocker).unwrap(), b"unrelated");
@@ -629,7 +645,11 @@ async fn preparing_checks_fail_fast() {
     no_encoders.candidates.clear();
     let (outcome, _) = run(&cfg, &no_encoders, &fake_plan).await;
     assert!(
-        matches!(&outcome, JobOutcome::Failed { error, .. } if error.starts_with("No working encoder was found for H.264")),
+        matches!(
+            &outcome,
+            JobOutcome::Failed { error, problem: ProblemKind::HardwareUnavailable, .. }
+                if error.starts_with("Nothing on this server can make H.264 video right now")
+        ),
         "{outcome:?}"
     );
 
@@ -637,7 +657,16 @@ async fn preparing_checks_fail_fast() {
     let mut folder_cfg = cfg.clone();
     folder_cfg.output_mode = OutputMode::Folder;
     let (outcome, _) = run(&folder_cfg, &spec_ok, &fake_plan).await;
-    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            JobOutcome::Failed {
+                problem: ProblemKind::Destination,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
 
     // The file disappeared after it was queued.
     std::fs::remove_file(&input).unwrap();
@@ -645,7 +674,8 @@ async fn preparing_checks_fail_fast() {
     assert_eq!(
         outcome,
         JobOutcome::Failed {
-            error: "The file no longer exists".into(),
+            error: "The file is no longer there. It may have been moved or deleted.".into(),
+            problem: ProblemKind::SourceChanged,
             log_tail: None,
             command: None,
             encoder: None,
@@ -818,7 +848,8 @@ async fn a_damaged_original_is_reported_as_damaged() {
         assert!(claimed >= 3.0, "the sample claims {claimed} s");
         let (outcome, _) = run(&config(validation), &spec, &fake_plan).await;
         match outcome {
-            JobOutcome::Failed { error, .. } => {
+            JobOutcome::Failed { error, problem, .. } => {
+                assert_eq!(problem, ProblemKind::UnreadableSource);
                 assert!(
                     error.starts_with(
                         "The original file appears damaged or incomplete (it stops after"
@@ -896,4 +927,77 @@ async fn a_damaged_original_is_confirmed_with_cpu_decoding() {
         other => panic!("expected Failed, got {other:?}"),
     }
     assert_eq!(std::fs::read(&input).unwrap(), before);
+}
+
+/// A work folder that can't be used fails the job before anything is
+/// encoded, with a plain reason and the `work_folder` kind: here a file is
+/// in the way of the folder's name.
+#[tokio::test]
+async fn a_blocked_work_folder_is_a_work_folder_problem() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &library);
+    let before = std::fs::read(&input).unwrap();
+    let blocker = dir.path().join("work");
+    std::fs::write(&blocker, b"not a folder").unwrap();
+    let mut cfg = config(ValidationLevel::Quick);
+    cfg.temp_dir = Some(blocker.clone());
+    let (outcome, _) = run(&cfg, &spec(&input, &library, profile()), &fake_plan).await;
+    match outcome {
+        JobOutcome::Failed {
+            error,
+            problem,
+            attempt,
+            ..
+        } => {
+            assert_eq!(problem, ProblemKind::WorkFolder);
+            assert_eq!(
+                error,
+                format!(
+                    "The work folder {} can't be used because a file with that name is in the \
+                     way. Fix it, or choose another work folder, in Settings > Output.",
+                    blocker.display()
+                )
+            );
+            assert_eq!(attempt, 0, "nothing was encoded");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), before);
+    assert_eq!(std::fs::read(&blocker).unwrap(), b"not a folder");
+}
+
+/// An encode that can't be planned for a reason with the file itself (none
+/// of its audio can be read) is an `unreadable_source` problem, in the
+/// planner's own words.
+#[tokio::test]
+async fn unreadable_audio_is_a_problem_with_the_original() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, dir.path());
+    let silent = |_: &PlanRequest<'_>| -> anyhow::Result<FfmpegPlan> {
+        Err(chrysopoeia_worker::plan::SourceProblem(
+            "None of this file's audio tracks can be read.".into(),
+        )
+        .into())
+    };
+    let (outcome, _) = run(
+        &config(ValidationLevel::Quick),
+        &spec(&input, dir.path(), profile()),
+        &silent,
+    )
+    .await;
+    assert!(
+        matches!(
+            &outcome,
+            JobOutcome::Failed {
+                problem: ProblemKind::UnreadableSource,
+                error,
+                ..
+            } if error == "None of this file's audio tracks can be read."
+        ),
+        "{outcome:?}"
+    );
 }

@@ -395,8 +395,9 @@ impl Drop for LibraryWatcher {
 fn absolute_root(root: &Path) -> anyhow::Result<PathBuf> {
     std::path::absolute(root).map_err(|error| {
         anyhow!(
-            "The folder \"{}\" cannot be watched for changes ({error}).",
-            root.display()
+            "The folder \"{}\" can't be watched for changes because {}.",
+            root.display(),
+            chrysopoeia_core::plain::io_reason(&error)
         )
     })
 }
@@ -945,7 +946,8 @@ fn check_watch_root(root: &Path) -> anyhow::Result<std::fs::Metadata> {
             "The folder {shown} does not exist, so it cannot be watched for changes."
         )),
         Err(error) => Err(anyhow!(
-            "The folder {shown} cannot be watched for changes ({error})."
+            "The folder {shown} can't be watched for changes because {}.",
+            chrysopoeia_core::plain::io_reason(&error)
         )),
     }
 }
@@ -1030,9 +1032,15 @@ fn describe_notify_error(error: &notify::Error, root: Option<&Path>) -> String {
         notify::ErrorKind::PathNotFound => {
             format!("The folder {folder} does not exist, so it cannot be watched for changes.")
         }
+        notify::ErrorKind::Io(io_error) => format!(
+            "Cannot watch {folder} for changes because {}. Periodic rescans still find new and \
+             changed files.",
+            chrysopoeia_core::plain::io_reason(io_error)
+        ),
         _ => format!(
-            "Cannot watch {folder} for changes ({error}). Periodic rescans still find new and \
-             changed files."
+            "Cannot watch {folder} for changes ({}). Periodic rescans still find new and \
+             changed files.",
+            chrysopoeia_core::plain::strip_os_error(&error.to_string())
         ),
     }
 }

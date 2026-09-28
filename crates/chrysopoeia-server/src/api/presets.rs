@@ -52,25 +52,21 @@ pub struct Presets {
     pub containers: Vec<ContainerPreset>,
 }
 
-/// Title and one-line trade-off for a goal.
+/// Title and a plain one-line outcome for a goal: what the files become,
+/// without codec names or speed claims (the UI has its own copy for those
+/// details; this stays for compatibility).
 pub fn goal_text(goal: Goal) -> (&'static str, &'static str) {
     match goal {
-        Goal::SaveSpace => (
-            "Save space",
-            "Smallest files. AV1 video with Opus audio; slower to convert without a recent GPU.",
-        ),
+        Goal::SaveSpace => ("Save space", "The smallest files, for everyday watching."),
         Goal::Balanced => (
             "Balanced",
-            "Much smaller files that play on most TVs. HEVC video, original audio kept.",
+            "Much smaller files that still play on most TVs and players.",
         ),
         Goal::Compatible => (
             "Plays everywhere",
-            "Plays on every device and browser. H.264 with AAC audio in MP4; files may not shrink much.",
+            "Files that play on every device and in every browser.",
         ),
-        Goal::Archive => (
-            "Archive",
-            "Near-original quality in less space. High-quality AV1, original audio kept.",
-        ),
+        Goal::Archive => ("Archive", "Near-original picture quality, in less space."),
         Goal::Custom => ("Custom", "Your own combination of settings."),
     }
 }
@@ -172,4 +168,34 @@ pub async fn get(State(state): State<AppState>) -> Json<Presets> {
         audio_codecs,
         containers,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn goal_summaries_are_plain_outcomes() {
+        for goal in [
+            Goal::SaveSpace,
+            Goal::Balanced,
+            Goal::Compatible,
+            Goal::Archive,
+            Goal::Custom,
+        ] {
+            let (title, summary) = goal_text(goal);
+            assert!(!title.is_empty());
+            assert!(summary.ends_with('.'), "{summary}");
+            assert_eq!(summary.matches(". ").count(), 0, "one line: {summary}");
+            for jargon in [
+                "AV1", "HEVC", "H.264", "H.265", "AAC", "Opus", "MP4", "MKV", "GPU", "CPU", "slow",
+                "fast", "quick",
+            ] {
+                assert!(
+                    !summary.to_lowercase().contains(&jargon.to_lowercase()),
+                    "{goal:?}: {summary}"
+                );
+            }
+        }
+    }
 }

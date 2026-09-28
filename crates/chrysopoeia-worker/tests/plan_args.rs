@@ -164,7 +164,11 @@ fn relative_paths_are_protected_and_bad_inputs_fail() {
         encoder: &hevc,
     })
     .unwrap_err();
-    assert!(err.to_string().contains("libx265"), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("The encoder Chrysopoeia picked makes HEVC (H.265) video"),
+        "{err}"
+    );
 
     // WebM cannot hold HEVC.
     let webm_hevc = profile(VideoCodec::Hevc, AudioCodec::Opus, Container::Webm);
@@ -1680,7 +1684,7 @@ fn quality_override_of_another_scale_is_ignored_with_a_note() {
     assert!(has_pair(&plan.args, "-q:v", "60"));
     assert!(
         plan.notes.iter().any(|n| n.contains("(24)")
-            && n.contains("hevc_videotoolbox")
+            && n.contains("with Apple VideoToolbox")
             && n.contains("Balanced")),
         "{:?}",
         plan.notes

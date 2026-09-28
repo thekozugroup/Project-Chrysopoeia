@@ -61,6 +61,13 @@ pub struct BrowseResponse {
     pub parent: Option<String>,
     pub roots: Vec<String>,
     pub entries: Vec<BrowseEntry>,
+    /// Video files in the browsed folder itself and below it, counted like
+    /// an entry's, so the picker can say what choosing this folder brings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_count: Option<u64>,
+    /// Present with `media_count`: counting stopped at a limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_count_capped: Option<bool>,
 }
 
 fn outside_roots() -> ApiError {
@@ -303,15 +310,28 @@ pub async fn browse(
     let toolkit = state.toolkit.clone();
     let dir = canonical.clone();
     let list_roots = roots.clone();
-    let entries = tokio::task::spawn_blocking(move || list_dirs(&dir, &list_roots, &toolkit))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(|_| {
-            ApiError::bad_request(
-                "not_readable",
-                "Chrysopoeia can't read that folder. Check its permissions.",
-            )
-        })?;
+    let (own, entries) = tokio::task::spawn_blocking(move || {
+        // The folder itself first, by the same rules as each entry; a
+        // folder that can't be counted is simply shown without a count.
+        let own = count_videos(
+            &dir,
+            &toolkit,
+            true,
+            MAX_COUNTED_ENTRIES,
+            COUNT_TIME_PER_FOLDER,
+        )
+        .ok()
+        .flatten();
+        (own, list_dirs(&dir, &list_roots, &toolkit))
+    })
+    .await
+    .map_err(ApiError::internal)?;
+    let entries = entries.map_err(|_| {
+        ApiError::bad_request(
+            "not_readable",
+            "Chrysopoeia can't read that folder. Check its permissions.",
+        )
+    })?;
     Ok(Json(BrowseResponse {
         path: canonical.to_string_lossy().into_owned(),
         parent,
@@ -320,6 +340,8 @@ pub async fn browse(
             .map(|r| r.to_string_lossy().into_owned())
             .collect(),
         entries,
+        media_count: own.map(|c| c.videos),
+        media_count_capped: own.map(|c| c.capped),
     }))
 }
 

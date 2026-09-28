@@ -33,6 +33,9 @@ async fn lists_folders_sorted_without_hidden_ones() {
     assert_eq!(r.json["path"], root.to_str().unwrap());
     assert!(r.json["parent"].is_null(), "no parent above a root");
     assert_eq!(r.json["roots"][0], root.to_str().unwrap());
+    // The browsed folder itself: its own video and those below it.
+    assert_eq!(r.json["media_count"], 4, "{}", r.text);
+    assert_eq!(r.json["media_count_capped"], false);
     let names: Vec<&str> = r.json["entries"]
         .as_array()
         .unwrap()
@@ -56,6 +59,8 @@ async fn lists_folders_sorted_without_hidden_ones() {
         .await;
     assert_eq!(r.status, StatusCode::OK);
     assert_eq!(r.json["parent"], root.to_str().unwrap());
+    assert_eq!(r.json["media_count"], 3);
+    assert_eq!(r.json["media_count_capped"], false);
     let entries = r.json["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["name"], "Season 1");

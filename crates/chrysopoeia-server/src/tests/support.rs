@@ -18,8 +18,8 @@ use chrysopoeia_core::paths::{ARTIFACT_MARKER, is_backup, original_name_from_bac
 use chrysopoeia_core::{
     CheckStatus, CpuInfo, EncoderCandidate, EncoderStatus, FfmpegInfo, HardwareInfo, HwApi,
     HwPreference, JobProgress, JobRecommendation, JobStage, MemoryInfo, OutputMode, ProbeInfo,
-    StreamInfo, StreamKind, TranscodeProfile, ValidationCheck, ValidationLevel, ValidationReport,
-    VideoCodec,
+    ProblemKind, StreamInfo, StreamKind, TranscodeProfile, ValidationCheck, ValidationLevel,
+    ValidationReport, VideoCodec,
 };
 use chrysopoeia_hwdetect::DetectOptions;
 use chrysopoeia_scanner::{DiscoveredFile, ProbeError, ScanOptions, WalkResult, WatchEvent};
@@ -45,8 +45,10 @@ pub enum Behavior {
     Done { ratio: f64 },
     /// Nothing written; skipped with this reason.
     Skip(String),
-    /// Fail with this error.
+    /// Fail with this error (an encoder problem).
     Fail(String),
+    /// Fail with this kind of problem and error.
+    FailWith(ProblemKind, String),
     /// Wait until cancelled, or until released (then behave like `Done`).
     Hold,
     /// Wait until cancelled, or until released (then fail with this error).
@@ -400,6 +402,7 @@ async fn fake_done(cfg: &RunConfig, spec: &JobSpec, ratio: f64) -> JobOutcome {
     if let Err(e) = tokio::fs::write(&out, &bytes).await {
         return JobOutcome::Failed {
             error: format!("write failed: {e}"),
+            problem: ProblemKind::Other,
             log_tail: None,
             command: None,
             encoder: None,
@@ -635,7 +638,17 @@ impl MediaToolkit for Arc<FakeToolkit> {
                 },
                 Behavior::Fail(error) => JobOutcome::Failed {
                     error,
+                    problem: ProblemKind::Encoder,
                     log_tail: Some("Error while decoding stream #0:0".into()),
+                    command: Some("ffmpeg -i in out".into()),
+                    encoder: Some("libx265".into()),
+                    attempt: 2,
+                    validation: None,
+                },
+                Behavior::FailWith(problem, error) => JobOutcome::Failed {
+                    error,
+                    problem,
+                    log_tail: None,
                     command: Some("ffmpeg -i in out".into()),
                     encoder: Some("libx265".into()),
                     attempt: 2,
@@ -648,6 +661,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                             if let Ok(p) = permit { p.forget(); }
                             JobOutcome::Failed {
                                 error,
+                                problem: ProblemKind::Encoder,
                                 log_tail: None,
                                 command: None,
                                 encoder: None,

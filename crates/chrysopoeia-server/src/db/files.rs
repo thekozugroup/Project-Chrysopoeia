@@ -1,7 +1,7 @@
 //! The `files` table: every media file in every library.
 
 use chrono::{DateTime, Utc};
-use chrysopoeia_core::{FileStatus, MediaFile, ProbeInfo};
+use chrysopoeia_core::{FileStatus, MediaFile, ProbeInfo, ProblemKind};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -16,7 +16,7 @@ use super::{
 const COLUMNS: &str = "f.id, f.library_id, f.path, f.relative_path, f.file_name, f.size_bytes, \
     f.modified_at, f.status, f.container, f.video_codec, f.audio_codec, f.resolution, f.hdr, \
     f.duration_secs, f.bit_rate, f.original_size_bytes, f.saved_bytes, f.skip_reason, f.error, \
-    f.job_id, f.scanned_at, f.updated_at, \
+    f.problem, f.job_id, f.scanned_at, f.updated_at, \
     CASE WHEN f.status = 'processing' THEN j.progress END AS progress";
 
 const FROM: &str = "FROM files f LEFT JOIN jobs j ON j.id = f.job_id";
@@ -32,9 +32,11 @@ fn from_row(row: &SqliteRow, with_probe: bool) -> sqlx::Result<MediaFile> {
         None
     };
     let progress: Option<f64> = row.try_get("progress")?;
+    let error: Option<String> = row.try_get("error")?;
+    let problem: Option<String> = row.try_get("problem")?;
     Ok(MediaFile {
-        // Filled from the `problem` column once the backend records causes.
-        problem: None,
+        problem: super::problem_of(error.as_deref(), problem.as_deref()),
+        error,
         id: uuid_col(row, "id")?,
         library_id: uuid_col(row, "library_id")?,
         path: row.try_get("path")?,
@@ -54,7 +56,6 @@ fn from_row(row: &SqliteRow, with_probe: bool) -> sqlx::Result<MediaFile> {
         original_size_bytes: opt_u64_col(row, "original_size_bytes")?,
         saved_bytes: row.try_get("saved_bytes")?,
         skip_reason: row.try_get("skip_reason")?,
-        error: row.try_get("error")?,
         job_id: opt_uuid_col(row, "job_id")?,
         #[allow(clippy::cast_possible_truncation)]
         progress: progress.map(|p| p as f32),
@@ -270,6 +271,14 @@ pub struct FileUpsert {
     pub probe: Option<ProbeInfo>,
     pub skip_reason: Option<String>,
     pub error: Option<String>,
+    /// What kind of problem `error` is (set whenever `error` is).
+    pub problem: Option<ProblemKind>,
+}
+
+/// The stored form of a file's problem: its kind whenever there is an
+/// error (`other` when none was given), else nothing.
+fn problem_col(error: Option<&str>, problem: Option<ProblemKind>) -> Option<String> {
+    error.map(|_| enum_str(&problem.unwrap_or(ProblemKind::Other)))
 }
 
 /// Columns derived from a probe.
@@ -320,8 +329,8 @@ pub async fn insert(conn: &mut SqliteConnection, f: &FileUpsert) -> sqlx::Result
     let done = sqlx::query(
         "INSERT INTO files (id, library_id, path, relative_path, file_name, size_bytes, \
          modified_at, status, probe, container, video_codec, audio_codec, resolution, hdr, \
-         duration_secs, bit_rate, skip_reason, error, scanned_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         duration_secs, bit_rate, skip_reason, error, problem, scanned_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(path) DO NOTHING",
     )
     .bind(id.to_string())
@@ -342,6 +351,7 @@ pub async fn insert(conn: &mut SqliteConnection, f: &FileUpsert) -> sqlx::Result
     .bind(pc.bit_rate)
     .bind(&f.skip_reason)
     .bind(&f.error)
+    .bind(problem_col(f.error.as_deref(), f.problem))
     .bind(&now)
     .bind(&now)
     .execute(conn)
@@ -364,7 +374,7 @@ pub async fn update_scanned(
         "UPDATE files SET relative_path = ?, file_name = ?, size_bytes = ?, modified_at = ?, \
          status = ?, probe = ?, container = ?, video_codec = ?, audio_codec = ?, \
          resolution = ?, hdr = ?, duration_secs = ?, bit_rate = ?, skip_reason = ?, error = ?, \
-         original_size_bytes = NULL, saved_bytes = NULL, scanned_at = ?, updated_at = ? \
+         problem = ?, original_size_bytes = NULL, saved_bytes = NULL, scanned_at = ?, updated_at = ? \
          WHERE id = ? AND status NOT IN ('queued', 'processing') AND updated_at = ? \
          AND size_bytes = ? AND modified_at = ?",
     )
@@ -383,6 +393,7 @@ pub async fn update_scanned(
     .bind(pc.bit_rate)
     .bind(&f.skip_reason)
     .bind(&f.error)
+    .bind(problem_col(f.error.as_deref(), f.problem))
     .bind(&now)
     .bind(&now)
     .bind(seen.id.to_string())
@@ -500,7 +511,7 @@ pub async fn set_status_where(
     qb.push_bind(status.as_str())
         .push(", skip_reason = ")
         .push_bind(skip_reason)
-        .push(", error = NULL, updated_at = ")
+        .push(", error = NULL, problem = NULL, updated_at = ")
         .push_bind(now_ts())
         .push(" WHERE id = ")
         .push_bind(id.to_string())
@@ -530,8 +541,9 @@ pub(crate) const LAST_CONVERSION_JOB: &str = "COALESCE((SELECT j.id FROM jobs j 
 /// done.
 pub async fn keep_converted(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<bool> {
     let done = sqlx::query(&format!(
-        "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ?, \
-         job_id = {LAST_CONVERSION_JOB} WHERE id = ? AND original_size_bytes IS NOT NULL"
+        "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, problem = NULL, \
+         updated_at = ?, job_id = {LAST_CONVERSION_JOB} \
+         WHERE id = ? AND original_size_bytes IS NOT NULL"
     ))
     .bind(now_ts())
     .bind(id.to_string())
@@ -540,20 +552,23 @@ pub async fn keep_converted(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Resu
     Ok(done.rows_affected() > 0)
 }
 
-/// Set a file's status, reason and error (and optionally its job).
+/// Set a file's status, reason and error with the kind of problem it is
+/// (no error clears both).
 pub async fn set_status(
     conn: &mut SqliteConnection,
     id: Uuid,
     status: FileStatus,
     skip_reason: Option<&str>,
-    error: Option<&str>,
+    error: Option<(&str, ProblemKind)>,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE files SET status = ?, skip_reason = ?, error = ?, updated_at = ? WHERE id = ?",
+        "UPDATE files SET status = ?, skip_reason = ?, error = ?, problem = ?, updated_at = ? \
+         WHERE id = ?",
     )
     .bind(status.as_str())
     .bind(skip_reason)
-    .bind(error)
+    .bind(error.map(|(e, _)| e))
+    .bind(error.map(|(_, p)| enum_str(&p)))
     .bind(now_ts())
     .bind(id.to_string())
     .execute(conn)
@@ -624,7 +639,7 @@ pub async fn skip_many(
 
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 'skipped', skip_reason = ");
     qb.push_bind(reason)
-        .push(", error = NULL, updated_at = ")
+        .push(", error = NULL, problem = NULL, updated_at = ")
         .push_bind(&now)
         .push(" WHERE id IN (");
     let mut sep = qb.separated(", ");
@@ -649,17 +664,22 @@ pub struct RemovedRow {
     pub probe: Option<ProbeInfo>,
     pub skip_reason: Option<String>,
     pub error: Option<String>,
+    pub problem: Option<ProblemKind>,
     pub original_size_bytes: Option<u64>,
     pub saved_bytes: Option<i64>,
 }
 
 const REMOVED_COLUMNS: &str = "library_id, size_bytes, modified_at, status, probe, \
-    skip_reason, error, original_size_bytes, saved_bytes";
+    skip_reason, error, problem, original_size_bytes, saved_bytes";
 
 fn removed_from_row(row: &SqliteRow) -> sqlx::Result<RemovedRow> {
     let status: String = row.try_get("status")?;
     let probe: Option<String> = row.try_get("probe")?;
+    let error: Option<String> = row.try_get("error")?;
+    let problem: Option<String> = row.try_get("problem")?;
     Ok(RemovedRow {
+        problem: super::problem_of(error.as_deref(), problem.as_deref()),
+        error,
         library_id: uuid_col(row, "library_id")?,
         size_bytes: u64_col(row, "size_bytes")?,
         modified_at: row.try_get("modified_at")?,
@@ -668,7 +688,6 @@ fn removed_from_row(row: &SqliteRow) -> sqlx::Result<RemovedRow> {
         // A probe that doesn't parse is just not carried over.
         probe: probe.as_deref().and_then(|p| parse_json(p).ok()),
         skip_reason: row.try_get("skip_reason")?,
-        error: row.try_get("error")?,
         original_size_bytes: opt_u64_col(row, "original_size_bytes")?,
         saved_bytes: row.try_get("saved_bytes")?,
     })
@@ -729,6 +748,7 @@ pub async fn insert_moved(
         probe: from.probe.clone(),
         skip_reason: from.skip_reason.clone(),
         error: from.error.clone(),
+        problem: from.problem,
         ..f.clone()
     };
     let Some(id) = insert(&mut *conn, &row).await? else {

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use chrono::{DateTime, SecondsFormat, Utc};
+use chrysopoeia_core::ProblemKind;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sqlx::sqlite::{
@@ -127,6 +128,18 @@ pub fn enum_str<T: Serialize>(value: &T) -> String {
 pub fn parse_enum<T: DeserializeOwned>(value: &str) -> sqlx::Result<T> {
     serde_json::from_value(serde_json::Value::String(value.to_string()))
         .map_err(|e| decode_error(format!("bad enum value {value:?}: {e}")))
+}
+
+/// The kind of problem behind a stored `error`: the stored `problem` when
+/// there is an error (`other` when a row has none or one this version
+/// doesn't know), and none without an error, so the two always go together.
+pub fn problem_of(error: Option<&str>, problem: Option<&str>) -> Option<ProblemKind> {
+    error?;
+    Some(
+        problem
+            .and_then(|p| parse_enum::<ProblemKind>(p).ok())
+            .unwrap_or(ProblemKind::Other),
+    )
 }
 
 /// Parse a JSON column.

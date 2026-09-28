@@ -27,9 +27,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use chrysopoeia_core::plain::io_reason;
 use chrysopoeia_core::{
-    EncoderCandidate, HwApi, JobProgress, JobStage, OutputMode, ProbeInfo, TranscodeProfile,
-    ValidationLevel, ValidationReport,
+    EncoderCandidate, HwApi, JobProgress, JobStage, OutputMode, ProbeInfo, ProblemKind,
+    TranscodeProfile, ValidationLevel, ValidationReport,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -37,13 +38,13 @@ use uuid::Uuid;
 
 use crate::ffmpeg::{
     DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, compute_progress, display_command,
-    is_input_damage, run_ffmpeg,
+    is_input_damage, lower_first, run_ffmpeg,
 };
 use crate::finalize::{
-    FileIdentity, FinalizeRequest, OriginalChanged, destination_conflict, final_output_path,
-    finalize, temp_output_path,
+    FileIdentity, FinalizeRequest, OriginalChanged, PlaceError, destination_conflict,
+    final_output_path, finalize, temp_output_path,
 };
-use crate::plan::{Decision, FfmpegPlan, PlanRequest};
+use crate::plan::{Decision, FfmpegPlan, PlanRequest, where_encoded};
 use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
 
 /// Settings that apply to every job.
@@ -127,8 +128,10 @@ pub enum JobOutcome {
     },
     /// The original is untouched.
     Failed {
-        /// Plain-language reason.
+        /// Plain-language reason: what happened and what to do.
         error: String,
+        /// What kind of problem it is, so the UI can offer the right fix.
+        problem: ProblemKind,
         /// Last ffmpeg output lines, when ffmpeg failed.
         log_tail: Option<String>,
         /// The ffmpeg command line of the last attempt, if one ran.
@@ -255,6 +258,7 @@ fn original_changed() -> String {
 #[derive(Debug, Clone)]
 struct Failure {
     error: String,
+    problem: ProblemKind,
     log_tail: Option<String>,
     command: Option<String>,
     encoder: Option<String>,
@@ -266,6 +270,7 @@ impl Failure {
     fn into_outcome(self) -> JobOutcome {
         JobOutcome::Failed {
             error: self.error,
+            problem: self.problem,
             log_tail: self.log_tail.filter(|t| !t.trim().is_empty()),
             command: self.command,
             encoder: self.encoder,
@@ -275,9 +280,10 @@ impl Failure {
     }
 }
 
-fn failed(error: impl Into<String>) -> JobOutcome {
+fn failed(problem: ProblemKind, error: impl Into<String>) -> JobOutcome {
     JobOutcome::Failed {
         error: error.into(),
+        problem,
         log_tail: None,
         command: None,
         encoder: None,
@@ -303,6 +309,15 @@ impl Job<'_> {
             None
         } else {
             self.spec.profile.min_savings_pct
+        }
+    }
+
+    /// Where the encode is written while it is being made.
+    fn temp_place(&self) -> Place {
+        if self.cfg.temp_dir.is_some() {
+            Place::WorkFolder
+        } else {
+            Place::Destination
         }
     }
 
@@ -333,11 +348,16 @@ impl Job<'_> {
         let (cfg, spec) = (self.cfg, self.spec);
         let input_meta = match tokio::fs::metadata(&spec.input).await {
             Ok(m) if m.is_file() => m,
-            Ok(_) => return Err(failed("The file no longer exists")),
+            Ok(_) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(failed("The file no longer exists"));
+                return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE));
             }
-            Err(e) => return Err(failed(format!("Could not read the file: {e}"))),
+            Err(e) => {
+                return Err(failed(
+                    ProblemKind::UnreadableSource,
+                    unreadable_original(&e),
+                ));
+            }
         };
 
         let decision = match (self.decider)(&spec.probe, &spec.profile) {
@@ -356,14 +376,21 @@ impl Job<'_> {
             });
         }
         if spec.candidates.is_empty() {
-            return Err(failed(format!(
-                "No working encoder was found for {}. Check the hardware settings",
-                spec.profile.video_codec.label()
-            )));
+            return Err(failed(
+                ProblemKind::HardwareUnavailable,
+                format!(
+                    "Nothing on this server can make {} video right now, so this file wasn't \
+                     converted. Choose Automatic under Hardware in Settings, or allow converting \
+                     on the CPU.",
+                    spec.profile.video_codec.label()
+                ),
+            ));
         }
         if cfg.output_mode == OutputMode::Folder && cfg.output_folder.is_none() {
             return Err(failed(
-                "Output to a separate folder is on, but no output folder is set",
+                ProblemKind::Destination,
+                "Saving converted files to a separate folder is turned on, but no folder is \
+                 chosen. Choose one in Settings > Output.",
             ));
         }
 
@@ -378,15 +405,15 @@ impl Job<'_> {
         if let Some(conflict) =
             destination_conflict(&spec.input, &final_path, cfg.output_mode).await
         {
-            return Err(failed(conflict));
+            return Err(failed(ProblemKind::Destination, conflict));
         }
         // The new file goes into this folder (and, when replacing, the
         // original is renamed there); find out now rather than after hours
         // of encoding.
         if let Some(dir) = final_path.parent()
-            && let Some(problem) = folder_not_writable(dir).await
+            && let Some(problem) = folder_not_writable(dir, Place::Destination).await
         {
-            return Err(failed(problem));
+            return Err(failed(ProblemKind::Destination, problem));
         }
 
         // Without a temp folder the encode is written next to where it ends
@@ -402,15 +429,22 @@ impl Job<'_> {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
+        let place = self.temp_place();
         let created_dirs = match create_dirs(&temp_dir).await {
             Ok(created) => created,
             Err(e) => {
-                return Err(failed(format!(
-                    "Could not use the temp folder {}: {e}",
-                    temp_dir.display()
-                )));
+                let (problem, error) = folder_unusable(&temp_dir, place, &e);
+                return Err(failed(problem, error));
             }
         };
+        // A work folder of its own must take new files too (the folder the
+        // new file goes to was checked above).
+        if place == Place::WorkFolder
+            && let Some(problem) = folder_not_writable(&temp_dir, place).await
+        {
+            remove_empty_dirs(&created_dirs).await;
+            return Err(failed(ProblemKind::WorkFolder, problem));
+        }
         let size = input_meta.len();
         let space = match self.reserve_space(size, &temp, &final_path).await {
             Ok(space) => space,
@@ -458,14 +492,12 @@ impl Job<'_> {
                 dir: temp_dir,
                 bytes: needed,
                 file: Some(temp.to_path_buf()),
-                what: "this file",
                 strict: true,
             },
             SpaceNeed {
                 dir: final_dir,
                 bytes: largest_kept,
                 file: None,
-                what: "the new file",
                 strict: false,
             },
         ];
@@ -477,12 +509,11 @@ impl Job<'_> {
                 .unwrap_or(Ok(SpaceGuard::default()));
             match result {
                 Ok(guard) => return Ok(guard),
-                Err(Shortfall::Never { dir, bytes, what }) => {
-                    return Err(failed(format!(
-                        "Not enough free space in {} for {what} (needs about {})",
-                        dir.display(),
-                        human_bytes(bytes)
-                    )));
+                Err(Shortfall::Never { dir, bytes }) => {
+                    return Err(failed(
+                        ProblemKind::DiskFull,
+                        no_room_message(&dir, bytes, self.temp_place(), self.cfg.output_mode),
+                    ));
                 }
                 Err(Shortfall::Busy { dir }) => {
                     if !waiting {
@@ -526,8 +557,10 @@ impl Job<'_> {
                 Ok(plan) => plan,
                 Err(e) => {
                     tracing::warn!(encoder = %candidate.name, "could not plan the encode: {e:#}");
+                    let (problem, error) = plan_failure(&e);
                     last_failure = Some(Failure {
-                        error: format!("Could not prepare the {} command: {e:#}", candidate.name),
+                        error,
+                        problem,
                         log_tail: None,
                         command: None,
                         encoder: Some(candidate.name.clone()),
@@ -556,8 +589,9 @@ impl Job<'_> {
 
             let run = self.encode(&args).await;
             let exit = run.exit;
-            let failure = |error: String, log_tail: Option<String>| Failure {
+            let failure = |problem: ProblemKind, error: String, log_tail: Option<String>| Failure {
                 error,
+                problem,
                 log_tail,
                 command: Some(command.clone()),
                 encoder: Some(candidate.name.clone()),
@@ -568,9 +602,13 @@ impl Job<'_> {
                 FfmpegExit::Success { .. } => {}
                 FfmpegExit::Cancelled => return JobOutcome::Cancelled,
                 other => {
-                    let error = other
-                        .describe_failure(&candidate.name)
-                        .unwrap_or_else(|| format!("{} failed", candidate.name));
+                    let (problem, error) = encode_failure(
+                        other,
+                        candidate.api,
+                        &prepared.temp,
+                        self.temp_place(),
+                        cfg.output_mode,
+                    );
                     // The job's notes (or its error) tell the user; the log
                     // keeps the attempt-by-attempt detail at debug level.
                     let next = if is_last {
@@ -579,7 +617,7 @@ impl Job<'_> {
                         "; trying the next option"
                     };
                     tracing::debug!(job = %spec.job_id, attempt, "{error}{next}");
-                    last_failure = Some(failure(error, other.tail().map(str::to_string)));
+                    last_failure = Some(failure(problem, error, other.tail().map(str::to_string)));
                     guard.clear().await;
                     continue;
                 }
@@ -589,7 +627,12 @@ impl Job<'_> {
                 Ok(m) if m.len() > 0 => m.len(),
                 _ => {
                     last_failure = Some(failure(
-                        format!("{} finished but wrote no output", candidate.name),
+                        ProblemKind::Encoder,
+                        format!(
+                            "Converting {} finished without writing a new file, so the original \
+                             was left unchanged. Try again, or look at the job's log for details.",
+                            where_encoded(candidate.api)
+                        ),
                         exit.tail().map(str::to_string),
                     ));
                     guard.clear().await;
@@ -614,6 +657,7 @@ impl Job<'_> {
                 unverified,
             ) {
                 let f = failure(
+                    ProblemKind::UnreadableSource,
                     damaged_source_message(stop),
                     exit.tail().map(str::to_string),
                 );
@@ -651,7 +695,13 @@ impl Job<'_> {
                         output_size: Some(output_size),
                     };
                 }
-                Err(_) => return failed("The file no longer exists"),
+                Err(_) => {
+                    return failed(
+                        ProblemKind::SourceChanged,
+                        "The file is no longer there. It was moved or deleted while it was being \
+                         converted.",
+                    );
+                }
             }
 
             let validation = if cfg.validation == ValidationLevel::Off {
@@ -694,11 +744,15 @@ impl Job<'_> {
                     .then(|| source_stops_early(expected, run.encoded_secs, true, false))
                     .flatten()
                 {
-                    let mut f = failure(damaged_source_message(stop), None);
+                    let mut f = failure(
+                        ProblemKind::UnreadableSource,
+                        damaged_source_message(stop),
+                        None,
+                    );
                     f.validation = Some(report.clone());
                     return f.into_outcome();
                 }
-                let mut f = failure(verification_error(report), None);
+                let mut f = failure(ProblemKind::Verification, verification_error(report), None);
                 f.validation = Some(report.clone());
                 if candidate.api.is_hardware() && !is_last {
                     tracing::debug!(
@@ -737,7 +791,19 @@ impl Job<'_> {
                     };
                 }
                 Err(e) => {
-                    let mut f = failure(format!("{e:#}"), None);
+                    let (problem, error) = match e.downcast_ref::<PlaceError>() {
+                        Some(placing) => (placing.problem, placing.message.clone()),
+                        None => {
+                            tracing::warn!(job = %spec.job_id, "could not put the new file in place: {e:#}");
+                            (
+                                ProblemKind::Other,
+                                "The new file couldn't be put in place, so the original was kept. \
+                                 The details are in the server log."
+                                    .to_string(),
+                            )
+                        }
+                    };
+                    let mut f = failure(problem, error, None);
                     f.validation = validation;
                     return f.into_outcome();
                 }
@@ -766,11 +832,18 @@ impl Job<'_> {
         match last_failure {
             Some(mut f) => {
                 if attempt > 1 {
-                    f.error = format!("All {attempt} attempts failed. Last error: {}", f.error);
+                    f.error = format!(
+                        "None of the {attempt} ways Chrysopoeia tried could convert this file. {}",
+                        f.error
+                    );
                 }
                 f.into_outcome()
             }
-            None => failed("No encoder could be used for this file"),
+            None => failed(
+                ProblemKind::Encoder,
+                "Chrysopoeia found no way to convert this file here, so it was left unchanged. \
+                 The details are in the server log.",
+            ),
         }
     }
 
@@ -979,41 +1052,318 @@ fn verify_eta(percent: f32, elapsed: Duration) -> Option<u64> {
     (secs.is_finite() && secs >= 0.0).then(|| secs.round() as u64)
 }
 
+/// A folder a job writes in, for messages about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The work folder chosen in Settings (or `TEMP_DIR`), where the new
+    /// file is made.
+    WorkFolder,
+    /// The folder the new file ends up in: beside the original, or in the
+    /// output folder. Without a work folder the new file is made there too.
+    Destination,
+}
+
 /// Why new files can't be written in `dir` (or, when it doesn't exist yet,
 /// in the closest folder above it that does), if they can't.
-async fn folder_not_writable(dir: &Path) -> Option<String> {
+async fn folder_not_writable(dir: &Path, place: Place) -> Option<String> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
         let existing = dir.ancestors().find(|d| d.is_dir())?;
-        if writable(existing) {
-            return None;
-        }
-        Some(format!(
-            "Chrysopoeia doesn't have permission to write in {}, so the converted file can't be \
-             put there. Check the folder's permissions (in Docker, the PUID/PGID user needs write \
-             access).",
-            existing.display()
-        ))
+        let blocked = write_access(existing).err()?;
+        let shown = existing.display();
+        Some(match (place, blocked) {
+            (Place::WorkFolder, WriteBlock::ReadOnly) => format!(
+                "The work folder {shown} is on a read-only drive, so nothing can be converted \
+                 there. Choose another work folder in Settings > Output."
+            ),
+            (Place::WorkFolder, WriteBlock::Denied) => format!(
+                "Chrysopoeia doesn't have permission to write in the work folder {shown}. Check \
+                 its permissions (in Docker, the PUID/PGID user needs write access), or choose \
+                 another work folder in Settings > Output."
+            ),
+            (Place::Destination, WriteBlock::ReadOnly) => format!(
+                "The folder {shown} is on a read-only drive, so the converted file can't be put \
+                 there. Make the drive writable, or save converted files to a separate folder \
+                 in Settings > Output."
+            ),
+            (Place::Destination, WriteBlock::Denied) => format!(
+                "Chrysopoeia doesn't have permission to write in {shown}, so the converted file \
+                 can't be put there. Check the folder's permissions (in Docker, the PUID/PGID \
+                 user needs write access)."
+            ),
+        })
     })
     .await
     .ok()
     .flatten()
 }
 
+/// Why a folder doesn't take new files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteBlock {
+    /// It is on a read-only drive or mount.
+    ReadOnly,
+    /// The permissions don't allow it.
+    Denied,
+}
+
 /// Whether this process may create files in `dir` (as the kernel sees it,
-/// so root may write in read-only folders).
+/// so root may write in folders without write permission, but not on a
+/// read-only drive).
 #[cfg(unix)]
-fn writable(dir: &Path) -> bool {
-    rustix::fs::access(
+fn write_access(dir: &Path) -> Result<(), WriteBlock> {
+    match rustix::fs::access(
         dir,
         rustix::fs::Access::WRITE_OK | rustix::fs::Access::EXEC_OK,
-    )
-    .is_ok()
+    ) {
+        Ok(()) => Ok(()),
+        Err(rustix::io::Errno::ROFS) => Err(WriteBlock::ReadOnly),
+        Err(_) => Err(WriteBlock::Denied),
+    }
 }
 
 #[cfg(not(unix))]
-fn writable(dir: &Path) -> bool {
-    std::fs::metadata(dir).is_ok_and(|m| !m.permissions().readonly())
+fn write_access(dir: &Path) -> Result<(), WriteBlock> {
+    match std::fs::metadata(dir) {
+        Ok(m) if !m.permissions().readonly() => Ok(()),
+        _ => Err(WriteBlock::Denied),
+    }
+}
+
+/// The problem and message when the folder for the new file (`dir`, in
+/// `place`) couldn't be created, e.g. "The work folder /temp can't be used
+/// because a file with that name is in the way. Fix it in Settings >
+/// Output."
+fn folder_unusable(dir: &Path, place: Place, e: &std::io::Error) -> (ProblemKind, String) {
+    use std::io::ErrorKind as K;
+    let shown = dir.display();
+    let (what, fix, problem) = match place {
+        Place::WorkFolder => (
+            format!("The work folder {shown}"),
+            "Fix it, or choose another work folder, in Settings > Output.",
+            ProblemKind::WorkFolder,
+        ),
+        Place::Destination => (
+            format!("The folder {shown} for the converted file"),
+            "Check the output folder in Settings > Output.",
+            ProblemKind::Destination,
+        ),
+    };
+    match e.kind() {
+        K::AlreadyExists | K::NotADirectory => (
+            problem,
+            format!("{what} can't be used because a file with that name is in the way. {fix}"),
+        ),
+        K::PermissionDenied => (
+            problem,
+            format!(
+                "{what} can't be created because Chrysopoeia doesn't have permission to write \
+                 in the folder above it (in Docker, the PUID/PGID user needs write access). {fix}"
+            ),
+        ),
+        K::ReadOnlyFilesystem => (
+            problem,
+            format!("{what} can't be created because its drive is read-only. {fix}"),
+        ),
+        K::StorageFull | K::QuotaExceeded => (
+            ProblemKind::DiskFull,
+            format!(
+                "{what} can't be created because the disk is full. Free up some space there. \
+                 {fix}"
+            ),
+        ),
+        _ => (
+            problem,
+            format!("{what} can't be used because {}. {fix}", io_reason(e)),
+        ),
+    }
+}
+
+/// The message when a disk can never hold the new file: `dir` needs about
+/// `bytes` and has less free space, even with no other job running.
+fn no_room_message(dir: &Path, bytes: u64, place: Place, mode: OutputMode) -> String {
+    let shown = dir.display();
+    let size = human_bytes(bytes);
+    match (place, mode) {
+        (Place::WorkFolder, _) => format!(
+            "There isn't enough free space in the work folder {shown} to convert this file (it \
+             needs about {size}). Free up some space there, or choose a work folder on a bigger \
+             disk in Settings > Output."
+        ),
+        (Place::Destination, OutputMode::Folder) => format!(
+            "There isn't enough free space in the output folder {shown} for this file (it needs \
+             about {size}). Free up some space there, or choose another output folder in \
+             Settings > Output."
+        ),
+        (Place::Destination, OutputMode::Replace) => format!(
+            "There isn't enough free space next to the original in {shown} to convert this file \
+             (it needs about {size}). Free up some space on that disk, or choose a work folder \
+             on another disk in Settings > Output."
+        ),
+    }
+}
+
+/// What to say when a job's original file is gone before it started.
+const SOURCE_GONE: &str = "The file is no longer there. It may have been moved or deleted.";
+
+/// Why the original couldn't be read when the job started.
+fn unreadable_original(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        "Chrysopoeia doesn't have permission to read this file. Check its permissions (in \
+         Docker, the PUID/PGID user needs read access)."
+            .to_string()
+    } else {
+        format!(
+            "This file couldn't be read because {}. Check that its drive or share is connected, \
+             then try again.",
+            io_reason(e)
+        )
+    }
+}
+
+/// The problem and message for a conversion the planner couldn't prepare.
+/// Its reasons are sentences for users already.
+fn plan_failure(e: &anyhow::Error) -> (ProblemKind, String) {
+    let problem = if e.downcast_ref::<crate::plan::SourceProblem>().is_some() {
+        ProblemKind::UnreadableSource
+    } else {
+        ProblemKind::Other
+    };
+    (
+        problem,
+        chrysopoeia_core::plain::strip_os_error(&format!("{e:#}")),
+    )
+}
+
+/// Longest part of ffmpeg's own words quoted in an error.
+const MAX_QUOTED_CHARS: usize = 160;
+
+/// The problem and message for an encode that ffmpeg ended with an error.
+/// Well-known causes (a full disk, a read-only folder, a missing GPU
+/// driver) are said plainly; anything else quotes ffmpeg's most useful line
+/// after a plain sentence.
+fn encode_failure(
+    exit: &FfmpegExit,
+    api: HwApi,
+    temp: &Path,
+    place: Place,
+    mode: OutputMode,
+) -> (ProblemKind, String) {
+    let converting = where_encoded(api);
+    let folder = temp.parent().unwrap_or(Path::new("."));
+    let shown = folder.display();
+    let (code, tail) = match exit {
+        FfmpegExit::Failed { code, tail } => (*code, tail.as_str()),
+        FfmpegExit::Stalled { after, .. } => {
+            return (
+                ProblemKind::Encoder,
+                format!(
+                    "Converting {converting} stopped making progress for {} minutes, so it was \
+                     stopped. The original was left unchanged. Try again; if it happens again, \
+                     the job's log has the details.",
+                    after.as_secs().div_ceil(60)
+                ),
+            );
+        }
+        FfmpegExit::NotStarted { error } => {
+            return (
+                ProblemKind::Other,
+                format!("The converter couldn't be started, so nothing was converted. {error}"),
+            );
+        }
+        FfmpegExit::Success { .. } | FfmpegExit::Cancelled => {
+            return (
+                ProblemKind::Other,
+                "The conversion ended unexpectedly, so the original was left unchanged."
+                    .to_string(),
+            );
+        }
+    };
+    let reason = crate::ffmpeg::failure_reason(tail.lines());
+    let lower = reason.as_deref().unwrap_or("").to_ascii_lowercase();
+    let full = || {
+        let fix = match (place, mode) {
+            (Place::WorkFolder, _) => {
+                "Free up some space there, or choose a work folder on a bigger disk in \
+                 Settings > Output."
+            }
+            (Place::Destination, OutputMode::Folder) => {
+                "Free up some space there, or choose another output folder in Settings > Output."
+            }
+            (Place::Destination, OutputMode::Replace) => {
+                "Free up some space on that disk, or choose a work folder on another disk in \
+                 Settings > Output."
+            }
+        };
+        let what = match place {
+            Place::WorkFolder => format!("the work folder {shown}"),
+            Place::Destination => format!("{shown}"),
+        };
+        format!(
+            "The disk ran out of space while the new file was being written in {what}, so the \
+             original was left unchanged. {fix}"
+        )
+    };
+    if lower.contains("no space left on device") || lower.contains("disk quota exceeded") {
+        return (ProblemKind::DiskFull, full());
+    }
+    let writing_fails = lower.contains("read-only file system")
+        || (lower.contains("permission denied")
+            && (lower.contains("output")
+                || lower.contains(&temp.to_string_lossy().to_ascii_lowercase())));
+    if writing_fails {
+        let problem = match place {
+            Place::WorkFolder => ProblemKind::WorkFolder,
+            Place::Destination => ProblemKind::Destination,
+        };
+        let what = match place {
+            Place::WorkFolder => format!("the work folder {shown}"),
+            Place::Destination => format!("{shown}"),
+        };
+        return (
+            problem,
+            format!(
+                "The new file couldn't be written in {what}: the drive is read-only or \
+                 Chrysopoeia doesn't have permission there. The original was left unchanged. \
+                 Check the folder (in Docker, the PUID/PGID user needs write access), or choose \
+                 another work folder in Settings > Output."
+            ),
+        );
+    }
+    if let Some(hint) = reason.as_deref().and_then(crate::ffmpeg::explain_failure) {
+        return (
+            ProblemKind::Encoder,
+            format!(
+                "Converting {converting} didn't work: {}. The original was left unchanged.",
+                lower_first(hint.trim_end_matches('.'))
+            ),
+        );
+    }
+    let said = reason
+        .map(|r| chrysopoeia_core::plain::strip_os_error(&r))
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            let short: String = r.chars().take(MAX_QUOTED_CHARS).collect();
+            let cut = if short.len() < r.len() { "…" } else { "" };
+            format!(" ffmpeg said: \"{}{cut}\".", short.trim_end_matches('.'))
+        });
+    let stopped = if code.is_none() {
+        "was stopped by the system (it may have run out of memory)"
+    } else {
+        "stopped with an error"
+    };
+    (
+        ProblemKind::Encoder,
+        match said {
+            Some(said) => format!(
+                "Converting {converting} {stopped}, so the original was left unchanged.{said}"
+            ),
+            None => format!(
+                "Converting {converting} {stopped}, so the original was left unchanged. The \
+                 job's log has the details."
+            ),
+        },
+    )
 }
 
 /// Create `dir` and any missing parents. Returns the folders that were
@@ -1102,13 +1452,16 @@ fn capitalize_first(text: &str) -> String {
 fn fallback_note(first: &EncoderCandidate, used: &EncoderCandidate) -> String {
     if first.name == used.name && first.hw_decode && !used.hw_decode {
         "Decoding on the GPU didn't work for this file, so it was decoded on the CPU".to_string()
+    } else if first.api == used.api {
+        format!(
+            "The first way of converting {} didn't work for this file, so another one was used",
+            where_encoded(used.api)
+        )
     } else {
         format!(
-            "{} ({}) didn't work for this file, so {} ({}) was used",
-            first.name,
-            first.api.label(),
-            used.name,
-            used.api.label()
+            "Converting {} didn't work for this file, so it was converted {}",
+            where_encoded(first.api),
+            where_encoded(used.api)
         )
     }
 }
@@ -1147,8 +1500,6 @@ struct SpaceNeed {
     dir: PathBuf,
     bytes: u64,
     file: Option<PathBuf>,
-    /// "this file" / "the new file", for the error message.
-    what: &'static str,
     /// Fail when the room can never be found. A non-strict need only waits
     /// for other jobs, and is reserved as it is otherwise.
     strict: bool,
@@ -1158,11 +1509,7 @@ struct SpaceNeed {
 #[derive(Debug)]
 enum Shortfall {
     /// Not enough even if no other job were running.
-    Never {
-        dir: PathBuf,
-        bytes: u64,
-        what: &'static str,
-    },
+    Never { dir: PathBuf, bytes: u64 },
     /// Other running jobs hold the room; try again later.
     Busy { dir: PathBuf },
 }
@@ -1231,7 +1578,6 @@ fn try_reserve_with(
             return Err(Shortfall::Never {
                 dir: need.dir.clone(),
                 bytes: need.bytes,
-                what: need.what,
             });
         }
     }
@@ -1582,7 +1928,6 @@ mod tests {
             dir: PathBuf::from(dir),
             bytes,
             file: file.map(Path::to_path_buf),
-            what: "this file",
             strict: true,
         }
     }
@@ -1789,8 +2134,211 @@ mod tests {
         assert!(fallback_note(&gpu, &cpu_decode).contains("decoded on the CPU"));
         assert_eq!(
             fallback_note(&gpu, &software),
-            "hevc_nvenc (NVIDIA NVENC) didn't work for this file, so libx265 (CPU) was used"
+            "Converting on the NVIDIA GPU didn't work for this file, so it was converted on the CPU"
         );
+        let qsv = candidate("hevc_qsv", HwApi::Qsv, false);
+        let other_qsv = candidate("hevc_qsv_alt", HwApi::Qsv, false);
+        assert_eq!(
+            fallback_note(&qsv, &other_qsv),
+            "The first way of converting with Intel Quick Sync didn't work for this file, so \
+             another one was used"
+        );
+    }
+
+    fn failed_run(tail: &str) -> FfmpegExit {
+        FfmpegExit::Failed {
+            code: Some(1),
+            tail: tail.to_string(),
+        }
+    }
+
+    #[test]
+    fn encode_failures_get_a_problem_kind_and_plain_words() {
+        let temp = Path::new("/temp/.a.chrysopoeia-1.tmp.mkv");
+        let disk_full = failed_run(
+            "[out#0/matroska @ 0x1] [error] Error writing trailer: No space left on device",
+        );
+        let (problem, error) = encode_failure(
+            &disk_full,
+            HwApi::Software,
+            temp,
+            Place::WorkFolder,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::DiskFull);
+        assert_eq!(
+            error,
+            "The disk ran out of space while the new file was being written in the work folder \
+             /temp, so the original was left unchanged. Free up some space there, or choose a \
+             work folder on a bigger disk in Settings > Output."
+        );
+
+        let read_only = failed_run(
+            "[out#0/matroska @ 0x1] [error] Error opening output /m/.a.tmp.mkv: Read-only file \
+             system",
+        );
+        let (problem, error) = encode_failure(
+            &read_only,
+            HwApi::Software,
+            Path::new("/m/.a.tmp.mkv"),
+            Place::Destination,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::Destination);
+        assert!(
+            error.starts_with("The new file couldn't be written in /m:"),
+            "{error}"
+        );
+        let (problem, _) = encode_failure(
+            &read_only,
+            HwApi::Software,
+            temp,
+            Place::WorkFolder,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::WorkFolder);
+
+        let driver = failed_run("[h264_nvenc @ 0x1] [error] Cannot load libcuda.so.1");
+        let (problem, error) = encode_failure(
+            &driver,
+            HwApi::Nvenc,
+            temp,
+            Place::WorkFolder,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::Encoder);
+        assert_eq!(
+            error,
+            "Converting on the NVIDIA GPU didn't work: the NVIDIA driver could not be loaded. \
+             Check that the GPU is passed through to the container. The original was left \
+             unchanged."
+        );
+
+        let odd = failed_run("[libsvtav1 @ 0x1] [error] Svt[error]: Instance 1: odd width");
+        let (problem, error) = encode_failure(
+            &odd,
+            HwApi::Software,
+            temp,
+            Place::WorkFolder,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::Encoder);
+        assert!(
+            error.starts_with(
+                "Converting on the CPU stopped with an error, so the original was left \
+                 unchanged. ffmpeg said: \""
+            ),
+            "{error}"
+        );
+
+        let stalled = FfmpegExit::Stalled {
+            after: Duration::from_secs(600),
+            tail: String::new(),
+        };
+        let (problem, error) = encode_failure(
+            &stalled,
+            HwApi::Vaapi,
+            temp,
+            Place::WorkFolder,
+            OutputMode::Replace,
+        );
+        assert_eq!(problem, ProblemKind::Encoder);
+        assert!(
+            error.starts_with("Converting on the GPU (VA-API) stopped making progress for 10"),
+            "{error}"
+        );
+        for (_, error) in [
+            encode_failure(
+                &disk_full,
+                HwApi::Nvenc,
+                temp,
+                Place::Destination,
+                OutputMode::Folder,
+            ),
+            encode_failure(
+                &odd,
+                HwApi::Software,
+                temp,
+                Place::Destination,
+                OutputMode::Folder,
+            ),
+        ] {
+            for jargon in ["libsvtav1", "libx264", "exit code", "os error"] {
+                assert!(!error.contains(jargon), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_work_folders_say_what_is_in_the_way() {
+        let exists = std::io::Error::from_raw_os_error(17);
+        let (problem, error) = folder_unusable(Path::new("/temp"), Place::WorkFolder, &exists);
+        assert_eq!(problem, ProblemKind::WorkFolder);
+        assert_eq!(
+            error,
+            "The work folder /temp can't be used because a file with that name is in the way. \
+             Fix it, or choose another work folder, in Settings > Output."
+        );
+        let full = std::io::Error::from_raw_os_error(28);
+        let (problem, error) = folder_unusable(Path::new("/out/TV"), Place::Destination, &full);
+        assert_eq!(problem, ProblemKind::DiskFull);
+        assert!(!error.contains("os error"), "{error}");
+        let odd = std::io::Error::from_raw_os_error(5);
+        let (problem, error) = folder_unusable(Path::new("/temp"), Place::WorkFolder, &odd);
+        assert_eq!(problem, ProblemKind::WorkFolder);
+        assert!(
+            error.contains("because the disk reported a read or write error"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_room_messages_name_the_folder_and_the_fix() {
+        let gb = 1_500_000_000;
+        assert_eq!(
+            no_room_message(
+                Path::new("/temp"),
+                gb,
+                Place::WorkFolder,
+                OutputMode::Replace
+            ),
+            "There isn't enough free space in the work folder /temp to convert this file (it \
+             needs about 1.5 GB). Free up some space there, or choose a work folder on a bigger \
+             disk in Settings > Output."
+        );
+        assert!(
+            no_room_message(
+                Path::new("/m/TV"),
+                gb,
+                Place::Destination,
+                OutputMode::Replace
+            )
+            .starts_with("There isn't enough free space next to the original in /m/TV")
+        );
+        assert!(
+            no_room_message(
+                Path::new("/out"),
+                gb,
+                Place::Destination,
+                OutputMode::Folder
+            )
+            .starts_with("There isn't enough free space in the output folder /out")
+        );
+    }
+
+    #[test]
+    fn planning_problems_with_the_original_are_unreadable_sources() {
+        let source: anyhow::Error =
+            crate::plan::SourceProblem("No audio can be read.".into()).into();
+        assert_eq!(
+            plan_failure(&source),
+            (
+                ProblemKind::UnreadableSource,
+                "No audio can be read.".to_string()
+            )
+        );
+        let other = anyhow::anyhow!("The path has odd characters. Renaming the file fixes this.");
+        assert_eq!(plan_failure(&other).0, ProblemKind::Other);
     }
 
     #[tokio::test]

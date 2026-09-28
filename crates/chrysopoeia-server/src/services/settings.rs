@@ -103,6 +103,25 @@ async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiRe
             let _ = tokio::fs::remove_file(&probe).await;
             Ok(())
         }
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Err(invalid_field(
+            field,
+            format!(
+                "The {what} {dir} is on a read-only drive. Choose a folder Chrysopoeia can write to."
+            ),
+        )),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ) =>
+        {
+            Err(invalid_field(
+                field,
+                format!(
+                    "The {what} {dir} is on a full disk. Free up some space there, or choose another folder."
+                ),
+            ))
+        }
         Err(_) => Err(invalid_field(
             field,
             format!(
@@ -170,7 +189,7 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
         }
     }
     if let Some(dir) = s.temp_dir.clone() {
-        check_writable_dir(&dir, "temporary folder", "temp_dir").await?;
+        check_writable_dir(&dir, "work folder", "temp_dir").await?;
     }
     if s.output_mode == OutputMode::Folder {
         let Some(dir) = s.output_folder.clone() else {

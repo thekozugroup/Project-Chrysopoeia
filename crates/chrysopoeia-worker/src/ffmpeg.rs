@@ -453,6 +453,46 @@ pub fn explain_failure(message: &str) -> Option<&'static str> {
         .map(|(_, hint)| *hint)
 }
 
+/// Why a program couldn't be started, and what to do about it.
+fn not_started_message(program: &Path, e: &std::io::Error) -> String {
+    let shown = program.display();
+    let name = program
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| shown.to_string());
+    let variable = if name.contains("ffprobe") {
+        "FFPROBE_PATH"
+    } else {
+        "FFMPEG_PATH"
+    };
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "{name} wasn't found at \"{shown}\". Install ffmpeg, or set {variable} to where it is."
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "{name} at \"{shown}\" couldn't be started because it isn't allowed to run. Check \
+             its permissions, or set {variable} to another copy."
+        ),
+        _ => format!(
+            "{name} at \"{shown}\" couldn't be started because {}.",
+            chrysopoeia_core::plain::io_reason(e)
+        ),
+    }
+}
+
+/// `text` with its first letter in lower case, unless it starts with a name
+/// or acronym ("NVIDIA", "Intel/AMD").
+pub(crate) fn lower_first(text: &str) -> String {
+    let first = text.split_whitespace().next().unwrap_or("");
+    let keep = (first.len() > 1 && first.chars().skip(1).any(char::is_uppercase))
+        || ["Intel", "Intel/AMD", "AMD", "NVIDIA"].contains(&first);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if !keep => c.to_lowercase().chain(chars).collect(),
+        _ => text.to_string(),
+    }
+}
+
 /// Remove a leading `[context @ 0x…] ` and `[level] ` from an ffmpeg log line.
 pub fn strip_log_prefix(line: &str) -> &str {
     split_log_line(line).2
@@ -535,24 +575,32 @@ pub enum FfmpegExit {
     Cancelled,
     /// The process could not be started at all.
     NotStarted {
-        /// Why, in plain language.
+        /// Why and what to do, in plain language, e.g. "ffmpeg wasn't found
+        /// at "/usr/bin/ffmpeg". Install ffmpeg, or set FFMPEG_PATH to where
+        /// it is."
         error: String,
     },
 }
 
 impl FfmpegExit {
-    /// Plain-language description of a failed run, for error messages.
+    /// Plain-language description of a failed run, for error messages:
+    /// "ffmpeg stopped with an error: "Invalid data found when processing
+    /// input"", or for a well-known cause its explanation ("ffmpeg stopped
+    /// with an error: the disk ran out of space while writing the new file").
     pub fn describe_failure(&self, program: &str) -> Option<String> {
         match self {
             Self::Success { .. } | Self::Cancelled => None,
             Self::Failed { code, tail } => {
-                let reason = failure_reason(tail.lines()).map(|r| match explain_failure(&r) {
-                    Some(hint) => format!("{hint} ({r})"),
-                    None => r,
-                });
+                let reason = failure_reason(tail.lines())
+                    .map(|r| chrysopoeia_core::plain::strip_os_error(&r))
+                    .filter(|r| !r.is_empty())
+                    .map(|r| match explain_failure(&r) {
+                        Some(hint) => lower_first(hint),
+                        None => format!("\"{}\"", r.trim_end_matches('.')),
+                    });
                 let status = match code {
-                    Some(c) => format!("stopped with exit code {c}"),
-                    None => "was stopped by the system".to_string(),
+                    Some(_) => "stopped with an error",
+                    None => "was stopped by the system",
                 };
                 Some(match reason {
                     Some(r) => format!("{program} {status}: {r}"),
@@ -563,7 +611,7 @@ impl FfmpegExit {
                 "{program} stopped responding for {} minutes and was stopped",
                 after.as_secs().div_ceil(60)
             )),
-            Self::NotStarted { error } => Some(format!("Could not start {program}: {error}")),
+            Self::NotStarted { error } => Some(error.clone()),
         }
     }
 
@@ -641,11 +689,7 @@ pub async fn run_ffmpeg(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let error = if e.kind() == std::io::ErrorKind::NotFound {
-                format!("{} was not found", cmd.program.display())
-            } else {
-                e.to_string()
-            };
+            let error = not_started_message(cmd.program, &e);
             return FfmpegExit::NotStarted { error };
         }
     };
@@ -1004,10 +1048,10 @@ Conversion failed!";
                 tail: tail.into(),
             };
             assert_eq!(
-                exit.describe_failure("h264_nvenc").as_deref(),
+                exit.describe_failure("ffmpeg").as_deref(),
                 Some(
-                    "h264_nvenc stopped with exit code 255: The NVIDIA driver could not be loaded. \
-                     Check that the GPU is passed through to the container (Cannot load libcuda.so.1)"
+                    "ffmpeg stopped with an error: the NVIDIA driver could not be loaded. \
+                     Check that the GPU is passed through to the container"
                 )
             );
         }
@@ -1023,12 +1067,10 @@ Conversion failed!";
             code: Some(228),
             tail: DISK_FULL_TAIL_TAGGED.into(),
         };
-        let message = exit.describe_failure("libx264").unwrap();
-        assert!(
-            message.starts_with(
-                "libx264 stopped with exit code 228: The disk ran out of space while writing the new file"
-            ),
-            "{message}"
+        let message = exit.describe_failure("ffmpeg").unwrap();
+        assert_eq!(
+            message,
+            "ffmpeg stopped with an error: the disk ran out of space while writing the new file"
         );
     }
 
@@ -1103,8 +1145,16 @@ Conversion failed!";
             tail: "[libx264 @ 0x1] Unknown option\nConversion failed!".into(),
         };
         assert_eq!(
-            failed.describe_failure("libx264").as_deref(),
-            Some("libx264 stopped with exit code 1: Unknown option")
+            failed.describe_failure("ffmpeg").as_deref(),
+            Some("ffmpeg stopped with an error: \"Unknown option\"")
+        );
+        let killed = FfmpegExit::Failed {
+            code: None,
+            tail: "Error opening input: Permission denied (os error 13)".into(),
+        };
+        assert_eq!(
+            killed.describe_failure("ffmpeg").as_deref(),
+            Some("ffmpeg was stopped by the system: \"Error opening input: Permission denied\"")
         );
         let stalled = FfmpegExit::Stalled {
             after: Duration::from_secs(600),

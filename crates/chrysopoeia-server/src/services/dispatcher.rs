@@ -24,7 +24,7 @@ use chrono::{DateTime, Local, Timelike, Utc};
 use chrysopoeia_core::encoder::VIDEO_ENCODERS;
 use chrysopoeia_core::{
     ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
-    JobState, MaxJobsSource, MediaFile, OutputMode, QueueState, Settings,
+    JobState, MaxJobsSource, MediaFile, OutputMode, ProblemKind, QueueState, Settings,
 };
 use chrysopoeia_scanner::WatchEvent;
 use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
@@ -39,7 +39,7 @@ use crate::db::jobs::{InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
 use crate::services::library::{
-    self, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, still_settling,
+    self, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, probe_problem, still_settling,
 };
 use crate::state::{AppState, lock};
 
@@ -616,9 +616,10 @@ enum Disposition {
     Requeue(Requeue),
 }
 
-fn failed(error: impl Into<String>) -> JobOutcome {
+fn failed(problem: ProblemKind, error: impl Into<String>) -> JobOutcome {
     JobOutcome::Failed {
         error: error.into(),
+        problem,
         log_tail: None,
         command: None,
         encoder: None,
@@ -674,10 +675,21 @@ async fn execute(
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
         Ok(Some(f)) => f,
-        Ok(None) => return done(failed("This file is no longer in the library."), ctx),
+        Ok(None) => {
+            return done(
+                failed(
+                    ProblemKind::SourceChanged,
+                    "This file is no longer in the library.",
+                ),
+                ctx,
+            );
+        }
         Err(e) => {
             tracing::error!(job = %job.id, "could not load the file: {e}");
-            return done(failed(crate::error::INTERNAL_MESSAGE), ctx);
+            return done(
+                failed(ProblemKind::Other, crate::error::INTERNAL_MESSAGE),
+                ctx,
+            );
         }
     };
     ctx.file = Some(file.clone());
@@ -686,7 +698,10 @@ async fn execute(
         Ok(None) => return done(JobOutcome::Cancelled, ctx),
         Err(e) => {
             tracing::error!(job = %job.id, "could not load the library: {e}");
-            return done(failed(crate::error::INTERNAL_MESSAGE), ctx);
+            return done(
+                failed(ProblemKind::Other, crate::error::INTERNAL_MESSAGE),
+                ctx,
+            );
         }
     };
     ctx.library_root = Some(PathBuf::from(&lib.path));
@@ -702,10 +717,13 @@ async fn execute(
                 return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
             }
             return done(
-                failed(format!(
-                    "{MISSING_INPUT_ERROR}{}. It may have been moved or deleted.",
-                    file.path
-                )),
+                failed(
+                    ProblemKind::SourceChanged,
+                    format!(
+                        "{MISSING_INPUT_ERROR}{}. It may have been moved or deleted.",
+                        file.path
+                    ),
+                ),
                 ctx,
             );
         }
@@ -736,7 +754,7 @@ async fn execute(
                 }
                 p
             }
-            Err(e) => return done(failed(probe_error_message(&e)), ctx),
+            Err(e) => return done(failed(probe_problem(&e), probe_error_message(&e)), ctx),
         },
     };
 
@@ -786,7 +804,13 @@ async fn execute(
                 ctx,
             );
         }
-        return done(failed(preference_failure(problem)), ctx);
+        return done(
+            failed(
+                ProblemKind::HardwareUnavailable,
+                preference_failure(problem),
+            ),
+            ctx,
+        );
     }
     let preference_problem = preference_problem.map(|(problem, _)| problem);
 
@@ -821,6 +845,7 @@ async fn execute(
     let outcome = match state.toolkit.run_job(cfg, spec, tx, cancel).await {
         Ok(outcome) => outcome,
         Err(_) => failed(
+            ProblemKind::Other,
             "The converter stopped unexpectedly. The original file is untouched. The details \
              are in the server log.",
         ),
@@ -1015,11 +1040,19 @@ async fn close_unrecorded(state: &AppState, job: &Job) {
             JobState::Failed,
             &JobFinish {
                 error: Some(error.to_string()),
+                problem: Some(ProblemKind::Other),
                 ..JobFinish::default()
             },
         )
         .await?;
-        db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(error)).await?;
+        db::files::set_status(
+            &mut tx,
+            job.file_id,
+            FileStatus::Failed,
+            None,
+            Some((error, ProblemKind::Other)),
+        )
+        .await?;
         tx.commit().await
     }
     .await;
@@ -1213,7 +1246,8 @@ async fn apply_outcome(
             let saved_total = db::i64_of(first_original) - db::i64_of(current_size);
             sqlx::query(
                 "UPDATE files SET status = 'done', original_size_bytes = ?, saved_bytes = ?, \
-                 skip_reason = NULL, error = NULL, job_id = ?, updated_at = ? WHERE id = ?",
+                 skip_reason = NULL, error = NULL, problem = NULL, job_id = ?, updated_at = ? \
+                 WHERE id = ?",
             )
             .bind(db::i64_of(first_original))
             .bind(saved_total)
@@ -1294,6 +1328,7 @@ async fn apply_outcome(
         }
         JobOutcome::Failed {
             error,
+            problem,
             log_tail,
             command,
             encoder,
@@ -1307,6 +1342,7 @@ async fn apply_outcome(
                 JobState::Failed,
                 &JobFinish {
                     error: Some(error.clone()),
+                    problem: Some(problem),
                     encoder,
                     attempt: (attempt > 0).then_some(attempt),
                     validation,
@@ -1324,8 +1360,14 @@ async fn apply_outcome(
                 && ctx.converted_before()
                 && db::files::keep_converted(&mut tx, job.file_id).await?;
             if exists && !kept_done {
-                db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(&error))
-                    .await?;
+                db::files::set_status(
+                    &mut tx,
+                    job.file_id,
+                    FileStatus::Failed,
+                    None,
+                    Some((&error, problem)),
+                )
+                .await?;
             }
             tx.commit().await?;
             if exists {
@@ -1441,13 +1483,20 @@ async fn remove_vanished(
             JobState::Failed,
             &JobFinish {
                 error: Some(error.clone()),
+                problem: Some(ProblemKind::SourceChanged),
                 ..JobFinish::default()
             },
         )
         .await?;
         if exists {
-            db::files::set_status(&mut tx, job.file_id, FileStatus::Failed, None, Some(&error))
-                .await?;
+            db::files::set_status(
+                &mut tx,
+                job.file_id,
+                FileStatus::Failed,
+                None,
+                Some((&error, ProblemKind::SourceChanged)),
+            )
+            .await?;
         }
         tx.commit().await?;
         if !exists {

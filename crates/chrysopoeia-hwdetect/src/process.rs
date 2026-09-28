@@ -32,7 +32,11 @@ impl std::fmt::Display for RunError {
         match self {
             Self::NotFound => f.write_str("The program was not found."),
             Self::TimedOut => f.write_str("The program did not finish in time."),
-            Self::Io(err) => write!(f, "The program could not be run: {err}."),
+            Self::Io(err) => write!(
+                f,
+                "The program couldn't be run because {}.",
+                chrysopoeia_core::plain::io_reason(err)
+            ),
         }
     }
 }

@@ -696,7 +696,9 @@ impl<'a> Ctx<'_, 'a> {
             Ok(dir) => dir,
             Err(e) => {
                 return Ok(VisualOutcome::only(CheckResult::skipped(format!(
-                    "No scratch space to compare pictures: {e}"
+                    "The pictures weren't compared because the scratch files for it couldn't be \
+                     made: {}",
+                    chrysopoeia_core::plain::io_reason(&e)
                 ))));
             }
         };
@@ -2365,8 +2367,10 @@ fn parse_seconds(value: Option<&String>) -> Option<f64> {
 
 /// Parse `ffprobe -print_format json -show_format -show_streams` output.
 fn parse_probe_json(json: &[u8]) -> Result<MediaProbe, String> {
-    let raw: FfprobeJson = serde_json::from_slice(json)
-        .map_err(|e| format!("ffprobe gave an unreadable answer ({e})"))?;
+    let raw: FfprobeJson = serde_json::from_slice(json).map_err(|e| {
+        tracing::debug!("ffprobe's answer could not be read: {e}");
+        "ffprobe's answer about the file couldn't be read".to_string()
+    })?;
     let streams = raw
         .streams
         .into_iter()
@@ -2438,7 +2442,10 @@ async fn probe_media(
         ProbeError::Failed(if e.kind() == std::io::ErrorKind::NotFound {
             format!("ffprobe was not found at {}", ffprobe.display())
         } else {
-            format!("ffprobe could not start ({e})")
+            format!(
+                "ffprobe couldn't be started because {}",
+                chrysopoeia_core::plain::io_reason(&e)
+            )
         })
     })?;
     let output = tokio::select! {
@@ -2448,7 +2455,10 @@ async fn probe_media(
             Err(_) => return Err(ProbeError::Failed(format!(
                 "ffprobe gave no answer within {} seconds", PROBE_TIMEOUT.as_secs()
             ))),
-            Ok(Err(e)) => return Err(ProbeError::Failed(format!("ffprobe failed ({e})"))),
+            Ok(Err(e)) => {
+                tracing::debug!("ffprobe stopped unexpectedly: {e}");
+                return Err(ProbeError::Failed("ffprobe stopped unexpectedly".to_string()));
+            }
             Ok(Ok(output)) => output,
         },
     };

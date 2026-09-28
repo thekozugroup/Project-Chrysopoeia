@@ -45,7 +45,8 @@ shapes here are normative. The Rust source of truth for every shared type is
 | `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `recover_artifact`) |
 | `chrysopoeia-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `chrysopoeia` |
 
-Existing public signatures are fixed; new public items may be added.
+Existing public signatures are fixed; new public items may be added. The
+workspace's minimum Rust version (MSRV) is 1.88.
 
 ## Configuration (server)
 
@@ -62,7 +63,7 @@ container templates) mean "not set".
 | `--ffprobe` | `FFPROBE_PATH` | `ffprobe` | |
 | `--browse-root` | `BROWSE_ROOTS` (comma-sep) | `/` | Roots the folder picker may show |
 | `--temp-dir` | `TEMP_DIR` | unset | Work folder used while `settings.temp_dir` is unset (`/temp` in Docker when mounted). Unset: encodes are written next to the file (folder mode: into the output folder) |
-| `--max-jobs` | `MAX_JOBS` | unset | 1–32 or `auto`. Stands in for the automatic job count whenever `settings.max_jobs` ("Files at once" in the UI) is null; a number saved in Settings wins, and the activity feed says so at start, as one warning ("MAX_JOBS=3 is not used because Files at once is set to 2 in Settings. Choose Automatic there to use MAX_JOBS.") |
+| `--max-jobs` | `MAX_JOBS` | unset | 1–32 or `auto`. Stands in for the automatic job count whenever `settings.max_jobs` ("Files at once" in the UI) is null (`QueueState.max_jobs_source` is then `env`); a number saved in Settings wins, and the activity feed says so at start, as one warning ("MAX_JOBS=3 is not used because Files at once is set to 2 in Settings. Choose Automatic there to use MAX_JOBS.") |
 | `--hw` | `HW_ACCEL` | `auto` | auto, cpu, nvenc/nvidia, qsv/intel, vaapi, amf, videotoolbox, rkmpp, v4l2m2m. Sets the `hardware` setting on the first run and again whenever the value changes; otherwise the Settings choice is kept |
 | `--library` | `LIBRARIES` (comma-sep) | none | Libraries created on the first run |
 | `--allowed-host` | `ALLOWED_HOSTS` (comma-sep) | none | Extra host names (e.g. a reverse proxy's domain; `.example.com` covers a domain; `*` = any) |
@@ -94,12 +95,12 @@ files(id TEXT PK, library_id FK→libraries ON DELETE CASCADE, path UNIQUE, rela
       file_name, size_bytes INT, modified_at TEXT, status TEXT, probe TEXT JSON NULL,
       container, video_codec, audio_codec, resolution, hdr, duration_secs REAL, bit_rate INT,
       original_size_bytes INT NULL, saved_bytes INT NULL, skip_reason, error,
-      job_id TEXT NULL, scanned_at, updated_at)
+      problem TEXT NULL, job_id TEXT NULL, scanned_at, updated_at)
       INDEX(library_id, status), INDEX(status)
 jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, file_path,
      state TEXT, stage TEXT, priority INT, progress REAL, fps REAL, speed REAL, eta_secs INT,
-     encoder, hw_api, attempt INT, input_size INT, output_size INT, error, skip_reason,
-     validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
+     encoder, hw_api, attempt INT, input_size INT, output_size INT, error, problem TEXT NULL,
+     skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs
@@ -117,10 +118,18 @@ daily rows can't be split by library and may include libraries removed
 before (even when one is left), so the history is rebuilt from the
 finished conversions on record; each file's latest conversion is kept by
 trimming, so they cover the 30 days shown (unless the history was cleared).
+6 = `jobs.problem` and `files.problem` (see Problems below). Errors recorded
+before are sorted by the few causes whose wording was fixed and known
+(missing file, damaged original, failed verification, full disk, unusable
+temp folder, refused hardware); the rest become `other`.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
   lowercase strings. Write transactions use `BEGIN IMMEDIATE`.
+- `problem` goes with `error`: every write that sets a file's or job's
+  `error` sets its `problem`, and every write that clears the error (queued
+  again, converted, skipped, kept as converted) clears it. Reads enforce the
+  same (`other` for an error stored without a kind, none without an error).
 - `files.size_bytes`/`modified_at` always describe the file currently on disk.
   After a replace they describe the new file, so rescans see it unchanged.
 - Activity keeps the newest 5 000 rows. Finished jobs are trimmed to the
@@ -142,13 +151,15 @@ Rules:
 
 ```
 scan/watch ─► probe ─► decide(profile)
-                        ├─ Skip{reason}          → file.status = skipped
-                        └─ Transcode             → pending, or queued + job(queued) if auto_queue
+              │         ├─ Skip{reason}          → file.status = skipped
+              │         └─ Transcode             → pending, or queued + job(queued) if auto_queue
+              └─ can't be read → file: failed + error, problem unreadable_source
+                                 (other when ffprobe itself can't run)
 dispatcher claims job ─► running(preparing ► transcoding ► verifying ► finalizing)
    ├─ Done     → file: done, size=new size, original_size, saved_bytes;
    │             savings[today, library] += saved
    ├─ Skipped  → file: skipped + reason (e.g. "Only 3% smaller — kept the original")
-   ├─ Failed   → file: failed + error; original untouched
+   ├─ Failed   → file: failed + error + problem; original untouched
    └─ Cancelled→ file: pending (queued again after "Stop now" or shutdown; skipped after "Skip")
    A file converted before (original_size set) stays done with its savings
    when its new job is skipped, cancelled, removed from the queue or fails;
@@ -163,7 +174,8 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   takes over the count). The folder watcher's count of media files still
   being written (`LibraryWatcher::waiting_files`, polled every 2 s) is kept
   beside it, and `LibraryStats.settling` is the larger of the two (both
-  usually see the same copies). A library that still had such files when
+  usually see the same copies); the UI shows "Waiting for N files to
+  finish copying" from it. A library that still had such files when
   the server stopped is scanned again at start. Removed files are deleted
   from the DB (their jobs cascade), except below folders the walk couldn't
   read or left alone, and never when a library that had files walks empty
@@ -218,8 +230,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 
 - Loop woken by `Notify` (new job, settings change, job finished) plus a 5 s tick.
 - Effective `max_jobs` = `settings.max_jobs`, else `MAX_JOBS`, else
-  `hardware.recommended_jobs.total` (automatic), clamped to 1–32. Changes
-  apply immediately; running jobs are never killed to shrink.
+  `hardware.recommended_jobs.total` (automatic), clamped to 1–32.
+  `QueueState.max_jobs_source` (`settings` | `env` | `auto`) says which, so
+  the UI can show e.g. "Automatic (3, from MAX_JOBS)". Changes apply
+  immediately; running jobs are never killed to shrink.
 - While the limit is automatic, jobs whose first-choice encoder is software
   are capped at `recommended_jobs.cpu_jobs` at once (the automatic limit may
   follow the GPU count); other libraries' GPU jobs still fill the free slots.
@@ -266,7 +280,8 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   that need no encoding wait too). Detection then runs again every 3
   minutes for as long as jobs wait, and the feed says once, at WARN, that
   conversions are waiting.
-- `jobs.force` is passed to the worker as `JobSpec.force`.
+- `jobs.force` is passed to the worker as `JobSpec.force` and echoed as
+  `Job.force`.
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
   start (older versions didn't read it).
 - A failure is logged once, at WARN, through its activity entry.
@@ -413,7 +428,45 @@ backup) when the job's backup exists and the new file is in place — the
 original's name taken again (same path) or free with the new name present
 (new extension) — else `NotPlaced`. `recover_artifact`: temp and staged files
 are deleted; a backup is renamed back when the original is missing, deleted
-otherwise.
+otherwise. A failure to put the new file in place is a
+`finalize::PlaceError` (inside the `anyhow::Error`) with its message and
+problem kind.
+
+## Problems (normative)
+
+Every failed job carries `JobOutcome::Failed.problem`, a `ProblemKind`
+recorded as `Job.problem` and, while the file is failed, `MediaFile.problem`
+(both also in `job.updated` / `file.updated` events). The UI groups problems
+and picks the fix by this code, never by reading sentences.
+
+| Kind | When | Examples |
+|---|---|---|
+| `unreadable_source` | The original can't be read as a video, or stops early | ffprobe rejects it at scan time; a cut-off download ("The original file appears damaged or incomplete (it stops after 0.1 s)…"); no readable audio track; no read permission |
+| `work_folder` | The work folder (`settings.temp_dir` / `TEMP_DIR`) can't be used | a file in the way of its name; no write permission; a read-only drive |
+| `destination` | The new file can't be put where it belongs | a read-only library or no write permission (checked before encoding); a file already using the new name; folder mode without an output folder |
+| `disk_full` | Not enough room | the work folder can't hold ~1.1× the original even with no other job running; the disk filled up while encoding or copying |
+| `encoder` | The encoder failed on every attempt | ffmpeg stops with an error, stops making progress for 10 min, or writes nothing |
+| `hardware_unavailable` | The hardware chosen in Settings can't make the codec and CPU fallback is off | also a worker given no encoder at all |
+| `verification` | The new file failed its checks on the last attempt | "The new file is shorter than the original …" |
+| `source_changed` | The original disappeared before or during the job (an original that was changed or replaced meanwhile is a skip, not a failure) | moved or deleted while queued or converting; gone right before replacing |
+| `other` | Anything else | the converter crashed, a database problem, ffmpeg not installed |
+
+A `done` file that is converted again keeps `done` and no problem whatever
+the new job's outcome, unless the file itself is gone (see Database rules);
+only the job records it.
+
+**Wording.** Every user-facing message (job and file errors, notes, the
+activity feed, setup hints, API errors) is one or two plain sentences: what
+happened, then what to do ("The work folder /temp can't be used because a
+file with that name is in the way. Fix it, or choose another work folder, in
+Settings > Output."). Messages never carry raw OS errors or error numbers
+(`chrysopoeia_core::plain::io_reason` turns an `io::Error` into a few words
+such as "the disk is full"), encoder names ("Converting on the NVIDIA GPU
+didn't work…", not `hevc_nvenc`), exit codes, or paths without saying what
+the folder is (the work folder, the output folder, next to the original).
+An unfamiliar ffmpeg failure is described plainly and then quoted
+("Converting on the CPU stopped with an error, so the original was left
+unchanged. ffmpeg said: "…""); the job's `log_tail` keeps the details.
 
 ## REST API (`/api`)
 
@@ -432,7 +485,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 |---|---|---|
 | `GET /health` | | `{"ok":true,"version":"0.2.0"}` |
 | `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `CHRYSOPOEIA_VERSION` when it differs from `version`, else null) |
-| `GET /overview` | | `Overview` |
+| `GET /overview` | | `Overview` (`totals` and `savings_history` cover the same libraries; `resolutions` has a "No video" bucket for files without a video stream, "Unknown" for pictures whose size couldn't be read) |
 | `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline) |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. Starts a scan. |
 | `GET /libraries/{id}` | | `Library` |
@@ -440,13 +493,13 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `DELETE /libraries/{id}` | | 204. Removes DB rows only (files, jobs and its share of the savings history), never media. Cancels its running jobs. |
 | `POST /libraries/{id}/scan` | | 202 `{"started":true}` (409 `scan_running`, 409 `library_disabled`) |
 | `POST /scan` | | 202, scans all enabled libraries |
-| `GET /files` | `status`, `library`, `q` (substring of name/path), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`) |
+| `GET /files` | `status`, `library`, `q` (substring of name/path), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`; `problem` with every `error`) |
 | `GET /files/{id}` | | `{"file": MediaFile (with probe), "jobs": Job[] (newest first, ≤10)}` |
 | `POST /files/{id}/queue` | `{"priority"?: int, "force"?: bool}` | `Job` (`force` echoed). Works for pending/failed/skipped/done (re-encode). `force` = "Convert anyway" (see `decide_forced`, no size rule; verified as usual). A done file whose new job ends without a new result (skipped, cancelled, failed) stays done. 409 `already_queued`. |
 | `POST /files/{id}/skip` | | `MediaFile` status skipped, reason "Skipped by you"; cancels its job |
 | `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`), except files skipped by the size rule under that goal; the rest are counted in `left_out` (0 for other selections). |
 | `GET /jobs` | `state` (`active` = running+queued, `running`, `queued`, `history` = finished, `all`), `limit`, `offset` | `{"items": Job[], "total"}`; active sorted running-first then queue order; history newest first |
-| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`) |
+| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`) |
 | `POST /jobs/{id}/cancel` | | `Job` (409 `job_finished`) |
 | `POST /jobs/{id}/priority` | `{"priority": int}` or `{"move":"top"}` | `Job` |
 | `POST /jobs/clear` | `{"state":"history"}` | `{"affected": n}` deletes finished job rows (files keep status) |
@@ -457,8 +510,8 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes) |
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
-| `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}], "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
-| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
+| `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
+| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair counts the browsed folder itself by the same rules (left out when it can't be counted), so the picker can say what choosing it brings. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
 | `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 
@@ -545,33 +598,67 @@ scripts) pass. No CORS headers are sent (except with `--dev-cors`).
 
 Next.js (App Router) exported statically (`output: "export"`) to `web/out` and
 served by the Rust binary. All data comes from `/api` on the same origin
-(`NEXT_PUBLIC_API_URL` overrides for `next dev`). No mock data in the bundle.
+(`NEXT_PUBLIC_API_URL` overrides for `next dev`) and stays current through
+`/api/ws` events. No mock data in the bundle. State lives in the URL hash
+(`#/queue/history`), so reloads and links keep the view.
 
-Screens (sidebar navigation; state in the URL hash so reloads keep the view):
-1. **Setup** (first run, when `settings.onboarded` is false and no libraries):
-   welcome → pick a folder with the server-side folder browser → choose a goal
-   (cards: Save space / Balanced / Plays everywhere / Archive, each with a one-line
-   trade-off and the detected hardware's speed hint) → "Start" (creates the
-   library, scan begins, `onboarded = true`).
-2. **Overview**: space saved (big number) + projected savings, library progress,
-   now-processing cards with live progress/fps/ETA/encoder badge, recent results
-   with a "Verified" badge, setup hints from hardware detection, codec and
-   resolution breakdown (files without a video stream count as "No video";
-   "Unknown" is a video whose picture size couldn't be read).
-3. **Queue**: Running / Up next / History (done, skipped, failed) with cancel,
-   move to top, retry, and a detail sheet (streams before→after, notes,
-   verification report with SSIM, ffmpeg command, log tail).
-4. **Library** (per library): file table with search, status filter, sort,
-   pagination, bulk actions; library settings (goal, quality, advanced).
-5. **Settings**: Processing (Files at once: Automatic (n) or a number; active
-   hours; auto-queue; watch folders), Output (replace vs folder; work folder,
-   naming `SystemInfo.default_temp_dir` as the automatic one; keep dates),
-   Verification level, Hardware (detected devices, verified encoders, hints,
-   check again, preference), Advanced (ignore patterns, min size in MB,
-   default profile). Field errors are shown next to the field named by `field`.
+Navigation: a sidebar on wide screens (Overview, Queue, each library, "Add
+library", Settings; appearance switch), a bottom tab bar on phones
+(Overview, Queue, Libraries, Settings). The queue link shows what is
+running. Details of a job or file open in a sheet over the current screen.
 
-Plain language first: say "Smaller files" not "CRF 32"; show codecs as
-secondary detail; every destructive action is reversible or confirmed.
+Screens:
+1. **Setup** (first run, when `settings.onboarded` is false and there are no
+   libraries): welcome (what Chrysopoeia does, three reassurances) → pick a
+   folder with the server-side folder picker, which shows how many videos
+   each folder and the current one hold (`media_count`) → choose a goal
+   (Save space / Balanced / Plays everywhere / Archive, each with its
+   trade-off and the detected hardware's speed) → start (creates the
+   library, scanning begins, `onboarded = true`). Later libraries are added
+   with the same two steps under "Add library".
+2. **Overview**, a status page: the space saved as one big number with a
+   one-line status sentence (what is happening now, what is left) and a
+   savings chart once there is history worth charting; **Needs your
+   attention** (setup hints from hardware detection, libraries that can't be
+   reached, failed files grouped by `problem` with the fix for each);
+   **Converting now** (live cards per running job: file, stage, progress,
+   speed, time left, where it runs); **Libraries** (each library's
+   progress, and "Add library"); the latest finished results. No codec
+   breakdown and no activity feed. Without libraries it shows the welcome
+   and "Choose a folder".
+3. **Queue**: tabs **Running** / **Up next** / **History** with counts.
+   Running jobs can be stopped; in Up next a job can be moved to the top or
+   taken out of the queue; History lists finished jobs (converted, kept as
+   they were, failed, cancelled) with "Try again" and "Convert anyway" where
+   they apply, and can be cleared. The activity **Log** (scans, warnings
+   and problems) sits under History. Queue controls: pause, resume, stop
+   now. A job's sheet
+   shows before → after, notes, the verification report, and the ffmpeg
+   command and log tail under a disclosure.
+4. **Library** (one per library, tabs **Files** and **Settings**): Files is
+   the library's progress and the file table with search, status filters
+   (with counts), sort, pages and bulk Convert / Skip, plus the
+   files-still-copying count (`LibraryStats.settling`) and the folder's
+   `path_error`; Settings holds the library's goal, quality, speed and
+   advanced format choices, its name, and pausing or removing the library
+   (media is never touched). "Scan now" is in the library's menu.
+5. **Settings**, in sections: **Processing** (Files at once: Automatic (n,
+   and its source) or a number; when to convert: active hours; finding
+   files: watch folders, rescan interval, auto-queue); **Output** (finished
+   files: replace the original or save to a separate folder; the work
+   folder, naming `SystemInfo.default_temp_dir` as the automatic one; keep
+   file dates; **Checks before replacing**: the verification level, with a
+   warning when checks are off); **This machine** (detected processor,
+   memory and graphics, setup tips, hardware preference and CPU fallback,
+   "check again", and encoders and ffmpeg details under a disclosure);
+   **Advanced** (ignored files, minimum file size in MB, defaults for new
+   libraries); and **About** (version, build, and a copyable bug-report
+   summary). Changes are saved with one save bar; a field error is shown
+   next to the field named by the API's `field` and in the save bar.
+
+Plain language first: "Smaller files", not "CRF 32"; codecs are secondary
+detail; problems are grouped by `problem` and each comes with its fix;
+every destructive action is reversible or confirmed.
 
 ## Deployment
 
@@ -586,48 +673,3 @@ secondary detail; every destructive action is reversible or confirmed.
 - `unraid/chrysopoeia.xml`: Community Applications template with those fields.
 - `docker-compose.yml` (CPU), `docker-compose.nvidia.yml`,
   `docker-compose.intel-amd.yml` overlays.
-
-## Contract additions, round 3 (normative)
-
-- `QueueState.max_jobs_source`: `auto` | `env` | `settings` — where the
-  effective job limit comes from. The UI shows e.g. "Automatic (3, from
-  MAX_JOBS)" for `env`.
-- `LibraryStats.settling`: files still being copied into the library, as the
-  last scan (files it deferred) or the folder watcher (copies in progress,
-  the usual case with `watch_folders` on) sees them, whichever is more; the
-  UI shows "Waiting for N files to finish copying" instead of parsing
-  activity text.
-- `SystemInfo.build`: the image build label from `CHRYSOPOEIA_VERSION`, when
-  it differs from `version`; shown in Settings for bug reports.
-- `POST /api/files/{id}/queue` accepts `{"priority"?: int, "force"?: bool}`.
-  `force: true` runs that one job without the skip rules (`skip_efficient`,
-  same-format) and without `min_savings_pct` ("Convert anyway"). Verification
-  still applies. A forced job that finishes keeps the file `done`.
-- A re-queued `done` file whose job ends `skipped`, is cancelled or removed
-  from the queue, or fails stays `done` (its savings are kept); the job row
-  records the attempt.
-- `POST /api/files/bulk` with `action: "queue"` and explicit `ids` only
-  creates jobs for files the profile would convert (or failed files) and
-  returns `{"affected": n, "left_out": m}`. Files a job already found not
-  small enough under the same goal (skipped by `min_savings_pct`) are left
-  out too: they would be encoded again only to end the same way ("Convert
-  anyway" is for those).
-- `Job.force` (bool) echoes the queue request's `force`.
-- `GET /api/fs/browse` entries: `media_count` counts video files below the
-  folder (see the endpoint), with `media_count_capped`.
-- `Overview.resolutions` has a "No video" bucket; `savings_history` and
-  `totals.saved_bytes` cover the same libraries.
-- Workspace MSRV is Rust 1.88.
-
-## Contract additions, round 4 (normative)
-
-- `Job.problem` / `MediaFile.problem`: optional `ProblemKind` —
-  `unreadable_source`, `work_folder`, `destination`, `disk_full`, `encoder`,
-  `hardware_unavailable`, `verification`, `source_changed`, `other`. Set
-  whenever `error` is set; persisted (`jobs.problem`, `files.problem`). The UI
-  groups problems and picks the fix by code, never by parsing sentences.
-- `GET /api/fs/browse` also returns `media_count` and `media_count_capped`
-  for the browsed folder itself (same counting rules as entries).
-- A re-conversion of a `done` file that fails, is cancelled or is skipped
-  leaves the file `done` (the converted file is still on disk); only the job
-  row records the outcome.

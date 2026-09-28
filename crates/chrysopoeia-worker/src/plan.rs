@@ -323,6 +323,34 @@ pub fn size_limit(profile: &TranscodeProfile) -> Option<SizeLimit> {
     Some(SizeLimit { short, long })
 }
 
+/// A planning failure caused by the original itself (for example, none of
+/// its audio can be read): converting it again won't help until the file
+/// is replaced. Carried inside the `anyhow::Error` [`build_plan`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceProblem(pub String);
+
+impl std::fmt::Display for SourceProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SourceProblem {}
+
+/// How a conversion runs, for messages: "on the CPU", "on the NVIDIA GPU".
+pub(crate) fn where_encoded(api: HwApi) -> &'static str {
+    match api {
+        HwApi::Software => "on the CPU",
+        HwApi::Nvenc => "on the NVIDIA GPU",
+        HwApi::Qsv => "with Intel Quick Sync",
+        HwApi::Vaapi => "on the GPU (VA-API)",
+        HwApi::VideoToolbox => "with Apple VideoToolbox",
+        HwApi::Amf => "on the AMD GPU",
+        HwApi::Rkmpp => "on the Rockchip video engine",
+        HwApi::V4l2m2m => "on the board's video engine",
+    }
+}
+
 /// Inputs for [`build_plan`].
 #[derive(Debug, Clone, Copy)]
 pub struct PlanRequest<'a> {
@@ -397,8 +425,8 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     }
     if encoder.codec != profile.video_codec {
         bail!(
-            "The {} encoder makes {} video, but this library is set to {}.",
-            encoder.name,
+            "The encoder Chrysopoeia picked makes {} video, but this library is set to {}. \
+             Check the hardware settings.",
             encoder.codec.label(),
             profile.video_codec.label()
         );
@@ -694,8 +722,8 @@ fn plan_video(
         && override_ignored(&quality)
     {
         notes.push(format!(
-            "Your custom quality value ({value}) doesn't fit the {} encoder's quality scale, so the “{}” quality setting was used",
-            encoder.name,
+            "Your custom quality value ({value}) doesn't fit the quality scale used when converting {}, so the “{}” quality setting was used",
+            where_encoded(api),
             quality_label(profile.quality)
         ));
     }
@@ -1187,9 +1215,12 @@ fn plan_audio(
     let container = profile.container;
     let selection = select_audio(probe, profile);
     if selection.all_unreadable {
-        bail!(
-            "None of this file's audio tracks can be read, so converting it would leave the video silent."
-        );
+        return Err(SourceProblem(
+            "None of this file's audio tracks can be read, so converting it would leave the \
+             video silent. The original was left unchanged."
+                .to_string(),
+        )
+        .into());
     }
     if selection.dropped_broken > 0 {
         notes.push(format!(

@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -150,12 +150,48 @@ const MIGRATION_V5: &[&str] = &[
     "ALTER TABLE savings_by_library RENAME TO savings",
 ];
 
+/// Version 6: `jobs.problem` and `files.problem`, the kind of problem behind
+/// an `error` (`ProblemKind` as snake_case text), so the UI can group
+/// problems and offer the right fix without reading sentences. Errors
+/// recorded before are sorted by the few causes whose wording is fixed and
+/// known; the rest are `other`.
+const MIGRATION_V6: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN problem TEXT",
+    "ALTER TABLE files ADD COLUMN problem TEXT",
+    "UPDATE jobs SET problem = CASE \
+        WHEN error LIKE 'The file is no longer at %' \
+          OR error LIKE 'The file no longer exists%' THEN 'source_changed' \
+        WHEN error LIKE 'The original file appears damaged or incomplete%' \
+          OR error LIKE 'This file can''t be read as a video%' THEN 'unreadable_source' \
+        WHEN error LIKE 'The new file %' THEN 'verification' \
+        WHEN error LIKE 'Not enough free space%' THEN 'disk_full' \
+        WHEN error LIKE 'Could not use the temp folder%' THEN 'work_folder' \
+        WHEN error LIKE '%converting on the CPU instead is turned off%' \
+          THEN 'hardware_unavailable' \
+        ELSE 'other' END \
+     WHERE error IS NOT NULL",
+    "UPDATE files SET problem = CASE \
+        WHEN error LIKE 'The file is no longer at %' \
+          OR error LIKE 'The file no longer exists%' THEN 'source_changed' \
+        WHEN error LIKE 'The original file appears damaged or incomplete%' \
+          OR error LIKE 'This file can''t be read as a video%' \
+          OR error LIKE 'The file is empty%' THEN 'unreadable_source' \
+        WHEN error LIKE 'The new file %' THEN 'verification' \
+        WHEN error LIKE 'Not enough free space%' THEN 'disk_full' \
+        WHEN error LIKE 'Could not use the temp folder%' THEN 'work_folder' \
+        WHEN error LIKE '%converting on the CPU instead is turned off%' \
+          THEN 'hardware_unavailable' \
+        ELSE 'other' END \
+     WHERE error IS NOT NULL",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
     (3, MIGRATION_V3),
     (4, MIGRATION_V4),
     (5, MIGRATION_V5),
+    (6, MIGRATION_V6),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -488,6 +524,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(savings_rows(db.pool()).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn version_6_sorts_recorded_errors_into_problem_kinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v5.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 5).await.unwrap();
+            sqlx::query(
+                "INSERT INTO libraries (id, name, path, profile, created_at) \
+                 VALUES ('l', 'Movies', '/m', '{}', '2026-01-01T00:00:00.000Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let rows = [
+                (
+                    "a",
+                    Some("The file is no longer at /m/a.mkv. It may have been moved."),
+                ),
+                (
+                    "b",
+                    Some("The original file appears damaged or incomplete (it stops after 0.1 s)."),
+                ),
+                (
+                    "c",
+                    Some("The new file is shorter than the original (0.1 s instead of 8.0 s)"),
+                ),
+                (
+                    "d",
+                    Some("libx264 stopped with exit code 1: Invalid argument"),
+                ),
+                ("e", None),
+            ];
+            for (i, (id, error)) in rows.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, error, scanned_at, updated_at) \
+                     VALUES (?, 'l', ?, 'x', 'x', 1, 'x', ?, ?, 'x', 'x')",
+                )
+                .bind(id)
+                .bind(format!("/m/{i}.mkv"))
+                .bind(if error.is_some() { "failed" } else { "done" })
+                .bind(error)
+                .execute(&pool)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, error, created_at) VALUES (?, ?, 'l', 'x', 'x', ?, 'waiting', ?, \
+                     '2026-01-02T00:00:00.000Z')",
+                )
+                .bind(format!("j{id}"))
+                .bind(id)
+                .bind(if error.is_some() { "failed" } else { "done" })
+                .bind(error)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let files: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT id, problem FROM files ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let expected = [
+            ("a", Some("source_changed")),
+            ("b", Some("unreadable_source")),
+            ("c", Some("verification")),
+            ("d", Some("other")),
+            ("e", None),
+        ];
+        let expected: Vec<(String, Option<String>)> = expected
+            .iter()
+            .map(|(id, p)| ((*id).to_string(), p.map(str::to_string)))
+            .collect();
+        assert_eq!(files, expected);
+        let jobs: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT substr(id, 2), problem FROM jobs ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(jobs, expected);
     }
 
     #[tokio::test]

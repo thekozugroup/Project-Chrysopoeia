@@ -246,9 +246,12 @@ impl IgnoreRules {
             }
         }
         let set = builder.build().unwrap_or_else(|error| {
-            invalid.push(format!(
-                "The ignore patterns could not be combined ({error}), so none were used"
-            ));
+            tracing::debug!("the ignore patterns could not be combined: {error}");
+            invalid.push(
+                "The ignore patterns couldn't be used together, so none were used. Check them in \
+                 Settings > Advanced"
+                    .to_string(),
+            );
             GlobSet::empty()
         });
         Self { set, invalid }
@@ -535,7 +538,10 @@ fn check_root(root: &Path) -> anyhow::Result<()> {
         io::ErrorKind::PermissionDenied => {
             anyhow!("Chrysopoeia does not have permission to open the folder {shown}.")
         }
-        _ => anyhow!("The folder {shown} could not be opened ({error})."),
+        _ => anyhow!(
+            "The folder {shown} couldn't be opened because {}.",
+            chrysopoeia_core::plain::io_reason(&error)
+        ),
     })?;
     if !metadata.is_dir() {
         bail!("{shown} is a file, not a folder.");
@@ -545,7 +551,10 @@ fn check_root(root: &Path) -> anyhow::Result<()> {
             "Chrysopoeia does not have permission to read the folder {shown}. Check the folder's \
              owner and permissions (PUID/PGID in Docker)."
         ),
-        _ => anyhow!("The folder {shown} could not be read ({error})."),
+        _ => anyhow!(
+            "The folder {shown} couldn't be read because {}.",
+            chrysopoeia_core::plain::io_reason(&error)
+        ),
     })?;
     Ok(())
 }

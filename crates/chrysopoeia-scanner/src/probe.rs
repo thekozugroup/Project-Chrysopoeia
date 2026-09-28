@@ -294,10 +294,10 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
 
     // When the caller's timeout drops this future, the child goes with it,
     // which kills ffprobe thanks to `kill_on_drop`.
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|error| ProbeError::Spawn(format!("ffprobe stopped unexpectedly ({error})")))?;
+    let output = child.wait_with_output().await.map_err(|error| {
+        tracing::debug!(path = %path.display(), "ffprobe stopped unexpectedly: {error}");
+        ProbeError::Spawn("ffprobe stopped unexpectedly while reading this file".to_string())
+    })?;
 
     if !output.status.success() {
         let reason = describe_ffprobe_failure(&output.stderr, &input, output.status);
@@ -334,7 +334,10 @@ fn describe_open_error(error: &io::Error) -> String {
         io::ErrorKind::PermissionDenied => {
             "Chrysopoeia doesn't have permission to read this file.".to_string()
         }
-        _ => format!("The file couldn't be opened ({error})."),
+        _ => format!(
+            "The file couldn't be opened because {}.",
+            chrysopoeia_core::plain::io_reason(error)
+        ),
     }
 }
 
@@ -348,7 +351,10 @@ fn describe_spawn_error(ffprobe: &Path, error: &io::Error) -> String {
         io::ErrorKind::PermissionDenied => {
             format!("\"{shown}\" is not executable; check the permissions of the ffprobe program")
         }
-        _ => format!("\"{shown}\" could not be started ({error})"),
+        _ => format!(
+            "\"{shown}\" couldn't be started because {}",
+            chrysopoeia_core::plain::io_reason(error)
+        ),
     }
 }
 
@@ -414,8 +420,10 @@ fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> 
                 detail.trim_end_matches('.')
             )
         }
-        (None, Some(code)) => {
-            format!("This file can't be read as a video (ffprobe stopped with exit code {code}).")
+        (None, Some(_)) => {
+            "This file can't be read as a video, and ffprobe gave no reason. It may be damaged or \
+             not a video at all."
+                .to_string()
         }
         (None, None) => "ffprobe stopped unexpectedly while reading this file.".to_string(),
     }
@@ -1381,7 +1389,8 @@ mod tests {
         );
         assert_eq!(
             describe_ffprobe_failure(b"", input, exit_status(3)),
-            "This file can't be read as a video (ffprobe stopped with exit code 3)."
+            "This file can't be read as a video, and ffprobe gave no reason. It may be damaged or \
+             not a video at all."
         );
     }
 

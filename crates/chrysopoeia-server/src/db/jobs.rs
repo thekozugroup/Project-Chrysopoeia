@@ -1,6 +1,8 @@
 //! The `jobs` table: one row per conversion attempt of a file.
 
-use chrysopoeia_core::{FileStatus, HwApi, Job, JobProgress, JobStage, JobState, ValidationReport};
+use chrysopoeia_core::{
+    FileStatus, HwApi, Job, JobProgress, JobStage, JobState, ProblemKind, ValidationReport,
+};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -12,7 +14,7 @@ use super::{
 
 const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, stage, priority, \
     progress, fps, speed, eta_secs, encoder, hw_api, attempt, input_size, output_size, error, \
-    skip_reason, validation, command, log_tail, notes, force, created_at, started_at, finished_at";
+    problem, skip_reason, validation, command, log_tail, notes, force, created_at, started_at, finished_at";
 
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
@@ -30,9 +32,11 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let attempt: i64 = row.try_get("attempt")?;
     let notes: Option<String> = row.try_get("notes")?;
     let force: i64 = row.try_get("force")?;
+    let error: Option<String> = row.try_get("error")?;
+    let problem: Option<String> = row.try_get("problem")?;
     Ok(Job {
-        // Filled from the `problem` column once the backend records causes.
-        problem: None,
+        problem: super::problem_of(error.as_deref(), problem.as_deref()),
+        error,
         force: force != 0,
         notes: notes
             .as_deref()
@@ -56,7 +60,6 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
         attempt: u32::try_from(attempt).unwrap_or(0),
         input_size: u64_col(row, "input_size")?,
         output_size: opt_u64_col(row, "output_size")?,
-        error: row.try_get("error")?,
         skip_reason: row.try_get("skip_reason")?,
         validation: validation
             .as_deref()
@@ -244,7 +247,7 @@ pub async fn create(conn: &mut SqliteConnection, new: &NewJob<'_>) -> sqlx::Resu
     let now = now_ts();
     let claimed = sqlx::query(
         "UPDATE files SET status = 'queued', job_id = ?, skip_reason = NULL, error = NULL, \
-         updated_at = ? WHERE id = ? AND status NOT IN ('queued', 'processing')",
+         problem = NULL, updated_at = ? WHERE id = ? AND status NOT IN ('queued', 'processing')",
     )
     .bind(id.to_string())
     .bind(&now)
@@ -332,7 +335,8 @@ pub async fn create_many(
 
     // Point each file at the job just created for it.
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "UPDATE files AS f SET status = 'queued', skip_reason = NULL, error = NULL, updated_at = ",
+        "UPDATE files AS f SET status = 'queued', skip_reason = NULL, error = NULL, \
+         problem = NULL, updated_at = ",
     );
     qb.push_bind(&now).push(
         ", job_id = (SELECT j.id FROM jobs j WHERE j.file_id = f.id AND j.state = 'queued' \
@@ -360,8 +364,8 @@ pub async fn claim_next(
     let now = now_ts();
     let mut qb = QueryBuilder::<Sqlite>::new(
         "UPDATE jobs SET state = 'running', stage = 'preparing', progress = 0, fps = NULL, \
-         speed = NULL, eta_secs = NULL, attempt = 1, error = NULL, skip_reason = NULL, \
-         notes = NULL, finished_at = NULL, started_at = ",
+         speed = NULL, eta_secs = NULL, attempt = 1, error = NULL, problem = NULL, \
+         skip_reason = NULL, notes = NULL, finished_at = NULL, started_at = ",
     );
     qb.push_bind(now.clone()).push(
         " WHERE id = (SELECT j.id FROM jobs j JOIN libraries l ON l.id = j.library_id \
@@ -396,8 +400,8 @@ pub async fn claim_next(
     let job = get_conn(&mut tx, id).await?;
     if let Some(job) = &job {
         sqlx::query(
-            "UPDATE files SET status = 'processing', job_id = ?, error = NULL, updated_at = ? \
-             WHERE id = ?",
+            "UPDATE files SET status = 'processing', job_id = ?, error = NULL, problem = NULL, \
+             updated_at = ? WHERE id = ?",
         )
         .bind(id.to_string())
         .bind(&now)
@@ -434,6 +438,8 @@ pub async fn update_progress(pool: &SqlitePool, p: &JobProgress) -> sqlx::Result
 #[derive(Debug, Clone, Default)]
 pub struct JobFinish {
     pub error: Option<String>,
+    /// What kind of problem `error` is (set whenever `error` is).
+    pub problem: Option<ProblemKind>,
     pub skip_reason: Option<String>,
     pub encoder: Option<String>,
     pub hw_api: Option<HwApi>,
@@ -460,7 +466,7 @@ pub async fn finish(
         Some(to_json(&f.notes)?)
     };
     let done = sqlx::query(
-        "UPDATE jobs SET state = ?, error = ?, skip_reason = ?, \
+        "UPDATE jobs SET state = ?, error = ?, problem = ?, skip_reason = ?, \
          encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), \
          attempt = COALESCE(?, attempt), output_size = ?, validation = ?, command = ?, \
          log_tail = ?, notes = ?, eta_secs = NULL, \
@@ -469,6 +475,11 @@ pub async fn finish(
     )
     .bind(enum_str(&state))
     .bind(&f.error)
+    .bind(
+        f.error
+            .as_ref()
+            .map(|_| enum_str(&f.problem.unwrap_or(ProblemKind::Other))),
+    )
     .bind(&f.skip_reason)
     .bind(&f.encoder)
     .bind(f.hw_api.map(|a| enum_str(&a)))
@@ -561,8 +572,8 @@ async fn close_file(
     let now = now_ts();
     if status == FileStatus::Pending {
         let kept = sqlx::query(&format!(
-            "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, updated_at = ?, \
-             job_id = {} WHERE id = ? AND job_id = ? AND status = ? \
+            "UPDATE files SET status = 'done', skip_reason = NULL, error = NULL, problem = NULL, \
+             updated_at = ?, job_id = {} WHERE id = ? AND job_id = ? AND status = ? \
              AND original_size_bytes IS NOT NULL",
             super::files::LAST_CONVERSION_JOB
         ))
