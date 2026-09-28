@@ -1,77 +1,48 @@
+# Chrysopoeia with CPU encoding. Works on any Docker host.
+#
+#   cp .env.example .env        # optional: adjust paths and ids
+#   docker compose up -d
+#   open http://localhost:8080
+#
+# Add a GPU with an overlay file:
+#   NVIDIA:     docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
+#   Intel/AMD:  docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d
+name: chrysopoeia
+
 services:
   chrysopoeia:
-    build: .
-    image: chrysopoeia:latest
+    # To run an image built from this checkout (`make docker`), set
+    # CHRYSOPOEIA_IMAGE=chrysopoeia:dev in .env.
+    image: ${CHRYSOPOEIA_IMAGE:-ghcr.io/thekozugroup/chrysopoeia:latest}
     container_name: chrysopoeia
+    restart: unless-stopped
     ports:
       - "${PORT:-8080}:8080"
-      - "${WEB_PORT:-3000}:3000"
     volumes:
+      # Database and settings. Back this folder up.
+      - ./config:/config
+      # Your media. Chrysopoeia replaces files here once each result is verified.
       - ${MEDIA_PATH:-./media}:/media
-      - chrysopoeia-data:/data
+      # Optional: a fast disk (SSD) for in-progress files. Without it, work
+      # files are written next to each original.
+      # - ${TEMP_PATH:-./temp}:/temp
     environment:
-      - RUST_LOG=${RUST_LOG:-info}
-      - DATABASE_URL=${DATABASE_URL:-sqlite:///data/chrysopoeia.db}
-      - MEDIA_PATH=/media
-      - MAX_CONCURRENT_JOBS=${MAX_CONCURRENT_JOBS:-2}
-      - DEFAULT_CODEC=${DEFAULT_CODEC:-av1}
-      - DEFAULT_QUALITY=${DEFAULT_QUALITY:-28}
-      - HW_ACCEL=${HW_ACCEL:-auto}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+      # Files are written as this user and group. Use the owner of your media
+      # (run `id` on the host). Unraid uses 99 and 100.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+      TZ: ${TZ:-Etc/UTC}
+      # auto picks the best verified hardware encoder, else the CPU. Other
+      # values: cpu, nvenc (NVIDIA), qsv (Intel), vaapi (Intel or AMD), amf,
+      # rkmpp (Rockchip), v4l2m2m (Raspberry Pi 4); see .env.example.
+      HW_ACCEL: ${HW_ACCEL:-auto}
+      # Jobs at once. Leave empty for automatic (based on CPU, memory and GPU).
+      MAX_JOBS: ${MAX_JOBS:-}
+      # Folders (inside the container) to add as libraries on first start,
+      # comma-separated, e.g. /media/Movies,/media/TV. You can also add them in the app.
+      LIBRARIES: ${LIBRARIES:-}
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
-        tag: "chrysopoeia|{{.Name}}"
-    deploy:
-      resources:
-        limits:
-          cpus: "${CPU_LIMIT:-0}"
-          memory: "${MEMORY_LIMIT:-0}"
-        # Uncomment the reservations block below for NVIDIA GPU passthrough.
-        # For non-NVIDIA systems, leave commented out and set HW_ACCEL=auto
-        # to use CPU-based encoding.
-        #
-        # reservations:
-        #   devices:
-        #     - driver: nvidia
-        #       count: all
-        #       capabilities: [gpu]
-    networks:
-      - chrysopoeia-net
-
-  # --------------------------------------------------------------------------
-  # Watchtower: auto-update running containers (optional)
-  # Uncomment to enable automatic image updates from a registry.
-  # --------------------------------------------------------------------------
-  # watchtower:
-  #   image: containrrr/watchtower
-  #   container_name: watchtower
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   environment:
-  #     - WATCHTOWER_CLEANUP=true
-  #     - WATCHTOWER_POLL_INTERVAL=3600
-  #     - WATCHTOWER_LABEL_ENABLE=true
-  #   restart: unless-stopped
-  #   logging:
-  #     driver: json-file
-  #     options:
-  #       max-size: "5m"
-  #       max-file: "2"
-  #   networks:
-  #     - chrysopoeia-net
-
-volumes:
-  chrysopoeia-data:
-
-networks:
-  chrysopoeia-net:
-    driver: bridge

@@ -1,13 +1,21 @@
-target/
-web/node_modules/
-web/.next/
-.git/
-*.db
-.env
-.env.*
-!.env.example
-*.log
-.claude/
-.github/
-README.md
-Makefile
+# Allowlist: the image needs only the Rust workspace, the web app and the
+# entrypoint. Everything else stays out of the build context.
+*
+!Cargo.toml
+!Cargo.lock
+!crates/
+!web/
+!docker/
+
+# Build output and local state inside the allowed folders
+**/target
+**/node_modules
+web/.next
+web/out
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+**/*.db
+**/*.db-*
+**/.DS_Store
+docker/test-*.sh
