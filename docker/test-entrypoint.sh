@@ -6,8 +6,9 @@
 # Covers PUID/PGID (including a gid that already exists, such as Unraid's 100
 # "users"), GPU device groups (never the root group), UMASK, the /temp and
 # empty-variable rules, the startup banner, warnings about missing, read-only
-# or unwritable mounts, /config ownership, the privilege drop and argument
-# pass-through. Fake GPU nodes are created inside the container with mknod
+# or unwritable mounts, /config ownership (only Chrysopoeia's own files are
+# re-owned, never a shared folder's other contents), the privilege drop and
+# argument pass-through. Fake GPU nodes are created inside the container with mknod
 # (Docker's default capabilities allow it), so no GPU and no sudo are needed.
 # Takes about 30 seconds; nothing is left behind.
 #
@@ -27,6 +28,7 @@ command -v docker >/dev/null 2>&1 || {
 
 VOLUME="chrysopoeia-entrypoint-test-$$"
 MEDIA_VOLUME="chrysopoeia-entrypoint-test-media-$$"
+SHARED_VOLUME="chrysopoeia-entrypoint-test-shared-$$"
 CONTAINER="chrysopoeia-entrypoint-test-$$"
 FAILURES=0
 OUT=""
@@ -34,7 +36,7 @@ STATUS=0
 
 cleanup() {
     docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
-    docker volume rm -f "$VOLUME" "$MEDIA_VOLUME" >/dev/null 2>&1 || true
+    docker volume rm -f "$VOLUME" "$MEDIA_VOLUME" "$SHARED_VOLUME" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -230,6 +232,69 @@ expect "treats empty template values as unset" '^jobs=unset hw=unset libs=unset 
 docker volume create "$VOLUME" >/dev/null
 run -v "$VOLUME:/config" -e PUID=99 -e PGID=100 -- stat -c '%u:%g' /config
 expect "gives /config to PUID/PGID" '^99:100$'
+
+# /config may be a folder shared with other apps (a template mistake such as
+# pointing Config at /mnt/user/appdata). Only Chrysopoeia's own files may change
+# owner; everything else in it must be left exactly as it is.
+
+# seed_shared <shell commands run as root in /config, which starts empty>
+seed_shared() {
+    docker run --rm --entrypoint /bin/sh -v "$SHARED_VOLUME:/config" "$IMAGE" -c \
+        "set -e; find /config -mindepth 1 -delete; $1"
+}
+# shared_owners <paths...>: "<path> <uid>:<gid>" lines in $OUT, read without the entrypoint.
+shared_owners() {
+    STATUS=0
+    OUT=$(docker run --rm --entrypoint /bin/stat -v "$SHARED_VOLUME:/config" "$IMAGE" -c '%n %u:%g' "$@" 2>&1) || STATUS=$?
+}
+docker volume create "$SHARED_VOLUME" >/dev/null
+
+# Chrysopoeia's database and lock files left behind by another owner (for
+# example by an earlier PUID) are fixed; a neighbour's files are not.
+seed_shared 'mkdir -p /config/otherapp/data
+echo x > /config/otherapp/data/file
+echo y > /config/notes.txt
+touch /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+chown -R 1234:1234 /config/otherapp /config/notes.txt
+chown 555:555 /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+chown 555:555 /config'
+run -v "$SHARED_VOLUME:/config" -e PUID=99 -e PGID=100 -- id -u
+expect "starts with a Config folder that has Chrysopoeia's files and other data" '^99$'
+shared_owners /config /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock \
+    /config/notes.txt /config/otherapp /config/otherapp/data /config/otherapp/data/file
+expect "gives the database to PUID/PGID" '^/config/chrysopoeia\.db 99:100$'
+expect "gives the database's write-ahead files to PUID/PGID" '^/config/chrysopoeia\.db-wal 99:100$'
+expect "gives the database's shared-memory file to PUID/PGID" '^/config/chrysopoeia\.db-shm 99:100$'
+expect "gives the lock file to PUID/PGID" '^/config/chrysopoeia\.lock 99:100$'
+expect "gives a Config folder that holds the database to PUID/PGID" '^/config 99:100$'
+expect "leaves another app's folder alone" '^/config/otherapp 1234:1234$'
+expect "leaves files inside another app's folder alone" '^/config/otherapp/data/file 1234:1234$'
+expect "leaves other files in the Config folder alone" '^/config/notes\.txt 1234:1234$'
+
+# A folder that only holds other data is not Chrysopoeia's to take over: it
+# is left as it is, and the container stops with a message if it cannot write.
+seed_shared 'mkdir -p /config/otherapp
+echo x > /config/otherapp/file
+chown -R 1234:1234 /config/otherapp
+chown 0:0 /config
+chmod 755 /config'
+run -v "$SHARED_VOLUME:/config" -e PUID=99 -e PGID=100 -- id -u
+expect_error "stops with a message instead of taking over a folder that holds other data" 'cannot write to /config.*never of anything else'
+shared_owners /config /config/otherapp /config/otherapp/file
+expect "did not change the shared folder's owner" '^/config 0:0$'
+expect "did not change the owner of anything in the shared folder" '^/config/otherapp 1234:1234$'
+expect "did not change the owner of files in the shared folder" '^/config/otherapp/file 1234:1234$'
+
+# Already writable for the app user: starts, leaves everything alone and says
+# that the folder looks shared.
+seed_shared 'echo y > /config/other.conf
+chown 1234:1234 /config/other.conf
+chown 99:100 /config
+chmod 775 /config'
+server_log -e PUID=99 -e PGID=100 -v "$SHARED_VOLUME:/config"
+expect "warns when the Config folder holds other files and no Chrysopoeia database" 'already holds other files but no Chrysopoeia database'
+shared_owners /config/other.conf
+expect "still leaves the other files alone" '^/config/other\.conf 1234:1234$'
 
 run -e PUID=99 -e PGID=100 -- sh -c 'grep -E "^(NoNewPrivs|CapEff)" /proc/self/status'
 expect "drops all capabilities" 'CapEff:[[:space:]]+0+$'

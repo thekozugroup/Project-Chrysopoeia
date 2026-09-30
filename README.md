@@ -8,15 +8,15 @@ original before it is allowed to replace it.
 It runs as one Docker container with one web page, on Unraid or any Linux,
 Windows or macOS machine that runs Docker (or natively on a Mac).
 
-![The Chrysopoeia overview: space saved, library progress and the files being converted right now](docs/screenshots/overview.png)
+![The Overview: the space saved so far, what is converting now, how far each library has come and the latest results](docs/screenshots/overview.png)
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/queue.png" alt="The queue: a running conversion with its current step, progress, speed and time left, plus tabs for the files up next and the finished ones"></td>
-    <td width="50%"><img src="docs/screenshots/hardware.png" alt="Settings, Hardware: the detected processor, memory and graphics, a setup tip, and which formats each encoder can produce"></td>
+    <td width="50%"><img src="docs/screenshots/queue.png" alt="The Queue: a running conversion with its current step, progress and time left, under the Running, Up next and History tabs"></td>
+    <td width="50%"><img src="docs/screenshots/hardware.png" alt="Settings, Hardware: this machine's processor, memory and graphics, setup tips, and which formats its encoders can produce"></td>
   </tr>
   <tr>
-    <td align="center"><sub>The queue, with a conversion running</sub></td>
+    <td align="center"><sub>The Queue, with a conversion running</sub></td>
     <td align="center"><sub>Settings › Hardware</sub></td>
   </tr>
 </table>
@@ -145,8 +145,9 @@ docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d   # I
 
 Chrysopoeia uses whichever encoders pass its test encode, so the only job is
 making the GPU visible to the container. **Settings › Hardware** in the app
-shows what was found, which encoders passed, and, if something is missing, the
-exact fix.
+(the page headed *This machine*) shows what was found and, if something is
+missing, the exact fix. Under *Details: encoders and ffmpeg*, each format shows
+*Works* once its test encode has passed on this machine.
 
 | Hardware | Host needs | Container needs | Encodes in hardware |
 |---|---|---|---|
@@ -170,7 +171,7 @@ variables; empty values count as not set.
 | `PUID` / `PGID` | `1000` / `1000` | User and group Chrysopoeia runs as and writes files as. Use the owner of your media (Unraid: `99` / `100`). |
 | `UMASK` | `002` | Permissions for new files (`002`: the group can edit them; `022`: only the owner). |
 | `TZ` | `UTC` | Time zone (e.g. `Europe/London`) for the *When to convert* schedule in Settings › Processing. Unraid sets it for you. Log lines are always stamped in UTC. |
-| `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). A GPU choice uses only that kind of GPU; files go to the CPU when it is missing or cannot encode the chosen format (Settings › Hardware shows whether its encoders are *verified*). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
+| `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). A GPU choice uses only that kind of GPU; files go to the CPU when it is missing or cannot encode the chosen format (Settings › Hardware, under *Details: encoders and ffmpeg*, shows *Works* for each format its test encode passed). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
 | `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Stands in for the automatic count while *Files at once* is *Automatic* in Settings › Processing; a number chosen there wins. |
 | `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. |
 | `ALLOWED_HOSTS` | none | Domain names the web UI may be opened at, comma-separated, e.g. `transcode.example.com`. Only needed behind a reverse proxy; see [below](#behind-a-reverse-proxy). |
@@ -229,21 +230,23 @@ Chrysopoeia never writes over a file it has not verified. Each conversion goes
 to a hidden temporary file; after it passes verification, the original is
 renamed to a hidden backup, the new file is moved into place, and only then is
 the backup deleted. If the power fails or the container stops halfway, the
-next start finds the backup and puts it back. A failed or cancelled job leaves
-the original untouched. If you would rather keep originals, choose *Output
-folder* in Settings and Chrysopoeia will never modify your library. As with any
-tool that rewrites files, keep a backup of media you cannot replace.
+next start finds the backup and puts it back. A failed or stopped job leaves
+the original untouched. If you would rather keep originals, choose *Save to a
+separate folder* in Settings › Output and Chrysopoeia will never modify your
+library. As with any tool that rewrites files, keep a backup of media you
+cannot replace.
 
 **What does "Verified" mean?**
 The new file was opened and checked before it replaced the original. With the
-default *Standard* level that means: it has the expected video, audio and
-subtitle streams in the target codec; its duration matches the original; it
-decodes from start to finish without a single error; and at four points in the
-file its picture was compared with the original (SSIM, a standard measure of
-visual similarity), catching green frames, blocking and other corruption.
-*Thorough* samples ten points and also checks for added black or frozen
-frames; *Quick* only checks streams and duration. Each job's report is in the
-Queue.
+default *Standard* level (Settings › Output, under *Checks before replacing*)
+that means: it has the expected video, audio and subtitle streams in the target
+codec; its duration matches the original; it decodes from start to finish
+without a single error; and at four points in the file its picture was compared
+with the original (SSIM, a standard measure of visual similarity), catching
+green frames, blocking and other corruption. *Thorough* samples ten points and
+also checks for added black or frozen frames; *Quick* only checks streams and
+duration. To see what was checked for a file, open it in the Queue (under
+*History*).
 
 **Why was a file skipped?**
 The reason is shown next to the file. The usual ones: the video is already as

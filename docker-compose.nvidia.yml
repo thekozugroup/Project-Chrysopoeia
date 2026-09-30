@@ -3,8 +3,8 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
 #
-# Check it worked: the Hardware page in the app lists NVENC encoders as
-# verified, and `docker exec chrysopoeia nvidia-smi` shows your GPU.
+# Check it worked: Settings > Hardware in the app shows NVENC encoders as
+# Works under Details, and `docker exec chrysopoeia nvidia-smi` shows your GPU.
 #
 # Docker itself sets NVIDIA_VISIBLE_DEVICES (and NVIDIA_DRIVER_CAPABILITIES)
 # from the reservation below, overriding any value in `environment:`, so

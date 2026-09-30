@@ -6,7 +6,9 @@
 #      Unraid uses 99/100) and applies UMASK (default 002),
 #   2. adds the user to the groups that own the GPU device nodes it can see
 #      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes), except root,
-#   3. makes /config (and the top of /temp) owned by that user,
+#   3. hands that user Chrysopoeia's own files in /config (the database and its
+#      lock) and the top of /config and /temp when those are new or empty,
+#      without ever re-owning other files or folders (the folder may be shared),
 #   4. prints a short banner and drops privileges with setpriv.
 # Started as any other user (docker run --user ...), it only applies UMASK
 # and the path defaults, then runs the command directly.
@@ -104,12 +106,27 @@ anonymous_volume() {
     mount_info "$1" | grep -Eq '^[^ ]+ [^ ]+ [^ ]+ [^ ]*/volumes/[0-9a-f]{64}/_data '
 }
 
+# Names of the files Chrysopoeia creates in the Config folder: the database (in
+# write-ahead mode, hence the extra files) and the lock that keeps a second
+# copy out.
+DB_FILE=chrysopoeia.db
+LOCK_FILE=chrysopoeia.lock
+
+# Whether the Config folder holds nothing yet (the "lost+found" of a freshly
+# formatted disk does not count).
+config_dir_is_empty() {
+    [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ]
+}
+
 # Warnings about missing or unusable mounts, printed when the server starts.
 # $1: a command prefix that runs a test as the app user (empty: as is).
 check_mounts() {
     [ "$show_banner" = 1 ] || return 0
     if ! mountpoint -q "$DATA_DIR" 2>/dev/null || anonymous_volume "$DATA_DIR"; then
         warn "No host folder is mounted at $DATA_DIR, so libraries, settings and history are lost when the container is recreated (for example by an update). Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
+    fi
+    if [ -d "$DATA_DIR" ] && [ ! -e "$DATA_DIR/$DB_FILE" ] && ! config_dir_is_empty; then
+        warn "$DATA_DIR already holds other files but no Chrysopoeia database. Chrysopoeia adds its own files there and leaves the rest alone, but if this folder is shared with other apps, give Chrysopoeia a folder of its own (Unraid: the Config path, for example /mnt/user/appdata/chrysopoeia)."
     fi
     if [ "$media_mounted" = 0 ]; then
         if [ -z "${BROWSE_ROOTS:-}" ] && [ -z "${LIBRARIES:-}" ]; then
@@ -288,14 +305,32 @@ check_nvidia_runtime
 
 # --- Ownership of writable folders ---------------------------------------------------
 
-if [ "$PUID" -ne 0 ]; then
-    mkdir -p "$DATA_DIR"
-    # Recursive for the (small) config folder, but only when something in it
-    # belongs to someone else.
-    if [ -n "$(find "$DATA_DIR" -xdev \( ! -user "$PUID" -o ! -group "$PGID" \) -print 2>/dev/null | head -n 1)" ]; then
-        log "Giving $DATA_DIR to uid $PUID, gid $PGID"
-        chown -R "$PUID:$PGID" "$DATA_DIR" || warn "Could not change the owner of $DATA_DIR."
+# Never change the owner of a whole folder tree: the Config folder may be shared
+# (for example an Unraid appdata folder that also holds other apps' data), and
+# re-owning that would damage those apps. Only what Chrysopoeia itself creates
+# is fixed: its database and lock files, and the top folder when it is new or
+# empty (or already holds Chrysopoeia's database).
+
+# Give $1, a file Chrysopoeia creates, to the app user. A symbolic link is
+# changed itself, never followed.
+own_file() {
+    { [ -e "$1" ] || [ -L "$1" ]; } || return 0
+    if [ "$(stat -c %u:%g "$1")" != "$PUID:$PGID" ]; then
+        chown -h "$PUID:$PGID" "$1" || warn "Could not change the owner of $1."
     fi
+}
+
+if [ "$PUID" -ne 0 ]; then
+    if [ ! -d "$DATA_DIR" ]; then
+        mkdir -p "$DATA_DIR" || die "Could not create $DATA_DIR. Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
+    fi
+    if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ] && { config_dir_is_empty || [ -e "$DATA_DIR/$DB_FILE" ]; }; then
+        log "Giving $DATA_DIR to uid $PUID, gid $PGID"
+        chown "$PUID:$PGID" "$DATA_DIR" || warn "Could not change the owner of $DATA_DIR."
+    fi
+    for name in "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" "$DB_FILE-journal" "$LOCK_FILE"; do
+        own_file "$DATA_DIR/$name"
+    done
     # The scratch folder may hold large files: fix only the folder itself.
     if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
         if [ "$(stat -c %u:%g "$TEMP_DIR")" != "$PUID:$PGID" ]; then
@@ -317,7 +352,7 @@ as_app() {
 }
 
 if ! as_app test -w "$DATA_DIR"; then
-    die "Chrysopoeia (uid $PUID) cannot write to $DATA_DIR. Make the folder writable for PUID/PGID $PUID/$PGID, or set PUID/PGID to the folder's owner."
+    die "Chrysopoeia (uid $PUID) cannot write to $DATA_DIR. Make the folder writable for PUID/PGID $PUID/$PGID, or set PUID/PGID to the folder's owner. (Chrysopoeia only changes the owner of its own files there, never of anything else in the folder.)"
 fi
 check_mounts as_app
 

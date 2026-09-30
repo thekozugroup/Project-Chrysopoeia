@@ -130,7 +130,8 @@ and files for inspection) tune it.
 1440x900 in the light theme: start the image with a library made by
 `scripts/make-test-media.sh <dir> 40` (plus a few renamed copies) mounted at
 `/media`, go through the setup screen, and capture the Overview and Queue
-while a file is converting, and Settings > Hardware. Save them as 256-colour
+while a file is converting, and Settings > Hardware (the page headed *This
+machine*), with its *Details: encoders and ffmpeg* open. Save them as 256-colour
 PNGs to keep the repository small.
 
 ## CI and releases
