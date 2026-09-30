@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, api, errorFromBody, onReachability, request } from "./api";
-import { countSavedFiles, fetchSystem } from "./queries";
+import { countSavedFiles } from "./queries";
 
 function jsonResponse(status: number, body: unknown): Response {
   return new Response(body === undefined ? null : JSON.stringify(body), {
@@ -86,29 +86,6 @@ describe("request", () => {
   });
 });
 
-describe("fetchSystem", () => {
-  afterEach(() => vi.unstubAllGlobals());
-
-  it("returns the server facts", async () => {
-    const info = { version: "0.2.0", default_temp_dir: "/temp", browse_roots: ["/media"], data_dir: "/config", in_container: true };
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(200, info)));
-    await expect(fetchSystem()).resolves.toEqual(info);
-  });
-
-  it("is null, not an error, on a server without the endpoint", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(jsonResponse(404, { error: "There's no API endpoint at /api/system.", code: "not_found" })),
-    );
-    await expect(fetchSystem()).resolves.toBeNull();
-  });
-
-  it("still fails when the server can't be reached", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
-    await expect(fetchSystem()).rejects.toBeInstanceOf(ApiError);
-  });
-});
-
 describe("countSavedFiles", () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -122,6 +99,7 @@ describe("countSavedFiles", () => {
     skipped: 0,
     failed: 0,
     saved_bytes,
+    settling: 0,
   });
 
   /** A server whose files have these statuses and savings. */
@@ -138,17 +116,18 @@ describe("countSavedFiles", () => {
     return fetch;
   }
 
-  it("counts only files that saved space, including converted files queued again", async () => {
+  it("counts every converted file the total adds up, and the ones that came out larger", async () => {
     serve([
       { status: "done", saved_bytes: 100 },
       { status: "done", saved_bytes: 50 },
-      // "Convert anyway" that came out larger: converted, but saved nothing.
+      // "Convert anyway" that came out larger: converted, and it takes away from the total.
       { status: "done", saved_bytes: -20 },
       // Converted, now queued again: it keeps its savings.
       { status: "queued", saved_bytes: 70 },
       { status: "queued", saved_bytes: null },
     ]);
-    await expect(countSavedFiles(totals(200, 3))).resolves.toBe(3);
+    // 200 = 100 + 50 - 20 + 70: four converted files, one of them larger, beside "Converted 3".
+    await expect(countSavedFiles(totals(200, 3))).resolves.toEqual({ files: 4, larger: 1 });
   });
 
   it("doesn't read the queue when the converted files hold every byte saved", async () => {
@@ -156,7 +135,7 @@ describe("countSavedFiles", () => {
       { status: "done", saved_bytes: 100 },
       { status: "queued", saved_bytes: null },
     ]);
-    await expect(countSavedFiles(totals(100, 1))).resolves.toBe(1);
+    await expect(countSavedFiles(totals(100, 1))).resolves.toEqual({ files: 1, larger: 0 });
     expect(fetch.mock.calls.map(([url]) => new URL(String(url), "http://localhost").searchParams.get("status"))).toEqual([
       "done",
     ]);

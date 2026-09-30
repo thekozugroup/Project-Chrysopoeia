@@ -10,17 +10,19 @@ import {
   isUnreadableSource,
   jobStanding,
   keptAsConverted,
+  newFileName,
   problemKind,
   reasonsFor,
   retryableCount,
   setupFix,
   setupProblem,
   skipNote,
+  skippedUnreadable,
   skipSummary,
   unreadableDetail,
 } from "./outcomes";
-import { serverLeftOutText, settlingCount, settlingText } from "./convertible";
-import { PROBLEM_KINDS, type ActivityEntry, type JobState, type LibraryStats, type MasteringDisplay, type ProblemKind } from "./types";
+import { serverLeftOutText, settlingText } from "./convertible";
+import { PROBLEM_KINDS, type JobState, type MasteringDisplay, type ProblemKind } from "./types";
 
 // Sentences the real server writes (chrysopoeia-scanner probe.rs, chrysopoeia-worker run.rs).
 const TRUNCATED = "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.";
@@ -52,20 +54,27 @@ describe("isUnreadableSource", () => {
   });
 
   it("counts failures by cause, treating any not listed as conversion failures", () => {
-    const failed = (error: string) => ({ status: "failed" as const, error });
-    expect(countFailures([failed(TRUNCATED), failed(FAKE), failed(VISUAL)])).toEqual({
+    const failed = (error: string, problem: ProblemKind) => ({ status: "failed" as const, error, problem });
+    expect(
+      countFailures([failed(TRUNCATED, "unreadable_source"), failed(FAKE, "unreadable_source"), failed(VISUAL, "verification")]),
+    ).toEqual({
       unreadable: 2,
       conversion: 1,
       setup: 0,
       changed: 0,
     });
-    expect(countFailures([failed(TRUNCATED)], 5)).toEqual({ unreadable: 1, conversion: 4, setup: 0, changed: 0 });
+    expect(countFailures([failed(TRUNCATED, "unreadable_source")], 5)).toEqual({
+      unreadable: 1,
+      conversion: 4,
+      setup: 0,
+      changed: 0,
+    });
   });
 });
 
 describe("problem codes", () => {
   const WORK = "Could not use the temp folder /temp: Permission denied (os error 13)";
-  const failure = (problem: ProblemKind | null | undefined, error: string | null = "Something went wrong.") => ({
+  const failure = (problem: ProblemKind | null, error: string | null = "Something went wrong.") => ({
     problem,
     error,
   });
@@ -79,11 +88,12 @@ describe("problem codes", () => {
     expect(problemKind(failure("gremlins" as ProblemKind))).toBe("other");
   });
 
-  it("reads the sentence only without a code (older servers)", () => {
-    expect(problemKind(failure(null, TRUNCATED))).toBe("unreadable_source");
-    expect(problemKind(failure(undefined, WORK))).toBe("other");
-    expect(problemKind(failure(undefined, null))).toBeNull();
-    expect(failureGroup(failure(undefined, null))).toBe("conversion");
+  it("never reads the sentence: an error without a code is \"other\"", () => {
+    // The server sends a code with every error; none means one from before it had them.
+    expect(problemKind(failure(null, TRUNCATED))).toBe("other");
+    expect(problemKind(failure(null, WORK))).toBe("other");
+    expect(problemKind(failure(null, null))).toBeNull();
+    expect(failureGroup(failure(null, null))).toBe("conversion");
   });
 
   it("groups every kind", () => {
@@ -107,6 +117,11 @@ describe("problem codes", () => {
 
   it("gives each setup problem its fix and the setting where it's made", () => {
     expect(setupFix("work_folder").setting.path).toBe("/settings/output");
+    // The work folder is at the bottom of Output: the link brings it into view.
+    expect(setupFix("work_folder").setting.focus).toBe("temp_dir");
+    expect(setupFix("disk_full").setting.focus).toBe("temp_dir");
+    expect(setupFix("destination", "folder").setting.focus).toBe("output_folder");
+    expect(setupFix("destination", "replace").setting.focus).toBeUndefined();
     expect(setupFix("disk_full").title).toBe("The disk is full");
     expect(setupFix("hardware_unavailable").setting).toEqual({ label: "Hardware settings", path: "/settings/hardware" });
     expect(setupFix("destination", "replace").fix).toMatch(/library folder.*read-write/);
@@ -273,36 +288,7 @@ describe("HDR in plain words", () => {
 });
 
 describe("round-3 counts", () => {
-  const stats = (settling?: number): LibraryStats => ({
-    file_count: 0,
-    total_bytes: 0,
-    pending: 0,
-    queued: 0,
-    processing: 0,
-    done: 0,
-    skipped: 0,
-    failed: 0,
-    saved_bytes: 0,
-    settling,
-  });
-  const feed: ActivityEntry[] = [
-    {
-      id: 1,
-      at: "2026-09-28T05:10:00Z",
-      level: "info",
-      message: "Scanned Movies: 0 files, 3 still being copied (checked again when they're finished)",
-      file_id: null,
-      job_id: null,
-      library_id: "lib",
-    },
-  ];
-
-  it("uses the server's settling count, and reads the scan summary only without it", () => {
-    expect(settlingCount({ id: "lib", stats: stats(5) }, feed)).toBe(5);
-    // 0 is the server's answer (the files settled), not "unknown".
-    expect(settlingCount({ id: "lib", stats: stats(0) }, feed)).toBe(0);
-    expect(settlingCount({ id: "lib", stats: stats(undefined) }, feed)).toBe(3);
-    expect(settlingCount({ id: "lib", stats: stats(0) }, [])).toBe(0);
+  it("says how many files are still being copied", () => {
     expect(settlingText(3)).toBe("Waiting for 3 files to finish copying");
     expect(settlingText(1)).toBe("Waiting for 1 file to finish copying");
   });
@@ -312,6 +298,45 @@ describe("round-3 counts", () => {
     expect(serverLeftOutText(1)).toBe("1 file was left out because this library's settings skip it.");
     expect(serverLeftOutText(0)).toBeNull();
     expect(serverLeftOutText(undefined)).toBeNull();
+  });
+});
+
+describe("newFileName", () => {
+  const job = { id: "j1", state: "done" as const, file_name: "Old Home Video.avi" };
+  const file = (file_name: string, job_id: string | null = "j1") => ({ file_name, job_id });
+
+  it("names the converted file when the conversion changed its extension", () => {
+    expect(newFileName(job, file("Old Home Video.mkv"), "replace")).toBe("Old Home Video.mkv");
+  });
+
+  it("says nothing when the name is the same, the file moved on, or the result went elsewhere", () => {
+    expect(newFileName(job, file("Old Home Video.avi"), "replace")).toBeNull();
+    // A later conversion made the file what it is now.
+    expect(newFileName(job, file("Old Home Video.mp4", "j2"), "replace")).toBeNull();
+    // Saved to a separate folder: the original is still where it was.
+    expect(newFileName(job, file("Old Home Video.mkv"), "folder")).toBeNull();
+    expect(newFileName(job, undefined, "replace")).toBeNull();
+    expect(newFileName({ ...job, state: "failed" }, file("Old Home Video.mkv"), "replace")).toBeNull();
+    // Settings not loaded yet.
+    expect(newFileName(job, file("Old Home Video.mkv"), undefined)).toBeNull();
+  });
+});
+
+describe("skippedUnreadable", () => {
+  const skipped = { status: "skipped" as const, skip_reason: "Skipped by you", video_codec: "h264" };
+
+  it("recognises a damaged original the user skipped", () => {
+    // Never read as a video at all.
+    expect(skippedUnreadable({ ...skipped, video_codec: null })).toBe(true);
+    // Read, but its last conversion found it damaged.
+    expect(skippedUnreadable(skipped, { state: "failed", error: TRUNCATED, problem: "unreadable_source" })).toBe(true);
+  });
+
+  it("leaves other skips alone", () => {
+    expect(skippedUnreadable(skipped)).toBe(false);
+    expect(skippedUnreadable(skipped, { state: "failed", error: VISUAL, problem: "verification" })).toBe(false);
+    expect(skippedUnreadable({ ...skipped, skip_reason: "Already HEVC", video_codec: null })).toBe(false);
+    expect(skippedUnreadable({ ...skipped, status: "failed", video_codec: null })).toBe(false);
   });
 });
 

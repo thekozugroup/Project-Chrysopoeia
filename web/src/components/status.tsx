@@ -82,7 +82,7 @@ export function FileStatusBadge({
   error?: string | null;
   problem?: Failure["problem"];
 }) {
-  const failure: Failure = { error: error ?? null, problem };
+  const failure: Failure = { error: error ?? null, problem: problem ?? null };
   if (status === "failed" && failureGroup(failure) !== "conversion") return <FailureBadge failure={failure} />;
   const style = FILE_STATUS_STYLE[status];
   const label =

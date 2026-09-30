@@ -204,20 +204,13 @@ export function recommendedGoal(hw: HardwareInfo | undefined): Exclude<Goal, "cu
   return "balanced";
 }
 
-/** Start of the hint title the server shows while its first detection runs. */
-const DETECTING_HINT = "Checking your hardware";
-
 /**
  * Whether this report is the server's stand-in while the first detection is
- * still running, rather than real results. It must never be shown as
- * "ffmpeg wasn't found". The server says so with `detecting`; servers from
- * before that flag are recognised by their stand-in (no encoders and a
- * "Checking…" hint).
+ * still running (`detecting`), rather than real results. It must never be
+ * shown as "ffmpeg wasn't found".
  */
 export function isDetecting(hw: HardwareInfo | undefined): boolean {
-  if (!hw) return false;
-  if (typeof hw.detecting === "boolean") return hw.detecting;
-  return hw.encoders.length === 0 && hw.hints.some((h) => h.title.startsWith(DETECTING_HINT));
+  return Boolean(hw?.detecting);
 }
 
 /** Failure text that means the device simply isn't there (not a broken one). */
@@ -331,7 +324,7 @@ export function bugReportText({
   }
   if (settings) lines.push(`Hardware preference: ${HW_PREFERENCE_LABEL[settings.hardware] ?? settings.hardware}`);
   if (queue) {
-    const source = queue.max_jobs_source ?? (queue.max_jobs_auto ? "auto" : "settings");
+    const source = queue.max_jobs_source;
     const from = source === "env" ? "from MAX_JOBS" : source === "auto" ? "automatic" : "set in Settings";
     lines.push(`Files at once: ${queue.max_jobs} (${from})`);
   }

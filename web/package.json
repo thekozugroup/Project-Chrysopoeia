@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "e2e": "node e2e/smoke.mjs",
+    "e2e:layout": "node e2e/layout.mjs",
     "mock": "node scripts/mock-api.mjs"
   },
   "dependencies": {

@@ -51,9 +51,12 @@ function job(partial: Partial<Job> = {}): Job {
     output_size: null,
     validation: null,
     error: null,
+    problem: null,
     skip_reason: null,
     command: null,
     log_tail: null,
+    notes: [],
+    force: false,
     created_at: "2026-09-28T10:00:00Z",
     started_at: "2026-09-28T10:01:00Z",
     finished_at: null,
@@ -82,6 +85,7 @@ function file(partial: Partial<MediaFile> = {}): MediaFile {
     saved_bytes: null,
     skip_reason: null,
     error: null,
+    problem: null,
     job_id: JOB_ID,
     progress: 40,
     scanned_at: "2026-09-28T09:00:00Z",
@@ -228,7 +232,15 @@ describe("applyEvent", () => {
   it("queue.state and stats.updated patch the queue and overview", () => {
     const { client, apply } = setup();
     client.setQueryData<Overview>(keys.overview, { totals: { done: 1 }, queue: { paused: false } } as unknown as Overview);
-    const state: QueueState = { paused: true, running: 1, queued: 4, max_jobs: 2, max_jobs_auto: true, waiting_for_schedule: false };
+    const state: QueueState = {
+      paused: true,
+      running: 1,
+      queued: 4,
+      max_jobs: 2,
+      max_jobs_auto: true,
+      max_jobs_source: "auto",
+      waiting_for_schedule: false,
+    };
     apply({ type: "queue.state", ...state });
     expect(client.getQueryData<QueueState>(keys.queue)).toEqual(state);
     expect(client.getQueryData<Overview>(keys.overview)?.queue).toEqual(state);

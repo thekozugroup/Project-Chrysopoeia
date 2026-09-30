@@ -95,18 +95,22 @@ export const GOALS: readonly Exclude<Goal, "custom">[] = [
   "archive",
 ];
 
+/** Each level is named for what it is; "Standard" is the one recommended (see `QUALITY_HELP`). */
 export const QUALITY_LABEL: Record<QualityLevel, string> = {
   smallest: "Smallest",
   small: "Small",
-  balanced: "Recommended",
+  balanced: "Standard",
   high: "High",
   best: "Best quality",
 };
 
+/** The quality level recommended for most libraries. */
+export const RECOMMENDED_QUALITY: QualityLevel = "balanced";
+
 export const QUALITY_HELP: Record<QualityLevel, string> = {
   smallest: "Biggest savings. Fine on phones and small screens; softer on a big TV.",
   small: "Large savings with a small loss in fine detail.",
-  balanced: "Looks like the original on most screens. A good default.",
+  balanced: "Recommended. Looks like the original on most screens.",
   high: "Hard to tell apart from the original, even on a large TV.",
   best: "Visually identical for nearly all content. Smaller savings.",
 };
@@ -114,7 +118,7 @@ export const QUALITY_HELP: Record<QualityLevel, string> = {
 export const SPEED_LABEL: Record<SpeedPreset, string> = {
   fast: "Faster",
   balanced: "Normal",
-  thorough: "Smaller files",
+  thorough: "Slower, smaller",
 };
 
 export const SPEED_HELP: Record<SpeedPreset, string> = {

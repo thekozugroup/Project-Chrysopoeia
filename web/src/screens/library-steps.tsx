@@ -16,7 +16,7 @@ import { Field, Input } from "@/components/ui/controls";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { recommendedGoal } from "@/lib/hardware";
 import { defaultsCustomized, profileForNewLibrary } from "@/lib/profile";
-import { keys, useHardwareInfo, usePresets, useSettings } from "@/lib/queries";
+import { keys, useHardwareInfo, useLibraries, usePresets, useSettings } from "@/lib/queries";
 import type { Goal, Library } from "@/lib/types";
 import { titleFromFolder } from "@/lib/utils";
 
@@ -85,6 +85,8 @@ export function FolderStep({
   /** 1 when the step is the page's own heading (Add library). */
   level?: 1 | 2;
 }) {
+  // Folders that are (or hold, or sit inside) a library are marked before the goal step.
+  const libraries = useLibraries();
   return (
     <div>
       <StepHeading step={step} level={level}>
@@ -100,6 +102,7 @@ export function FolderStep({
         onSelect={onPicked}
         error={error}
         onNavigate={onNavigate}
+        libraries={libraries.data}
       />
     </div>
   );

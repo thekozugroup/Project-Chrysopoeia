@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { SavingsChart, worthCharting } from "@/components/charts";
+import { FileName } from "@/components/file-name";
 import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
 import { LibraryBar, LibraryLegend, finishedPercent, remainingCount } from "@/components/library-bar";
 import { QueueControls } from "@/components/queue-controls";
@@ -40,13 +41,14 @@ import {
   useHardwareInfo,
   useJobStandings,
   useJobs,
-  useKeptSetupFailures,
   useLibraries,
   useOverview,
   useSavedFileCount,
   useSettings,
-  useSettling,
+  useSetupProblems,
+  RECENT_RESULTS_QUERY,
   type Failures,
+  type SavedFiles,
 } from "@/lib/queries";
 import { href, openSheet } from "@/lib/router";
 import { useLive, useServerDown } from "@/lib/store";
@@ -54,7 +56,6 @@ import type {
   BulkRequest,
   HardwareInfo,
   Job,
-  JobQuery,
   Library,
   LibraryStats,
   Overview,
@@ -184,16 +185,22 @@ function StatusLine({ queue, failed }: { queue: QueueState; failed: number }) {
 }
 
 /**
- * "from 12 converted files": the files the space saved comes from (those
- * with `saved_bytes > 0`, including converted files queued again), not
- * every converted file, since one that came out larger saved nothing.
+ * "from 12 converted files (1 came out larger)": the converted files the
+ * space saved is the net sum of (see `countSavedFiles`), so the count
+ * agrees with the libraries' "Converted", and a file that grew is named
+ * rather than silently left out.
  */
+export function savedFromText(saved: SavedFiles): string {
+  const from = `from ${plural(saved.files, "converted file")}`;
+  return saved.larger > 0 ? `${from} (${formatCount(saved.larger)} came out larger)` : from;
+}
+
 function SavedFrom({ totals }: { totals: LibraryStats }) {
   const count = useSavedFileCount(totals);
-  // Counting failed (an unusual server): the converted files are the closest answer.
-  const files = count.data ?? (count.error ? totals.done : null);
-  if (files === null) return <Skeleton className="inline-block h-3.5 w-36 align-middle" />;
-  return <>from {plural(files, "converted file")}</>;
+  // Counting failed: the converted files are the closest answer.
+  const saved = count.data ?? (count.error ? { files: totals.done, larger: 0 } : null);
+  if (saved === null) return <Skeleton className="inline-block h-3.5 w-36 align-middle" />;
+  return <>{savedFromText(saved)}</>;
 }
 
 function SavedHero({ overview }: { overview: Overview }) {
@@ -438,7 +445,7 @@ export function problemsFrom(
           ? blockedText(files.length, keptJobs.length, !failures.complete)
           : `${blockedText(files.length, keptJobs.length, !failures.complete)} ${fix.fix}`,
         reasons,
-        action: { label: fix.setting.label, href: href(fix.setting.path) },
+        action: { label: fix.setting.label, href: href(fix.setting.path, { focus: fix.setting.focus }) },
         retry: retryFor(files, keptJobs, failures, failedTotal),
       });
     }
@@ -512,23 +519,8 @@ function RetryAll({ retry }: { retry: Retry }) {
   );
 }
 
-const RECENT_QUERY: JobQuery = { state: "history", limit: 6 };
+const RECENT_QUERY = RECENT_RESULTS_QUERY;
 const EMPTY_JOBS: Job[] = [];
-
-/**
- * Setup problems from both places they show: failed files, and converted
- * files whose second conversion a setup problem stopped (read from the
- * recent history, see `useKeptSetupFailures`). `open` when there's any.
- */
-function useSetupProblems(): { kept: Partial<Record<SetupProblem, Job[]>>; open: boolean } {
-  const failures = useFailures();
-  const recent = useJobs(RECENT_QUERY);
-  const kept = useKeptSetupFailures(recent.data?.items ?? EMPTY_JOBS);
-  const open =
-    Object.values(failures.setup).some((files) => files && files.length > 0) ||
-    Object.values(kept).some((jobs) => jobs && jobs.length > 0);
-  return { kept, open };
-}
 
 function NeedsAttention() {
   const libraries = useLibraries();
@@ -618,14 +610,14 @@ function NowConverting({ queue }: { queue: QueueState }) {
           {errorMessage(running.error)} This retries on its own.
         </Callout>
       ) : jobs.length > 0 ? (
-        <div className="grid gap-4 lg:grid-cols-2">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
           {jobs.map((job, i) => (
             <JobCard key={job.id} job={job} onOpen={open} announce={i === 0} />
           ))}
         </div>
       ) : (
         // A job just started; its card arrives with the next list refresh.
-        <div className="grid gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
           <JobCardSkeleton />
         </div>
       )}
@@ -636,7 +628,7 @@ function NowConverting({ queue }: { queue: QueueState }) {
 export function LibraryRow({ library }: { library: Library }) {
   const scan = useLive((s) => s.scans[library.id]);
   const failures = useFailures();
-  const copying = useSettling(library);
+  const copying = library.stats.settling;
   const stats = library.stats;
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   const scanning = library.scanning || (scan && scan.phase !== "done");
@@ -734,8 +726,20 @@ function Libraries() {
       skipped: acc.skipped + l.stats.skipped,
       failed: acc.failed + l.stats.failed,
       saved_bytes: acc.saved_bytes + l.stats.saved_bytes,
+      settling: acc.settling + l.stats.settling,
     }),
-    { file_count: 0, total_bytes: 0, pending: 0, queued: 0, processing: 0, done: 0, skipped: 0, failed: 0, saved_bytes: 0 },
+    {
+      file_count: 0,
+      total_bytes: 0,
+      pending: 0,
+      queued: 0,
+      processing: 0,
+      done: 0,
+      skipped: 0,
+      failed: 0,
+      saved_bytes: 0,
+      settling: 0,
+    },
   );
   return (
     <section aria-labelledby="libraries-heading">
@@ -804,7 +808,7 @@ function RecentResults() {
                   className="flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-raised/60"
                 >
                   <span className="flex w-full items-center justify-between gap-3">
-                    <span className="min-w-0 truncate text-sm font-medium text-fg">{job.file_name}</span>
+                    <FileName name={job.file_name} className="text-sm font-medium text-fg" />
                     <JobStateBadge job={job} standing={standing} />
                   </span>
                   <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">

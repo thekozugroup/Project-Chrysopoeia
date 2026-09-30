@@ -17,6 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
+import { FileName } from "@/components/file-name";
 import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
 import { QueueControls, queueSentence } from "@/components/queue-controls";
 import { PageHeader } from "@/components/shell";
@@ -124,7 +125,7 @@ function RunningTab() {
   const noLibraries = useNoLibraries();
   if (running.isPending) {
     return (
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <JobCardSkeleton />
         <JobCardSkeleton />
       </div>
@@ -146,7 +147,7 @@ function RunningTab() {
     if (queue.data && queue.data.running > 0) {
       // A job just started; its card arrives with the next list refresh.
       return (
-        <div className="grid gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-2" aria-busy="true" aria-label="Loading what's converting">
           <JobCardSkeleton />
         </div>
       );
@@ -161,7 +162,7 @@ function RunningTab() {
   return (
     <>
       <StaleNote show={Boolean(running.error)} />
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {items.map((job, i) => (
           <JobCard key={job.id} job={job} onOpen={openJob} announce={i === 0} />
         ))}
@@ -199,7 +200,7 @@ function UpNextTab({ offset }: { offset: number }) {
               {offset + i + 1}
             </span>
             <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
-              <span className="block truncate text-sm font-medium text-fg hover:text-accent-ink">{job.file_name}</span>
+              <FileName name={job.file_name} className="text-sm font-medium text-fg hover:text-accent-ink" />
               <span className="block truncate text-[0.8125rem] text-muted">
                 {[libraryName(job.library_id), formatBytes(job.input_size), `added ${formatRelative(job.created_at)}`]
                   .filter(Boolean)
@@ -288,9 +289,7 @@ function HistoryTab({ offset }: { offset: number }) {
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">
               <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
                 <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                  <span className="min-w-0 truncate text-sm font-medium text-fg hover:text-accent-ink">
-                    {job.file_name}
-                  </span>
+                  <FileName name={job.file_name} className="text-sm font-medium text-fg hover:text-accent-ink" />
                   <JobStateBadge job={job} standing={standing} />
                 </span>
                 {/* When the note wraps, the library and time start their own line, with no stray "·". */}

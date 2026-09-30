@@ -6,10 +6,9 @@ import {
   leftOutText,
   nothingToConvertText,
   planBulkConvert,
-  settlingCount,
-  stillCopyingCount,
+  repeatsForce,
 } from "./convertible";
-import type { ActivityEntry, MediaFile, TranscodeProfile } from "./types";
+import type { MediaFile, TranscodeProfile } from "./types";
 
 const balanced: TranscodeProfile = {
   goal: "balanced",
@@ -61,6 +60,7 @@ function file(partial: Partial<MediaFile> = {}): MediaFile {
     saved_bytes: null,
     skip_reason: null,
     error: null,
+    problem: null,
     job_id: null,
     progress: null,
     scanned_at: "2026-09-28T05:10:00Z",
@@ -141,9 +141,15 @@ describe("planBulkConvert", () => {
     const truncated = file({
       status: "failed",
       error: "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.",
+      problem: "unreadable_source",
     });
-    const fake = file({ status: "failed", video_codec: null, error: "This file can't be read as a video: it has no MP4 index." });
-    const conversion = file({ status: "failed", error: "The new file didn't match the original." });
+    const fake = file({
+      status: "failed",
+      video_codec: null,
+      error: "This file can't be read as a video: it has no MP4 index.",
+      problem: "unreadable_source",
+    });
+    const conversion = file({ status: "failed", error: "The new file didn't match the original.", problem: "verification" });
     const kept = file({ status: "skipped", video_codec: "hevc", skip_reason: "Already HEVC" });
     const plan = planBulkConvert([truncated, fake, conversion, kept], balanced);
     expect(plan.ids).toEqual([conversion.id]);
@@ -178,67 +184,18 @@ describe("planBulkConvert", () => {
   });
 });
 
-describe("stillCopyingCount", () => {
-  const entry = (id: number, message: string, library_id: string | null = "lib"): ActivityEntry => ({
-    id,
-    at: "2026-09-28T05:10:00Z",
-    level: "info",
-    message,
-    file_id: null,
-    job_id: null,
-    library_id,
+describe("repeatsForce", () => {
+  it("repeats Convert anyway for a conversion that failed or was stopped", () => {
+    expect(repeatsForce({ force: true, state: "failed" })).toBe(true);
+    expect(repeatsForce({ force: true, state: "cancelled" })).toBe(true);
   });
 
-  it("reads the library's latest scan summary", () => {
-    const feed = [
-      entry(3, "Scanned Other: 0 files, 0 need converting, 9 still being copied (checked again when they're finished)", "other"),
-      entry(2, "Scanned Fresh: 0 files, 0 need converting, 1,204 still being copied (checked again when they're finished)"),
-      entry(1, "Scanned Fresh: 0 files, 0 need converting"),
-    ];
-    expect(stillCopyingCount(feed, "lib")).toBe(1204);
-    expect(stillCopyingCount(feed, "other")).toBe(9);
-  });
-
-  it("is 0 when the latest scan found nothing being copied, or there is none", () => {
-    expect(stillCopyingCount([entry(2, "Scanned Fresh: 3 files, 3 need converting"), entry(1, "Scanned Fresh: 0 files, 0 need converting, 3 still being copied (checked again when they're finished)")], "lib")).toBe(0);
-    expect(stillCopyingCount([], "lib")).toBe(0);
-    expect(stillCopyingCount(undefined, "lib")).toBe(0);
-  });
-
-  it("takes off files found since the scan (they settled)", () => {
-    const feed = [
-      entry(9, "Found Clip 3.mkv in Big"),
-      entry(8, "Found Clip 1.mkv in Other", "other"),
-      entry(7, "Found Clip 2.mkv in Big"),
-      entry(6, "Scanned Big: 0 files, 0 need converting, 6 still being copied (checked again when they're finished)"),
-      entry(5, "Found Clip 0.mkv in Big"),
-    ];
-    expect(stillCopyingCount(feed, "lib")).toBe(4);
-    const settled = [...Array.from({ length: 6 }, (_, i) => entry(20 - i, `Found Clip ${i}.mkv in Big`)), ...feed.slice(3)];
-    expect(stillCopyingCount(settled, "lib")).toBe(0);
-  });
-});
-
-describe("settlingCount", () => {
-  const stale: ActivityEntry[] = [
-    {
-      id: 1,
-      at: "2026-09-28T05:10:00Z",
-      level: "info",
-      message: "Scanned Big: 0 files, 0 need converting, 6 still being copied (checked again when they're finished)",
-      file_id: null,
-      job_id: null,
-      library_id: "lib",
-    },
-  ];
-  const stats = { file_count: 6, total_bytes: 0, pending: 0, queued: 4, processing: 2, done: 0, skipped: 0, failed: 0, saved_bytes: 0 };
-
-  it("trusts the server's count, including 0, over an old scan summary", () => {
-    expect(settlingCount({ id: "lib", stats: { ...stats, settling: 0 } }, stale)).toBe(0);
-    expect(settlingCount({ id: "lib", stats: { ...stats, settling: 2 } }, stale)).toBe(2);
-  });
-
-  it("reads the activity feed only from servers without the field", () => {
-    expect(settlingCount({ id: "lib", stats }, stale)).toBe(6);
+  it("doesn't for plain conversions, finished ones or no conversion at all", () => {
+    expect(repeatsForce({ force: false, state: "failed" })).toBe(false);
+    // Converted: converting it again follows the library's (new) goal.
+    expect(repeatsForce({ force: true, state: "done" })).toBe(false);
+    // Kept the original anyway (a safety rule): nothing to repeat.
+    expect(repeatsForce({ force: true, state: "skipped" })).toBe(false);
+    expect(repeatsForce(undefined)).toBe(false);
   });
 });

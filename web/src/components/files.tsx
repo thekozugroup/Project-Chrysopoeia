@@ -12,7 +12,7 @@ import {
   ConvertAgainAction,
   ConvertAnywayButton,
   FailureCallout,
-  IgnoreFileButton,
+  SkipUnreadableButton,
   SheetSection,
   savingsText,
 } from "@/components/jobs";
@@ -21,7 +21,7 @@ import { Button } from "@/components/ui/button";
 import { Badge, Callout, Detail, Disclosure, Meter, Skeleton } from "@/components/ui/display";
 import { Sheet } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
-import { convertsAgain, skipFollowsSettings } from "@/lib/convertible";
+import { convertsAgain, repeatsForce, skipFollowsSettings } from "@/lib/convertible";
 import {
   formatBitrate,
   formatBytes,
@@ -31,10 +31,10 @@ import {
   middleTruncate,
 } from "@/lib/format";
 import { channelsLabel, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
-import { hdrSummary, hdrTechnical, isUnreadable, jobStanding, skipSummary } from "@/lib/outcomes";
+import { hdrSummary, hdrTechnical, isUnreadable, jobStanding, skippedUnreadable, skipSummary } from "@/lib/outcomes";
 import { useFile, useLibrary } from "@/lib/queries";
 import { openSheet } from "@/lib/router";
-import { useFileLive, useLive } from "@/lib/store";
+import { useFileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo, TranscodeProfile } from "@/lib/types";
 import { useRetained } from "@/lib/utils";
 
@@ -190,8 +190,17 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   const live = useFileLive(file.id);
   const { library } = useLibrary(file.library_id);
   const latest = jobs[0];
-  const forcedIgnored = useLive((s) => Boolean(latest && latest.state === "skipped" && s.forced[latest.id]));
   if (file.status === "failed") return <FailureCallout failure={file} title="The last attempt failed" />;
+  if (skippedUnreadable(file, latest)) {
+    return (
+      <Callout tone="info" title="Skipped by you">
+        <p>
+          It can&apos;t be read (it looks damaged or isn&apos;t a video), so it&apos;s left alone. Replace it with a good
+          copy and the new one is picked up automatically.
+        </p>
+      </Callout>
+    );
+  }
   if (file.status === "skipped") {
     // "Kept the original" when a new file was made and thrown away (the size
     // rule); everything else never needed work.
@@ -200,12 +209,6 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
     return (
       <Callout tone="info" title={summary.title}>
         <p>{summary.body}</p>
-        {forcedIgnored ? (
-          <p className="mt-1.5">
-            Convert anyway didn&apos;t take effect: this server still applied the library&apos;s rules. Update the
-            Chrysopoeia container to convert files like this one.
-          </p>
-        ) : null}
       </Callout>
     );
   }
@@ -258,15 +261,17 @@ function hasActions(file: MediaFile, profile: TranscodeProfile | undefined): boo
   }
 }
 
-function FileActions({ file }: { file: MediaFile }) {
+function FileActions({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   const { queue, skip } = useFileActions();
   const { library } = useLibrary(file.library_id);
+  // Its latest conversion was "Convert anyway" and didn't finish: queue it that way again.
+  const force = repeatsForce(jobs[0]);
   if (file.status === "done") {
     return (
       <ConvertAgainAction
         file={file}
         profile={library?.profile}
-        onConfirm={() => queue.mutate({ file })}
+        onConfirm={() => queue.mutate({ file, force })}
         loading={queue.isPending}
       />
     );
@@ -276,21 +281,23 @@ function FileActions({ file }: { file: MediaFile }) {
     // sets the library's rules aside for this one file.
     return skipFollowsSettings(file) ? <ConvertAnywayButton file={file} /> : null;
   }
-  if (file.status === "failed" && isUnreadable(file)) {
+  const unreadable = file.status === "failed" && isUnreadable(file);
+  if (unreadable || skippedUnreadable(file, jobs[0])) {
+    // Converting a damaged original can't work; trying again reads it afresh (once it's replaced, say).
     return (
       <>
         <Button
           variant="secondary"
           size="sm"
-          onClick={() => queue.mutate({ file })}
+          onClick={() => queue.mutate({ file, force })}
           loading={queue.isPending}
-          className="mr-auto"
+          className={unreadable ? "mr-auto" : undefined}
           needsServer
         >
           <RotateCcw aria-hidden />
           Try again
         </Button>
-        <IgnoreFileButton file={file} />
+        {unreadable ? <SkipUnreadableButton file={file} /> : null}
       </>
     );
   }
@@ -315,7 +322,7 @@ function FileActions({ file }: { file: MediaFile }) {
         <Button
           variant="secondary"
           size="sm"
-          onClick={() => queue.mutate({ file, next: true })}
+          onClick={() => queue.mutate({ file, next: true, force })}
           disabled={queue.isPending}
           needsServer
         >
@@ -324,7 +331,7 @@ function FileActions({ file }: { file: MediaFile }) {
         </Button>
       ) : null}
       {canQueue ? (
-        <Button variant="primary" size="sm" onClick={() => queue.mutate({ file })} loading={queue.isPending} needsServer>
+        <Button variant="primary" size="sm" onClick={() => queue.mutate({ file, force })} loading={queue.isPending} needsServer>
           {file.status === "failed" ? <RotateCcw aria-hidden /> : <Play aria-hidden />}
           {file.status === "failed" ? "Try again" : "Convert"}
         </Button>
@@ -361,7 +368,7 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
       onOpenChange={(open) => !open && onClose()}
       title={file ? middleTruncate(file.file_name, 80) : "Loading…"}
       description={file ? <span className="font-mono text-xs break-all">{file.relative_path}</span> : undefined}
-      footer={file && hasActions(file, library?.profile) ? <FileActions file={file} /> : undefined}
+      footer={file && detail && hasActions(file, library?.profile) ? <FileActions file={file} jobs={detail.jobs} /> : undefined}
     >
       {detail && file ? (
         <>

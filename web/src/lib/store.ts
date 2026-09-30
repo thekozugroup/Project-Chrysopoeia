@@ -30,12 +30,6 @@ interface LiveState {
   scans: Record<string, ScanProgress>;
   /** Latest polite screen-reader announcement. */
   announcement: string;
-  /**
-   * Jobs queued with "Convert anyway" in this browser session, so a server
-   * that ignored the request (and skipped the file again) can be told apart
-   * from an ordinary skip.
-   */
-  forced: Record<string, true>;
   setConnection: (state: ConnectionState) => void;
   setPolling: (polling: boolean) => void;
   setServerDown: (down: boolean) => void;
@@ -46,7 +40,6 @@ interface LiveState {
   /** Forget live progress, e.g. when the connection drops and it goes stale. */
   clearProgress: () => void;
   announce: (text: string) => void;
-  markForced: (jobId: string) => void;
 }
 
 export const useLive = create<LiveState>((set) => ({
@@ -56,7 +49,6 @@ export const useLive = create<LiveState>((set) => ({
   jobs: {},
   scans: {},
   announcement: "",
-  forced: {},
   setConnection: (connection) => set((s) => (s.connection === connection ? s : { connection })),
   setPolling: (polling) => set((s) => (s.polling === polling ? s : { polling })),
   setServerDown: (serverDown) => set((s) => (s.serverDown === serverDown ? s : { serverDown })),
@@ -79,7 +71,6 @@ export const useLive = create<LiveState>((set) => ({
   clearProgress: () =>
     set((s) => (Object.keys(s.jobs).length || Object.keys(s.scans).length ? { jobs: {}, scans: {} } : s)),
   announce: (announcement) => set({ announcement }),
-  markForced: (jobId) => set((s) => ({ forced: { ...s.forced, [jobId]: true } })),
 }));
 
 /**

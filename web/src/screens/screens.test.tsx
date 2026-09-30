@@ -1,14 +1,15 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { folderVideos, videoCount } from "@/components/folder-picker";
+import { folderVideos, libraryConflict, videoCount } from "@/components/folder-picker";
 import { limitText, queueSentence } from "@/components/queue-controls";
 import { NO_FAILURES, type FailureCounts } from "@/lib/outcomes";
 import { api } from "@/lib/api";
 import { FAILED_READ_MAX, failuresFrom, fetchFailedFiles, type Failures } from "@/lib/queries";
 import type { HardwareInfo, Job, Library, MediaFile, ProblemKind, QueueState } from "@/lib/types";
 import { finishedPercent } from "@/components/library-bar";
-import { overviewStatus, problemsFrom } from "./overview";
+import { queueSummary } from "@/components/shell";
+import { overviewStatus, problemsFrom, savedFromText } from "./overview";
 import { logLevel } from "./queue";
-import { automaticJobs, splitPatterns } from "./settings";
+import { automaticJobs, newLibraryDefaultsText, splitPatterns } from "./settings";
 
 const queue = (partial: Partial<QueueState> = {}): QueueState => ({
   paused: false,
@@ -63,6 +64,7 @@ function library(partial: Partial<Library> = {}): Library {
       min_savings_pct: 10,
     },
     stats: {
+      settling: 0,
       file_count: 4,
       total_bytes: 1,
       pending: 0,
@@ -188,7 +190,8 @@ describe("needs your attention", () => {
     // The server's sentence is the fix; the generic one isn't repeated beside it.
     expect(problems[0].detail).toBe("2 files couldn't be converted because of it.");
     expect(problems[0].reasons).toEqual(["It went wrong."]);
-    expect(problems[0].action?.href).toBe("#/settings/output");
+    // Straight to the work folder, at the bottom of Output.
+    expect(problems[0].action?.href).toBe("#/settings/output?focus=temp_dir");
     expect(problems[3].reasons).toEqual(["The file is no longer there. It may have been moved or deleted."]);
     expect(problems[3].tone).toBe("info");
   });
@@ -282,15 +285,15 @@ describe("needs your attention", () => {
     expect(merged[0].retry).toEqual({ requests: [{ action: "retry_failed", ids: ["h1", "h2"] }], count: 2 });
   });
 
-  it("reads damaged originals from their sentence when an older server sends no code", () => {
+  it("goes by the code, never the sentence: an error without one is a failed conversion", () => {
     const libs = [library()];
     const files = [
       failedFile("u1", "lib-a", null, "The original file appears damaged or incomplete (it stops after 0.1 s)."),
       failedFile("x1", "lib-a", null, "Could not use the temp folder /temp: Permission denied"),
     ];
     const failures = failuresFrom(libs, files);
-    expect(failures.byLibrary["lib-a"]).toEqual(counts(1, 1));
-    expect(failures.retry["lib-a"]).toEqual({ request: { action: "retry_failed", ids: ["x1"] }, count: 1 });
+    expect(failures.byLibrary["lib-a"]).toEqual(counts(0, 2));
+    expect(failures.retry["lib-a"]).toEqual({ request: { action: "retry_failed", ids: ["u1", "x1"] }, count: 2 });
   });
 });
 
@@ -391,5 +394,51 @@ describe("log tone", () => {
     ).toBe("warning");
     expect(logLevel(entry("error", "Clip.mkv failed its visual check. The original was kept."))).toBe("error");
     expect(logLevel(entry("info", "Scanned Movies: 3 files"))).toBe("info");
+  });
+});
+
+describe("the frame's queue pill", () => {
+  it("says a fix is needed, not \"Watching\", once a setup problem stops conversions", () => {
+    expect(queueSummary(queue(), undefined, false, true)).toMatchObject({ text: "Needs a fix", tone: "blocked" });
+    expect(queueSummary(queue(), undefined, false, false)).toMatchObject({ text: "Watching for new files", tone: "idle" });
+    // Work in progress still comes first.
+    expect(queueSummary(queue({ running: 1 }), undefined, false, true).text).toBe("Converting 1 file");
+    expect(queueSummary(queue({ queued: 3 }), undefined, false, true).text).toBe("3 files waiting");
+  });
+});
+
+describe("the space saved", () => {
+  it("counts every converted file behind the total, naming the ones that grew", () => {
+    expect(savedFromText({ files: 5, larger: 1 })).toBe("from 5 converted files (1 came out larger)");
+    expect(savedFromText({ files: 1, larger: 0 })).toBe("from 1 converted file");
+  });
+});
+
+describe("defaults for new libraries", () => {
+  it("says what Add library really starts with", () => {
+    expect(newLibraryDefaultsText(false, "balanced")).toMatch(
+      /^Until you change these, Add library suggests the goal that suits this machine \(Balanced\)/,
+    );
+    expect(newLibraryDefaultsText(true, "balanced")).toMatch(/^New libraries start with these settings\./);
+  });
+});
+
+describe("picking a folder for a new library", () => {
+  const libs = [
+    { name: "Movies", path: "/media/Movies" },
+    { name: "TV", path: "/media/TV/" },
+  ];
+
+  it("says why a folder can't be used before the goal step", () => {
+    expect(libraryConflict("/media/Movies", libs)).toBe("This folder is already the library “Movies”.");
+    expect(libraryConflict("/media/TV", libs)).toBe("This folder is already the library “TV”.");
+    expect(libraryConflict("/media/Movies/Classics", libs)).toBe("This folder is inside “Movies”, which is already a library.");
+    expect(libraryConflict("/media", libs)).toMatch(/^This folder contains the library “Movies”\./);
+  });
+
+  it("allows folders beside a library, even with a similar name", () => {
+    expect(libraryConflict("/media/Movies 4K", libs)).toBeNull();
+    expect(libraryConflict("/media/Music", libs)).toBeNull();
+    expect(libraryConflict("/media/Movies", [])).toBeNull();
   });
 });

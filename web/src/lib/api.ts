@@ -8,6 +8,7 @@
 
 import type {
   Affected,
+  BulkResult,
   BulkRequest,
   CreateLibraryRequest,
   FileDetail,
@@ -234,7 +235,7 @@ export const api = {
   queueFile: (id: string, options: QueueFileRequest = {}) =>
     request<Job>(`/files/${seg(id)}/queue`, { method: "POST", body: options }),
   skipFile: (id: string) => request<MediaFile>(`/files/${seg(id)}/skip`, { method: "POST" }),
-  bulk: (body: BulkRequest) => request<Affected>("/files/bulk", { method: "POST", body }),
+  bulk: (body: BulkRequest) => request<BulkResult>("/files/bulk", { method: "POST", body }),
 
   jobs: (query: JobQuery, signal?: AbortSignal) =>
     request<ListResponse<Job>>("/jobs", { query: { ...query }, signal }),

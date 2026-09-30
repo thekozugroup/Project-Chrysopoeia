@@ -29,6 +29,7 @@ function hardware(partial: Partial<HardwareInfo>): HardwareInfo {
     recommended_jobs: { cpu_jobs: 2, gpu_jobs: 0, total: 2, reason: "Two at once." },
     hints: [],
     in_container: true,
+    detecting: false,
     detected_at: "2026-09-28T00:00:00Z",
     ...partial,
   };
@@ -40,6 +41,7 @@ const placeholder = hardware({
   encoders: [],
   ffmpeg: { ffmpeg_path: "ffmpeg", ffprobe_path: "ffprobe", found: false, ffprobe_found: false, version: null },
   hints: [{ level: "info", title: "Checking your hardware…", detail: "Testing encoders.", fix: null }],
+  detecting: true,
 });
 
 describe("isDetecting", () => {
@@ -62,7 +64,7 @@ describe("isDetecting", () => {
   });
 
   it("trusts the server's detecting flag over the look of the report", () => {
-    // Newer servers say so outright; a stand-in without the hint still counts.
+    // A stand-in without the hint still counts.
     expect(isDetecting({ ...placeholder, hints: [], detecting: true })).toBe(true);
     // And a finished detection that happens to find nothing is real.
     expect(isDetecting({ ...placeholder, detecting: false })).toBe(false);
@@ -232,9 +234,9 @@ describe("bugReportText", () => {
   it("leaves out what hasn't loaded, and says when nothing was found", () => {
     expect(bugReportText({ system: { version: "0.2.0", build: null, in_container: false } })).toBe("Chrysopoeia 0.2.0");
     const bare = bugReportText({
-      system: { version: "0.2.0", in_container: false },
+      system: { version: "0.2.0", build: null, in_container: false },
       hw: hardware({ encoders: [] }),
-      queue: { max_jobs: 2, max_jobs_auto: true },
+      queue: { max_jobs: 2, max_jobs_auto: true, max_jobs_source: "auto" },
     });
     expect(bare).toContain("GPUs: none found");
     expect(bare).toContain("Verified encoders: none");

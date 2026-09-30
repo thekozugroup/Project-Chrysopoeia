@@ -55,6 +55,7 @@ function file(partial: Partial<MediaFile> = {}): MediaFile {
     saved_bytes: null,
     skip_reason: "Already HEVC",
     error: null,
+    problem: null,
     job_id: null,
     progress: null,
     scanned_at: "2026-09-28T05:10:00Z",

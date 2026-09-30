@@ -20,6 +20,7 @@ import {
   Wrench,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
+import { FileName } from "@/components/file-name";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -45,6 +46,7 @@ import {
   failureNote,
   isUnreadable,
   jobStanding,
+  newFileName,
   setupFix,
   setupProblem,
   skipNote,
@@ -57,7 +59,7 @@ import {
 import { overallProgress } from "@/lib/progress";
 import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
-import { useLive, useLiveJob } from "@/lib/store";
+import { useLiveJob } from "@/lib/store";
 import type { Job, JobStage, MediaFile, TranscodeProfile, ValidationCheck, ValidationReport } from "@/lib/types";
 import { cn, useRetained } from "@/lib/utils";
 
@@ -130,18 +132,31 @@ export function StopJobButton({
   size = "sm",
   variant = "quiet",
   label = "Stop",
+  named = false,
 }: {
   job: Job;
   size?: "sm" | "md";
   variant?: "quiet" | "secondary";
   /** "Stop" on a card, "Stop converting" in the sheet. */
   label?: string;
+  /**
+   * Add the file's name to the accessible name ("Stop The Office…"), for a
+   * card among others whose buttons would otherwise all be called "Stop".
+   */
+  named?: boolean;
 }) {
   const { cancel } = useJobActions();
   const [confirm, setConfirm] = useState(false);
   if (job.state === "queued") {
     return (
-      <Button variant={variant} size={size} onClick={() => cancel.mutate(job)} loading={cancel.isPending} needsServer>
+      <Button
+        variant={variant}
+        size={size}
+        onClick={() => cancel.mutate(job)}
+        loading={cancel.isPending}
+        aria-label={named ? `Remove ${job.file_name} from the queue` : undefined}
+        needsServer
+      >
         <CircleMinus aria-hidden />
         Remove from queue
       </Button>
@@ -149,7 +164,13 @@ export function StopJobButton({
   }
   return (
     <>
-      <Button variant={variant} size={size} onClick={() => setConfirm(true)} needsServer>
+      <Button
+        variant={variant}
+        size={size}
+        onClick={() => setConfirm(true)}
+        aria-label={named ? `${label} ${job.file_name}` : undefined}
+        needsServer
+      >
         <CircleStop aria-hidden />
         {label}
       </Button>
@@ -198,17 +219,22 @@ export function JobCard({
     `${job.id}:${job.stage}`,
   );
 
+  const titleId = `job-card-${job.id}`;
   return (
-    <article className="flex flex-col gap-3.5 rounded-lg border border-line bg-surface p-4 shadow-card sm:p-5">
+    // `min-w-0`: a long name is cut to the card's width instead of widening it past the screen.
+    <article
+      aria-labelledby={titleId}
+      className="flex min-w-0 flex-col gap-3.5 rounded-lg border border-line bg-surface p-4 shadow-card sm:p-5"
+    >
       <div className="flex items-start gap-3">
         <div className="min-w-0 flex-1">
           <button
+            id={titleId}
             type="button"
             onClick={() => onOpen(job)}
-            className="block max-w-full truncate text-left text-[0.9375rem] font-semibold text-fg hover:text-accent-ink"
-            title={job.file_name}
+            className="flex max-w-full text-left text-[0.9375rem] font-semibold text-fg hover:text-accent-ink"
           >
-            {job.file_name}
+            <FileName name={job.file_name} />
           </button>
           <p className="mt-0.5 truncate text-[0.8125rem] text-muted">
             {libraryName ? `${libraryName} · ` : ""}
@@ -233,9 +259,10 @@ export function JobCard({
         ) : null}
       </div>
 
+      {/* Named after the file: with several cards, "Stop" and "Details" alone would be ambiguous. */}
       <div className="flex items-center justify-end gap-2 border-t border-line pt-3">
-        <StopJobButton job={job} />
-        <Button variant="secondary" size="sm" onClick={() => onOpen(job)}>
+        <StopJobButton job={job} named />
+        <Button variant="secondary" size="sm" onClick={() => onOpen(job)} aria-label={`Details for ${job.file_name}`}>
           Details
         </Button>
       </div>
@@ -246,7 +273,7 @@ export function JobCard({
 /** Placeholder with the card's shape. */
 export function JobCardSkeleton() {
   return (
-    <div className="flex flex-col gap-4 rounded-lg border border-line bg-surface p-5">
+    <div className="flex min-w-0 flex-col gap-4 rounded-lg border border-line bg-surface p-5">
       <Skeleton className="h-4 w-2/3" />
       <Skeleton className="h-3 w-1/3" />
       <Skeleton className="h-2.5 w-full rounded-full" />
@@ -463,7 +490,7 @@ function SetupCallout({ kind, error, kept = false }: { kind: SetupProblem; error
       tone="warning"
       title={fix.title}
       action={
-        <a href={href(fix.setting.path)} className={buttonVariants({ variant: "secondary", size: "sm" })}>
+        <a href={href(fix.setting.path, { focus: fix.setting.focus })} className={buttonVariants({ variant: "secondary", size: "sm" })}>
           <Wrench aria-hidden />
           {fix.setting.label}
         </a>
@@ -547,10 +574,9 @@ function MovedOnCallout({ job, standing }: { job: Job; standing: "converted" | "
   );
 }
 
-function Outcome({ job, standing }: { job: Job; standing: JobStanding }) {
+function Outcome({ job, standing, renamed }: { job: Job; standing: JobStanding; renamed: string | null }) {
   const settings = useSettings();
   const { library } = useLibrary(job.library_id);
-  const forced = useLive((s) => Boolean(s.forced[job.id]));
   if (standing === "unknown") return <Skeleton className="h-20 w-full rounded-lg" />;
   if (standing === "kept") return <KeptConvertedCallout job={job} minSavingsPct={library?.profile.min_savings_pct} />;
   if ((standing === "converted" || standing === "queued") && job.state !== "skipped") {
@@ -565,12 +591,6 @@ function Outcome({ job, standing }: { job: Job; standing: JobStanding }) {
       <Callout tone="info" title={summary.title}>
         <p>{summary.body}</p>
         {standing === "converted" ? <p className="mt-1.5">The file has been converted since.</p> : null}
-        {forced ? (
-          <p className="mt-1.5">
-            Convert anyway didn&apos;t take effect: this server still applied the library&apos;s rules. Update the
-            Chrysopoeia container to convert files like this one.
-          </p>
-        ) : null}
       </Callout>
     );
   }
@@ -589,13 +609,21 @@ function Outcome({ job, standing }: { job: Job; standing: JobStanding }) {
         tone="success"
         title={verified ? (toFolder ? "Verified and saved" : "Verified and replaced") : toFolder ? "Saved" : "Replaced"}
       >
-        {verified
-          ? toFolder
-            ? "The new file passed every check and was saved to the output folder. The original is untouched."
-            : "The new file passed every check before it took the original's place."
-          : toFolder
-            ? "The new file was saved to the output folder. Checks were off, so it wasn't checked."
-            : "The new file took the original's place. Checks were off, so it wasn't checked."}
+        <p>
+          {verified
+            ? toFolder
+              ? "The new file passed every check and was saved to the output folder. The original is untouched."
+              : "The new file passed every check before it took the original's place."
+            : toFolder
+              ? "The new file was saved to the output folder. Checks were off, so it wasn't checked."
+              : "The new file took the original's place. Checks were off, so it wasn't checked."}
+        </p>
+        {renamed ? (
+          // Another format, another extension: say so, or the old name is searched for in vain.
+          <p className="mt-1.5">
+            It&apos;s now called <span className="font-medium break-all text-fg">{renamed}</span>.
+          </p>
+        ) : null}
       </Callout>
     );
   }
@@ -661,6 +689,9 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
   const libraries = useLibraries();
   const library = libraries.data?.find((l) => l.id === job.library_id);
   const standing = useStanding(job);
+  const settings = useSettings();
+  const file = useFile(job.file_id).data?.file;
+  const renamed = newFileName(job, file, settings.data?.output_mode);
   const eta = formatEta(job.eta_secs);
   const overall = jobOverall(job);
   return (
@@ -687,7 +718,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
         </div>
       ) : null}
 
-      <Outcome job={job} standing={standing} />
+      <Outcome job={job} standing={standing} renamed={renamed} />
 
       {job.notes && job.notes.length > 0 ? (
         <SheetSection title="What changed">
@@ -717,9 +748,14 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
       <SheetSection title="Details">
         <dl className="divide-y divide-line">
           <Detail label="Library">{library?.name ?? "—"}</Detail>
-          <Detail label="File" mono>
+          <Detail label={renamed ? "Original" : "File"} mono>
             {job.file_path}
           </Detail>
+          {renamed && file ? (
+            <Detail label="Now" mono>
+              {file.path}
+            </Detail>
+          ) : null}
           {job.hw_api ? <Detail label="Converted on">{HW_API_LABEL[job.hw_api]}</Detail> : null}
           {job.started_at && job.finished_at ? (
             <Detail label="Took">
@@ -832,13 +868,23 @@ export function ConvertAnywayButton({ file, variant = "secondary" }: { file: Med
   );
 }
 
-/** "Ignore this file": a damaged original is left alone for good ("Skipped by you"). */
-export function IgnoreFileButton({ file, variant = "primary" }: { file: MediaFile; variant?: "primary" | "secondary" }) {
-  const { ignore } = useFileActions();
+/**
+ * "Skip this file": a damaged original is left alone until it's replaced
+ * ("Skipped by you", the same word as every other skip; "Ignored files" in
+ * Settings are the ignore patterns, a different thing).
+ */
+export function SkipUnreadableButton({ file, variant = "primary" }: { file: MediaFile; variant?: "primary" | "secondary" }) {
+  const { skipUnreadable } = useFileActions();
   return (
-    <Button variant={variant} size="sm" onClick={() => ignore.mutate(file)} loading={ignore.isPending} needsServer>
+    <Button
+      variant={variant}
+      size="sm"
+      onClick={() => skipUnreadable.mutate(file)}
+      loading={skipUnreadable.isPending}
+      needsServer
+    >
       <CircleMinus aria-hidden />
-      Ignore this file
+      Skip this file
     </Button>
   );
 }
@@ -899,7 +945,7 @@ function JobSheetActions({ job }: { job: Job }) {
       {current && job.state === "failed" && unreadable ? (
         <>
           {retryButton(false)}
-          {file?.status === "failed" ? <IgnoreFileButton file={file} /> : null}
+          {file?.status === "failed" ? <SkipUnreadableButton file={file} /> : null}
         </>
       ) : null}
       {current && job.state === "failed" && !unreadable ? retryButton(true) : null}

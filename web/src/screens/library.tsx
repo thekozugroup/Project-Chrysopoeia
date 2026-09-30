@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
+import { FileName } from "@/components/file-name";
 import { LibraryBar, LibraryLegend, countedFiles } from "@/components/library-bar";
 import { ProfileEditor } from "@/components/profile-editor";
 import { SaveBar } from "@/components/save-bar";
@@ -55,7 +56,6 @@ import {
   useLibrary,
   usePresets,
   useSettings,
-  useSettling,
 } from "@/lib/queries";
 import { profileFieldOf, type ProfileErrors } from "@/lib/settings-form";
 import { href, navigate, openSheet, updateParams, type Route } from "@/lib/router";
@@ -188,7 +188,7 @@ function Header({ library }: { library: Library }) {
 
 /** "Waiting for 3 files to finish copying": files copied in right now, added once they stop changing. */
 function SettlingLine({ library }: { library: Library }) {
-  const copying = useSettling(library);
+  const copying = library.stats.settling;
   if (copying <= 0) return null;
   return (
     <p className="mt-2.5 flex items-center gap-2 text-[0.8125rem] text-muted">
@@ -372,7 +372,7 @@ function SetupNotice({ library }: { library: Library }) {
                 ) : null}
               </div>
               <a
-                href={href(fix.setting.path)}
+                href={href(fix.setting.path, { focus: fix.setting.focus })}
                 className={cn(buttonVariants({ variant: "secondary", size: "sm" }), "max-sm:ml-[1.875rem]")}
               >
                 <Wrench aria-hidden />
@@ -455,7 +455,14 @@ function formatLine(file: MediaFile): string {
 
 function SavedCell({ file }: { file: MediaFile }) {
   if (file.saved_bytes === null || file.status !== "done") return <span className="text-muted">—</span>;
-  if (file.saved_bytes < 0) return <span className="text-danger">+{formatBytes(-file.saved_bytes)}</span>;
+  if (file.saved_bytes < 0) {
+    return (
+      <span className="text-danger" title="The converted file came out larger">
+        +{formatBytes(-file.saved_bytes)}
+        <span className="sr-only"> larger</span>
+      </span>
+    );
+  }
   return <span className="text-accent-ink">{formatBytes(file.saved_bytes)}</span>;
 }
 
@@ -509,7 +516,7 @@ function Checkbox({
  */
 function NoFilesYet({ library }: { library: Library }) {
   const activity = useActivity();
-  const copying = useSettling(library);
+  const copying = library.stats.settling;
   const latest = activity.data?.items.find((e) => e.library_id === library.id);
   if (copying > 0) {
     // The header already says how many; this says what happens next.
@@ -552,7 +559,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
   const { bulk } = useFileActions();
   const failures = useFailures();
   // Damaged originals are left out: trying them again can't help. They get
-  // their own "Ignore" instead.
+  // their own "Skip" instead.
   const retry = failures.ready ? (failures.retry[library.id] ?? null) : null;
   const unreadableIds = failures.ready
     ? failures.unreadable.filter((f) => f.library_id === library.id).map((f) => f.id)
@@ -690,9 +697,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                     </td>
                     <td className="py-2.5 pr-4">
                       <button type="button" onClick={() => openFile(file)} className="block max-w-full text-left">
-                        <span className="block truncate font-medium text-fg hover:text-accent-ink" title={file.file_name}>
-                          {file.file_name}
-                        </span>
+                        <FileName name={file.file_name} className="font-medium text-fg hover:text-accent-ink" />
                         {folder ? <span className="block truncate text-xs text-muted">{folder}</span> : null}
                       </button>
                     </td>
@@ -723,7 +728,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                 />
               </span>
               <button type="button" onClick={() => openFile(file)} className="min-w-0 flex-1 text-left">
-                <span className="block truncate text-sm font-medium text-fg">{file.file_name}</span>
+                <FileName name={file.file_name} className="text-sm font-medium text-fg" />
                 <span className="mt-0.5 block text-xs text-muted">
                   {formatBytes(file.size_bytes)}
                   {formatLine(file) ? ` · ${formatLine(file)}` : ""}
@@ -732,6 +737,9 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                   <StatusCell file={file} />
                   {file.status === "done" && file.saved_bytes && file.saved_bytes > 0 ? (
                     <span className="text-xs text-accent-ink">{formatBytes(file.saved_bytes)} saved</span>
+                  ) : null}
+                  {file.status === "done" && file.saved_bytes !== null && file.saved_bytes < 0 ? (
+                    <span className="text-xs text-danger">{formatBytes(-file.saved_bytes)} larger</span>
                   ) : null}
                 </span>
               </button>
@@ -871,14 +879,14 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                 variant="secondary"
                 size="sm"
                 loading={bulk.isPending && bulk.variables?.action === "skip"}
-                onClick={() => bulk.mutate({ action: "skip", ids: unreadableIds, ignored: true })}
+                onClick={() => bulk.mutate({ action: "skip", ids: unreadableIds, unreadable: true })}
                 title="Leave them as they are. A replaced copy is picked up automatically."
                 needsServer
               >
                 <CircleMinus aria-hidden />
                 {unreadableIds.length === 1
-                  ? "Ignore the file that can't be read"
-                  : `Ignore ${formatCount(unreadableIds.length)} files that can't be read`}
+                  ? "Skip the file that can't be read"
+                  : `Skip ${formatCount(unreadableIds.length)} files that can't be read`}
               </Button>
             ) : null}
             {items.length > 0 ? (

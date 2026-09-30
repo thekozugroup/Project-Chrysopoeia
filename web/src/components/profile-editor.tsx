@@ -20,6 +20,7 @@ import {
   MIN_SAVINGS,
   QUALITY_HELP,
   QUALITY_LABEL,
+  RECOMMENDED_QUALITY,
   SPEED_HELP,
   SPEED_LABEL,
   VIDEO_CODEC_HELP,
@@ -314,12 +315,20 @@ export function ProfileEditor({
         <FieldError message={errors.goal} />
       </Group>
 
-      <Group level={headingLevel} title="Quality" description="How closely the new file matches the original.">
+      <Group
+        level={headingLevel}
+        title="Quality"
+        description={`How closely the new file matches the original. ${QUALITY_LABEL[RECOMMENDED_QUALITY]} suits most libraries.`}
+      >
         <Segmented<QualityLevel>
           label="Quality"
           value={profile.quality}
           onChange={(quality) => update({ quality })}
-          options={QUALITY_LEVELS.map((q) => ({ value: q, label: QUALITY_LABEL[q] }))}
+          options={QUALITY_LEVELS.map((q) => ({
+            value: q,
+            label: QUALITY_LABEL[q],
+            ariaLabel: q === RECOMMENDED_QUALITY ? `${QUALITY_LABEL[q]} (recommended)` : undefined,
+          }))}
           stackOnPhones
         />
         <div className="mt-2 hidden justify-between text-xs text-muted sm:flex" aria-hidden>

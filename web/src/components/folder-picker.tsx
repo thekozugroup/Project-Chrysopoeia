@@ -7,7 +7,7 @@
  */
 
 import { ChevronLeft, ChevronRight, CornerDownLeft, Folder, FolderOpen, HardDrive } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/controls";
 import { Callout, Skeleton } from "@/components/ui/display";
@@ -16,6 +16,8 @@ import { formatCount } from "@/lib/format";
 import { useBrowse } from "@/lib/queries";
 import type { FsBrowse } from "@/lib/types";
 import { cn } from "@/lib/utils";
+
+const NO_LIBRARIES: readonly KnownLibrary[] = [];
 
 interface Crumb {
   label: string;
@@ -64,6 +66,48 @@ export function folderVideos(count: number, capped = false): string {
   return videoCount(count, capped) ?? "no videos";
 }
 
+/** A library already set up, as the picker needs it. */
+export interface KnownLibrary {
+  name: string;
+  path: string;
+}
+
+/** A path without trailing slashes ("/media/tv/" → "/media/tv"; "/" stays). */
+function trimSlashes(path: string): string {
+  return path.replace(/(.)\/+$/, "$1");
+}
+
+/** Whether `child` is a folder somewhere inside `parent`. */
+function isInside(child: string, parent: string): boolean {
+  return parent === "/" ? child !== "/" : child.startsWith(`${parent}/`);
+}
+
+/**
+ * Why a folder can't become a new library, in the server's terms
+ * (`library_exists`, `library_overlaps`), so it's said before the goal step
+ * rather than after "Add library": it is a library, is inside one, or holds
+ * one. `null` when it's free. The server still checks (it also resolves
+ * links).
+ */
+export function libraryConflict(path: string, libraries: readonly KnownLibrary[]): string | null {
+  const folder = trimSlashes(path);
+  for (const library of libraries) {
+    const existing = trimSlashes(library.path);
+    if (folder === existing) return `This folder is already the library “${library.name}”.`;
+    if (isInside(folder, existing)) return `This folder is inside “${library.name}”, which is already a library.`;
+    if (isInside(existing, folder)) {
+      return `This folder contains the library “${library.name}”. Pick a folder inside it or next to it, or remove “${library.name}” first.`;
+    }
+  }
+  return null;
+}
+
+/** The library a folder is, if any, to mark it in the listing. */
+function libraryAt(path: string, libraries: readonly KnownLibrary[]): KnownLibrary | undefined {
+  const folder = trimSlashes(path);
+  return libraries.find((l) => trimSlashes(l.path) === folder);
+}
+
 /** The last part of a folder path, for naming it on the button. */
 function folderName(path: string, roots: string[]): string {
   const trimmed = path.replace(/(.)\/+$/, "$1");
@@ -85,6 +129,12 @@ interface FolderPickerProps {
   className?: string;
   /** Called whenever the user navigates, so parents can clear stale errors. */
   onNavigate?: (path: string) => void;
+  /**
+   * Libraries already set up, when picking a folder for a new one: they're
+   * marked in the listing, and a folder that is, holds or is inside one
+   * can't be used (see `libraryConflict`).
+   */
+  libraries?: readonly KnownLibrary[];
 }
 
 export function FolderPicker({
@@ -95,6 +145,7 @@ export function FolderPicker({
   busy,
   className,
   onNavigate,
+  libraries = NO_LIBRARIES,
 }: FolderPickerProps) {
   const [path, setPath] = useState<string | undefined>(initialPath || undefined);
   const [typed, setTyped] = useState("");
@@ -115,9 +166,8 @@ export function FolderPicker({
   const [lastGood, setLastGood] = useState<FsBrowse | null>(null);
   if (data && !loadingNew && data !== lastGood) setLastGood(data);
   const shown = data ?? (browse.error ? lastGood : undefined);
-  // Video counts seen in listings: the server counts the folder you're in
-  // too, and older servers only its entries, so a folder opened from its
-  // parent still knows its own.
+  // Video counts seen in listings (the entries' and the folder's own), so a
+  // folder opened from its parent keeps the count it showed there.
   const [counts, setCounts] = useState<Record<string, { count: number; capped: boolean }>>({});
   const [countedFrom, setCountedFrom] = useState<FsBrowse | null>(null);
   if (data && data !== countedFrom) {
@@ -198,6 +248,8 @@ export function FolderPicker({
   };
 
   const forbidden = browse.error instanceof ApiError && browse.error.status === 403;
+  const conflict = data && !loadingNew ? libraryConflict(data.path, libraries) : null;
+  const conflictId = useId();
 
   return (
     <div className={cn("flex flex-col overflow-hidden rounded-lg border border-line bg-surface", className)}>
@@ -359,6 +411,14 @@ export function FolderPicker({
                 >
                   <Folder className="size-[1.125rem] shrink-0 text-accent-ink" aria-hidden />
                   <span className="min-w-0 flex-1 truncate text-fg">{entry.name}</span>
+                  {libraryAt(entry.path, libraries) ? (
+                    <span
+                      className="shrink-0 rounded-full border border-line-strong/60 px-2 py-0.5 text-xs text-muted"
+                      title={`Already the library “${libraryAt(entry.path, libraries)?.name}”`}
+                    >
+                      Library
+                    </span>
+                  ) : null}
                   {videoCount(entry.media_count, entry.media_count_capped) ? (
                     <span className="shrink-0 text-[0.8125rem] text-muted tabular">
                       {videoCount(entry.media_count, entry.media_count_capped)}
@@ -379,8 +439,9 @@ export function FolderPicker({
         </p>
         <Button
           variant="primary"
-          onClick={() => data && !loadingNew && onSelect(data.path)}
-          disabled={!data || loadingNew || Boolean(browse.error)}
+          onClick={() => data && !loadingNew && !conflict && onSelect(data.path)}
+          disabled={!data || loadingNew || Boolean(browse.error) || Boolean(conflict)}
+          aria-describedby={conflict ? conflictId : undefined}
           loading={busy}
           className="max-w-full min-w-0"
         >
@@ -392,7 +453,11 @@ export function FolderPicker({
           )}
         </Button>
       </div>
-      {error ? (
+      {conflict ? (
+        <p id={conflictId} role="status" className="border-t border-warning/30 bg-warning-soft px-4 py-2.5 text-[0.8125rem] font-medium text-fg">
+          {conflict}
+        </p>
+      ) : error ? (
         <p role="alert" className="border-t border-danger/30 bg-danger-soft px-4 py-2.5 text-[0.8125rem] font-medium text-danger">
           {error}
         </p>

@@ -7,6 +7,7 @@ import {
   formatEta,
   formatRelative,
   plural,
+  splitFileName,
 } from "./format";
 import { languageLabel, skippedByUser, sourceCodecLabel } from "./labels";
 
@@ -118,5 +119,27 @@ describe("sourceCodecLabel", () => {
     expect(sourceCodecLabel("No video")).toBe("No video");
     expect(sourceCodecLabel("No audio")).toBe("No audio");
     expect(sourceCodecLabel(null)).toBe("Unknown");
+  });
+});
+
+describe("splitFileName", () => {
+  it("keeps a late episode in view", () => {
+    expect(splitFileName("Das außergewöhnlich lange Serienfinale einer Show (2024) - S01E04 - Pilot.mkv")).toEqual({
+      head: "Das außergewöhnlich lange Serienfinale einer Show (2024) - ",
+      tail: "S01E04 - Pilot.mkv",
+    });
+    expect(splitFileName("[Group] A Very Long Anime Series Title Here - 07 [1080p].mkv")?.tail).toBe("07 [1080p].mkv");
+    expect(splitFileName("The Late Night Show With Someone Famous 2024-05-01 Guest.mkv")?.tail).toBe("2024-05-01 Guest.mkv");
+  });
+
+  it("cuts at the end when that already keeps what tells names apart", () => {
+    // Sonarr's usual naming: the episode is near the start.
+    expect(splitFileName("The Office (US) - S02E03 - The Dundies Extended Cut Bluray-1080p.mkv")).toBeNull();
+    // A movie: its title comes first.
+    expect(splitFileName("Some Very Long Movie Title (2010) Remastered Bluray-1080p.mkv")).toBeNull();
+    // Short names fit.
+    expect(splitFileName("Show - S01E02.mkv")).toBeNull();
+    // Picture sizes and codecs aren't episodes.
+    expect(splitFileName("A Rather Long Home Video Title Here 1920x1080 x264.mkv")).toBeNull();
   });
 });

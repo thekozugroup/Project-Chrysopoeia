@@ -15,9 +15,6 @@
  *                           without WebSocket support
  *   MOCK_MAX_JOBS=          a number: the job limit comes from the container's
  *                           MAX_JOBS (QueueState.max_jobs_source "env")
- *   MOCK_FORCE=on           "Convert anyway": on (round-3 server), "ignore" (accepts
- *                           force but skips the file again) or "reject" (an older
- *                           server: 400 for the unknown field)
  *   MOCK_HOST=allow         "deny" answers every request 403 host_not_allowed, like
  *                           the real server reached under an unknown name
  *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
@@ -62,7 +59,6 @@ const TICK_MS = Number(process.env.MOCK_TICK_MS ?? 1000);
 const DETECT_MS = Number(process.env.MOCK_DETECT_MS ?? 0);
 const WS_ON = (process.env.MOCK_WS ?? "on") !== "off";
 const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
-const FORCE = process.env.MOCK_FORCE ?? "on";
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
 const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
@@ -1133,8 +1129,8 @@ function startJobs() {
     const file = files.get(job.file_id);
     const lib = libraries.get(job.library_id);
     if (!file || !lib) continue;
-    // "Convert anyway" sets the skip rules aside (a server ignoring it doesn't).
-    const reason = forcedJobs.has(job.id) && FORCE === "on" ? null : skipReasonFor(file, lib);
+    // "Convert anyway" sets the skip rules aside.
+    const reason = forcedJobs.has(job.id) ? null : skipReasonFor(file, lib);
     if (reason) {
       skipAtStart(job, file, reason);
       emitLibrary(lib);
@@ -1520,7 +1516,7 @@ route("POST", "/api/files/:id/queue", async ({ id }, _q, req) => {
   const file = getFile(id);
   const body = await readBody(req);
   for (const key of Object.keys(body)) {
-    if (key === "priority" || (key === "force" && FORCE !== "reject")) continue;
+    if (key === "priority" || key === "force") continue;
     // The real server's words for a field it doesn't know (an older one, for "force").
     throw new HttpError(
       400,

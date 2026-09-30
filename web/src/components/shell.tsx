@@ -28,7 +28,7 @@ import { Brand } from "@/components/brand";
 import { finishedPercent } from "@/components/library-bar";
 import { Tooltip } from "@/components/ui/overlays";
 import { formatHour, formatPercent, plural } from "@/lib/format";
-import { useFailures, useLibraries, useQueueState, useSettings } from "@/lib/queries";
+import { useFailures, useLibraries, useQueueState, useSettings, useSetupProblems } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import { useLive, useServerDown, type ConnectionState } from "@/lib/store";
 import { setTheme, useTheme, type ThemeChoice } from "@/lib/theme";
@@ -53,12 +53,18 @@ export function useAnyScanning(): boolean {
   return liveScan || Boolean(libraries.data?.some((l) => l.scanning));
 }
 
-/** Queue state in a few words, e.g. "Converting 2 files" or "Paused". */
+/**
+ * Queue state in a few words, e.g. "Converting 2 files" or "Paused". Once
+ * nothing is running or waiting, a setup problem that stops conversions
+ * (`blocked`, see `useSetupProblems`) reads "Needs a fix", never the calm
+ * "Watching for new files".
+ */
 export function queueSummary(
   queue: QueueState | undefined,
   settings: Settings | undefined,
   scanning = false,
-): { text: string; icon: ReactNode; tone: "active" | "paused" | "idle" | "waiting" } {
+  blocked = false,
+): { text: string; icon: ReactNode; tone: "active" | "paused" | "idle" | "waiting" | "blocked" } {
   if (!queue) return { text: "Loading…", icon: <Clock aria-hidden />, tone: "idle" };
   if (queue.paused) {
     return {
@@ -84,6 +90,7 @@ export function queueSummary(
   }
   if (queue.queued > 0) return { text: `${plural(queue.queued, "file")} waiting`, icon: <Clock aria-hidden />, tone: "waiting" };
   if (scanning) return { text: "Scanning", icon: <ScanSearch aria-hidden />, tone: "waiting" };
+  if (blocked) return { text: "Needs a fix", icon: <TriangleAlert aria-hidden />, tone: "blocked" };
   return {
     text: settings?.watch_folders === false ? "All caught up" : "Watching for new files",
     icon: <CircleCheck aria-hidden />,
@@ -96,12 +103,13 @@ function QueuePill({ className }: { className?: string }) {
   const settings = useSettings();
   const libraries = useLibraries();
   const scanning = useAnyScanning();
+  const blocked = useSetupProblems().open;
   const connection = useLive((s) => s.connection);
   const polling = useLive((s) => s.polling);
   const serverDown = useLive((s) => s.serverDown);
   // The banner is up: the server can't be reached.
   const away = useServerDown();
-  const summary = queueSummary(queue.data, settings.data, scanning);
+  const summary = queueSummary(queue.data, settings.data, scanning, blocked);
   // No folder is watched yet: there's no queue state worth a pill.
   if (libraries.data?.length === 0) return null;
   // Without live updates (and before polling catches up), or while the
@@ -110,7 +118,8 @@ function QueuePill({ className }: { className?: string }) {
   const lastKnown = `Last known: ${summary.text.charAt(0).toLowerCase()}${summary.text.slice(1)}`;
   return (
     <a
-      href={href("/queue")}
+      // A setup problem is explained, with its fix, under "Needs your attention" on the overview.
+      href={summary.tone === "blocked" ? href("/") : href("/queue")}
       title={stale ? lastKnown : undefined}
       className={cn(
         "inline-flex h-8 min-w-0 items-center gap-2 rounded-full px-3 text-[0.8125rem] font-medium whitespace-nowrap no-underline transition-[color,background-color,opacity] pointer-coarse:h-11 [&_svg]:size-4 [&_svg]:shrink-0",
@@ -120,7 +129,7 @@ function QueuePill({ className }: { className?: string }) {
           ? "border border-dashed border-line-strong/70 bg-transparent text-muted hover:text-fg [&_.spin]:animate-none"
           : summary.tone === "active"
             ? "bg-accent-soft text-accent-ink"
-            : summary.tone === "paused"
+            : summary.tone === "paused" || summary.tone === "blocked"
               ? "bg-warning-soft text-warning"
               : "bg-raised text-muted hover:text-fg",
         className,

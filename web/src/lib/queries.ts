@@ -8,7 +8,6 @@
 import { keepPreviousData, useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { api, ApiError } from "./api";
-import { settlingCount } from "./convertible";
 import { isDetecting } from "./hardware";
 import {
   NO_FAILURES,
@@ -31,7 +30,6 @@ import type {
   Library,
   LibraryStats,
   MediaFile,
-  SystemInfo,
 } from "./types";
 
 /** Query keys. Lists take their parameters as the last element. */
@@ -62,24 +60,11 @@ export function shouldRetry(failureCount: number, error: unknown): boolean {
   return failureCount < 2;
 }
 
-/**
- * Facts about the server (`GET /api/system`), e.g. the automatic work folder.
- * `null` when the server is too old to have the endpoint (404), so callers
- * can fall back to generic wording instead of showing an error.
- */
-export async function fetchSystem(signal?: AbortSignal): Promise<SystemInfo | null> {
-  try {
-    return await api.system(signal);
-  } catch (err) {
-    if (err instanceof ApiError && (err.status === 404 || err.status === 405)) return null;
-    throw err;
-  }
-}
-
+/** Facts about the server (`GET /api/system`), e.g. the automatic work folder. */
 export function useSystem() {
   return useQuery({
     queryKey: keys.system,
-    queryFn: ({ signal }) => fetchSystem(signal),
+    queryFn: ({ signal }) => api.system(signal),
     staleTime: 10 * 60_000,
   });
 }
@@ -359,17 +344,6 @@ export function useActivity(options: { enabled?: boolean } = {}) {
   });
 }
 
-/**
- * Files of a library still being copied in: the server's `stats.settling`,
- * or, only from servers too old to send it, read from the latest scan
- * summary in the activity feed (which is then fetched).
- */
-export function useSettling(library: Pick<Library, "id" | "stats">): number {
-  const known = typeof library.stats.settling === "number";
-  const activity = useActivity({ enabled: !known });
-  return settlingCount(library, known ? undefined : activity.data?.items);
-}
-
 /** At most this many files are read per list to tell where its jobs stand. */
 const STANDING_FILES_MAX = 50;
 
@@ -458,22 +432,57 @@ export function useKeptSetupFailures(recent: Job[]): Partial<Record<SetupProblem
   return kept;
 }
 
-/** Statuses a file that saved space can have: converted, or queued again after that. */
+/** The latest results, as the overview lists them (also read for setup problems, see `useSetupProblems`). */
+export const RECENT_RESULTS_QUERY: JobQuery = { state: "history", limit: 6 };
+const NO_JOBS: Job[] = [];
+
+/**
+ * Setup problems that stop conversions, from every place they show: failed
+ * files waiting on a fix (work folder, destination, disk space, chosen
+ * hardware), converted files whose second conversion one stopped (see
+ * `useKeptSetupFailures`), and hardware detection's errors (nothing can be
+ * converted until they're fixed). `open` when there's any: the overview's
+ * status and the queue pill in the frame then say a fix is needed instead
+ * of "All caught up".
+ */
+export function useSetupProblems(): { kept: Partial<Record<SetupProblem, Job[]>>; open: boolean } {
+  const failures = useFailures();
+  const recent = useJobs(RECENT_RESULTS_QUERY);
+  const { hw } = useHardwareInfo();
+  const kept = useKeptSetupFailures(recent.data?.items ?? NO_JOBS);
+  const open =
+    Object.values(failures.setup).some((files) => files && files.length > 0) ||
+    Object.values(kept).some((jobs) => jobs && jobs.length > 0) ||
+    Boolean(hw?.hints.some((h) => h.level === "error"));
+  return { kept, open };
+}
+
+/** Statuses a file holding a conversion's result can have: converted, or queued again after that. */
 const SAVED_STATUSES: FileStatus[] = ["done", "queued", "processing"];
 const SAVED_PAGE = 500;
 /** At most this many files are read per status to count them. */
 const SAVED_MAX_PER_STATUS = 5_000;
 
+/** The converted files the space saved is added up from, and how many of them came out larger. */
+export interface SavedFiles {
+  files: number;
+  larger: number;
+}
+
 /**
- * Count the files that saved space (`saved_bytes > 0`): converted files,
- * and converted files queued again (they keep their savings); files that
- * came out larger ("Convert anyway") don't count. Converted files are read
- * page by page (in a very large library, those past the first 5,000 are
- * taken to have saved space, as nearly all do); queued ones only when the
- * converted files don't account for all of `totals.saved_bytes`.
+ * Count the converted files the space saved is added up from: every file
+ * with a result (`saved_bytes` set), including converted files queued
+ * again (they keep their savings), and, among them, the ones that came out
+ * larger ("Convert anyway"), which take away from the total. The total is
+ * the net sum, so the count matches it: "from 5 converted files (1 came out
+ * larger)", beside "Converted 5". Converted files are read page by page
+ * (in a very large library, those past the first 5,000 are counted without
+ * being read); queued ones only when the converted files don't account for
+ * all of `totals.saved_bytes`.
  */
-export async function countSavedFiles(totals: LibraryStats, signal?: AbortSignal): Promise<number> {
+export async function countSavedFiles(totals: LibraryStats, signal?: AbortSignal): Promise<SavedFiles> {
   let files = 0;
+  let larger = 0;
   let savedSeen = 0;
   for (const status of SAVED_STATUSES) {
     // Nothing else holds savings once the converted files add up to the total.
@@ -483,7 +492,8 @@ export async function countSavedFiles(totals: LibraryStats, signal?: AbortSignal
       for (const file of page.items) {
         if (file.saved_bytes === null) continue;
         savedSeen += file.saved_bytes;
-        if (file.saved_bytes > 0) files += 1;
+        files += 1;
+        if (file.saved_bytes < 0) larger += 1;
       }
       const read = offset + page.items.length;
       if (read >= page.total || page.items.length === 0) break;
@@ -496,7 +506,7 @@ export async function countSavedFiles(totals: LibraryStats, signal?: AbortSignal
       }
     }
   }
-  return files;
+  return { files, larger };
 }
 
 /**

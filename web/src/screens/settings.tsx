@@ -8,7 +8,7 @@
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Minus, Plus } from "lucide-react";
-import { useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { FolderField } from "@/components/folder-field";
 import { ProfileEditor } from "@/components/profile-editor";
@@ -18,10 +18,21 @@ import { Button } from "@/components/ui/button";
 import { ChoiceCard, Field, Input, Select, SwitchRow, Textarea } from "@/components/ui/controls";
 import { Badge, Callout, CopyButton, Skeleton } from "@/components/ui/display";
 import { ApiError, api, errorMessage } from "@/lib/api";
-import { formatHour } from "@/lib/format";
-import { bugReportText } from "@/lib/hardware";
-import { VALIDATION_HELP, VALIDATION_LABEL, VALIDATION_LEVELS } from "@/lib/labels";
-import { keys, useHardwareInfo, usePresets, useQueueState, useSettings, useSystem } from "@/lib/queries";
+import { formatHour, plural } from "@/lib/format";
+import { bugReportText, recommendedGoal } from "@/lib/hardware";
+import { GOAL_LABEL, VALIDATION_HELP, VALIDATION_LABEL, VALIDATION_LEVELS } from "@/lib/labels";
+import { defaultsCustomized } from "@/lib/profile";
+import { reasonsFor, setupFix, type SettingFocus, type SetupProblem } from "@/lib/outcomes";
+import {
+  keys,
+  useFailures,
+  useHardwareInfo,
+  usePresets,
+  useQueueState,
+  useSettings,
+  useSetupProblems,
+  useSystem,
+} from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import {
   changedKeys,
@@ -34,7 +45,7 @@ import {
   type ProfileErrors,
   type SectionId,
 } from "@/lib/settings-form";
-import type { QueueState, Settings, SystemInfo, ValidationLevel } from "@/lib/types";
+import type { Goal, QueueState, Settings, SystemInfo, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
 
@@ -55,7 +66,7 @@ export function automaticJobs(
   queue: QueueState | undefined,
   recommended: { total: number; reason: string } | undefined,
 ): { count: number | null; fromEnv: boolean; description: string } {
-  const source = queue?.max_jobs_source ?? (queue?.max_jobs_auto ? "auto" : undefined);
+  const source = queue?.max_jobs_source;
   if (queue && source === "env") {
     return {
       count: queue.max_jobs,
@@ -77,9 +88,24 @@ export function automaticJobs(
   };
 }
 
-function Block({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
+function Block({
+  title,
+  description,
+  children,
+  anchor,
+}: {
+  title: string;
+  description?: ReactNode;
+  children: ReactNode;
+  /** The setting a link can bring into view (`?focus=`, see `SetupFix.setting`). */
+  anchor?: SettingFocus;
+}) {
   return (
-    <section className="grid gap-4 border-t border-line py-7 first:border-t-0 first:pt-0 lg:grid-cols-[15rem_1fr] lg:gap-10">
+    <section
+      id={anchor ? `setting-${anchor}` : undefined}
+      tabIndex={anchor ? -1 : undefined}
+      className="grid scroll-mt-20 gap-4 border-t border-line py-7 outline-none first:border-t-0 first:pt-0 lg:grid-cols-[15rem_1fr] lg:gap-10"
+    >
       <div>
         <h2 className="text-[1.0625rem] leading-snug font-semibold text-fg">{title}</h2>
         {description ? <p className="mt-1 text-[0.8125rem] leading-snug text-muted">{description}</p> : null}
@@ -185,7 +211,7 @@ function ProcessingSection({ draft, onChange, errors }: SectionProps) {
         </fieldset>
       </Block>
 
-      <Block title="When to convert" description="Changes take effect right away. Running files always finish.">
+      <Block title="When to convert" description="Saved changes apply right away. Running files always finish.">
         <SwitchRow
           label="Only start new conversions during certain hours"
           description="Handy for keeping evenings free for streaming. Uses the server's time zone."
@@ -264,12 +290,8 @@ function ProcessingSection({ draft, onChange, errors }: SectionProps) {
   );
 }
 
-/**
- * What "Automatic" means for the work folder on this server. `undefined`
- * while loading and `null` from servers without `/api/system` give the
- * general rule.
- */
-export function automaticWorkFolderText(system: SystemInfo | null | undefined): ReactNode {
+/** What "Automatic" means for the work folder on this server; the general rule while it loads. */
+export function automaticWorkFolderText(system: SystemInfo | undefined): ReactNode {
   if (!system) {
     return "The server's work folder when it has one (the Docker image uses /temp when it's mapped), otherwise next to each file, which needs free space on the same drive as the video.";
   }
@@ -286,13 +308,63 @@ export function automaticWorkFolderText(system: SystemInfo | null | undefined): 
     : "Next to each file, which needs free space on the same drive as the video.";
 }
 
-function OutputSection({ draft, onChange, errors }: SectionProps) {
+/**
+ * Bring the setting a problem's link points at (`?focus=temp_dir`) into
+ * view, once the frame has scrolled to the top of the new screen.
+ */
+function useFocusSetting(focus: string | null) {
+  useEffect(() => {
+    if (!focus) return;
+    const frame = requestAnimationFrame(() => {
+      const el = document.getElementById(`setting-${focus}`);
+      if (!el) return;
+      el.scrollIntoView({ block: "start" });
+      el.focus({ preventScroll: true });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [focus]);
+}
+
+/**
+ * What recent conversions ran into with this setting, in the server's own
+ * words (which name the folder and the fix), so the setting that needs a
+ * fix is marked where it's made. Files are tried again from the overview.
+ */
+function RecentProblem({ kinds }: { kinds: SetupProblem[] }) {
+  const failures = useFailures();
+  const { kept } = useSetupProblems();
+  const settings = useSettings();
+  for (const kind of kinds) {
+    const items = [...(failures.setup[kind] ?? []), ...(kept[kind] ?? [])];
+    if (!items.length) continue;
+    const reason = reasonsFor(items, 1).reasons[0]?.text;
+    const fix = setupFix(kind, settings.data?.output_mode);
+    return (
+      <Callout tone="warning" title={fix.title}>
+        <p>{reason ?? fix.fix}</p>
+        <p className="mt-1.5">
+          {`${plural(items.length, "file")} waited on this.`} Once it&apos;s fixed, try{" "}
+          {items.length === 1 ? "it" : "them"} again from the <a href={href("/")}>Overview</a>.
+        </p>
+      </Callout>
+    );
+  }
+  return null;
+}
+
+function OutputSection({ draft, onChange, errors, focus }: SectionProps & { focus: string | null }) {
   const name = useId();
   const tempName = useId();
   const system = useSystem();
+  useFocusSetting(focus);
   return (
     <>
-      <Block title="Finished files" description="Nothing is written anywhere until the new file has passed its checks.">
+      <Block
+        title="Finished files"
+        description="Nothing is written anywhere until the new file has passed its checks."
+        anchor="output_folder"
+      >
+        <RecentProblem kinds={["destination"]} />
         <fieldset className="flex flex-col gap-3">
           <legend className="sr-only">Where finished files go</legend>
           <ChoiceCard
@@ -301,7 +373,7 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
             checked={draft.output_mode === "replace"}
             onChange={() => onChange({ output_mode: "replace" })}
             title="Replace the original"
-            description="The new file takes the original's place, keeping your media server's library tidy."
+            description="The new file takes the original's place, keeping your media server's library tidy. When the goal's format differs, the extension changes too (Movie.mp4 becomes Movie.mkv); Plex, Jellyfin and Emby pick that up at their next scan."
           />
           <ChoiceCard
             name={name}
@@ -309,7 +381,7 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
             checked={draft.output_mode === "folder"}
             onChange={() => onChange({ output_mode: "folder" })}
             title="Save to a separate folder"
-            description="Originals stay untouched. New files mirror each library's folder structure."
+            description="Originals stay untouched. New files mirror each library's folder structure, with the goal's extension (such as .mkv)."
           />
         </fieldset>
         {draft.output_mode === "folder" ? (
@@ -341,7 +413,9 @@ function OutputSection({ draft, onChange, errors }: SectionProps) {
       <Block
         title="Work folder"
         description="Where files are written while they're being converted. A fast SSD or cache pool speeds things up."
+        anchor="temp_dir"
       >
+        <RecentProblem kinds={["work_folder", "disk_full"]} />
         <fieldset className="flex flex-col gap-3">
           <legend className="sr-only">Work folder</legend>
           <ChoiceCard
@@ -518,8 +592,7 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey, profil
       <section className="border-t border-line pt-7">
         <h2 className="text-[0.9375rem] font-semibold text-fg">Defaults for new libraries</h2>
         <p className="mt-1 mb-6 max-w-2xl text-[0.8125rem] text-muted">
-          New libraries start with these settings. Existing libraries keep their own; change them in each
-          library&apos;s Settings tab.
+          {newLibraryDefaultsText(defaultsCustomized(presets.data, draft.default_profile), recommendedGoal(hardware.hw))}
         </p>
         <ProfileEditor
           profile={draft.default_profile}
@@ -537,6 +610,17 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey, profil
   );
 }
 
+/**
+ * What these defaults do, as "Add library" really applies them: untouched,
+ * it suggests the goal that suits this machine instead (see `GoalStep`);
+ * once changed, new libraries start with them.
+ */
+export function newLibraryDefaultsText(customized: boolean, suggested: Exclude<Goal, "custom">): string {
+  const existing = "Existing libraries keep their own; change them in each library's Settings tab.";
+  if (customized) return `New libraries start with these settings. ${existing}`;
+  return `Until you change these, Add library suggests the goal that suits this machine (${GOAL_LABEL[suggested]}); once you do, new libraries start with them. ${existing}`;
+}
+
 interface SectionProps {
   draft: Settings;
   onChange: (patch: Partial<Settings>) => void;
@@ -548,7 +632,7 @@ interface SectionProps {
   profileErrors: ProfileErrors;
 }
 
-function SettingsForm({ settings, section }: { settings: Settings; section: SectionId }) {
+function SettingsForm({ settings, section, focus }: { settings: Settings; section: SectionId; focus: string | null }) {
   const client = useQueryClient();
   const [base, setBase] = useState(settings);
   const [draft, setDraft] = useState(settings);
@@ -611,7 +695,7 @@ function SettingsForm({ settings, section }: { settings: Settings; section: Sect
   return (
     <>
       {section === "processing" ? <ProcessingSection {...sectionProps} /> : null}
-      {section === "output" ? <OutputSection {...sectionProps} /> : null}
+      {section === "output" ? <OutputSection {...sectionProps} focus={focus} /> : null}
       {section === "hardware" ? <HardwareSection draft={draft} onChange={onChange} /> : null}
       {/* Kept mounted while hidden, so text typed there (valid or not) isn't
           lost on switching sections, and invalid text keeps blocking Save. */}
@@ -739,7 +823,7 @@ export function SettingsScreen({ route }: { route: Route }) {
         </nav>
         <div className="min-w-0">
           {settings.data ? (
-            <SettingsForm settings={settings.data} section={section} />
+            <SettingsForm settings={settings.data} section={section} focus={route.params.get("focus")} />
           ) : settings.error ? (
             <Callout tone="danger" title="Couldn't load settings">
               {errorMessage(settings.error)}

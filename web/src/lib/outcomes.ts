@@ -4,10 +4,8 @@
  * conversion failed, or the file changed meanwhile), what a skip means, and
  * what a video's HDR data says.
  *
- * Failures are grouped by the server's `problem` code. Only when it is
- * missing (an older server, or a file that failed before the server had
- * it) are damaged originals recognised from the sentences it writes for
- * them; everything else then reads as a failed conversion.
+ * Failures are grouped by the server's `problem` code, which it sends with
+ * every error (an error recorded before it had codes reads as `other`).
  */
 
 import { formatCount, formatPercent, plural } from "./format";
@@ -18,8 +16,8 @@ import { PROBLEM_KINDS, type Job, type MediaFile, type OutputMode, type ProblemK
  * Sentences the server uses when the original itself can't be read:
  * `chrysopoeia-scanner` probe errors ("This file can't be read as a video:
  * …", "The disk reported a read error…") and the worker's "The original
- * file appears damaged or incomplete (it stops after 0.1 s)." Only a
- * fallback for failures without a `problem` code.
+ * file appears damaged or incomplete (it stops after 0.1 s)." Only for the
+ * activity log, whose entries carry no code.
  */
 const UNREADABLE = [
   /can't be read as a video/i,
@@ -29,32 +27,26 @@ const UNREADABLE = [
   /not really a video/i,
 ];
 
-/**
- * Whether an error sentence says the original is damaged or isn't a video.
- * The fallback reading for servers without `problem`, and for the activity
- * feed, whose entries carry no code.
- */
+/** Whether an activity entry says the original is damaged or isn't a video (entries carry no code). */
 export function isUnreadableSource(error: string | null | undefined): boolean {
   const text = error?.trim();
   return Boolean(text && UNREADABLE.some((re) => re.test(text)));
 }
 
-/** A failed file or job: its sentence and, from newer servers, its code. */
+/** A failed file or job: its sentence and its code. */
 export interface Failure {
   error: string | null;
-  problem?: ProblemKind | null;
+  problem: ProblemKind | null;
 }
 
 /**
- * The kind of a failure: the server's code whenever it sends one (a kind
- * this UI doesn't know reads as `other`), else, from older servers, a
- * damaged original recognised by its sentence or `other`. `null` when
- * there's no failure at all.
+ * The kind of a failure: the server's code (a kind this UI doesn't know
+ * reads as `other`, as does an error without one). `null` when there's no
+ * failure at all.
  */
 export function problemKind(item: Failure): ProblemKind | null {
   const code = item.problem;
   if (typeof code === "string" && code) return PROBLEM_KINDS.includes(code) ? code : "other";
-  if (isUnreadableSource(item.error)) return "unreadable_source";
   return item.error?.trim() ? "other" : null;
 }
 
@@ -95,15 +87,53 @@ export function isUnreadable(item: Failure): boolean {
   return failureGroup(item) === "unreadable";
 }
 
+/**
+ * Whether a file the user skipped is one whose original can't be read
+ * ("Skip this file" on a damaged original): it was never read as a video,
+ * or its latest conversion found it damaged. Converting it can't work until
+ * it's replaced, so only "Try again" is worth offering.
+ */
+export function skippedUnreadable(
+  file: Pick<MediaFile, "status" | "skip_reason" | "video_codec">,
+  latest?: (Pick<Job, "state"> & Failure) | null,
+): boolean {
+  if (file.status !== "skipped" || !skippedByUser(file.skip_reason)) return false;
+  if (!file.video_codec) return true;
+  return latest?.state === "failed" && isUnreadable(latest);
+}
+
+/**
+ * The name a conversion gave the file, when it isn't the original's: the
+ * goal's format has another extension ("Old Home Video.avi" became "Old
+ * Home Video.mkv"). Jobs keep the original's name, so it's read from the
+ * file, and only while this job's result is what the file is now. `null`
+ * when the name didn't change, isn't known, or the result went to a
+ * separate folder (the original is still where it was).
+ */
+export function newFileName(
+  job: Pick<Job, "id" | "state" | "file_name">,
+  file: Pick<MediaFile, "job_id" | "file_name"> | null | undefined,
+  outputMode: OutputMode | undefined,
+): string | null {
+  if (job.state !== "done" || outputMode !== "replace" || !file || file.job_id !== job.id) return null;
+  return file.file_name !== job.file_name ? file.file_name : null;
+}
+
 /** What a setup problem is and exactly how to fix it. */
 export interface SetupFix {
   /** The cause in a few words, as a title: "The work folder can't be used". */
   title: string;
   /** The exact fix, in a sentence or two. */
   fix: string;
-  /** Where the fix is made. */
-  setting: { label: string; path: string };
+  /**
+   * Where the fix is made: the settings screen, and the setting on it to
+   * bring into view (`?focus=`), when it isn't at the top.
+   */
+  setting: { label: string; path: string; focus?: SettingFocus };
 }
+
+/** Settings a problem's link can bring into view (see `SetupFix.setting`). */
+export type SettingFocus = "temp_dir" | "output_folder";
 
 /**
  * The cause and fix for a setup problem. `outputMode` picks the fix for a
@@ -116,14 +146,14 @@ export function setupFix(kind: SetupProblem, outputMode?: OutputMode): SetupFix 
       return {
         title: "The work folder can't be used",
         fix: "Make sure the work folder exists and Chrysopoeia can write to it (in Docker, the PUID/PGID user needs write access), or choose another one.",
-        setting: { label: "Work folder settings", path: "/settings/output" },
+        setting: { label: "Work folder settings", path: "/settings/output", focus: "temp_dir" },
       };
     case "destination":
       return outputMode === "folder"
         ? {
             title: "Finished files can't be saved",
             fix: "Chrysopoeia can't write to the output folder. Make sure the PUID/PGID user can write to it, or choose another one.",
-            setting: { label: "Output settings", path: "/settings/output" },
+            setting: { label: "Output settings", path: "/settings/output", focus: "output_folder" },
           }
         : {
             title: "Finished files can't be saved",
@@ -134,7 +164,7 @@ export function setupFix(kind: SetupProblem, outputMode?: OutputMode): SetupFix 
       return {
         title: "The disk is full",
         fix: "Free up space on the drive, or choose a work folder on a drive with more room.",
-        setting: { label: "Work folder settings", path: "/settings/output" },
+        setting: { label: "Work folder settings", path: "/settings/output", focus: "temp_dir" },
       };
     case "hardware_unavailable":
       return {

@@ -147,9 +147,8 @@ export interface HardwareInfo {
   /**
    * True only for the stand-in the server returns while its first detection
    * runs; the other fields are placeholders until `hardware.updated` arrives.
-   * Older servers leave it out.
    */
-  detecting?: boolean;
+  detecting: boolean;
   detected_at: Timestamp;
 }
 
@@ -330,11 +329,8 @@ export interface MediaFile {
   saved_bytes: number | null;
   skip_reason: string | null;
   error: string | null;
-  /**
-   * Machine-readable cause of `error` (see `ProblemKind`). Older servers,
-   * and files that failed before the server had it, leave it out or null.
-   */
-  problem?: ProblemKind | null;
+  /** Machine-readable cause of `error` (see `ProblemKind`); set with every `error`. */
+  problem: ProblemKind | null;
   job_id: Uuid | null;
   progress: number | null;
   /** Only present on `GET /files/{id}`. */
@@ -354,10 +350,10 @@ export interface LibraryStats {
   failed: number;
   saved_bytes: number;
   /**
-   * Files the last scan found still being copied (they are added once they
-   * stop changing). Older servers leave it out.
+   * Files still being copied into the library (they are added once they
+   * stop changing).
    */
-  settling?: number;
+  settling: number;
 }
 
 export interface Library {
@@ -451,20 +447,19 @@ export interface Job {
   input_size: number;
   output_size: number | null;
   error: string | null;
-  /** Machine-readable cause of `error`. Older servers leave it out. */
-  problem?: ProblemKind | null;
+  /** Machine-readable cause of `error`; set with every `error`. */
+  problem: ProblemKind | null;
   skip_reason: string | null;
   validation: ValidationReport | null;
   command: string | null;
   log_tail: string | null;
   /**
    * Plain-language compromises the conversion made, e.g. "Removed 2
-   * picture-based subtitles because MP4 can't hold them". Older servers
-   * leave it out.
+   * picture-based subtitles because MP4 can't hold them".
    */
-  notes?: string[];
-  /** Queued with "Convert anyway". Older servers leave it out. */
-  force?: boolean;
+  notes: string[];
+  /** Queued with "Convert anyway". */
+  force: boolean;
   created_at: Timestamp;
   started_at: Timestamp | null;
   finished_at: Timestamp | null;
@@ -507,10 +502,9 @@ export interface QueueState {
   max_jobs_auto: boolean;
   /**
    * Where `max_jobs` comes from: hardware detection, the container's
-   * `MAX_JOBS` variable, or a number saved in Settings. Older servers leave
-   * it out.
+   * `MAX_JOBS` variable, or a number saved in Settings.
    */
-  max_jobs_source?: MaxJobsSource;
+  max_jobs_source: MaxJobsSource;
   waiting_for_schedule: boolean;
 }
 
@@ -575,11 +569,8 @@ export interface Overview {
 /** `GET /api/system`: facts about the server the settings screens explain. */
 export interface SystemInfo {
   version: string;
-  /**
-   * Image build label (`CHRYSOPOEIA_VERSION`, e.g. `edge-1a2b3c4`) when it
-   * differs from `version`. Older servers leave it out.
-   */
-  build?: string | null;
+  /** Image build label (`CHRYSOPOEIA_VERSION`, e.g. `edge-1a2b3c4`) when it differs from `version`. */
+  build: string | null;
   /**
    * Scratch folder used when `Settings.temp_dir` is unset (`--temp-dir` /
    * `TEMP_DIR`, e.g. `/temp` in Docker). `null` means next to each file.
@@ -662,7 +653,7 @@ export interface FsBrowse {
   entries: FsEntry[];
   /**
    * Videos in the browsed folder itself and the folders inside it, counted
-   * like the entries'. Older servers leave it out.
+   * like the entries'. Left out when a file inside can't be checked.
    */
   media_count?: number | null;
   /** True when counting the browsed folder stopped early ("1,000+"). */
@@ -680,11 +671,15 @@ export interface BulkRequest {
 
 export interface Affected {
   affected: number;
+}
+
+/** Answer of `POST /files/bulk`. */
+export interface BulkResult extends Affected {
   /**
    * Bulk "queue" with explicit ids: files left out because the library's
-   * settings wouldn't convert them. Older servers leave it out.
+   * settings wouldn't convert them (0 for every other request).
    */
-  left_out?: number;
+  left_out: number;
 }
 
 /** Body of `POST /files/{id}/queue`. */

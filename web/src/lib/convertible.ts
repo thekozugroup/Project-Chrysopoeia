@@ -10,7 +10,7 @@
 import { plural } from "./format";
 import { skippedByUser } from "./labels";
 import { isUnreadable } from "./outcomes";
-import type { ActivityEntry, Container, Library, MediaFile, TranscodeProfile, VideoCodec } from "./types";
+import type { Container, Job, MediaFile, TranscodeProfile, VideoCodec } from "./types";
 
 /**
  * Skip reasons that come from the library's settings, which "Convert anyway"
@@ -33,6 +33,17 @@ export function skipFollowsSettings(file: MediaFile): boolean {
     ? file.probe.streams.some((s) => s.kind === "video" && !s.is_attached_pic)
     : Boolean(file.video_codec);
   return hasVideo && (file.duration_secs ?? 0) >= 1 && SETTINGS_SKIP.test(file.skip_reason?.trim() ?? "");
+}
+
+/**
+ * Whether trying a file again should repeat "Convert anyway": its latest
+ * conversion was queued that way and ended without a result (it failed, for
+ * instance on a full disk, or was stopped). Queued plainly, the library's
+ * rules would apply this time and could keep the original, undoing the
+ * user's choice. The server doesn't carry the choice over by itself.
+ */
+export function repeatsForce(latest: Pick<Job, "force" | "state"> | null | undefined): boolean {
+  return Boolean(latest?.force) && (latest?.state === "failed" || latest?.state === "cancelled");
 }
 
 /** Efficiency rank of an ffprobe codec name (core `source_efficiency_rank`). */
@@ -256,39 +267,6 @@ export function nothingToConvertText(plan: LeftOut): string {
     return `${g.n === 1 ? "This file" : "These files"} ${g.n === 1 ? g.one : g.many}.${hint}`;
   }
   return `Nothing to convert: ${groups.map((g) => `${plural(g.n, "file")} ${g.n === 1 ? g.one : g.many}`).join(", ")}.${hint}`;
-}
-
-/** The server's scan summary: "Scanned Movies: …, 4 still being copied (…)". */
-const STILL_COPYING = /\b([\d,]+) still being copied\b/;
-
-/**
- * How many files the library's latest scan found still being copied (the
- * server waits until they stop changing), from the activity feed, which is
- * newest first. Files that settled since arrive as "Found <name> in
- * <library>" entries, never as a new scan summary, so each of those after
- * the summary takes one off. 0 when the latest scan found none, or no scan
- * is listed.
- */
-export function stillCopyingCount(entries: ActivityEntry[] | undefined, libraryId: string): number {
-  const own = entries?.filter((e) => e.library_id === libraryId) ?? [];
-  const at = own.findIndex((e) => e.message.startsWith("Scanned "));
-  if (at < 0) return 0;
-  const match = STILL_COPYING.exec(own[at].message);
-  const copying = match ? Number(match[1].replace(/,/g, "")) || 0 : 0;
-  const settledSince = own.slice(0, at).filter((e) => e.message.startsWith("Found ")).length;
-  return Math.max(0, copying - settledSince);
-}
-
-/**
- * How many of a library's files are still being copied: the server's
- * `stats.settling` whenever it sends it (0 is an answer: nothing is being
- * copied), or, from older servers that leave it out, the latest scan
- * summary in the activity feed.
- */
-export function settlingCount(library: Pick<Library, "id" | "stats">, entries: ActivityEntry[] | undefined): number {
-  const settling = library.stats.settling;
-  if (typeof settling === "number" && Number.isFinite(settling)) return Math.max(0, settling);
-  return stillCopyingCount(entries, library.id);
 }
 
 /** "Waiting for 3 files to finish copying" (see `settlingCount`). */

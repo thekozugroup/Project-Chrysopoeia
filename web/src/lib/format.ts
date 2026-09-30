@@ -193,3 +193,35 @@ export function middleTruncate(text: string, max = 48): string {
   const keepEnd = Math.min(16, Math.floor(max / 3));
   return `${text.slice(0, max - keepEnd - 1)}…${text.slice(-keepEnd)}`;
 }
+
+/**
+ * Where an episode is named: S01E02, 1x02, "Episode 2", E02, an air date
+ * (2024-05-01), or an anime-style " - 02".
+ */
+const EPISODE_MARK =
+  /(?:\bS\d{1,4}[ ._-]?E\d{1,4}\b|\b\d{1,2}x\d{2,3}\b|\bEp(?:isode)?[ ._]?\d{1,4}\b|\bE\d{2,4}\b|\b\d{4}[-.]\d{2}[-.]\d{2}\b| - \d{2,4}\b)/i;
+
+/** Names at most this long are never split: they fit, or end truncation keeps enough. */
+const SPLIT_MIN_LENGTH = 32;
+/** An episode mark starting before this is still seen when the name is cut at its end. */
+const EARLY_MARK = 24;
+
+/**
+ * How a long file name is cut in a narrow list: `head` gives way first, and
+ * `tail`, the part that tells similar names apart, stays in view (see
+ * `FileName`). The tail starts at the episode mark when the name holds one
+ * too far in to survive being cut at the end ("Das außergewöhnlich…S01E01
+ * - Pilot.mkv"). `null`, so the name is cut at its end as usual, when it's
+ * short, its episode mark is near the start ("The Office (US) - S02E03 -
+ * …"), or it has none: a movie's title comes first, and that's what tells
+ * it apart.
+ */
+export function splitFileName(name: string): { head: string; tail: string } | null {
+  if (name.length <= SPLIT_MIN_LENGTH) return null;
+  const mark = EPISODE_MARK.exec(name);
+  if (!mark) return null;
+  // " - 02" starts at its dash; the tail starts at the number.
+  const start = mark[0].startsWith(" - ") ? mark.index + 3 : mark.index;
+  if (start < EARLY_MARK) return null;
+  return { head: name.slice(0, start), tail: name.slice(start) };
+}

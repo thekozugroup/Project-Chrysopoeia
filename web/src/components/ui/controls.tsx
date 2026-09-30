@@ -247,8 +247,12 @@ export function Segmented<T extends string>({
           <label
             key={option.value}
             className={cn(
-              "relative flex min-w-0 flex-1 cursor-pointer items-center rounded-[5px] px-2 font-medium transition-[background-color,color,box-shadow] duration-150 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink",
-              stackOnPhones ? "justify-start px-3 sm:justify-center sm:px-2 sm:text-center" : "justify-center text-center",
+              "relative flex min-w-0 cursor-pointer items-center rounded-[5px] px-2 font-medium transition-[background-color,color,box-shadow] duration-150 has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-1 has-[:focus-visible]:outline-accent-ink",
+              // Stacked, a zero flex basis would squash each option to its text
+              // height; the height below applies only while they don't grow.
+              stackOnPhones
+                ? "flex-none justify-start px-3 sm:flex-1 sm:justify-center sm:px-2 sm:text-center"
+                : "flex-1 justify-center text-center",
               size === "sm" ? "h-7 text-[0.8125rem]" : stackOnPhones ? "h-10 text-sm sm:h-8" : "h-8 text-sm",
               "pointer-coarse:h-11",
               // The selected option carries a 1.5px gold ring (≥3:1 against the
