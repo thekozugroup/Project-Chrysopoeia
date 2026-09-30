@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api } from "@/lib/api";
 import type { Job, ValidationCheck, ValidationReport } from "@/lib/types";
-import { checkValueText, checksLead, errorLinesFirst, historyNote, jobOverall, savingsText } from "./jobs";
+import { JobCard, StopJobButton, checkValueText, checksLead, errorLinesFirst, historyNote, jobOverall, savingsText } from "./jobs";
 
 const check = (id: string, value: number | null, status: ValidationCheck["status"] = "pass"): ValidationCheck => ({
   id,
@@ -179,5 +182,39 @@ describe("job summaries", () => {
     expect(historyNote(failed, null, "converted")).toBe("The work folder can't be used · now converted");
     expect(historyNote(failed, null, "queued")).toBe("The work folder can't be used · queued again");
     expect(historyNote(job({ state: "cancelled", output_size: null }), null, "converted")).toBe("Stopped · now converted");
+  });
+});
+
+describe("a running job's card", () => {
+  afterEach(cleanup);
+
+  const name = "Das außergewöhnlich lange Serienfinale einer Show (2024) - S01E04 - Extended Cut Bluray-1080p.mkv";
+
+  function renderWithClient(ui: React.ReactElement) {
+    vi.spyOn(api, "libraries").mockResolvedValue([]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  }
+
+  it("names its buttons after the file, so several cards don't all say just Stop and Details", () => {
+    renderWithClient(<JobCard job={job({ state: "running", stage: "transcoding", progress: 40, file_name: name })} onOpen={() => {}} />);
+    expect(screen.getByRole("button", { name: `Stop ${name}` }).textContent).toContain("Stop");
+    expect(screen.getByRole("button", { name: `Details for ${name}` }).textContent).toContain("Details");
+    // The card itself is named by its title too.
+    expect(screen.getByRole("article", { name }).tagName).toBe("ARTICLE");
+  });
+
+  it("can shrink below its name's width, so a long name never pushes the buttons off a phone", () => {
+    const { container } = renderWithClient(
+      <JobCard job={job({ state: "running", stage: "transcoding", progress: 40, file_name: name })} onOpen={() => {}} />,
+    );
+    // A grid or flex child defaults to `min-width: auto`; without `min-w-0` the card is as wide as the name.
+    expect(container.querySelector("article")?.className).toMatch(/\bmin-w-0\b/);
+  });
+
+  it("keeps the visible word first in the name of a file's Remove from queue button", () => {
+    renderWithClient(<StopJobButton job={job({ state: "queued", file_name: name })} named />);
+    // Voice control says what's on the button; the file name follows.
+    expect(screen.getByRole("button", { name: `Remove from queue: ${name}` }).textContent).toContain("Remove from queue");
   });
 });

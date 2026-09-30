@@ -154,7 +154,7 @@ export function StopJobButton({
         size={size}
         onClick={() => cancel.mutate(job)}
         loading={cancel.isPending}
-        aria-label={named ? `Remove ${job.file_name} from the queue` : undefined}
+        aria-label={named ? `Remove from queue: ${job.file_name}` : undefined}
         needsServer
       >
         <CircleMinus aria-hidden />

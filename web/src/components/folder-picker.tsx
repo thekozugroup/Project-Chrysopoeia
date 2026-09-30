@@ -399,35 +399,38 @@ export function FolderPicker({
             inert={loadingNew || undefined}
             className={cn("py-1 outline-none", browse.isFetching && "opacity-60 transition-opacity")}
           >
-            {entries.map((entry, i) => (
-              <li key={entry.path}>
-                <button
-                  type="button"
-                  data-index={i}
-                  tabIndex={i === Math.max(0, focusIndex) ? 0 : -1}
-                  onFocus={() => setFocusIndex(i)}
-                  onClick={() => go(entry.path)}
-                  className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-raised focus-visible:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-ink pointer-coarse:min-h-11"
-                >
-                  <Folder className="size-[1.125rem] shrink-0 text-accent-ink" aria-hidden />
-                  <span className="min-w-0 flex-1 truncate text-fg">{entry.name}</span>
-                  {libraryAt(entry.path, libraries) ? (
-                    <span
-                      className="shrink-0 rounded-full border border-line-strong/60 px-2 py-0.5 text-xs text-muted"
-                      title={`Already the library “${libraryAt(entry.path, libraries)?.name}”`}
-                    >
-                      Library
-                    </span>
-                  ) : null}
-                  {videoCount(entry.media_count, entry.media_count_capped) ? (
-                    <span className="shrink-0 text-[0.8125rem] text-muted tabular">
-                      {videoCount(entry.media_count, entry.media_count_capped)}
-                    </span>
-                  ) : null}
-                  <ChevronRight className="size-4 shrink-0 text-muted" aria-hidden />
-                </button>
-              </li>
-            ))}
+            {entries.map((entry, i) => {
+              const known = libraryAt(entry.path, libraries);
+              return (
+                <li key={entry.path}>
+                  <button
+                    type="button"
+                    data-index={i}
+                    tabIndex={i === Math.max(0, focusIndex) ? 0 : -1}
+                    onFocus={() => setFocusIndex(i)}
+                    onClick={() => go(entry.path)}
+                    className="flex w-full items-center gap-3 px-4 py-2 text-left text-sm hover:bg-raised focus-visible:bg-raised focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent-ink pointer-coarse:min-h-11"
+                  >
+                    <Folder className="size-[1.125rem] shrink-0 text-accent-ink" aria-hidden />
+                    <span className="min-w-0 flex-1 truncate text-fg">{entry.name}</span>
+                    {known ? (
+                      <span
+                        className="shrink-0 rounded-full border border-line-strong/60 px-2 py-0.5 text-xs text-muted"
+                        title={`Already the library “${known.name}”`}
+                      >
+                        Library
+                      </span>
+                    ) : null}
+                    {videoCount(entry.media_count, entry.media_count_capped) ? (
+                      <span className="shrink-0 text-[0.8125rem] text-muted tabular">
+                        {videoCount(entry.media_count, entry.media_count_capped)}
+                      </span>
+                    ) : null}
+                    <ChevronRight className="size-4 shrink-0 text-muted" aria-hidden />
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

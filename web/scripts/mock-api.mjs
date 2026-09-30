@@ -1585,7 +1585,8 @@ route("POST", "/api/files/bulk", async (_p, _q, req) => {
   emitQueue();
   emitStats();
   startJobs();
-  return body.action === "queue" && body.ids ? { affected, left_out: leftOut } : { affected };
+  // Like the real server: `left_out` is always there (0 unless a queue request left files out).
+  return { affected, left_out: body.action === "queue" && body.ids ? leftOut : 0 };
 });
 
 route("GET", "/api/jobs", (_p, q) => {
