@@ -98,10 +98,10 @@ fn within(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|r| path.starts_with(r))
 }
 
-async fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+fn canonical_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(roots.len());
     for r in roots {
-        if let Ok(c) = tokio::fs::canonicalize(r).await
+        if let Ok(c) = std::fs::canonicalize(r)
             && !out.contains(&c)
         {
             out.push(c);
@@ -280,34 +280,69 @@ fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Resul
     Ok(Listing { entries: out, own })
 }
 
+/// How long a folder listing may take before the folder is reported as not
+/// responding (a share whose server went away never answers).
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// `GET /api/fs/browse`
 pub async fn browse(
     State(state): State<AppState>,
     ApiQuery(q): ApiQuery<BrowseQuery>,
 ) -> ApiResult<Json<BrowseResponse>> {
-    let roots = canonical_roots(&state.config.browse_roots).await;
+    let requested = q
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+    if requested.as_ref().is_some_and(|p| !p.is_absolute()) {
+        return Err(ApiError::bad_request(
+            "path_not_absolute",
+            "Use a full folder path, starting with /.",
+        ));
+    }
+    // The listing runs on one thread per folder at a time (see `fs_guard`),
+    // so a hung share can't use up the server's threads.
+    let key = requested
+        .as_deref()
+        .map_or_else(PathBuf::new, lexical_normalize);
+    let config_roots = state.config.browse_roots.clone();
+    let toolkit = state.toolkit.clone();
+    let listed = fs_guard::guarded("browse", &key, BROWSE_TIMEOUT, move || {
+        browse_blocking(requested, &config_roots, &toolkit)
+    })
+    .await;
+    match listed {
+        Some(result) => result.map(Json),
+        None => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not_responding",
+            "That folder isn't responding. If it's on a network share or an external drive, \
+             check the connection.",
+        )),
+    }
+}
+
+/// [`browse`]'s work, with blocking calls.
+fn browse_blocking(
+    requested: Option<PathBuf>,
+    config_roots: &[PathBuf],
+    toolkit: &Toolkit,
+) -> ApiResult<BrowseResponse> {
+    let roots = canonical_roots(config_roots);
     let Some(first_root) = roots.first().cloned() else {
         return Err(ApiError::not_found(
             "no_browse_roots",
             "None of the folders the picker may show exist on the server. Check BROWSE_ROOTS.",
         ));
     };
-    let requested = match q.path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
-        Some(p) => PathBuf::from(p),
-        None => first_root,
-    };
-    if !requested.is_absolute() {
-        return Err(ApiError::bad_request(
-            "path_not_absolute",
-            "Use a full folder path, starting with /.",
-        ));
-    }
+    let requested = requested.unwrap_or(first_root);
     let lexical = lexical_normalize(&requested);
-    let lexical_ok = within(&lexical, &roots) || within(&lexical, &state.config.browse_roots);
+    let lexical_ok = within(&lexical, &roots) || within(&lexical, config_roots);
     if !lexical_ok {
         return Err(outside_roots());
     }
-    let canonical = match tokio::fs::canonicalize(&lexical).await {
+    let canonical = match std::fs::canonicalize(&lexical) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(ApiError::not_found(
@@ -325,8 +360,7 @@ pub async fn browse(
     if !within(&canonical, &roots) {
         return Err(outside_roots());
     }
-    if !tokio::fs::metadata(&canonical)
-        .await
+    if !std::fs::metadata(&canonical)
         .map(|m| m.is_dir())
         .unwrap_or(false)
     {
@@ -340,20 +374,14 @@ pub async fn browse(
         .filter(|p| within(p, &roots))
         .and_then(|p| p.to_str())
         .map(str::to_string);
-    let toolkit = state.toolkit.clone();
-    let dir = canonical.clone();
-    let list_roots = roots.clone();
-    let listing = tokio::task::spawn_blocking(move || list_dirs(&dir, &list_roots, &toolkit))
-        .await
-        .map_err(ApiError::internal)?;
-    let Listing { entries, own } = listing.map_err(|_| {
+    let Listing { entries, own } = list_dirs(&canonical, &roots, toolkit).map_err(|_| {
         ApiError::bad_request(
             "not_readable",
             "Chrysopoeia can't read that folder. Check its permissions (in Docker, the \
              PUID/PGID user needs read access).",
         )
     })?;
-    Ok(Json(BrowseResponse {
+    Ok(BrowseResponse {
         path: canonical.to_string_lossy().into_owned(),
         parent,
         roots: roots

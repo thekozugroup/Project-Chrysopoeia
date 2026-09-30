@@ -8,8 +8,10 @@
 //! - [`settings`]: settings changes.
 //! - [`watcher`]: folder watching.
 //! - [`rescan`]: periodic rescans.
+//! - [`fs_guard`]: checks on folders that may hang (network shares).
 
 pub mod dispatcher;
+pub mod fs_guard;
 pub mod hardware;
 pub mod library;
 pub mod library_admin;

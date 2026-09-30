@@ -591,6 +591,72 @@ async fn cancelled_before_start_does_nothing() {
     assert_eq!(support::walk(dir.path()), [input]);
 }
 
+/// Replacing an MKV with an MP4 that can't hold its picture-based subtitles
+/// or its subtitle fonts would lose them for good: the file is left as it
+/// is. Converting anyway, or into a separate folder (the original stays),
+/// goes ahead.
+#[tokio::test]
+async fn replacing_never_silently_loses_picture_subtitles_or_fonts() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MKV_1080P_SUBS, dir.path());
+    let original = std::fs::read(&input).unwrap();
+    let mp4 = TranscodeProfile {
+        container: Container::Mp4,
+        ..profile()
+    };
+    let mut s = spec(&input, dir.path(), mp4);
+    let next = u32::try_from(s.probe.streams.len()).unwrap();
+    s.probe.streams.push(chrysopoeia_core::StreamInfo {
+        index: next,
+        kind: Some(chrysopoeia_core::StreamKind::Subtitle),
+        codec: "hdmv_pgs_subtitle".into(),
+        ..Default::default()
+    });
+    s.probe.streams.push(chrysopoeia_core::StreamInfo {
+        index: next + 1,
+        kind: Some(chrysopoeia_core::StreamKind::Attachment),
+        codec: "ttf".into(),
+        ..Default::default()
+    });
+    let cfg = config(ValidationLevel::Quick);
+    let (outcome, _) = run(&cfg, &s, &fake_plan).await;
+    match outcome {
+        JobOutcome::Skipped {
+            reason,
+            encoder: None,
+            output_size: None,
+        } => assert!(
+            reason.starts_with(
+                "MP4 can't hold this file's 1 picture-based subtitle and 1 subtitle font, so it \
+                 was left unchanged."
+            ),
+            "{reason}"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(support::artifacts_in(dir.path()).is_empty());
+
+    // Past that check, planning fails here on purpose (nothing is encoded).
+    let unplannable =
+        |_: &PlanRequest<'_>| -> anyhow::Result<FfmpegPlan> { anyhow::bail!("not planned") };
+    s.force = true;
+    let (outcome, _) = run(&cfg, &s, &unplannable).await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    s.force = false;
+    let out = dir.path().join("converted");
+    std::fs::create_dir_all(&out).unwrap();
+    let folder = RunConfig {
+        output_mode: OutputMode::Folder,
+        output_folder: Some(out),
+        ..cfg.clone()
+    };
+    let (outcome, _) = run(&folder, &s, &unplannable).await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
 #[tokio::test]
 async fn preparing_checks_fail_fast() {
     require_ffmpeg!();

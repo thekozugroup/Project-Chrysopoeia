@@ -248,6 +248,15 @@ pub async fn index(pool: &SqlitePool, library_id: Uuid) -> sqlx::Result<Vec<Inde
     rows.iter().map(index_from_row).collect()
 }
 
+/// Whether a library lists any file.
+pub async fn any_in_library(pool: &SqlitePool, library_id: Uuid) -> sqlx::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM files WHERE library_id = ? LIMIT 1")
+        .bind(library_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
 /// Index entry for one path.
 pub async fn find_by_path(pool: &SqlitePool, path: &str) -> sqlx::Result<Option<IndexEntry>> {
     find_by_path_conn(&mut *pool.acquire().await?, path).await

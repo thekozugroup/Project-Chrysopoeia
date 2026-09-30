@@ -38,6 +38,7 @@ use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile, missing_input_error};
 use crate::db::jobs::{InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
+use crate::services::fs_guard;
 use crate::services::library::{
     self, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, probe_problem, still_settling,
 };
@@ -59,6 +60,12 @@ const OUTCOME_HARD_ATTEMPTS: u32 = 5;
 const OUTCOME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Minimum time between progress writes to the database, per job.
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the file a job starts on may take to answer before its library
+/// counts as offline. Generous: an array disk that has to spin up first
+/// takes several seconds.
+const INPUT_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a folder may take to list a job's leftovers.
+const LEFTOVER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard upper bound on concurrent jobs.
 pub const MAX_JOBS_LIMIT: u32 = 32;
 
@@ -231,9 +238,9 @@ impl DispatcherHandle {
         lock(&self.running).values().filter(|j| j.software).count()
     }
 
-    /// Whether a job is running.
-    pub fn is_running(&self, job_id: Uuid) -> bool {
-        lock(&self.running).contains_key(&job_id)
+    /// The jobs running right now.
+    pub fn running_ids(&self) -> Vec<Uuid> {
+        lock(&self.running).keys().copied().collect()
     }
 
     /// Cancel a running job. Returns false when it isn't running.
@@ -552,10 +559,28 @@ fn start_job(state: &AppState, job: Job, software: bool) {
 
         let (disposition, ctx) = execute(&state, &job, cancel).await;
         let intent = guard.intent();
+        // A file moved during its conversion (a folder renamed by Sonarr or
+        // Radarr, say) leaves the temp file written next to it in the
+        // folder's new place, where this job can't find it; a scan cleans it
+        // up. (With watching off, the next scan does.)
+        let source_gone = matches!(
+            &disposition,
+            Disposition::Finished(JobOutcome::Failed {
+                problem: ProblemKind::SourceChanged,
+                ..
+            })
+        ) && ctx.worker_ran
+            && {
+                let settings = state.settings();
+                settings.watch_folders && run_config(&state, &settings).temp_dir.is_none()
+            };
         // The slot stays taken until the result is recorded.
         record(&state, &job, disposition, intent, &ctx).await;
         // Free the slot before announcing, so the queue state is current.
         drop(guard);
+        if source_gone && !state.shutdown.is_cancelled() {
+            let _ = library::start_scan(&state, job.library_id);
+        }
         state.broadcast_job(job.id).await;
         state.broadcast_file(job.file_id).await;
         state.broadcast_library(job.library_id).await;
@@ -582,6 +607,8 @@ struct ExecContext {
     library_root: Option<PathBuf>,
     library_name: Option<String>,
     output_mode: OutputMode,
+    /// The worker ran (so it may have written a temp file).
+    worker_ran: bool,
 }
 
 impl ExecContext {
@@ -671,6 +698,7 @@ async fn execute(
         library_root: None,
         library_name: None,
         output_mode: settings.output_mode,
+        worker_ran: false,
     };
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
@@ -708,18 +736,46 @@ async fn execute(
     ctx.library_name = Some(lib.name.clone());
 
     let input = PathBuf::from(&file.path);
-    let meta = match tokio::fs::metadata(&input).await {
-        Ok(m) if m.is_file() => m,
-        _ => {
-            // A whole library missing is a disconnected drive or share, not
-            // a deleted file: wait for it instead of failing every job.
-            if let Some(reason) = library::root_unavailable(&lib.path).await {
+    let mut restored = false;
+    let meta = loop {
+        // A share that stopped answering would keep this job (and its slot)
+        // "preparing" forever, and deaf to Cancel and Stop.
+        let looked = tokio::select! {
+            m = fs_guard::metadata(&input, INPUT_CHECK_TIMEOUT) => m,
+            () = cancel.cancelled() => return done(JobOutcome::Cancelled, ctx),
+        };
+        match looked {
+            None => {
+                let reason = library::root_unavailable(&lib.path)
+                    .await
+                    .unwrap_or_else(|| library::not_responding(&lib.path));
                 return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
             }
-            return done(
-                failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
-                ctx,
-            );
+            Some(Ok(m)) if m.is_file() => break m,
+            Some(_) => {
+                // A whole library missing is a disconnected drive or share,
+                // not a deleted file: wait for it instead of failing every
+                // job.
+                if let Some(reason) = library::root_unavailable(&lib.path).await {
+                    return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
+                }
+                // This job's own earlier run may have left the original
+                // moved aside when the server stopped (its folder was out of
+                // reach at the start): put it back and go on.
+                if !restored
+                    && let Some(dir) = input.parent()
+                    && recover_job_leftovers(state, job.id, &[dir.to_path_buf()])
+                        .await
+                        .contains(&input)
+                {
+                    restored = true;
+                    continue;
+                }
+                return done(
+                    failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
+                    ctx,
+                );
+            }
         }
     };
     let modified: DateTime<Utc> = meta
@@ -779,7 +835,7 @@ async fn execute(
     // fail for their own reason) as usual.
     let preference_problem = hw
         .as_deref()
-        .filter(|_| would_convert(state, &probe, &lib.profile, job.force))
+        .filter(|_| would_convert(state, &probe, &lib.profile, job.force, settings.output_mode))
         .and_then(|hw| {
             let codec = Some(lib.profile.video_codec);
             chrysopoeia_hwdetect::preference_problem(hw, settings.hardware, codec).map(|problem| {
@@ -836,6 +892,7 @@ async fn execute(
 
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
     let forwarder = tokio::spawn(forward_progress(state.clone(), rx));
+    ctx.worker_ran = true;
     let outcome = match state.toolkit.run_job(cfg, spec, tx, cancel).await {
         Ok(outcome) => outcome,
         Err(_) => failed(
@@ -890,13 +947,15 @@ async fn execute(
 
 /// Whether the worker would convert this file (so it needs an encoder): the
 /// decision the worker makes before its first attempt, including "Convert
-/// anyway". A decision that can't be made counts as converting; the worker
-/// reports the problem.
+/// anyway" and leaving alone a file whose replacement couldn't hold all its
+/// subtitles or attachments. A decision that can't be made counts as
+/// converting; the worker reports the problem.
 fn would_convert(
     state: &AppState,
     probe: &chrysopoeia_core::ProbeInfo,
     profile: &chrysopoeia_core::TranscodeProfile,
     force: bool,
+    output_mode: OutputMode,
 ) -> bool {
     match state.toolkit.decide(probe, profile) {
         Ok(Decision::Skip { .. }) if force => matches!(
@@ -904,7 +963,12 @@ fn would_convert(
             Decision::Transcode
         ),
         Ok(Decision::Skip { .. }) => false,
-        Ok(Decision::Transcode) | Err(_) => true,
+        Ok(Decision::Transcode) => {
+            force
+                || output_mode != OutputMode::Replace
+                || chrysopoeia_worker::replace_loss(probe, profile).is_none()
+        }
+        Err(_) => true,
     }
 }
 
@@ -1551,14 +1615,10 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         }
     }
     let mut completed = 0;
+    // Where each job may have left files of its own: its file's folder and
+    // the folder its result was going to.
+    let mut leftover_dirs: Vec<(Uuid, Vec<PathBuf>)> = Vec::new();
     for InterruptedJob { job, final_path } in jobs {
-        let Some(final_path) = final_path else {
-            continue;
-        };
-        // Two interrupted jobs aiming at one name can't be told apart.
-        if targets.get(&final_path).copied().unwrap_or(0) > 1 {
-            continue;
-        }
         let file = db::files::get(state.db.pool(), job.file_id, true)
             .await
             .ok()
@@ -1567,6 +1627,20 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             file.as_ref()
                 .map_or(job.file_path.as_str(), |f| f.path.as_str()),
         );
+        let mut dirs: Vec<PathBuf> = input.parent().map(Path::to_path_buf).into_iter().collect();
+        if let Some(dir) = final_path.as_deref().and_then(|p| Path::new(p).parent())
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_path_buf());
+        }
+        leftover_dirs.push((job.id, dirs));
+        let Some(final_path) = final_path else {
+            continue;
+        };
+        // Two interrupted jobs aiming at one name can't be told apart.
+        if targets.get(&final_path).copied().unwrap_or(0) > 1 {
+            continue;
+        }
         let target = PathBuf::from(&final_path);
         let replace = target.parent() == input.parent();
         let placed = if replace {
@@ -1619,6 +1693,7 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             } else {
                 OutputMode::Folder
             },
+            worker_ran: true,
         };
         let outcome = JobOutcome::Done {
             output_path: target,
@@ -1635,7 +1710,45 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         record(state, &job, Disposition::Finished(outcome), None, &ctx).await;
         completed += 1;
     }
+    // Whatever the last stop recorded and wherever the library search gets
+    // to, an original the crash left moved aside is put back now (and its
+    // job's temp files go), so the job finds its file when it runs again.
+    for (job_id, dirs) in leftover_dirs {
+        recover_job_leftovers(state, job_id, &dirs).await;
+    }
     completed
+}
+
+/// Hand what a job left in `dirs` (its temp files, its backup of the
+/// original) to crash recovery: the backup is put back when the original's
+/// name is free. Folders that don't answer are left for the library search.
+async fn recover_job_leftovers(state: &AppState, job_id: Uuid, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        let d = dir.clone();
+        // One check per job and folder (see `fs_guard`).
+        let key = dir.join(job_id.to_string());
+        let listed = fs_guard::guarded("job_leftovers", &key, LEFTOVER_CHECK_TIMEOUT, move || {
+            std::fs::read_dir(&d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| chrysopoeia_core::paths::is_artifact_of(n, job_id))
+                        })
+                        .map(|e| e.path())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await;
+        found.extend(listed.unwrap_or_default());
+    }
+    if found.is_empty() {
+        return Vec::new();
+    }
+    library::recover_leftovers(state, found, Some(job_id)).await
 }
 
 /// Stop starting jobs, cancel the running ones (they go back to the queue)

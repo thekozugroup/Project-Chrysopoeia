@@ -253,3 +253,55 @@ async fn large_library_is_scanned_in_batches() {
     app.rescan(lib["id"].as_str().unwrap()).await;
     assert_eq!(app.fake.probes.load(Ordering::SeqCst), probes);
 }
+
+/// Leftovers of interrupted conversions in a library: a temp file left in a
+/// folder renamed while its file was converted is removed by the next scan,
+/// and an original a crash left moved aside is put back and stays listed.
+/// The files of a job that is running are left alone.
+#[tokio::test]
+async fn scans_clean_up_leftovers_of_interrupted_conversions() {
+    use chrysopoeia_core::paths::{backup_file_name, temp_file_name};
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.write("Movies/Show (2020)/a.mkv", h264());
+    app.write("Movies/b.mkv", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    let id = lib["id"].as_str().unwrap().to_string();
+    let movies = std::fs::canonicalize(app.media.join("Movies")).unwrap();
+    let stray = movies
+        .join("Show (2020)")
+        .join(temp_file_name("a", uuid::Uuid::new_v4(), "mkv"));
+    std::fs::write(&stray, "most of an encode").unwrap();
+    let b = movies.join("b.mkv");
+    let backup = movies.join(backup_file_name("b.mkv", uuid::Uuid::new_v4()));
+    std::fs::rename(&b, &backup).unwrap();
+
+    app.rescan(&id).await;
+    assert!(!stray.exists(), "the stray temp file was removed");
+    assert!(b.exists(), "the original was put back");
+    assert!(!backup.exists());
+    let files = app.files_by_name(&id).await;
+    assert!(files.contains_key("b.mkv"), "{files:#?}");
+    let act = app.get("/api/activity").await;
+    assert!(act.text.contains("Restored"), "{}", act.text);
+    assert!(!crate::state::lock(&app.state.leftovers).due());
+
+    // A running job's temp file is its own.
+    app.fake.set_behavior("b.mkv", Behavior::Hold);
+    app.post("/api/files/bulk", json!({ "action": "queue", "library": id }))
+        .await;
+    app.resume().await;
+    let state = app.state.clone();
+    wait_until("the job runs", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_count() == 1 }
+    })
+    .await;
+    let job_id = app.state.dispatcher.running_ids()[0];
+    let own = movies.join(temp_file_name("b", job_id, "mkv"));
+    std::fs::write(&own, "being written").unwrap();
+    app.rescan(&id).await;
+    assert!(own.exists(), "a running job's temp file was left alone");
+    app.fake.release.add_permits(1);
+    app.wait_queue_idle().await;
+}

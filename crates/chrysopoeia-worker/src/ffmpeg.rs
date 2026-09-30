@@ -24,10 +24,51 @@ use tokio_util::sync::CancellationToken;
 /// Number of stderr lines kept for error reports.
 pub const STDERR_TAIL_LINES: usize = 40;
 
-/// Default time without any output after which an encode counts as hung.
-/// ffmpeg prints a progress block every half second while it works, so ten
-/// silent minutes only happen when it is stuck (for example in a GPU driver).
+/// Default time without progress after which an encode counts as hung.
+/// ffmpeg's progress blocks move on every half second while it works, so
+/// ten minutes without a frame, a moment of output or a byte written only
+/// happen when it is stuck (for example in a GPU driver). ffmpeg 7 keeps
+/// printing progress blocks while it is stuck, so blocks that repeat the
+/// last one don't count as progress (see [`Liveness`]).
 pub const DEFAULT_STALL_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Tells ffmpeg working apart from ffmpeg merely printing. ffmpeg 6 prints a
+/// progress block only when something happened, but ffmpeg 7 (the Docker
+/// image's jellyfin-ffmpeg) prints one every half second from its main
+/// thread even when no frame moves, so a hung encoder or a stuck read would
+/// never look silent.
+#[derive(Debug, Default)]
+struct Liveness {
+    /// Frame count, output time and bytes written of the last block.
+    last: Option<(Option<u64>, Option<u64>, Option<u64>)>,
+    /// The last stderr line.
+    last_stderr: Option<String>,
+}
+
+impl Liveness {
+    /// Whether a progress block shows work done since the previous block
+    /// (the first block and the final one always do).
+    fn block(&mut self, block: &ProgressBlock) -> bool {
+        let marks = (
+            block.frame,
+            block.out_time_secs.map(f64::to_bits),
+            block.total_size,
+        );
+        let moved = block.end || self.last != Some(marks);
+        self.last = Some(marks);
+        moved
+    }
+
+    /// Whether a stderr line is news: a line repeated over and over (a
+    /// decoder complaining in a loop) is not progress by itself.
+    fn stderr(&mut self, line: &str) -> bool {
+        if self.last_stderr.as_deref() == Some(line) {
+            return false;
+        }
+        self.last_stderr = Some(line.to_string());
+        true
+    }
+}
 
 /// Niceness used for low-priority encodes.
 const NICE_LEVEL: &str = "10";
@@ -708,6 +749,7 @@ pub async fn run_ffmpeg(
     let mut stderr = child.stderr.take().map(|s| BufReader::new(s).split(b'\n'));
     let mut parser = ProgressParser::new();
     let mut tail = StderrTail::default();
+    let mut liveness = Liveness::default();
     let stall = tokio::time::sleep(cmd.stall_timeout);
     tokio::pin!(stall);
 
@@ -721,27 +763,38 @@ pub async fn run_ffmpeg(
             }
             () = &mut stall => {
                 drop((stdout.take(), stderr.take()));
-                tracing::warn!(program = %cmd.program.display(), "ffmpeg printed nothing for {:?}; stopping it", cmd.stall_timeout);
+                tracing::warn!(program = %cmd.program.display(), "ffmpeg made no progress for {:?}; stopping it", cmd.stall_timeout);
                 kill_child(&mut child).await;
                 return FfmpegExit::Stalled { after: cmd.stall_timeout, tail: tail.joined() };
             }
             segment = next_segment(&mut stdout), if stdout.is_some() => match segment {
                 Some(bytes) => {
-                    stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
+                    let mut alive = false;
                     for line in split_output_lines(&bytes) {
                         if let Some(block) = parser.push_line(&line) {
+                            alive |= liveness.block(&block);
                             on_progress(&block);
+                        } else if !line.contains('=') {
+                            // Not part of a progress block: output of its own.
+                            alive = true;
                         }
+                    }
+                    if alive {
+                        stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
                     }
                 }
                 None => stdout = None,
             },
             segment = next_segment(&mut stderr), if stderr.is_some() => match segment {
                 Some(bytes) => {
-                    stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
+                    let mut alive = false;
                     for line in split_output_lines(&bytes) {
+                        alive |= liveness.stderr(&line);
                         on_stderr(&line);
                         tail.push(&line);
+                    }
+                    if alive {
+                        stall.as_mut().reset(Instant::now() + cmd.stall_timeout);
                     }
                 }
                 None => stderr = None,
@@ -1382,5 +1435,69 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
         cmd.stall_timeout = Duration::from_millis(300);
         let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
         assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
+    }
+
+    #[test]
+    fn only_blocks_that_move_count_as_progress() {
+        let mut live = Liveness::default();
+        let block = |frame: u64, secs: f64, size: u64| ProgressBlock {
+            frame: Some(frame),
+            out_time_secs: Some(secs),
+            total_size: Some(size),
+            fps: Some(24.0),
+            speed: Some(1.0),
+            end: false,
+        };
+        assert!(live.block(&block(0, 0.0, 0)), "the first block");
+        assert!(live.block(&block(24, 1.0, 1000)));
+        let mut stuck = block(24, 1.0, 1000);
+        for speed in [0.9, 0.5, 0.1] {
+            // ffmpeg 7 while stuck: the same position, a falling speed.
+            stuck.speed = Some(speed);
+            assert!(!live.block(&stuck));
+        }
+        assert!(live.block(&block(24, 1.0, 1200)), "bytes written");
+        assert!(live.block(&block(25, 1.0, 1200)), "a frame");
+        assert!(live.block(&ProgressBlock {
+            end: true,
+            ..block(25, 1.0, 1200)
+        }));
+        assert!(live.stderr("warning A"));
+        assert!(!live.stderr("warning A"));
+        assert!(live.stderr("warning B"));
+    }
+
+    /// ffmpeg 7 keeps printing progress blocks while it is stuck; a process
+    /// that repeats the same block forever is hung all the same.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeating_the_same_progress_block_counts_as_stalled() {
+        let stuck = "while true; do printf 'frame=59\\nfps=0.0\\nout_time_us=5900000\\n\
+total_size=48000\\nspeed=0.5x\\nprogress=continue\\n'; echo 'decoder error' >&2; \
+sleep 0.05; done";
+        let args = vec!["-c".to_string(), stuck.to_string()];
+        let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
+        cmd.stall_timeout = Duration::from_millis(500);
+        let mut blocks = 0;
+        let started = std::time::Instant::now();
+        let exit = run_ffmpeg(
+            &cmd,
+            &CancellationToken::new(),
+            &mut |_| blocks += 1,
+            &mut |_| {},
+        )
+        .await;
+        assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
+        assert!(blocks > 3, "{blocks} blocks");
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        // The same pace with the position moving is progress.
+        let working = "i=0; while [ $i -lt 30 ]; do i=$((i+1)); printf \"frame=$i\\n\
+out_time_us=${i}00000\\nprogress=continue\\n\"; sleep 0.05; done";
+        let args = vec!["-c".to_string(), working.to_string()];
+        let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
+        cmd.stall_timeout = Duration::from_millis(500);
+        let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
+        assert!(matches!(exit, FfmpegExit::Success { .. }), "{exit:?}");
     }
 }

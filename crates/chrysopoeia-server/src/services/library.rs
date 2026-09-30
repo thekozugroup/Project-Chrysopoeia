@@ -19,6 +19,7 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_scanner::{DiscoveredFile, IgnoreRules, ProbeError, ScanOptions, WatchEvent};
 use chrysopoeia_worker::Decision;
+use chrysopoeia_worker::finalize::Recovery;
 use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::sync::Semaphore;
@@ -31,6 +32,7 @@ use crate::db::jobs::NewJob;
 use crate::db::libraries::LibraryRow;
 use crate::db::{self, ts};
 use crate::format::{count, plural};
+use crate::services::fs_guard;
 use crate::services::watcher::ActiveWatcher;
 use crate::state::{AppState, lock};
 
@@ -943,6 +945,22 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     ));
     report_walk_problems(state, &lib, &walk.errors, &walk.notes).await;
 
+    // Leftovers of interrupted conversions (a temp file left behind when a
+    // folder was renamed during a conversion, an original moved aside by a
+    // crash): cleaned up, and an original put back is not taken for removed.
+    let restored: HashSet<String> = if walk.artifacts.is_empty() {
+        HashSet::new()
+    } else {
+        recover_leftovers(state, walk.artifacts.clone(), None)
+            .await
+            .into_iter()
+            .filter_map(|p| p.to_str().map(str::to_string))
+            .collect()
+    };
+    if !walk.files.is_empty() || !walk.artifacts.is_empty() || index.is_empty() {
+        lock(&state.leftovers).unreached.remove(Path::new(&lib.path));
+    }
+
     let mut seen: HashSet<&str> = HashSet::with_capacity(walk.files.len());
     let mut to_analyze: Vec<(Option<IndexEntry>, DiscoveredFile)> = Vec::new();
     let mut settling: Vec<PathBuf> = Vec::new();
@@ -995,7 +1013,7 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         .collect();
     let removed: Vec<IndexEntry> = index
         .values()
-        .filter(|e| !seen.contains(e.path.as_str()))
+        .filter(|e| !seen.contains(e.path.as_str()) && !restored.contains(&e.path))
         .filter(|e| e.status != FileStatus::Processing)
         .filter(|e| !under_unreadable(&e.path, &unreadable))
         .cloned()
@@ -1429,15 +1447,78 @@ pub async fn redecide(
     Ok(changed)
 }
 
-/// Why a library's folder can't be used right now, if it can't.
-pub async fn path_problem(path: &str) -> Option<String> {
-    match tokio::time::timeout(PATH_CHECK_TIMEOUT, check_path(path)).await {
-        Ok(problem) => problem,
-        Err(_) => Some(format!(
-            "The folder {path} isn't responding. If it's on a network share or an external \
-             drive, check the connection."
-        )),
+/// Hand leftover temp and backup files (a walk's `artifacts`) to the
+/// worker's crash recovery: temp files are deleted, and an original moved
+/// aside as a backup is put back when its name is free (the backup is
+/// deleted otherwise). Files of jobs running right now are theirs and left
+/// alone, except those of `own_job` (a job looking for what its interrupted
+/// run left, before it starts working). Returns the originals put back.
+pub async fn recover_leftovers(
+    state: &AppState,
+    mut artifacts: Vec<PathBuf>,
+    own_job: Option<Uuid>,
+) -> Vec<PathBuf> {
+    artifacts.sort();
+    artifacts.dedup();
+    let mut running = state.dispatcher.running_ids();
+    running.retain(|id| Some(*id) != own_job);
+    let mut restored = Vec::new();
+    for path in artifacts {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if running
+            .iter()
+            .any(|id| chrysopoeia_core::paths::is_artifact_of(&name, *id))
+        {
+            continue;
+        }
+        match state.toolkit.recover_artifact(path.clone()).await {
+            Ok(Recovery::RestoredBackup(original)) => {
+                state
+                    .activity(
+                        ActivityLevel::Warning,
+                        format!(
+                            "Restored {} from its backup after an interrupted conversion.",
+                            original.display()
+                        ),
+                        ActivityRefs::default(),
+                    )
+                    .await;
+                restored.push(original);
+            }
+            Ok(r) => tracing::debug!(path = %path.display(), "leftover: {r:?}"),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "could not clean up a leftover file: {e:#}")
+            }
+        }
     }
+    restored
+}
+
+/// The reason given for a folder that doesn't answer in time.
+pub fn not_responding(path: &str) -> String {
+    format!(
+        "The folder {path} isn't responding. If it's on a network share or an external drive, \
+         check the connection."
+    )
+}
+
+/// Why a library's folder can't be used right now, if it can't. A folder
+/// that doesn't answer within a few seconds is reported as not responding;
+/// the check itself runs on one thread per folder at a time (see
+/// [`fs_guard`]), so a hung share can't use up the server's threads.
+pub async fn path_problem(path: &str) -> Option<String> {
+    let p = path.to_string();
+    fs_guard::guarded(
+        "path_problem",
+        Path::new(path),
+        PATH_CHECK_TIMEOUT,
+        move || check_path(&p),
+    )
+    .await
+    .unwrap_or_else(|| Some(not_responding(path)))
 }
 
 /// Why a library folder can't hold the files the queue expects right now:
@@ -1445,30 +1526,30 @@ pub async fn path_problem(path: &str) -> Option<String> {
 /// library with files almost always means an unmounted drive or share (the
 /// mount point is left behind empty).
 pub async fn root_unavailable(path: &str) -> Option<String> {
-    if let Some(problem) = path_problem(path).await {
-        return Some(problem);
-    }
-    let empty = async {
-        match tokio::fs::read_dir(path).await {
-            Ok(mut rd) => matches!(rd.next_entry().await, Ok(None)),
-            Err(_) => false,
-        }
-    };
-    match tokio::time::timeout(PATH_CHECK_TIMEOUT, empty).await {
-        Ok(false) => None,
-        Ok(true) => Some(format!(
-            "The folder {path} is empty. If it's on a drive or network share, check that it's \
-             connected."
-        )),
-        Err(_) => Some(format!(
-            "The folder {path} isn't responding. If it's on a network share or an external \
-             drive, check the connection."
-        )),
-    }
+    let p = path.to_string();
+    fs_guard::guarded(
+        "root_unavailable",
+        Path::new(path),
+        PATH_CHECK_TIMEOUT,
+        move || {
+            check_path(&p).or_else(|| {
+                let empty = std::fs::read_dir(&p).is_ok_and(|mut rd| rd.next().is_none());
+                empty.then(|| {
+                    format!(
+                        "The folder {p} is empty. If it's on a drive or network share, check \
+                         that it's connected."
+                    )
+                })
+            })
+        },
+    )
+    .await
+    .unwrap_or_else(|| Some(not_responding(path)))
 }
 
-async fn check_path(path: &str) -> Option<String> {
-    match tokio::fs::metadata(path).await {
+/// [`path_problem`]'s check, with blocking calls.
+fn check_path(path: &str) -> Option<String> {
+    match std::fs::metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
             "The folder {path} is missing. If it's on a drive or network share, check that it's connected."
         )),
@@ -1482,7 +1563,7 @@ async fn check_path(path: &str) -> Option<String> {
             chrysopoeia_core::plain::io_reason(&e)
         )),
         Ok(m) if !m.is_dir() => Some(format!("{path} is not a folder.")),
-        Ok(_) => match tokio::fs::read_dir(path).await {
+        Ok(_) => match std::fs::read_dir(path) {
             Ok(_) => None,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
                 "Chrysopoeia doesn't have permission to read {path}. Check the folder's \

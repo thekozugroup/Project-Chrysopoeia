@@ -78,6 +78,29 @@ pub struct AppInner {
     pub library: LibraryHandle,
     /// Cancelled when the server shuts down.
     pub shutdown: CancellationToken,
+    /// Crash leftovers still to be looked for in library folders.
+    pub leftovers: std::sync::Mutex<Leftovers>,
+}
+
+/// The search for crash leftovers (temp files and, above all, originals
+/// moved aside as backups) in library folders after an unclean stop. The
+/// stop is only recorded as clean once that search has been done
+/// everywhere, so a library that was offline at the start (or a stop during
+/// the search) doesn't hide an original for good.
+#[derive(Debug, Default)]
+pub struct Leftovers {
+    /// The start-up search hasn't finished yet.
+    pub searching: bool,
+    /// Library (or output) folders the start-up search couldn't reach; a
+    /// scan that reaches one does the search there.
+    pub unreached: std::collections::HashSet<std::path::PathBuf>,
+}
+
+impl Leftovers {
+    /// Whether some library folder still has to be searched.
+    pub fn due(&self) -> bool {
+        self.searching || !self.unreached.is_empty()
+    }
 }
 
 impl AppState {
@@ -102,6 +125,7 @@ impl AppState {
             dispatcher: DispatcherHandle::new(queue_paused),
             library: LibraryHandle::default(),
             shutdown: CancellationToken::new(),
+            leftovers: std::sync::Mutex::new(Leftovers::default()),
         }))
     }
 

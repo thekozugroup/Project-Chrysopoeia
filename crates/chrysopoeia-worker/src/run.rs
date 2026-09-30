@@ -326,9 +326,14 @@ impl Job<'_> {
             return JobOutcome::Cancelled;
         }
         self.reporter.stage(JobStage::Preparing, 0.0).await;
-        let prepared = match self.prepare().await {
-            Ok(p) => p,
-            Err(outcome) => return outcome,
+        // A folder on a share that stopped answering blocks the checks
+        // below; Cancel and Stop must still end the job at once.
+        let prepared = tokio::select! {
+            prepared = self.prepare() => match prepared {
+                Ok(p) => p,
+                Err(outcome) => return outcome,
+            },
+            () = self.cancel.cancelled() => return JobOutcome::Cancelled,
         };
         self.reporter.stage(JobStage::Preparing, 100.0).await;
 
@@ -346,13 +351,15 @@ impl Job<'_> {
 
     async fn prepare(&self) -> Result<Prepared, JobOutcome> {
         let (cfg, spec) = (self.cfg, self.spec);
-        let input_meta = match tokio::fs::metadata(&spec.input).await {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let looked = tokio::time::timeout(INPUT_CHECK_TIMEOUT, tokio::fs::metadata(&spec.input));
+        let input_meta = match looked.await {
+            Err(_) => return Err(failed(ProblemKind::UnreadableSource, not_answering())),
+            Ok(Ok(m)) if m.is_file() => m,
+            Ok(Ok(_)) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE));
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 return Err(failed(
                     ProblemKind::UnreadableSource,
                     unreadable_original(&e),
@@ -369,6 +376,20 @@ impl Job<'_> {
             decision => decision,
         };
         if let Decision::Skip { reason } = decision {
+            return Err(JobOutcome::Skipped {
+                reason,
+                encoder: None,
+                output_size: None,
+            });
+        }
+        // Replacing the original with a file that can't hold all of its
+        // subtitles or attachments would lose them for good; converting
+        // anyway (or into a separate folder, which keeps the original) is
+        // the user's call.
+        if cfg.output_mode == OutputMode::Replace
+            && !spec.force
+            && let Some(reason) = crate::plan::replace_loss(&spec.probe, &spec.profile)
+        {
             return Err(JobOutcome::Skipped {
                 reason,
                 encoder: None,
@@ -1237,6 +1258,18 @@ fn no_room_message(dir: &Path, bytes: u64, place: Place, mode: OutputMode) -> St
 /// What to say when a job's original file is gone before it started.
 const SOURCE_GONE: &str = "The file is no longer there. It may have been moved or deleted. If \
     it was moved, scan the library again to find it.";
+
+/// How long the original may take to answer when the job starts.
+const INPUT_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Why the job stopped when the original didn't answer at the start.
+fn not_answering() -> String {
+    format!(
+        "This file didn't answer for {} seconds, so it wasn't converted. If it's on a network \
+         share or an external drive, check the connection, then try again.",
+        INPUT_CHECK_TIMEOUT.as_secs()
+    )
+}
 
 /// Why the original couldn't be read when the job started.
 fn unreadable_original(e: &std::io::Error) -> String {
