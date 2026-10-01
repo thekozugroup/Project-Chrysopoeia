@@ -55,6 +55,19 @@ pub async fn get(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<LibraryRow>
     row.as_ref().map(from_row).transpose()
 }
 
+/// A library's goal, read on `conn` (inside the caller's transaction);
+/// `None` when the library is gone.
+pub async fn profile_conn(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+) -> sqlx::Result<Option<TranscodeProfile>> {
+    let stored: Option<String> = sqlx::query_scalar("SELECT profile FROM libraries WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_optional(conn)
+        .await?;
+    stored.as_deref().map(parse_json).transpose()
+}
+
 /// Insert a library.
 pub async fn insert(pool: &SqlitePool, lib: &LibraryRow) -> sqlx::Result<()> {
     sqlx::query(

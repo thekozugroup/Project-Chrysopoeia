@@ -1,7 +1,7 @@
 //! The `files` table: every media file in every library.
 
 use chrono::{DateTime, Utc};
-use chrysopoeia_core::{FileStatus, MediaFile, ProbeInfo, ProblemKind};
+use chrysopoeia_core::{FileStatus, MediaFile, ProbeInfo, ProblemKind, TranscodeProfile};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -299,6 +299,22 @@ pub struct FileUpsert {
     pub error: Option<String>,
     /// What kind of problem `error` is (set whenever `error` is).
     pub problem: Option<ProblemKind>,
+    /// The goal (profile JSON, see [`profile_json`]) `status` was decided
+    /// with, for a `pending`, `queued` or `skipped` verdict; `None` for a
+    /// file that couldn't be read.
+    pub verdict_profile: Option<String>,
+}
+
+/// The stored form of the goal a verdict was decided with
+/// (`files.verdict_profile`) or a job ran with (`jobs.profile`).
+pub fn profile_json(profile: &TranscodeProfile) -> sqlx::Result<String> {
+    to_json(profile)
+}
+
+/// A stored goal; `None` when it is missing or no longer parses (an
+/// unknown goal).
+pub fn parse_profile(stored: Option<&str>) -> Option<TranscodeProfile> {
+    stored.and_then(|s| parse_json::<TranscodeProfile>(s).ok())
 }
 
 /// The stored form of a file's problem: its kind whenever there is an
@@ -355,8 +371,9 @@ pub async fn insert(conn: &mut SqliteConnection, f: &FileUpsert) -> sqlx::Result
     let done = sqlx::query(
         "INSERT INTO files (id, library_id, path, relative_path, file_name, size_bytes, \
          modified_at, status, probe, container, video_codec, audio_codec, resolution, hdr, \
-         duration_secs, bit_rate, skip_reason, error, problem, scanned_at, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         duration_secs, bit_rate, skip_reason, error, problem, verdict_profile, scanned_at, \
+         updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(path) DO NOTHING",
     )
     .bind(id.to_string())
@@ -378,6 +395,7 @@ pub async fn insert(conn: &mut SqliteConnection, f: &FileUpsert) -> sqlx::Result
     .bind(&f.skip_reason)
     .bind(&f.error)
     .bind(problem_col(f.error.as_deref(), f.problem))
+    .bind(&f.verdict_profile)
     .bind(&now)
     .bind(&now)
     .execute(conn)
@@ -400,7 +418,8 @@ pub async fn update_scanned(
         "UPDATE files SET relative_path = ?, file_name = ?, size_bytes = ?, modified_at = ?, \
          status = ?, probe = ?, container = ?, video_codec = ?, audio_codec = ?, \
          resolution = ?, hdr = ?, duration_secs = ?, bit_rate = ?, skip_reason = ?, error = ?, \
-         problem = ?, original_size_bytes = NULL, saved_bytes = NULL, scanned_at = ?, updated_at = ? \
+         problem = ?, verdict_profile = ?, original_size_bytes = NULL, saved_bytes = NULL, \
+         scanned_at = ?, updated_at = ? \
          WHERE id = ? AND status NOT IN ('queued', 'processing') AND updated_at = ? \
          AND size_bytes = ? AND modified_at = ?",
     )
@@ -420,6 +439,7 @@ pub async fn update_scanned(
     .bind(&f.skip_reason)
     .bind(&f.error)
     .bind(problem_col(f.error.as_deref(), f.problem))
+    .bind(&f.verdict_profile)
     .bind(&now)
     .bind(&now)
     .bind(seen.id.to_string())
@@ -524,19 +544,24 @@ pub async fn apply_replacement(
     Ok(())
 }
 
-/// Set a file's status, reason and error, but only while its status is one
-/// of `only_if`. Returns whether the row changed.
+/// Record a decision about a file: its status and reason (no error), and
+/// the goal it was decided with (`verdict_profile`, see [`profile_json`]),
+/// but only while its status is one of `only_if`. Returns whether the row
+/// changed.
 pub async fn set_status_where(
     conn: &mut SqliteConnection,
     id: Uuid,
     status: FileStatus,
     skip_reason: Option<&str>,
+    verdict_profile: Option<&str>,
     only_if: &[FileStatus],
 ) -> sqlx::Result<bool> {
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = ");
     qb.push_bind(status.as_str())
         .push(", skip_reason = ")
         .push_bind(skip_reason)
+        .push(", verdict_profile = ")
+        .push_bind(verdict_profile)
         .push(", error = NULL, problem = NULL, updated_at = ")
         .push_bind(now_ts())
         .push(" WHERE id = ")
@@ -579,7 +604,10 @@ pub async fn keep_converted(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Resu
 }
 
 /// Set a file's status, reason and error with the kind of problem it is
-/// (no error clears both).
+/// (no error clears both). This is not a decision under the library's goal
+/// (a cancelled job, a failure, the user's skip), so the goal of the last
+/// decision is forgotten: a `pending` or `skipped` file is decided again by
+/// the next scan (see `services::library::redecide`).
 pub async fn set_status(
     conn: &mut SqliteConnection,
     id: Uuid,
@@ -588,14 +616,34 @@ pub async fn set_status(
     error: Option<(&str, ProblemKind)>,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE files SET status = ?, skip_reason = ?, error = ?, problem = ?, updated_at = ? \
-         WHERE id = ?",
+        "UPDATE files SET status = ?, skip_reason = ?, error = ?, problem = ?, \
+         verdict_profile = NULL, updated_at = ? WHERE id = ?",
     )
     .bind(status.as_str())
     .bind(skip_reason)
     .bind(error.map(|(e, _)| e))
     .bind(error.map(|(_, p)| enum_str(&p)))
     .bind(now_ts())
+    .bind(id.to_string())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Record the goal (`verdict_profile`) a file's `pending` or `skipped`
+/// verdict holds for: the goal a job that skipped it ran with, or a new goal
+/// that decides the same as the earlier one (or whose change doesn't touch
+/// what the size rule would say). Only while the file is still pending or
+/// skipped; nothing else about it changes.
+pub async fn confirm_verdict(
+    conn: &mut SqliteConnection,
+    id: Uuid,
+    verdict_profile: &str,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE files SET verdict_profile = ? WHERE id = ? AND status IN ('pending', 'skipped')",
+    )
+    .bind(verdict_profile)
     .bind(id.to_string())
     .execute(conn)
     .await?;
@@ -693,10 +741,12 @@ pub struct RemovedRow {
     pub problem: Option<ProblemKind>,
     pub original_size_bytes: Option<u64>,
     pub saved_bytes: Option<i64>,
+    /// The goal its verdict was decided with (see [`FileUpsert`]).
+    pub verdict_profile: Option<String>,
 }
 
 const REMOVED_COLUMNS: &str = "library_id, size_bytes, modified_at, status, probe, \
-    skip_reason, error, problem, original_size_bytes, saved_bytes";
+    skip_reason, error, problem, original_size_bytes, saved_bytes, verdict_profile";
 
 fn removed_from_row(row: &SqliteRow) -> sqlx::Result<RemovedRow> {
     let status: String = row.try_get("status")?;
@@ -716,6 +766,7 @@ fn removed_from_row(row: &SqliteRow) -> sqlx::Result<RemovedRow> {
         skip_reason: row.try_get("skip_reason")?,
         original_size_bytes: opt_u64_col(row, "original_size_bytes")?,
         saved_bytes: row.try_get("saved_bytes")?,
+        verdict_profile: row.try_get("verdict_profile")?,
     })
 }
 
@@ -775,6 +826,7 @@ pub async fn insert_moved(
         skip_reason: from.skip_reason.clone(),
         error: from.error.clone(),
         problem: from.problem,
+        verdict_profile: from.verdict_profile.clone(),
         ..f.clone()
     };
     let Some(id) = insert(&mut *conn, &row).await? else {
@@ -801,6 +853,8 @@ pub struct RedecideCandidate {
     /// A finished job skipped it because the result was not small enough
     /// (as opposed to a decision that needed no job at all).
     pub size_rule_skip: bool,
+    /// The goal its verdict was decided with (see [`FileUpsert`]).
+    pub verdict_profile: Option<String>,
 }
 
 /// Whether a file (`f`) is skipped because a job's result was not small
@@ -816,19 +870,59 @@ const SIZE_RULE_SKIP: &str = "(f.status = 'skipped' AND j.state = 'skipped' \
 const REDECIDE_FILTER: &str = "f.status IN ('pending', 'skipped') AND f.probe IS NOT NULL \
     AND (f.skip_reason IS NULL OR f.skip_reason != ?)";
 
-/// Ids of the files of a library a profile change re-decides.
-pub async fn redecide_candidate_ids(
+/// The goals the verdicts of a library's re-decidable files were decided
+/// with, each once (`None`: unknown).
+pub async fn verdict_profiles(
     pool: &SqlitePool,
     library_id: Uuid,
     user_skip_reason: &str,
-) -> sqlx::Result<Vec<Uuid>> {
-    let rows = sqlx::query(&format!(
-        "SELECT f.id FROM files f WHERE f.library_id = ? AND {REDECIDE_FILTER}"
+) -> sqlx::Result<Vec<Option<String>>> {
+    sqlx::query_scalar(&format!(
+        "SELECT DISTINCT f.verdict_profile FROM files f WHERE f.library_id = ? \
+         AND {REDECIDE_FILTER}"
     ))
     .bind(library_id.to_string())
     .bind(user_skip_reason)
     .fetch_all(pool)
-    .await?;
+    .await
+}
+
+/// Ids of the re-decidable files of a library whose verdict was decided
+/// with one of the goals in `verdicts` (`None`: unknown).
+pub async fn redecide_candidate_ids(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    user_skip_reason: &str,
+    verdicts: &[Option<String>],
+) -> sqlx::Result<Vec<Uuid>> {
+    let known: Vec<&str> = verdicts.iter().flatten().map(String::as_str).collect();
+    let unknown = verdicts.iter().any(Option::is_none);
+    if known.is_empty() && !unknown {
+        return Ok(Vec::new());
+    }
+    let (before, after) = REDECIDE_FILTER
+        .split_once('?')
+        .unwrap_or((REDECIDE_FILTER, ""));
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id FROM files f WHERE f.library_id = ");
+    qb.push_bind(library_id.to_string())
+        .push(" AND ")
+        .push(before)
+        .push_bind(user_skip_reason)
+        .push(after)
+        .push(" AND (0");
+    if unknown {
+        qb.push(" OR f.verdict_profile IS NULL");
+    }
+    if !known.is_empty() {
+        qb.push(" OR f.verdict_profile IN (");
+        let mut sep = qb.separated(", ");
+        for v in known {
+            sep.push_bind(v);
+        }
+        qb.push(")");
+    }
+    qb.push(")");
+    let rows = qb.build().fetch_all(pool).await?;
     rows.iter().map(|r| uuid_col(r, "id")).collect()
 }
 
@@ -841,7 +935,8 @@ pub async fn redecide_candidates(
     user_skip_reason: &str,
 ) -> sqlx::Result<Vec<RedecideCandidate>> {
     let mut qb = QueryBuilder::<Sqlite>::new(format!(
-        "SELECT f.id, f.status, f.probe, f.skip_reason, {SIZE_RULE_SKIP} AS size_rule_skip \
+        "SELECT f.id, f.status, f.probe, f.skip_reason, f.verdict_profile, \
+         {SIZE_RULE_SKIP} AS size_rule_skip \
          FROM files f LEFT JOIN jobs j ON j.id = f.job_id WHERE f.id IN ("
     ));
     let mut sep = qb.separated(", ");
@@ -864,6 +959,7 @@ pub async fn redecide_candidates(
         let probe: String = row.try_get("probe")?;
         let size_rule_skip: Option<bool> = row.try_get("size_rule_skip")?;
         let skip_reason: Option<String> = row.try_get("skip_reason")?;
+        let verdict_profile: Option<String> = row.try_get("verdict_profile")?;
         let Some(status) = FileStatus::parse(&status) else {
             continue;
         };
@@ -874,6 +970,7 @@ pub async fn redecide_candidates(
                 probe,
                 skip_reason,
                 size_rule_skip: size_rule_skip.unwrap_or(false),
+                verdict_profile,
             }),
             Err(e) => tracing::warn!("skipping a stored probe that no longer parses: {e}"),
         }

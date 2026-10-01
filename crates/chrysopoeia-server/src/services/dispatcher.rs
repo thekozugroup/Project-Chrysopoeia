@@ -26,9 +26,10 @@ use chrysopoeia_core::encoder::VIDEO_ENCODERS;
 use chrysopoeia_core::{
     ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
     JobState, MaxJobsSource, MediaFile, OutputMode, ProblemKind, QueueState, Settings,
+    TranscodeProfile,
 };
 use chrysopoeia_scanner::WatchEvent;
-use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
+use chrysopoeia_worker::finalize::{Interrupted, final_output_path, output_name_taken};
 use chrysopoeia_worker::run::Unfinished;
 use chrysopoeia_worker::slow_fs::{self, NotAnswering, WATCH_INTERVAL};
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
@@ -38,7 +39,7 @@ use uuid::Uuid;
 
 use crate::db::activity::ActivityRefs;
 use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile, missing_input_error};
-use crate::db::jobs::{InterruptedJob, JobFinish};
+use crate::db::jobs::{DestinationOwner, InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
 use crate::services::fs_guard;
@@ -967,6 +968,10 @@ struct ExecContext {
     /// After a replacement: the new file as the file list should show it
     /// (see [`prepare_record`]).
     replaced: Option<ReplacedFile>,
+    /// The goal the job ran with (`None`: not known, e.g. an earlier run
+    /// from before it was recorded). When it ends under another goal, its
+    /// file is decided again (see [`follow_goal_change`]).
+    profile: Option<TranscodeProfile>,
 }
 
 impl ExecContext {
@@ -1067,6 +1072,7 @@ async fn execute(
         shared_original: false,
         input_gone: false,
         replaced: None,
+        profile: None,
     };
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
@@ -1102,6 +1108,7 @@ async fn execute(
     };
     ctx.library_root = Some(PathBuf::from(&lib.path));
     ctx.library_name = Some(lib.name.clone());
+    ctx.profile = Some(lib.profile.clone());
 
     let input = PathBuf::from(&file.path);
     let offline = |reason: String, check: Option<PathBuf>, ctx: ExecContext| {
@@ -1127,7 +1134,11 @@ async fn execute(
     // answering then): what is on the disk tells whether it got there.
     match or_cancelled!(resume_earlier_run(state, job, &input, &lib.path)) {
         Resumed::NotPlaced => {}
-        Resumed::Placed(outcome) => return done(outcome, ctx),
+        Resumed::Placed(outcome) => {
+            // That run's goal, not the one this run would have used.
+            ctx.profile = earlier_profile(state, job.id).await;
+            return done(outcome, ctx);
+        }
         Resumed::Unreachable { reason, check } => return offline(reason, check, ctx),
     }
 
@@ -1246,16 +1257,14 @@ async fn execute(
     // convert at all when converting on the CPU is turned off. Only files
     // that would be converted need an encoder: the others are skipped (or
     // fail for their own reason) as usual.
-    let preference_problem = hw
-        .as_deref()
-        .filter(|_| would_convert(state, &probe, &lib.profile, job.force, settings.output_mode))
-        .and_then(|hw| {
-            let codec = Some(lib.profile.video_codec);
-            chrysopoeia_hwdetect::preference_problem(hw, settings.hardware, codec).map(|problem| {
-                let busy = chrysopoeia_hwdetect::preference_busy(hw, settings.hardware, codec);
-                (problem, busy)
-            })
-        });
+    let converts = would_convert(state, &probe, &lib.profile, job.force, settings.output_mode);
+    let preference_problem = hw.as_deref().filter(|_| converts).and_then(|hw| {
+        let codec = Some(lib.profile.video_codec);
+        chrysopoeia_hwdetect::preference_problem(hw, settings.hardware, codec).map(|problem| {
+            let busy = chrysopoeia_hwdetect::preference_busy(hw, settings.hardware, codec);
+            (problem, busy)
+        })
+    });
     if let Some((problem, busy)) = &preference_problem
         && !settings.cpu_fallback
     {
@@ -1278,8 +1287,13 @@ async fn execute(
     let preference_problem = preference_problem.map(|(problem, _)| problem);
 
     let cfg = run_config(state, &settings);
-    // Where the result goes, so start-up recovery can finish the
-    // replacement if the server stops while it is being put in place.
+    // Where the result goes (so start-up recovery can finish the
+    // replacement if the server stops while it is being put in place) and
+    // the goal it is made for. Another file being converted to the same
+    // name right now (the same relative path in two libraries saved to one
+    // output folder) would only have one of them refused at the end: this
+    // one is refused now, before it is encoded. (A file that won't be
+    // converted puts nothing anywhere.)
     let final_path = final_output_path(
         &input,
         lib.profile.container,
@@ -1287,11 +1301,33 @@ async fn execute(
         cfg.output_folder.as_deref(),
         Path::new(&lib.path),
     );
-    if let Some(p) = final_path.to_str()
-        && let Err(e) = db::jobs::set_final_path(state.db.pool(), job.id, p).await
-    {
-        tracing::warn!(job = %job.id, "could not store where the result goes: {e}");
+    let goal = db::files::profile_json(&lib.profile).ok();
+    if let Some(p) = final_path.to_str() {
+        let place = converts.then_some(p);
+        match db::jobs::claim_destination(&state.db, job.id, file.id, place, goal.as_deref()).await
+        {
+            Ok(None) => {}
+            Ok(Some(owner)) => {
+                return done(
+                    failed(
+                        ProblemKind::Destination,
+                        name_taken_error(
+                            &owner,
+                            lib.id,
+                            &final_path,
+                            cfg.output_mode,
+                            cfg.output_folder.as_deref(),
+                        ),
+                    ),
+                    ctx,
+                );
+            }
+            Err(e) => {
+                tracing::warn!(job = %job.id, "could not store where the result goes: {e}");
+            }
+        }
     }
+    let (output_mode, output_folder) = (cfg.output_mode, cfg.output_folder.clone());
     let spec = JobSpec {
         job_id: job.id,
         file_id: file.id,
@@ -1347,6 +1383,46 @@ async fn execute(
         }
         (outcome, _) => outcome,
     };
+    // The name in the output folder was taken: say whose file has it.
+    let outcome = match outcome {
+        JobOutcome::Failed {
+            error,
+            problem: ProblemKind::Destination,
+            log_tail,
+            command,
+            encoder,
+            attempt,
+            validation,
+        } if output_mode == OutputMode::Folder && output_name_taken(&error) => {
+            let owner = match final_path.to_str() {
+                Some(p) => db::jobs::destination_owner(state.db.pool(), p, file.id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::debug!(job = %job.id, "could not look for the other file: {e}");
+                        None
+                    }),
+                None => None,
+            };
+            JobOutcome::Failed {
+                error: owner.map_or(error, |owner| {
+                    name_taken_error(
+                        &owner,
+                        lib.id,
+                        &final_path,
+                        output_mode,
+                        output_folder.as_deref(),
+                    )
+                }),
+                problem: ProblemKind::Destination,
+                log_tail,
+                command,
+                encoder,
+                attempt,
+                validation,
+            }
+        }
+        outcome => outcome,
+    };
     // The sender is gone once `run_job` returns, so the forwarder drains and
     // ends; don't wait on a worker that leaked a clone of it.
     if tokio::time::timeout(Duration::from_secs(2), forwarder)
@@ -1365,6 +1441,259 @@ async fn execute(
         return offline(reason, Some(path.clone()), ctx);
     }
     done(outcome, ctx)
+}
+
+/// The error of a job whose new file would take the name another file's
+/// conversion (`owner`) has, or is about to have, at `final_path`: two
+/// libraries saved to one output folder mirror their folders there without
+/// the library's name, so the same relative path in both gives one name
+/// (and two originals that differ only by extension give one name too).
+fn name_taken_error(
+    owner: &DestinationOwner,
+    library_id: Uuid,
+    final_path: &Path,
+    mode: OutputMode,
+    output_folder: Option<&Path>,
+) -> String {
+    let file_name = final_path.file_name().map_or_else(
+        || final_path.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let (verb, untouched) = if owner.running {
+        ("is being converted", "")
+    } else {
+        ("was converted", " and that file wasn't overwritten")
+    };
+    match (mode, output_folder) {
+        (OutputMode::Folder, Some(folder)) => {
+            let name = final_path
+                .strip_prefix(folder)
+                .map_or_else(|_| file_name.clone(), |r| r.display().to_string());
+            let folder = folder.display();
+            if owner.library_id != library_id {
+                let lib = &owner.library_name;
+                if owner.running {
+                    format!(
+                        "Another library's file, from {lib}, is being converted to the same \
+                         name, \"{name}\", in the output folder {folder}, so this file wasn't \
+                         converted. Rename one of the two files, or convert one library at a \
+                         time, each to a different output folder chosen in Settings › Output."
+                    )
+                } else {
+                    format!(
+                        "Another library's converted file, from {lib}, already uses the name \
+                         \"{name}\" in the output folder {folder}, so this file wasn't \
+                         converted and that file wasn't overwritten. Rename one of the two \
+                         files, or convert one library at a time, each to a different output \
+                         folder chosen in Settings › Output."
+                    )
+                }
+            } else {
+                format!(
+                    "Another file in this library, \"{}\", {verb} to the same name, \"{name}\", \
+                     in the output folder {folder}, so this file wasn't converted{untouched}. \
+                     Rename one of the two files, then convert this one again.",
+                    owner.relative_path
+                )
+            }
+        }
+        _ => {
+            let other = Path::new(&owner.relative_path).file_name().map_or_else(
+                || owner.relative_path.clone(),
+                |n| n.to_string_lossy().into_owned(),
+            );
+            format!(
+                "Another file in the same folder, \"{other}\", {verb} to the same name, \
+                 \"{file_name}\", so this file wasn't converted{untouched}. Rename one of the \
+                 two files, then convert this one again."
+            )
+        }
+    }
+}
+
+/// The goal an earlier run of job `id` ran with, as it recorded it.
+async fn earlier_profile(state: &AppState, id: Uuid) -> Option<TranscodeProfile> {
+    let stored = db::jobs::profile(state.db.pool(), id)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::debug!(job = %id, "could not read the goal the job ran with: {e}");
+            None
+        });
+    db::files::parse_profile(stored.as_deref())
+}
+
+/// How a job's end left its file, for [`follow_goal_change`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    /// Converted and recorded `done`; `probed`: the new file replaced the
+    /// original and was probed, so the stored probe describes it.
+    Converted { probed: bool },
+    /// A file converted before stays `done` (the job had no new result).
+    Kept,
+    /// Skipped; `size_rule`: an encode was made and set aside (not small
+    /// enough under the size rule).
+    Skipped { size_rule: bool },
+    /// Failed by a rule of the goal: the hardware chosen in Settings can't
+    /// make its codec.
+    FailedBySetting,
+}
+
+/// What [`follow_goal_change`] did with the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Followed {
+    /// Queued again for the current goal.
+    Queued,
+    /// Back to `pending`: the current goal would convert it (auto-queue
+    /// is off).
+    Pending,
+    /// Skipped with the current goal's reason.
+    Skipped(String),
+}
+
+/// A job ended (`ended`) while its library's goal was no longer the one it
+/// ran with (it changed while the job ran, maybe more than once): decide
+/// its file again against the current goal, as the change did for the
+/// files that weren't running, in the transaction that records the end.
+///
+/// - Skipped or failed by the goal's own rule: queued again when the
+///   current goal converts it (`pending` without auto-queue), else skipped
+///   with the current goal's reason. A size-rule skip stays (with the
+///   current goal as its verdict's) when the change doesn't touch what the
+///   size rule would say.
+/// - Converted (or kept as converted) in place: queued again when the
+///   current goal would convert the file as it is now (the usual rules
+///   skip files already in an efficient format), with auto-queue on; it
+///   stays `done` otherwise. Not in folder mode: the result already sits
+///   in the output folder and a second conversion would need that name.
+///
+/// A job's goal is the one it was given, "Convert anyway" included: the
+/// new decision uses the usual rules, and a job that ran with the current
+/// goal is never decided again, so nothing loops. Nothing is done for a
+/// job whose goal isn't known.
+async fn follow_goal_change(
+    conn: &mut sqlx::SqliteConnection,
+    state: &AppState,
+    job: &Job,
+    ctx: &ExecContext,
+    ended: Ended,
+) -> anyhow::Result<Option<Followed>> {
+    let Some(ran_with) = &ctx.profile else {
+        return Ok(None);
+    };
+    let Some(current) = db::libraries::profile_conn(&mut *conn, job.library_id).await? else {
+        return Ok(None);
+    };
+    if current == *ran_with {
+        return Ok(None);
+    }
+    let goal = db::files::profile_json(&current)?;
+    let settings = state.settings();
+    let converted = match ended {
+        Ended::Converted { probed } => {
+            if !probed {
+                return Ok(None);
+            }
+            true
+        }
+        Ended::Kept => true,
+        Ended::Skipped { size_rule } => {
+            if size_rule && !library::affects_output_size(ran_with, &current) {
+                db::files::confirm_verdict(&mut *conn, job.file_id, &goal).await?;
+                return Ok(None);
+            }
+            false
+        }
+        Ended::FailedBySetting => false,
+    };
+    let replacing =
+        ctx.output_mode == OutputMode::Replace && settings.output_mode == OutputMode::Replace;
+    if converted && !(replacing && settings.auto_queue) {
+        return Ok(None);
+    }
+    let Some(file) = db::files::get_conn(&mut *conn, job.file_id, true).await? else {
+        return Ok(None);
+    };
+    let Some(probe) = &file.probe else {
+        return Ok(None);
+    };
+    let decision = match state.toolkit.decide(probe, &current) {
+        Ok(decision) => decision,
+        Err(_) => {
+            tracing::warn!(job = %job.id, "could not decide the file again for the new goal");
+            return Ok(None);
+        }
+    };
+    let only_if = [FileStatus::Skipped, FileStatus::Failed];
+    let followed = match decision {
+        Decision::Transcode if settings.auto_queue => {
+            let created = db::jobs::create(
+                &mut *conn,
+                &db::jobs::NewJob {
+                    file_id: file.id,
+                    library_id: file.library_id,
+                    file_name: &file.file_name,
+                    file_path: &file.path,
+                    input_size: file.size_bytes,
+                    priority: job.priority,
+                    force: false,
+                },
+            )
+            .await?;
+            created.map(|_| Followed::Queued)
+        }
+        Decision::Transcode if !converted => db::files::set_status_where(
+            &mut *conn,
+            file.id,
+            FileStatus::Pending,
+            None,
+            Some(&goal),
+            &only_if,
+        )
+        .await?
+        .then_some(Followed::Pending),
+        Decision::Skip { reason } if !converted => db::files::set_status_where(
+            &mut *conn,
+            file.id,
+            FileStatus::Skipped,
+            Some(&reason),
+            Some(&goal),
+            &only_if,
+        )
+        .await?
+        .then_some(Followed::Skipped(reason)),
+        // A converted file the current goal leaves as it is stays done.
+        _ => None,
+    };
+    Ok(followed)
+}
+
+/// Say in the feed what [`follow_goal_change`] did.
+async fn announce_followed(
+    state: &AppState,
+    ctx: &ExecContext,
+    name: &str,
+    followed: Option<Followed>,
+    refs: ActivityRefs,
+) {
+    let Some(followed) = followed else {
+        return;
+    };
+    let library = ctx.library_name.as_deref().unwrap_or("this library");
+    let changed = format!("The goal of {library} changed while {name} was being converted");
+    let message = match followed {
+        Followed::Queued => {
+            state.dispatcher.wake();
+            format!("{changed}, so it was queued again for the new goal.")
+        }
+        Followed::Pending => format!(
+            "{changed}. The new goal would convert it, so it is back among the files to convert."
+        ),
+        Followed::Skipped(reason) => format!(
+            "{changed}. Under the new goal it is left as it is: {}.",
+            reason.trim_end_matches('.')
+        ),
+    };
+    state.activity(ActivityLevel::Info, message, refs).await;
 }
 
 /// Whether the worker would convert this file (so it needs an encoder): the
@@ -1755,6 +2084,9 @@ async fn apply_outcome(
                 db::i64_of(original_size) - db::i64_of(output_size)
             };
             db::stats::add_savings(&mut tx, job.library_id, saved_now).await?;
+            let probed = replaced.as_ref().is_some_and(|r| r.probe.is_some());
+            let followed =
+                follow_goal_change(&mut tx, state, job, ctx, Ended::Converted { probed }).await?;
             tx.commit().await?;
 
             let pct = format::percent(saved_now, original_size);
@@ -1782,6 +2114,7 @@ async fn apply_outcome(
             }
             tracing::debug!(job = %job.id, encoder, "job done");
             state.activity(ActivityLevel::Success, message, refs).await;
+            announce_followed(state, ctx, &name, followed, refs).await;
         }
         JobOutcome::Skipped {
             reason,
@@ -1815,7 +2148,24 @@ async fn apply_outcome(
                     None,
                 )
                 .await?;
+                // The verdict of the goal the job ran with.
+                if let Some(ran_with) = &ctx.profile {
+                    let goal = db::files::profile_json(ran_with)?;
+                    db::files::confirm_verdict(&mut tx, job.file_id, &goal).await?;
+                }
             }
+            let ended = if kept_done {
+                Ended::Kept
+            } else {
+                Ended::Skipped {
+                    size_rule: output_size.is_some(),
+                }
+            };
+            let followed = if exists {
+                follow_goal_change(&mut tx, state, job, ctx, ended).await?
+            } else {
+                None
+            };
             tx.commit().await?;
             if exists {
                 let message = if kept_done {
@@ -1824,6 +2174,7 @@ async fn apply_outcome(
                     format!("Skipped {name}: {reason}")
                 };
                 state.activity(ActivityLevel::Info, message, refs).await;
+                announce_followed(state, ctx, &name, followed, refs).await;
             }
         }
         JobOutcome::Failed {
@@ -1869,6 +2220,19 @@ async fn apply_outcome(
                 )
                 .await?;
             }
+            let ended = if kept_done {
+                Some(Ended::Kept)
+            } else if problem == ProblemKind::HardwareUnavailable {
+                Some(Ended::FailedBySetting)
+            } else {
+                None
+            };
+            let followed = match ended {
+                Some(ended) if exists => {
+                    follow_goal_change(&mut tx, state, job, ctx, ended).await?
+                }
+                _ => None,
+            };
             tx.commit().await?;
             if exists {
                 // The activity entry below is the one warning in the log.
@@ -1882,6 +2246,7 @@ async fn apply_outcome(
                     format!("Failed {name}: {error}")
                 };
                 state.activity(ActivityLevel::Error, message, refs).await;
+                announce_followed(state, ctx, &name, followed, refs).await;
             }
         }
         // Mapped to a requeue before it is recorded (see `execute`); should
@@ -2275,6 +2640,7 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             shared_original: false,
             input_gone: false,
             replaced: None,
+            profile: earlier_profile(state, job.id).await,
         };
         let outcome = resumed_outcome(&job, target, size, original_size);
         tracing::debug!(job = %job.id, file = %job.file_path, "finished a conversion the last stop interrupted");

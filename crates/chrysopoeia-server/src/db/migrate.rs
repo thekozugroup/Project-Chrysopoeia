@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -260,6 +260,33 @@ const MIGRATION_V9: &[&str] = &[
      WHERE level = 'error' AND job_id IS NOT NULL",
 ];
 
+/// Version 10:
+/// - `files.verdict_profile`: the goal (profile JSON) the file's `pending`
+///   or `skipped` verdict was decided with, so a verdict made under another
+///   goal is decided again (see `services::library::redecide`).
+/// - `jobs.profile`: the goal (profile JSON) a job ran with, written when it
+///   starts.
+///
+/// Verdicts recorded before are taken to be the library's current goal's,
+/// except a file a job skipped by the size rule ("Only 4% smaller — kept
+/// the original") in a library whose goal has no size rule now: that verdict
+/// came from an earlier goal, so it is left unknown and decided again by
+/// the next scan.
+const MIGRATION_V10: &[&str] = &[
+    "ALTER TABLE files ADD COLUMN verdict_profile TEXT",
+    "ALTER TABLE jobs ADD COLUMN profile TEXT",
+    "UPDATE files SET verdict_profile = \
+         (SELECT l.profile FROM libraries l WHERE l.id = files.library_id) \
+     WHERE status IN ('pending', 'skipped') AND NOT ( \
+         status = 'skipped' \
+         AND EXISTS (SELECT 1 FROM jobs j WHERE j.id = files.job_id AND j.state = 'skipped' \
+             AND j.output_size IS NOT NULL AND j.skip_reason IS files.skip_reason) \
+         AND EXISTS (SELECT 1 FROM libraries l WHERE l.id = files.library_id \
+             AND COALESCE(CASE WHEN json_valid(l.profile) \
+                 THEN json_type(l.profile, '$.min_savings_pct') ELSE 'unknown' END, 'null') \
+                 = 'null'))",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -270,6 +297,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (7, MIGRATION_V7),
     (8, MIGRATION_V8),
     (9, MIGRATION_V9),
+    (10, MIGRATION_V10),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -1025,6 +1053,127 @@ mod tests {
                 ("The job is done", None),
             ]
         );
+    }
+
+    /// Version 10 records the goal each pending or skipped verdict was
+    /// decided with: the library's current goal, except a size-rule skip in
+    /// a library whose goal has no size rule (an earlier goal's verdict,
+    /// left unknown so the next scan decides it again).
+    #[tokio::test]
+    async fn version_10_records_the_goal_of_each_verdict() {
+        const NO_RULE: &str = "00000000-0000-0000-0000-0000000000a1";
+        const RULE: &str = "00000000-0000-0000-0000-0000000000a2";
+        let no_rule_profile = r#"{"goal":"compatible","min_savings_pct":null}"#;
+        let rule_profile = r#"{"goal":"save_space","min_savings_pct":10}"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v9.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 9).await.unwrap();
+            for (id, name, profile) in [
+                (NO_RULE, "Kids", no_rule_profile),
+                (RULE, "Movies", rule_profile),
+            ] {
+                sqlx::query(
+                    "INSERT INTO libraries (id, name, path, profile, created_at) \
+                     VALUES (?, ?, ?, ?, '2026-01-01T00:00:00.000Z')",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(format!("/{name}"))
+                .bind(profile)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            // (file, library, status, skip reason, the job that skipped it
+            // by the size rule)
+            let files: [(&str, &str, &str, Option<&str>, bool); 6] = [
+                (
+                    "size",
+                    NO_RULE,
+                    "skipped",
+                    Some("Only 4% smaller — kept the original"),
+                    true,
+                ),
+                ("plain", NO_RULE, "skipped", Some("Already H.264"), false),
+                ("wait", NO_RULE, "pending", None, false),
+                ("done", NO_RULE, "done", None, false),
+                (
+                    "kept",
+                    RULE,
+                    "skipped",
+                    Some("Only 4% smaller — kept the original"),
+                    true,
+                ),
+                ("user", RULE, "skipped", Some("Skipped by you"), false),
+            ];
+            for (n, (name, lib, status, reason, size_rule)) in files.into_iter().enumerate() {
+                let file_id = format!("00000000-0000-0000-0000-00000000010{n}");
+                let job_id = format!("00000000-0000-0000-0000-00000000020{n}");
+                sqlx::query(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, skip_reason, job_id, scanned_at, \
+                     updated_at) VALUES (?, ?, ?, ?, ?, 1, 'x', ?, ?, ?, 'x', 'x')",
+                )
+                .bind(&file_id)
+                .bind(lib)
+                .bind(format!("/{lib}/{name}.mkv"))
+                .bind(format!("{name}.mkv"))
+                .bind(format!("{name}.mkv"))
+                .bind(status)
+                .bind(reason)
+                .bind(size_rule.then_some(&job_id))
+                .execute(&pool)
+                .await
+                .unwrap();
+                if size_rule {
+                    sqlx::query(
+                        "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, \
+                         state, stage, output_size, skip_reason, created_at) VALUES \
+                         (?, ?, ?, 'f.mkv', '/f.mkv', 'skipped', 'waiting', 96, ?, \
+                         '2026-01-02T00:00:00.000Z')",
+                    )
+                    .bind(&job_id)
+                    .bind(&file_id)
+                    .bind(lib)
+                    .bind(reason)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+            }
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT file_name, verdict_profile FROM files ORDER BY rowid")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let verdicts: Vec<(&str, Option<&str>)> = rows
+            .iter()
+            .map(|(name, v)| (name.as_str(), v.as_deref()))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                ("size.mkv", None),
+                ("plain.mkv", Some(no_rule_profile)),
+                ("wait.mkv", Some(no_rule_profile)),
+                ("done.mkv", None),
+                ("kept.mkv", Some(rule_profile)),
+                ("user.mkv", Some(rule_profile)),
+            ]
+        );
+        // Jobs from before don't know their goal.
+        let goals: Vec<Option<String>> = sqlx::query_scalar("SELECT profile FROM jobs")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(goals, [None, None]);
     }
 
     #[tokio::test]

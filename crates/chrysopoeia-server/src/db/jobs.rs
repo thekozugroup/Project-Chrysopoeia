@@ -627,8 +627,9 @@ async fn close_file(
             return Ok(());
         }
     }
+    // Not a decision under the library's goal: see `files::set_status`.
     sqlx::query(
-        "UPDATE files SET status = ?, skip_reason = ?, updated_at = ? \
+        "UPDATE files SET status = ?, skip_reason = ?, verdict_profile = NULL, updated_at = ? \
          WHERE id = ? AND job_id = ? AND status = ?",
     )
     .bind(status.as_str())
@@ -734,10 +735,8 @@ pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
     Ok(done.rows_affected())
 }
 
-/// Remember where a running job will put its result (see
-/// [`interrupted`]).
 /// Where an earlier run of job `id` was going to put its result, if it got
-/// that far (see [`set_final_path`]).
+/// that far (see [`claim_destination`]).
 pub async fn final_path(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<String>> {
     let path: Option<Option<String>> =
         sqlx::query_scalar("SELECT final_path FROM jobs WHERE id = ?")
@@ -747,13 +746,104 @@ pub async fn final_path(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<Stri
     Ok(path.flatten())
 }
 
-pub async fn set_final_path(pool: &SqlitePool, id: Uuid, path: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE jobs SET final_path = ? WHERE id = ? AND state = 'running'")
-        .bind(path)
+/// The goal (profile JSON) job `id` ran with, as its last run stored it
+/// when it started (see [`claim_destination`]).
+pub async fn profile(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<String>> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT profile FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(stored.flatten())
+}
+
+/// The conversion of another file that puts (or put) its result at the
+/// same place as a job's (see [`claim_destination`] and
+/// [`destination_owner`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DestinationOwner {
+    pub library_id: Uuid,
+    pub library_name: String,
+    /// The other file, relative to its library's folder.
+    pub relative_path: String,
+    /// It is being converted right now (else it was converted there).
+    pub running: bool,
+}
+
+async fn owner_of(
+    conn: &mut SqliteConnection,
+    final_path: &str,
+    file_id: Uuid,
+    running_only: bool,
+) -> sqlx::Result<Option<DestinationOwner>> {
+    let states = if running_only {
+        "('running')"
+    } else {
+        "('running', 'done')"
+    };
+    let row = sqlx::query(&format!(
+        "SELECT j.library_id, l.name AS library_name, f.relative_path, \
+         j.state = 'running' AS running FROM jobs j \
+         JOIN files f ON f.id = j.file_id JOIN libraries l ON l.id = j.library_id \
+         WHERE j.final_path = ? AND j.file_id != ? AND j.state IN {states} \
+         ORDER BY j.state = 'running' DESC, j.finished_at DESC, j.rowid DESC LIMIT 1"
+    ))
+    .bind(final_path)
+    .bind(file_id.to_string())
+    .fetch_optional(conn)
+    .await?;
+    row.map(|row| {
+        Ok(DestinationOwner {
+            library_id: uuid_col(&row, "library_id")?,
+            library_name: row.try_get("library_name")?,
+            relative_path: row.try_get("relative_path")?,
+            running: row.try_get("running")?,
+        })
+    })
+    .transpose()
+}
+
+/// A running job (of file `file_id`) starts with the goal `profile` (JSON),
+/// and is about to put its result at `final_path` (`None`: it won't convert
+/// anything). Remember both (the place for start-up recovery, see
+/// [`interrupted`]), unless a conversion of another file running right now
+/// puts its result at the same place: that one is returned instead, and
+/// nothing is written. One transaction, so two jobs starting at the same
+/// moment can't both take the place.
+pub async fn claim_destination(
+    db: &Db,
+    id: Uuid,
+    file_id: Uuid,
+    final_path: Option<&str>,
+    profile: Option<&str>,
+) -> sqlx::Result<Option<DestinationOwner>> {
+    let mut tx = db.write_tx().await?;
+    let owner = match final_path {
+        Some(path) => owner_of(&mut tx, path, file_id, true).await?,
+        None => None,
+    };
+    if owner.is_none() {
+        sqlx::query(
+            "UPDATE jobs SET final_path = ?, profile = ? WHERE id = ? AND state = 'running'",
+        )
+        .bind(final_path)
+        .bind(profile)
         .bind(id.to_string())
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    }
+    tx.commit().await?;
+    Ok(owner)
+}
+
+/// The conversion of another file than `file_id` that is putting, or last
+/// put, its result at `final_path`.
+pub async fn destination_owner(
+    pool: &SqlitePool,
+    final_path: &str,
+    file_id: Uuid,
+) -> sqlx::Result<Option<DestinationOwner>> {
+    owner_of(&mut *pool.acquire().await?, final_path, file_id, false).await
 }
 
 /// A job that was running when the server stopped, with where it was going

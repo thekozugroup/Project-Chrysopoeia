@@ -16,6 +16,11 @@
 //! - Folder mode: creates the folders, refuses to overwrite anything and never
 //!   touches the original.
 //!
+//! A new name (folder mode, or a new extension) is claimed for the whole
+//! step: two jobs of this process aiming at one name (two libraries holding
+//! the same relative path, saved to one output folder) can't both find it
+//! free, so the second is refused instead of overwriting the first's file.
+//!
 //! If the original no longer matches the [`FileIdentity`] recorded when the
 //! job started (a Sonarr/Radarr upgrade replaced it mid-encode), nothing is
 //! replaced and [`OriginalChanged`] is returned. The new file gets the
@@ -24,11 +29,12 @@
 //! replacement whose new file was already in place, and [`recover_artifact`]
 //! cleans up whatever else was left behind.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -720,6 +726,11 @@ fn replace_with_new_name(
             ),
         )
     };
+    // Another job putting a file under this name right now (another
+    // original with the same name and another extension): its file wins.
+    let Some(_claim) = NameClaim::take(&req.final_path) else {
+        return Err(conflict());
+    };
     if exists(&req.final_path)? {
         return Err(conflict());
     }
@@ -734,21 +745,72 @@ fn replace_with_new_name(
     result
 }
 
+/// New names being put in place by this process right now (see
+/// [`NameClaim`]).
+static NAMES_BEING_PLACED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+
+/// A new file's final name, claimed while it is put in place, so that two
+/// jobs aiming at the same name (two libraries holding the same relative
+/// path, saved to one output folder) can't both find it free and the second
+/// rename overwrite the first's file. Released when dropped.
+struct NameClaim(PathBuf);
+
+impl NameClaim {
+    /// Claim `path`; `None` when another job is putting a file there now.
+    fn take(path: &Path) -> Option<Self> {
+        NAMES_BEING_PLACED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path.to_path_buf())
+            .then(|| Self(path.to_path_buf()))
+    }
+}
+
+impl Drop for NameClaim {
+    fn drop(&mut self) {
+        NAMES_BEING_PLACED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Start of the errors for a converted file whose name in the output folder
+/// is taken (see [`output_name_taken`]).
+const NAME_TAKEN_START: &str = "A file named \"";
+
+/// Whether a job's error says that the converted file's name in the output
+/// folder was already taken (before the encode, or by a file that appeared
+/// while it ran), so nothing was written there.
+pub fn output_name_taken(error: &str) -> bool {
+    error.starts_with(NAME_TAKEN_START)
+        && (error.contains("\" is already in the output folder, so it wasn't overwritten")
+            || error.contains("\" appeared in the output folder while this file was being"))
+}
+
+/// The error when a file took the new file's name in the output folder
+/// while it was being converted.
+fn appeared_in_output_folder(final_path: &Path) -> anyhow::Error {
+    PlaceError::error(
+        ProblemKind::Destination,
+        format!(
+            "{NAME_TAKEN_START}{}\" appeared in the output folder while this file was being \
+             converted, so it wasn't overwritten. Move or delete it, then convert this file \
+             again.",
+            file_name_lossy(final_path)
+        ),
+    )
+}
+
 /// Folder mode: create folders, refuse to clobber, never touch the input.
 fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> {
+    let conflict = || appeared_in_output_folder(&req.final_path);
+    // Another job putting a file under this name right now: its file wins.
+    let Some(_claim) = NameClaim::take(&req.final_path) else {
+        return Err(conflict());
+    };
     let dir = parent_dir(&req.final_path);
     fs::create_dir_all(&dir).map_err(|e| placing_failed(&e, &dir, req.mode))?;
-    let conflict = || {
-        PlaceError::error(
-            ProblemKind::Destination,
-            format!(
-                "A file named \"{}\" appeared in the output folder while this file was being \
-                 converted, so it wasn't overwritten. Move or delete it, then convert this file \
-                 again.",
-                file_name_lossy(&req.final_path)
-            ),
-        )
-    };
     if exists(&req.final_path)? {
         return Err(conflict());
     }
@@ -1086,7 +1148,7 @@ pub async fn destination_conflict(
                 file_name_lossy(&final_path)
             )),
             OutputMode::Folder if taken => Some(format!(
-                "A file named \"{}\" is already in the output folder, so it wasn't \
+                "{NAME_TAKEN_START}{}\" is already in the output folder, so it wasn't \
                  overwritten. Move or delete it, then try again.",
                 file_name_lossy(&final_path)
             )),
@@ -1795,6 +1857,121 @@ mod tests {
             names(&dir.path().join("library")),
             ["Movie.mkv", "Movie.mp4"]
         );
+    }
+
+    /// The same relative path in two libraries saved to one output folder
+    /// (`/media/movies/Movies/Frozen.mkv` and `/media/kids/Movies/Frozen.mkv`
+    /// both become `/out/Movies/Frozen.mkv`): when both jobs put their file
+    /// in place at the same moment, the second is refused and the first's
+    /// file is kept as it is. (Without the claim on the name, both found it
+    /// free and the second rename replaced the first's file.)
+    #[test]
+    fn two_jobs_putting_a_file_under_one_name_never_overwrite_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out/Movies/Frozen.mkv");
+        let request = |library: &str, job_id: Uuid, contents: &[u8]| {
+            let input = dir.path().join(library).join("Movies/Frozen.mkv");
+            fs::create_dir_all(input.parent().unwrap()).unwrap();
+            fs::write(&input, OLD).unwrap();
+            let temp = dir
+                .path()
+                .join("scratch")
+                .join(temp_file_name("Frozen", job_id, "mkv"));
+            fs::create_dir_all(temp.parent().unwrap()).unwrap();
+            fs::write(&temp, contents).unwrap();
+            let meta = fs::metadata(&input).unwrap();
+            let req = OwnedRequest {
+                final_path: out.clone(),
+                input,
+                temp,
+                mode: OutputMode::Folder,
+                job_id,
+                keep_dates: false,
+                original: Some(FileIdentity::of(&meta)),
+                force_copy: true,
+                stop: Arc::new(AtomicBool::new(false)),
+            };
+            (req, meta)
+        };
+        let (first, first_meta) = request("movies", Uuid::new_v4(), NEW);
+        let (second, second_meta) = request("kids", Uuid::new_v4(), NEWER);
+        let second_result = std::cell::RefCell::new(None);
+        // The second job finishes while the first is about to rename its
+        // staged file into place.
+        let race = |_: &Path| {
+            let mover = Mover {
+                job_id: second.job_id,
+                force_copy: true,
+                original: &second_meta,
+                keep_dates: false,
+                hooks: TestHooks::default(),
+            };
+            *second_result.borrow_mut() = Some(place_in_folder(&second, &mover));
+        };
+        let mover = Mover {
+            job_id: first.job_id,
+            force_copy: true,
+            original: &first_meta,
+            keep_dates: false,
+            hooks: TestHooks {
+                before_commit: Some(&race),
+                ..TestHooks::default()
+            },
+        };
+        place_in_folder(&first, &mover).unwrap();
+        let err = second_result.into_inner().unwrap().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "A file named \"Frozen.mkv\" appeared in the output folder while this file was \
+             being converted, so it wasn't overwritten. Move or delete it, then convert this \
+             file again."
+        );
+        assert!(output_name_taken(&err.to_string()));
+        assert_eq!(
+            err.downcast_ref::<PlaceError>().map(|e| e.problem),
+            Some(ProblemKind::Destination)
+        );
+        assert_eq!(fs::read(&out).unwrap(), NEW);
+        // Nothing of the second job's was left there; both originals stay.
+        assert_eq!(names(out.parent().unwrap()), ["Frozen.mkv"]);
+        assert_eq!(fs::read(&first.input).unwrap(), OLD);
+        assert_eq!(fs::read(&second.input).unwrap(), OLD);
+        // The name is free again for later jobs.
+        assert!(NameClaim::take(&out).is_some());
+    }
+
+    /// The errors that say the name in the output folder was taken are
+    /// recognised (the server then names the library whose file has it).
+    #[tokio::test]
+    async fn a_taken_name_in_the_output_folder_is_recognised() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("kids/Movies/Frozen.mkv");
+        let out = dir.path().join("out/Movies/Frozen.mkv");
+        fs::create_dir_all(input.parent().unwrap()).unwrap();
+        fs::create_dir_all(out.parent().unwrap()).unwrap();
+        fs::write(&input, OLD).unwrap();
+        fs::write(&out, NEW).unwrap();
+        let conflict =
+            destination_conflict(&input, &out, OutputMode::Folder, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(output_name_taken(&conflict), "{conflict}");
+        assert!(output_name_taken(
+            &appeared_in_output_folder(&out).to_string()
+        ));
+        // Next to the original, or anything else: not about the output folder.
+        let beside = dir.path().join("kids/Movies/Frozen.mp4");
+        fs::write(&beside, NEW).unwrap();
+        let replace =
+            destination_conflict(&input, &beside, OutputMode::Replace, Duration::from_secs(5))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(!output_name_taken(&replace), "{replace}");
+        assert!(!output_name_taken(
+            "Chrysopoeia doesn't have permission to write in the output folder /out"
+        ));
     }
 
     /// The files a crash can leave, and what [`resume_blocking`] makes of
