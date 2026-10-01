@@ -72,7 +72,9 @@ cd web && pnpm install && NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 
 Server options are flags with environment-variable fallbacks
 (`cargo run -p chrysopoeia-server -- --help`); the table is in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-server).
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-server). To work on
+the UI alone, [web/README.md](web/README.md) describes a mock API with sample
+data and the phone layout check (`pnpm e2e:layout`).
 
 ### Test media
 
@@ -85,6 +87,11 @@ cases: H.264 MP4 with two audio languages, 1080p H.264 MKV with 5.1 AC-3 and
 subtitles, 10-bit HEVC, interlaced MPEG-2 in MPEG-TS, an MPEG-4 AVI with odd
 dimensions, an audio-only FLAC, a truncated MKV and a text file named `.mp4`.
 Rust tests generate the same kind of media into temporary folders.
+
+Tests that make a folder stop answering, as a hung network share does, use the
+`test-hooks` feature of `chrysopoeia-worker` (`slow_fs::hang`,
+`finalize::hold`). The crates' own tests turn it on, so `cargo test --workspace`
+needs nothing extra; it is never part of the release build or the image.
 
 ## Docker image
 
@@ -160,10 +167,12 @@ inspection) tune it.
 `scripts/e2e-browser.sh` runs `web/e2e/smoke.mjs`: a real browser goes through
 the welcome, folder and goal screens, waits for a file to be converted and
 verified, sees the live card and the saved space appear without a reload, opens
-the file's verification report and Settings > Hardware, and fails on any
-console or server error. It needs Playwright (see Prerequisites). It takes
-about a minute. `E2E_GOAL`, `E2E_TIMEOUT`, `E2E_PORT`, `E2E_KEEP=1` and
-`E2E_SCREENSHOTS=<dir>` (a picture of each step) tune it.
+the file's verification report, checks that History lists a renamed file under
+its new name with *Was <old name>* beneath it, opens Settings > Hardware, and
+fails on any console or server error. It needs Playwright (see Prerequisites).
+It takes about two minutes on four cores. `E2E_GOAL`, `E2E_TIMEOUT` (the 300 s
+limit for conversions), `E2E_PORT`, `E2E_KEEP=1` and `E2E_SCREENSHOTS=<dir>` (a
+picture of each step) tune it.
 
 ### Screenshots
 
@@ -182,9 +191,12 @@ The script goes through the first-run screens on a fresh server, adds a second
 library, waits until a conversion is part-way with some files already done, and
 saves `setup`, `overview`, `queue`, `phone`, `job` (a verified file's checks) and
 `hardware` (Settings > Hardware, the page headed *This machine*). It takes about
-twenty minutes on four cores. Shrink the results before committing them
+ten minutes on four cores. Make the demo media as the user the container runs
+as (as above), or the job page shows a note about a changed file owner. Shrink
+the results before committing them
 (`pngquant --force --ext .png --quality 60-85 docs/screenshots/*.png`, or any
-256-colour quantizer): each should be well under 150 KB.
+256-colour quantizer): each should be well under 150 KB. Retake only the shots
+whose screen has visibly changed since the last time.
 
 ## CI and releases
 

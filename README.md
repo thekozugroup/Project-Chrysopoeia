@@ -68,10 +68,12 @@ while asking far less of you:
   10-bit colour where the target allows; deinterlaces broadcast recordings; skips
   files that are already efficient.
 - Never loses part of a file by replacing it: when the target format can't hold
-  something the original has (picture subtitles, subtitle styling, fonts or cover
-  images in MP4 or WebM), the original is left as it is. An MKV goal keeps it
-  all; with an output folder or Convert anyway the file is converted and each
-  loss is noted on the job.
+  something the original has (picture subtitles, styled ASS/SSA subtitles, fonts
+  and other attachments, or a cover image that MP4 or WebM can't store), the file
+  is skipped, the reason is shown and the original stays as it is. An MKV goal
+  keeps it all, and covers are kept in MKV and, if JPEG, PNG or BMP, in MP4. With
+  an output folder or *Convert anyway* the file is converted and each loss is
+  noted on the job.
 - Watches folders and picks up new files, with an optional schedule (*When to
   convert*), pause, priorities and retry.
 - Replaces originals in place, or writes to a separate output folder and leaves
@@ -79,7 +81,9 @@ while asking far less of you:
   `Movie.mp4` becomes `Movie.mkv`: Plex, Jellyfin and Emby pick that up at their
   next scan, while Sonarr and Radarr see the old file as missing until their next
   disk scan or a *Refresh & Scan* of the series or movie (see the
-  [FAQ](#faq)).
+  [FAQ](#faq)). History and *Recently finished* show the new name with the old
+  one under it (*Was Movie.mp4*), and a library's search finds the file by
+  either.
 
 ### Goals
 
@@ -91,7 +95,9 @@ while asking far less of you:
 | Archive | AV1, highest quality | original | MKV | at least 5% smaller |
 
 The first-run screen suggests the goal that suits the machine (the *Best fit*
-badge) and shows how fast each goal converts on it.
+badge) and shows how fast each goal converts on it. When originals are replaced,
+*Plays everywhere* skips a file that has picture subtitles, styled subtitles or
+attachments MP4 can't hold, instead of trimming it (see the [FAQ](#faq)).
 
 ## Quick start
 
@@ -193,7 +199,9 @@ the folder you want converted and click the button that names it, **Use
 “Movies”**. Then pick a goal and click **Start**. Chrysopoeia scans the folder,
 queues the files that need work and starts converting; the Overview shows the
 space saved and what is happening now. Add more folders later with **Add
-library**.
+library**. A library can't be `/`, `/config`, `/app`, `/proc`, `/sys` or `/dev`,
+or a folder inside one of them: the picker disables the button and says why, and
+the same rule applies to `LIBRARIES`.
 
 ### Which image
 
@@ -324,13 +332,22 @@ leave them as they are.
 | `/media` | Your media. Needs write access so originals can be replaced. |
 | `/temp` | Optional scratch space on a fast disk (SSD or cache pool). |
 
+Each container needs its own `/config` folder. A second one started on the same
+folder stops at once and says *Another Chrysopoeia is already using the data
+folder /config*, so nothing is changed; give it its own folder (Unraid: the
+Config path; docker: `-v /other/folder:/config`) or stop the first. If the disk
+that holds `/config` is full, the start fails with *The disk that holds the data
+folder (/config) is full, so the database there couldn't be opened*: free some
+space there and start it again.
+
 ### Behind a reverse proxy
 
 Chrysopoeia answers on its IP address, `localhost` and local names (`tower`,
 `tower.local`, `nas.lan`, `*.home.arpa`, `*.ts.net` and similar) without any
 setup. So that a hostile website cannot reach it through a look-alike domain,
 any other name must be listed in `ALLOWED_HOSTS`; until it is, the app shows
-*Chrysopoeia doesn't answer to the address "…"*.
+*Chrysopoeia doesn't answer to the address "…"* with the line to add and, for
+nginx, the `proxy_set_header Host $http_host;` hint.
 
 - Set `ALLOWED_HOSTS=transcode.example.com` (several: separate with commas; a
   leading dot, `.example.com`, allows every name under that domain).
@@ -415,9 +432,11 @@ chose under *More format options*. `Movie.mp4` becomes `Movie.mkv`, and an
 container keeps its name. Because the old path then no longer exists, Plex,
 Jellyfin and Emby pick up the new name at their next library scan, while Sonarr
 and Radarr show the file as missing until their next disk scan or until you
-run *Refresh & Scan* on the series or movie. To keep names as they are, choose
-a goal whose container matches your files (*Balanced* for a library of `.mkv`
-files), or *Save to a separate folder*.
+run *Refresh & Scan* on the series or movie. In History and *Recently finished*
+the file appears under its new name with *Was Movie.mp4* beneath it, and the
+library's search finds it by the old name too. To keep names as they are,
+choose a goal whose container matches your files (*Balanced* for a library of
+`.mkv` files), or *Save to a separate folder*.
 
 **What does "Verified" mean?**
 The new file was opened and checked before it replaced the original. With the
@@ -447,7 +466,9 @@ each with its fix and, where trying again can help, a **Try again** button:
 - *N files couldn't be converted*: the encoder or the checks failed. The
   originals are untouched; the file's page says why.
 - *N files changed or moved while being converted*: nothing was replaced.
-- *Movies: the folder can't be read* (a library's name comes first): the folder is missing or offline.
+- *Movies: the folder can't be read* (a library's name comes first): the folder
+  is missing, offline, or on a share or drive that isn't responding (see *What if
+  a network share or drive stops answering?* below).
 
 **Why was a file skipped?**
 The reason is shown next to the file. The usual ones: the video is already as
@@ -455,15 +476,24 @@ efficient as the target (for example it is already AV1); it is audio-only; it
 could not be read or is shorter than a second; the converted file was not
 enough smaller to be worth keeping (the original is kept); it is HDR and the
 goal is H.264 (tone mapping is not supported yet); it is Dolby Vision profile 5,
-whose colours cannot be kept; the goal saves to MP4 or WebM (for example
-*Plays everywhere*) and the file has something that format cannot hold
-(picture-based subtitles, styled subtitles, subtitle fonts or other attached
-files, or a cover image MP4 can't store), so replacing it would lose it; or you
-skipped it. *Convert anyway* on a skipped file converts it once, ignoring the
-library's rules for skipping (the usual checks still run); in the subtitle case
-what the format cannot hold is left out and noted on the job. An MKV goal keeps
-everything, and *Save to a separate folder* converts the file while the
-original stays.
+whose colours cannot be kept; it has another hard link (a torrent that is still
+seeding), so replacing it would use more space instead of saving it; the goal
+saves to MP4 or WebM (for example *Plays everywhere*) and the file has something
+that format can't hold; or you skipped it.
+
+When the format can't hold something, replacing the file would lose it, so the
+original is left alone and the reason says what: *MP4 can't hold this file's 2
+picture-based subtitles, 1 styled subtitle and 1 subtitle font, so it was left
+unchanged.* That covers picture-based subtitles (PGS, VobSub), styled ASS/SSA
+subtitles (MP4 and WebM keep only their text), fonts and other attached files,
+and cover images the format can't store (WebM holds none; MP4 holds JPEG, PNG
+and BMP). An MKV goal keeps everything, and *Save to a separate folder*
+converts the file while the original stays.
+
+*Convert anyway* on a skipped file converts it once, ignoring the library's
+rules for skipping (the usual checks still run). What the format can't hold is
+left out and noted on the job; a file with another hard link ends as
+*Converted, no space freed*.
 
 **How many files convert at once?**
 By default it is automatic (*Files at once* in Settings › Processing). On the
@@ -477,6 +507,31 @@ Running jobs are stopped and their temporary files removed; the original is
 never left half-replaced. After the restart those files are back in the queue
 and start again from the beginning. `docker stop` waits for them to wind down,
 normally a few seconds.
+
+**What if a network share or drive stops answering?**
+Whenever it stops, in the middle of a job or before one starts, its library
+shows *The folder /media/Movies isn't responding. If it's on a network share or
+an external drive, check the connection.* under *Needs your attention* within
+seconds, and a running job goes back in the queue within a minute. Nothing is
+marked failed, the files stay listed, and the other libraries keep converting.
+When the share answers again the job starts over. **Cancel** and *Stop now*
+still answer within seconds. A new file that was being put in place when the
+share hung is finished or undone once it answers; the original is never left
+half-replaced.
+
+If it never answers, fix the mount (or unmount it) on the host: Chrysopoeia
+can't do that from inside the container. `docker stop` makes Chrysopoeia exit
+within seconds, but Linux can't kill a process that is waiting on a hung mount,
+so Docker may go on showing the container as running, and `docker stop` may
+report *tried to kill container, but did not receive an exit event*, until the
+share answers.
+
+**What happens to files when I change a library's goal?**
+Files that were skipped or are waiting are decided again under the new goal; a
+scan does the same for any it missed. Files already converted stay as they are.
+A file that is converting when you change the goal is decided again when its job
+ends: when originals are replaced and the new goal would still convert the
+result, it is queued again; otherwise it stays as it is.
 
 **A job's ffmpeg log says `set_mempolicy: Operation not permitted`.**
 Harmless. The x265 (HEVC) encoder asks the kernel where to place its memory,

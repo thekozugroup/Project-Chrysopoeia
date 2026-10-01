@@ -118,12 +118,17 @@ Click **Apply**. Unraid pulls the image and starts the container.
 2. Click **Choose a folder**. The folder browser opens at `/media`, which is
    the Media share you picked. Open the folder you want converted (for
    example `Movies`) and click the button at the bottom, which names the folder
-   you are in: **Use “Movies”**. You can add more libraries later.
+   you are in: **Use “Movies”**. You can add more libraries later. The picker
+   won't take `/`, `/config` or the app's own and system folders: the button
+   is disabled and the picker says why. Choose the folder that holds your videos.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
    suits old devices; *Archive* keeps near-original quality. Each card shows
    how fast your hardware handles it, and the one that suits this machine is
-   marked *Best fit*. You can rename the library here.
+   marked *Best fit*. You can rename the library here. Under *Plays everywhere*
+   a file whose subtitles or attachments MP4 can't hold is skipped, with the
+   reason shown, instead of losing them; see
+   [Troubleshooting](#troubleshooting).
 4. Click **Start**. Chrysopoeia scans the folder, queues the files that need
    work, and starts converting. The **Overview** shows the space saved so far
    and what is happening now; the **Queue** has three tabs: **Running** (each
@@ -149,7 +154,8 @@ The converted file gets the new container's extension, so `Movie.mp4` becomes
 that is already in that container keeps its name. Plex, Jellyfin and Emby pick
 this up at their next scan. Sonarr and Radarr see the old file as missing until
 their next disk scan, or until you run *Refresh & Scan* on the series or
-movie.
+movie. In **History** and *Recently finished* the file shows its new name with
+*Was Movie.mp4* beneath it, and the library's search finds it by either name.
 
 ## Transcode cache on an SSD
 
@@ -190,11 +196,14 @@ Config, Media and Transcode cache:
 
 The new files mirror each library's folder structure inside `/output`, with
 the goal's extension, but without the library's own folder name. Two libraries
-that hold the same relative path therefore want the same output file: the
-second is not written (it is never overwritten), and its page says *A file
-named "…" is already in the output folder*. When your libraries are folders
-of one share (`Movies`, `TV`), add that share as a single library instead:
-the output then keeps the `Movies` and `TV` folders.
+that hold the same relative path therefore want the same output file. The
+second is refused and nothing is overwritten: that file fails with *Another
+library's converted file, from Kids, already uses the name "Frozen
+(2013)/Frozen.mkv" in the output folder /output, so this file wasn't converted
+and that file wasn't overwritten*, and the Overview lists it under *Finished
+files can't be saved*. When your libraries are folders of one share (`Movies`,
+`TV`), add that share as a single library instead: the output then keeps the
+`Movies` and `TV` folders.
 
 ## Reverse proxy (SWAG, Nginx Proxy Manager, Traefik)
 
@@ -347,10 +356,17 @@ GPU device it can see.
 | Log says */config already holds other files but no Chrysopoeia database* | The Config path points at a folder that other apps use, such as `/mnt/user/appdata`. Chrysopoeia only adds its own files there and leaves the rest alone, but give it a folder of its own: **Edit** the container, set Config to `/mnt/user/appdata/chrysopoeia` and click **Apply**. |
 | Log says *cannot write to /config* | The Config folder belongs to someone else and is not writable for PUID/PGID, and Chrysopoeia will not take over a folder that holds other data. Set PUID/PGID to the folder's owner, or set Config to a new folder such as `/mnt/user/appdata/chrysopoeia`, which Chrysopoeia then takes over. |
 | Log says *No host folder is mounted at /config* | The Config path is empty, so settings and history would be lost on the next update. Set it to `/mnt/user/appdata/chrysopoeia`. |
+| Log says *Another Chrysopoeia is already using the data folder /config* | A second Chrysopoeia container uses the same Config path (or the first is still running). Nothing was changed. Stop the other one, or **Edit** this one and give it a Config folder of its own, for example `/mnt/user/appdata/chrysopoeia2`. |
+| Log says *The disk that holds the data folder (/config) is full* | The disk behind the Config path (your cache pool or an array disk) has no room for the database. Free some space on it, then start the container again. |
+| A library is listed under **Needs your attention** as *The folder … isn't responding*, and nothing in it converts | The share or drive behind that folder stopped answering, for example a remote SMB or NFS share that went away, or an Unassigned Devices drive that is stuck. Whenever that happens, even in the middle of a job, the job goes back in the queue and nothing is marked failed; the other libraries keep converting, and **Cancel** and *Stop now* still answer within seconds. Fix the connection or the mount on the Unraid side: when the folder answers, the files start over by themselves. A new file that was being put in place is finished or undone, never left half-replaced. Chrysopoeia exits within seconds when you stop the container, but Linux can't kill a process that is waiting on a hung mount, so Docker may keep showing it as running (and the stop may fail with *did not receive an exit event*) until the share answers or its mount is fixed. |
+| A file is skipped with *MP4 can't hold this file's …, so it was left unchanged* | The goal writes MP4 (*Plays everywhere*) and the file has picture-based subtitles (PGS, VobSub), styled ASS/SSA subtitles, fonts or other attached files, or a cover image MP4 can't keep, so replacing the original would lose them. Choose an MKV goal (*Balanced*, *Save space* or *Archive*), which keeps everything; save converted files to a separate folder ([Keeping your originals](#keeping-your-originals)); or open the file and click **Convert anyway** to convert it without them. |
+| A file is skipped with *This file has another hard link* | A torrent that is still seeding, or another hard link, shares the file, so replacing it would use more space instead of saving it. Remove the other link, or click **Convert anyway**; the job then reads *Converted, no space freed*. |
+| Choosing a folder says *The whole server can't be a library*, or that */config* or a system folder can't be one | A library can't be `/`, `/config`, `/app`, `/proc`, `/sys` or `/dev`, or a folder inside one of them. Choose the folder that holds your videos, inside `/media`. |
+| With an output folder, a file fails with *Another library's converted file, from Kids, already uses the name …* | Two libraries hold the same relative path, so both would write the same file in the output folder. The second is refused and nothing is overwritten. Rename one of the two files, or add the share above both folders as one library (see [Keeping your originals](#keeping-your-originals)). |
 | New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or open the **⋯** menu at the top right of the library's page and choose **Scan now**. |
 | The server feels slow while converting | Lower *Files at once* in Settings > Processing, or turn on *When to convert* there so conversions run overnight. |
 | Nothing converts at night / during the day as expected | *When to convert* uses the server's time zone. Unraid passes it automatically; check **Settings > Date and Time**. |
-| The app says *Chrysopoeia doesn't answer to the address …* | You opened it through a domain name. Add that name to ALLOWED_HOSTS (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). |
+| The app says *Chrysopoeia doesn't answer to the address …* | You opened it through a name that is not listed. The screen shows the line to use: add that name to ALLOWED_HOSTS and restart (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). Behind nginx, it also needs `proxy_set_header Host $http_host;`. |
 | Through a reverse proxy the page opens, but saving says *This request came from another website, so Chrysopoeia refused it* | The proxy replaces the address the browser used. nginx: add `proxy_set_header Host $http_host;`; Apache: `ProxyPreserveHost On` (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). Opened directly (`http://<server IP>:8080`), this message means a page on another website really did try to change something. |
 | MAX_JOBS or HW_ACCEL seem to be ignored | A number chosen in the app under *Files at once* wins over MAX_JOBS; choose *Automatic* there to use MAX_JOBS. HW_ACCEL is applied when its value changes, so a later choice in Settings > Hardware stays until you change HW_ACCEL again. |
 | A job's ffmpeg log says `set_mempolicy: Operation not permitted` | Harmless: the HEVC (x265) encoder asks for a memory placement that Docker does not allow, and carries on normally. To silence it, add `--cap-add=SYS_NICE` to Extra Parameters. |
