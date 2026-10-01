@@ -4,7 +4,7 @@ import { limitText, queueSentence } from "@/components/queue-controls";
 import { NO_FAILURES, type FailureCounts } from "@/lib/outcomes";
 import { api } from "@/lib/api";
 import { FAILED_READ_MAX, failuresFrom, fetchFailedFiles, type Failures } from "@/lib/queries";
-import type { HardwareInfo, Job, Library, MediaFile, ProblemKind, QueueState } from "@/lib/types";
+import type { ActivityEntry, HardwareInfo, Job, Library, MediaFile, ProblemKind, QueueState } from "@/lib/types";
 import { finishedPercent } from "@/components/library-bar";
 import { queueSummary } from "@/components/shell";
 import { overviewStatus, problemsFrom, savedFromText } from "./overview";
@@ -387,13 +387,35 @@ describe("finished share", () => {
 });
 
 describe("log tone", () => {
-  const entry = (level: "error" | "warning" | "info" | "success", message: string) => ({ level, message });
+  const entry = (
+    level: "error" | "warning" | "info" | "success",
+    message: string,
+    problem?: ProblemKind | null,
+  ): Pick<ActivityEntry, "level" | "message" | "problem"> => ({ level, message, ...(problem === undefined ? {} : { problem }) });
+
   it("shows a damaged original as a warning, like its badge, and leaves other failures red", () => {
+    expect(logLevel(entry("error", "Failed Truncated.mkv: x", "unreadable_source"))).toBe("warning");
+    expect(logLevel(entry("error", "Clip.mkv failed its visual check. The original was kept.", "verification"))).toBe("error");
+    expect(logLevel(entry("error", "Failed Clip.mkv: x", null))).toBe("error");
+    expect(logLevel(entry("info", "Scanned Movies: 3 files", null))).toBe("info");
+    // A code on a quieter entry doesn't make it louder or quieter.
+    expect(logLevel(entry("warning", "Left Clip.mkv unchanged", "unreadable_source"))).toBe("warning");
+  });
+
+  it("goes by the code, not by what the sentence sounds like", () => {
+    const damaged = "Failed Clip.mkv: The original file appears damaged or incomplete (it stops after 0.1 s).";
+    // Sounds like a damaged original, but the server says it was something else.
+    expect(logLevel(entry("error", damaged, "encoder"))).toBe("error");
+    expect(logLevel(entry("error", damaged, null))).toBe("error");
+    // And a damaged original is amber however the server words it.
+    expect(logLevel(entry("error", "Couldn't open Clip.mkv.", "unreadable_source"))).toBe("warning");
+  });
+
+  it("reads the sentence only for an entry from a server that sends no code", () => {
     expect(
       logLevel(entry("error", "Failed Truncated.mkv: The original file appears damaged or incomplete (it stops after 0.1 s).")),
     ).toBe("warning");
     expect(logLevel(entry("error", "Clip.mkv failed its visual check. The original was kept."))).toBe("error");
-    expect(logLevel(entry("info", "Scanned Movies: 3 files"))).toBe("info");
   });
 });
 
@@ -420,6 +442,15 @@ describe("defaults for new libraries", () => {
       /^Until you change these, Add library suggests the goal that suits this machine \(Balanced\)/,
     );
     expect(newLibraryDefaultsText(true, "balanced")).toMatch(/^New libraries start with these settings\./);
+  });
+
+  it("names the goal when the defaults were saved as one, and stops suggesting the hardware's", () => {
+    // Saving Plays everywhere used to leave "Until you change these … (Balanced)" on screen.
+    const text = newLibraryDefaultsText(true, "balanced", "compatible");
+    expect(text).toMatch(/^New libraries start with Plays everywhere\./);
+    expect(text).not.toMatch(/Until you change these|Balanced/);
+    // Untouched defaults still say what Add library suggests, whatever goal they match.
+    expect(newLibraryDefaultsText(false, "balanced", "save_space")).toMatch(/^Until you change these/);
   });
 });
 

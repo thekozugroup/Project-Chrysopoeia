@@ -17,7 +17,7 @@ import {
   X,
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
-import { FileName } from "@/components/file-name";
+import { FileName, WasName } from "@/components/file-name";
 import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
 import { QueueControls, queueSentence } from "@/components/queue-controls";
 import { PageHeader } from "@/components/shell";
@@ -29,7 +29,7 @@ import { ConfirmDialog } from "@/components/ui/overlays";
 import { useJobActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { formatBytes, formatRelative, plural } from "@/lib/format";
-import { isUnreadable, isUnreadableSource } from "@/lib/outcomes";
+import { entryIsUnreadable, isUnreadable, newFileName } from "@/lib/outcomes";
 import { useActivity, useJobStandings, useJobs, useLibraries, useQueueState, useSettings } from "@/lib/queries";
 import { href, openSheet, updateParams, type Route } from "@/lib/router";
 import type { ActivityEntry, ActivityLevel, Job } from "@/lib/types";
@@ -252,6 +252,7 @@ function HistoryTab({ offset }: { offset: number }) {
   const history = useJobs({ state: "history", limit: PAGE, offset });
   const libraryName = useLibraryName();
   const minSavings = useMinSavings();
+  const outputMode = useSettings().data?.output_mode;
   const { retry, clearHistory } = useJobActions();
   const [confirmClear, setConfirmClear] = useState(false);
   const items = history.data?.items ?? EMPTY_JOBS;
@@ -285,13 +286,16 @@ function HistoryTab({ offset }: { offset: number }) {
           // first, in its sheet. No button until the file has been read.
           const retryable =
             standing === "current" && (job.state === "cancelled" || (job.state === "failed" && !isUnreadable(job)));
+          // A conversion that changed the file's extension is listed by the new name, the old one secondary.
+          const renamed = newFileName(job, undefined, outputMode);
           return (
             <li key={job.id} className="flex items-center gap-3 px-3 py-3 sm:px-4">
               <button type="button" onClick={() => openJob(job)} className="min-w-0 flex-1 text-left">
                 <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                  <FileName name={job.file_name} className="text-sm font-medium text-fg hover:text-accent-ink" />
+                  <FileName name={renamed ?? job.file_name} className="text-sm font-medium text-fg hover:text-accent-ink" />
                   <JobStateBadge job={job} standing={standing} />
                 </span>
+                {renamed ? <WasName name={job.file_name} className="mt-0.5" /> : null}
                 {/* When the note wraps, the library and time start their own line, with no stray "·". */}
                 <span className="mt-1 flex flex-wrap items-baseline gap-x-3 gap-y-0.5">
                   <span className={cn("min-w-0 text-[0.8125rem]", job.state === "done" ? "text-fg/85" : "text-muted")}>
@@ -357,8 +361,8 @@ const LOG_ICON: Record<ActivityLevel, ReactNode> = {
  * An entry's tone. A damaged original is the file's problem, not a failed
  * conversion: amber, as everywhere else ("Can't be read").
  */
-export function logLevel(entry: Pick<ActivityEntry, "level" | "message">): ActivityLevel {
-  return entry.level === "error" && isUnreadableSource(entry.message) ? "warning" : entry.level;
+export function logLevel(entry: Pick<ActivityEntry, "level" | "message" | "problem">): ActivityLevel {
+  return entry.level === "error" && entryIsUnreadable(entry) ? "warning" : entry.level;
 }
 
 /** Scans, warnings and problems as they happened, closed until wanted. */

@@ -16,7 +16,7 @@ needs no Node at runtime. Everything talks to `/api` on the same origin; see
 | `pnpm typecheck` | `tsc --noEmit` |
 | `pnpm test` | Unit and component tests (Vitest + jsdom): API errors and their `field`, live events and reconnecting, router and navigation guard, profiles, formatting |
 | `pnpm e2e <url>` | Browser smoke test of the first-run flow against a running server with an empty data dir (`e2e/smoke.mjs`, needs Playwright; see the file for options) |
-| `pnpm e2e:layout` | After `pnpm build`: phone and tablet layout check of `out/` against the mock API with 90-character file names (no sideways scrolling, running-job buttons on screen and named after their file, touch-sized quality options; `e2e/layout.mjs`, needs Playwright) |
+| `pnpm e2e:layout` | After `pnpm build`: phone (390 and 320 px) and tablet layout check of `out/` against the mock API with 90-character file names (no sideways scrolling, running-job buttons on screen and named after their file, touch-sized quality options, a confirmation's title fitting its dialog with a dotted release name; `e2e/layout.mjs`, needs Playwright) |
 | `pnpm mock` | Dev-only mock API with fake sample data on http://localhost:8787 |
 
 ## Working on the UI
@@ -40,6 +40,7 @@ MOCK_WS=off pnpm mock            # no WebSocket, like a proxy without it: the ap
 MOCK_MAX_JOBS=2 pnpm mock        # the job limit comes from the container's MAX_JOBS
 MOCK_HOST=deny pnpm mock         # every request answers 403 host_not_allowed
 MOCK_SETTLE_MS=0 pnpm mock       # files still being copied never settle (default: after 60 s)
+MOCK_FORCE=off pnpm mock         # ignores "Convert anyway", like a server older than it
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 
@@ -48,7 +49,11 @@ exported bundle. It follows the real server's error codes, messages and
 `field`s (nested ones such as `profile.max_height` too), serves `/api/system`,
 `Job.notes`, `HardwareInfo.detecting` and the round-3 additions
 (`max_jobs_source`, `settling`, `build`, HDR10 metadata, `force`, `left_out`,
-capped folder counts), and uses the server's own sentences for damaged
+capped folder counts) and the round-5 ones (`Job.freed_bytes`,
+`Job.output_name`, `ActivityEntry.problem`, a files search that also finds a
+file by the names it had before a conversion renamed it; the demo holds a
+hard-linked file converted anyway and a "Demo Anime" library whose files MP4
+can't hold in full), and uses the server's own sentences for damaged
 originals; keep it in step when the API changes. `NEXT_PUBLIC_API_URL` is baked in at build time; production
 builds leave it unset so the UI uses the same origin.
 

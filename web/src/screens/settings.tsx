@@ -21,7 +21,7 @@ import { ApiError, api, errorMessage } from "@/lib/api";
 import { formatHour, plural } from "@/lib/format";
 import { bugReportText, recommendedGoal } from "@/lib/hardware";
 import { GOAL_LABEL, VALIDATION_HELP, VALIDATION_LABEL, VALIDATION_LEVELS } from "@/lib/labels";
-import { defaultsCustomized } from "@/lib/profile";
+import { defaultsCustomized, defaultsPresetGoal } from "@/lib/profile";
 import { reasonsFor, setupFix, type SettingFocus, type SetupProblem } from "@/lib/outcomes";
 import {
   keys,
@@ -592,7 +592,11 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey, profil
       <section className="border-t border-line pt-7">
         <h2 className="text-[0.9375rem] font-semibold text-fg">Defaults for new libraries</h2>
         <p className="mt-1 mb-6 max-w-2xl text-[0.8125rem] text-muted">
-          {newLibraryDefaultsText(defaultsCustomized(presets.data, draft.default_profile), recommendedGoal(hardware.hw))}
+          {newLibraryDefaultsText(
+            defaultsCustomized(presets.data, draft.default_profile),
+            recommendedGoal(hardware.hw),
+            defaultsPresetGoal(presets.data, draft.default_profile),
+          )}
         </p>
         <ProfileEditor
           profile={draft.default_profile}
@@ -612,12 +616,21 @@ function AdvancedSection({ draft, onChange, errors, onValidity, resetKey, profil
 
 /**
  * What these defaults do, as "Add library" really applies them: untouched,
- * it suggests the goal that suits this machine instead (see `GoalStep`);
- * once changed, new libraries start with them.
+ * it suggests the goal that suits this machine instead (see `newLibraryStart`);
+ * once changed, new libraries start with them, named by goal when they are
+ * exactly that goal's preset ("Plays everywhere").
  */
-export function newLibraryDefaultsText(customized: boolean, suggested: Exclude<Goal, "custom">): string {
+export function newLibraryDefaultsText(
+  customized: boolean,
+  suggested: Exclude<Goal, "custom">,
+  presetGoal: Exclude<Goal, "custom"> | null = null,
+): string {
   const existing = "Existing libraries keep their own; change them in each library's Settings tab.";
-  if (customized) return `New libraries start with these settings. ${existing}`;
+  if (customized) {
+    return presetGoal
+      ? `New libraries start with ${GOAL_LABEL[presetGoal]}. ${existing}`
+      : `New libraries start with these settings. ${existing}`;
+  }
   return `Until you change these, Add library suggests the goal that suits this machine (${GOAL_LABEL[suggested]}); once you do, new libraries start with them. ${existing}`;
 }
 

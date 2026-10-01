@@ -20,6 +20,8 @@
  *   MOCK_SETTLE_MS=60000    the demo's files still being copied settle this long after
  *                           start, one every few seconds ("Found … in <library>"),
  *                           and LibraryStats.settling goes down to 0 (0 = never)
+ *   MOCK_FORCE=on           "off" ignores `force` on POST /api/files/{id}/queue, like a
+ *                           server older than "Convert anyway" (Job.force stays false)
  *   MOCK_BULK_FAILED=0      add a "Demo Bulk" library with this many files that all
  *                           failed because the work folder can't be used (more than
  *                           one 500-file page: the UI must read them all)
@@ -47,6 +49,20 @@
  * skipped, stopped or fails, and bulk queue leaves out files the size rule
  * already kept. Settings errors use the server's words ("Files at once
  * must be between 1 and 32.").
+ *
+ * Round 5 (contract additions C1-C4): `Job.freed_bytes` (0 for a converted
+ * hard-linked original, whose old data stays on disk, else input minus
+ * output; null until a job is done), `ActivityEntry.problem` (the cause of
+ * an entry about a failed or skipped file), `Job.output_name` (a converted
+ * file is renamed to its goal's extension: land1080.mp4 becomes
+ * land1080.mkv, in replace mode) and a files search that also finds a file by
+ * the names its jobs recorded (q=land1080.mp4 finds land1080.mkv). The demo
+ * has such a file (a hard-linked one converted anyway), and a "Demo Anime"
+ * library on the Plays everywhere goal whose files hold picture-based
+ * subtitles or fonts MP4 can't keep: replacing their originals is skipped
+ * with the worker's sentence ("MP4 can't hold this file's …, so it was left
+ * unchanged. …; Convert anyway converts it without them") until converted
+ * anyway.
  */
 
 import { randomUUID } from "node:crypto";
@@ -62,6 +78,15 @@ const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
 const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
+const FORCE = process.env.MOCK_FORCE ?? "on";
+/** The worker's sentence for a file with other hard links (SHARED_ORIGINAL), left alone when originals are replaced. */
+const HARD_LINK_SKIP =
+  "This file has another hard link (for example a torrent that is still seeding), so replacing it would use more space instead of saving it. It was left unchanged; Convert anyway converts it all the same";
+/** The note on a hard-linked original converted anyway (SHARED_ORIGINAL_NOTE). */
+const HARD_LINK_NOTE = "The original has another hard link (for example a seeding torrent), so replacing it freed no space";
+/** The worker's sentence when the goal's container can't hold some of a file's tracks (plan::replace_loss). */
+const lossSkip = (container, lost) =>
+  `${container} can't hold this file's ${lost}, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them`;
 /** The server's sentence when the work folder can't be created (chrysopoeia-worker run.rs). */
 const WORK_FOLDER_ERROR =
   "The work folder /temp can't be created because Chrysopoeia doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
@@ -383,8 +408,13 @@ const RESOLUTIONS = {
   "480p": [720, 480],
 };
 
+/**
+ * `extra.problem` is the cause of an entry about a failed or skipped file
+ * (the same codes as `Job.problem`); every entry has the field, null when
+ * there is none.
+ */
 function addActivity(level, message, extra = {}) {
-  const entry = { id: activityId++, at: iso(Date.now()), level, message, file_id: null, job_id: null, library_id: null, ...extra };
+  const entry = { id: activityId++, at: iso(Date.now()), level, message, problem: null, file_id: null, job_id: null, library_id: null, ...extra };
   activity.unshift(entry);
   if (activity.length > 500) activity.pop();
   return entry;
@@ -431,6 +461,19 @@ function makeProbe(file) {
       frame_rate: null, color_primaries: null, color_transfer: null, color_space: null, color_range: null, hdr: null,
       interlaced: false, channels: null, channel_layout: null, sample_rate: null,
     });
+  }
+  // Tracks the Plays everywhere container can't hold (see `lossTracks`).
+  if (file.lossTracks) {
+    const track = (index, kind, codec, language) => ({
+      index, kind, codec, profile: null, language, title: null, is_default: false, is_forced: false, is_attached_pic: false,
+      bit_rate: null, width: null, height: null, pix_fmt: null, bit_depth: null, frame_rate: null, color_primaries: null,
+      color_transfer: null, color_space: null, color_range: null, hdr: null, interlaced: false, channels: null,
+      channel_layout: null, sample_rate: null,
+    });
+    if (/picture-based/.test(file.lossTracks)) {
+      streams.push(track(2, "subtitle", "hdmv_pgs_subtitle", "eng"), track(3, "subtitle", "hdmv_pgs_subtitle", "jpn"));
+    }
+    streams.push(track(4, "attachment", /font/.test(file.lossTracks) ? "ttf" : "mjpeg", null));
   }
   return {
     container: file.container,
@@ -506,6 +549,8 @@ function makeJob(file, state, extra = {}) {
     attempt: 1,
     input_size: file.original_size_bytes ?? file.size_bytes,
     output_size: null,
+    freed_bytes: null,
+    output_name: null,
     error: null,
     problem: null,
     skip_reason: null,
@@ -563,11 +608,33 @@ function makeFile(library, relative, opts) {
  */
 function notesFor(file) {
   const library = libraries.get(file.library_id);
+  // Converted anyway: the tracks the container can't hold are left out.
+  if (file.lossTracks) return [`Removed ${file.lossTracks} because ${library?.profile.container === "webm" ? "WebM" : "MP4"} can't hold them`];
+  if (file.hardLinked) return [HARD_LINK_NOTE];
   if (file.file_name.length % 4 !== 0) return [];
   if (library?.profile.container === "mp4") {
     return ["Removed 2 picture-based subtitles because MP4 can't hold them"];
   }
   return ["Converted the MOV text subtitle to SRT so MKV can hold it"];
+}
+
+/**
+ * A converted file takes its goal's extension (`land1080.mp4` becomes
+ * `land1080.mkv`): the job records the result's name (`output_name`, null
+ * while the name stays) and, when originals are replaced, the file itself is
+ * renamed. The job keeps the input's name.
+ */
+function renameToGoal(file, job) {
+  const container = libraries.get(file.library_id)?.profile.container ?? "mkv";
+  const next = file.file_name.replace(/\.[^.]+$/, `.${container}`);
+  if (next === file.file_name) return;
+  job.output_name = next;
+  if (settings.output_mode !== "replace") return;
+  const swap = (path) => path.slice(0, path.length - file.file_name.length) + next;
+  file.path = swap(file.path);
+  file.relative_path = swap(file.relative_path);
+  file.file_name = next;
+  file.container = container === "mp4" ? "mov" : "matroska";
 }
 
 function markDone(file, ratio, finishedSecsAgo) {
@@ -584,12 +651,14 @@ function markDone(file, ratio, finishedSecsAgo) {
     progress: 100,
     input_size: original,
     output_size: out,
+    freed_bytes: original - out,
     validation: validationReport(),
     notes: notesFor(file),
     started_at: iso(finished - between(900, 3600) * 1000),
     finished_at: iso(finished),
   });
   job.created_at = iso(finished - 7200 * 1000);
+  renameToGoal(file, job);
   file.updated_at = job.finished_at;
   const day = job.finished_at.slice(0, 10);
   const entry = savingsByDay.get(day) ?? { saved_bytes: 0, files: 0 };
@@ -915,14 +984,73 @@ function seedDemo() {
     });
   }
 
+  // Round 5. A hard-linked file converted anyway: the new file is smaller but
+  // its original's space wasn't released (`freed_bytes` 0), and its name
+  // changed with its format (`output_name`).
+  const clip = makeFile(movies, "Clips/land1080.mp4", { size: 718_000, codec: "h264", resolution: "1080p", duration: 12, audio: "aac" });
+  clip.hardLinked = true;
+  makeJob(clip, "skipped", {
+    stage: "preparing",
+    skip_reason: HARD_LINK_SKIP,
+    created_at: ago(7400),
+    started_at: ago(7300),
+    finished_at: ago(7290),
+  });
+  Object.assign(clip, { original_size_bytes: 718_000, size_bytes: 402_000, saved_bytes: 0, status: "done", video_codec: "hevc" });
+  const forcedClip = makeJob(clip, "done", {
+    force: true,
+    stage: "finalizing",
+    progress: 100,
+    input_size: 718_000,
+    output_size: 402_000,
+    freed_bytes: 0,
+    validation: validationReport(),
+    notes: [HARD_LINK_NOTE],
+    created_at: ago(900),
+    started_at: ago(880),
+    finished_at: ago(600),
+  });
+  renameToGoal(clip, forcedClip);
+  clip.updated_at = forcedClip.finished_at;
+
+  // Plays everywhere replaces originals as MP4: files holding tracks MP4 can't keep are left unchanged.
+  const anime = createLibrary("Demo Anime", "/media/demo/anime", "compatible");
+  for (const [name, lost] of [
+    ["Demo Anime - S01E01.mkv", "2 picture-based subtitles and 1 subtitle font"],
+    ["Demo Anime - S01E02.mkv", "1 attached file"],
+  ]) {
+    const episode = makeFile(anime, `Demo Anime/${name}`, { size: between(1.2e9, 1.5e9), codec: "h264", resolution: "1080p", duration: 24 * 60, audio: "aac" });
+    episode.lossTracks = lost;
+    episode.status = "skipped";
+    episode.skip_reason = lossSkip("MP4", lost);
+    makeJob(episode, "skipped", { stage: "preparing", skip_reason: episode.skip_reason, created_at: ago(5000), started_at: ago(4990), finished_at: ago(4980) });
+    addActivity("warning", `Left ${name} unchanged: MP4 can't hold its ${lost}.`, { library_id: anime.id, file_id: episode.id });
+  }
+  makeFile(anime, "Demo Anime/Demo Anime - S01E03.mkv", { size: between(1.2e9, 1.5e9), codec: "h264", resolution: "1080p", duration: 24 * 60, audio: "aac" });
+  // Scene-release names have no space to break at: a dialog title or a list row must still fit a phone.
+  const releaseLoss = makeFile(anime, "Releases/Some.Really.Long.Scene.Release.Name.2021.1080p.BluRay.x264.DTS-HD.MA.5.1.REMUX-GROUP.mkv", {
+    size: 9.4e9, codec: "h264", resolution: "1080p", duration: 7200, audio: "dts",
+  });
+  releaseLoss.lossTracks = "3 picture-based subtitles";
+  releaseLoss.status = "skipped";
+  releaseLoss.skip_reason = lossSkip("MP4", releaseLoss.lossTracks);
+  makeJob(releaseLoss, "skipped", { stage: "preparing", skip_reason: releaseLoss.skip_reason, created_at: ago(4800), started_at: ago(4790), finished_at: ago(4780) });
+  // Converted under an older goal (HEVC): "Convert again" is offered for it.
+  const releaseDone = makeFile(anime, "Releases/Another.Really.Long.Scene.Release.Name.2021.2160p.UHD.BluRay.x265.DTS-HD.MA.7.1.REMUX-GROUP.mkv", {
+    size: 31e9, codec: "hevc", resolution: "4K", duration: 7800, audio: "truehd",
+  });
+  markDone(releaseDone, 0.48, 3 * 3600);
+  releaseDone.video_codec = "hevc";
+
   settling.set(tv.id, 3);
   addActivity("info", "Scanned Demo TV: 250 files, 3 still being copied (checked again when they're finished)", { library_id: tv.id });
   addActivity("info", "Scanned Demo Movies: 136 files, 2 new.", { library_id: movies.id });
   addActivity("success", "Converted Sintel (2010).mkv and saved 4.1 GB.", { library_id: movies.id });
   addActivity("warning", `Kept the original of ${skippedFile.file_name}: only 4% smaller.`, { library_id: movies.id });
-  addActivity("error", `${failedA.file_name} failed its visual check. The original was kept.`, { library_id: movies.id });
+  addActivity("error", `${failedA.file_name} failed its visual check. The original was kept.`, { library_id: movies.id, file_id: failedA.id, problem: "verification" });
   // The real server's wording for a failed job ("Failed <name>: <error>"), here a damaged original.
-  addActivity("error", `Failed ${failedB.file_name}: ${failedB.error}`, { library_id: movies.id, file_id: failedB.id });
+  // The server sends the cause with it, so the Log doesn't have to read the sentence.
+  addActivity("error", `Failed ${failedB.file_name}: ${failedB.error}`, { library_id: movies.id, file_id: failedB.id, problem: "unreadable_source" });
   addActivity("success", "Converted Demo Show - S01E04.mkv and saved 1.1 GB.", { library_id: tv.id });
   activity.forEach((e, i) => (e.at = ago(600 + i * 1900)));
 }
@@ -1042,6 +1170,8 @@ function listFile(f) {
   delete out.unreadable;
   delete out.dvNoBaseLayer;
   delete out.wasDone;
+  delete out.hardLinked;
+  delete out.lossTracks;
   return out;
 }
 
@@ -1098,6 +1228,11 @@ const TARGET_NAME = { av1: "AV1", hevc: "HEVC", h264: "H.264", vp9: "VP9" };
 function skipReasonFor(file, lib) {
   if (!file.video_codec) return "Audio-only file — nothing to convert";
   const profile = lib.profile;
+  // Originals are replaced: a shared original, or tracks the new container can't hold, are left alone.
+  if (settings.output_mode === "replace") {
+    if (file.hardLinked) return HARD_LINK_SKIP;
+    if (file.lossTracks && profile.container !== "mkv") return lossSkip(profile.container === "webm" ? "WebM" : "MP4", file.lossTracks);
+  }
   const source = EFFICIENCY[file.video_codec] ?? 1;
   const target = EFFICIENCY[profile.video_codec] ?? 3;
   if (profile.skip_efficient && source >= target) {
@@ -1153,6 +1288,8 @@ function finishJob(job) {
   const lib = libraries.get(job.library_id);
   const ratio = between(0.35, 0.6);
   const out = Math.round(job.input_size * ratio);
+  // A hard-linked original's old data stays on disk through its other link: nothing is freed.
+  const shared = Boolean(file?.hardLinked);
   Object.assign(job, {
     state: "done",
     stage: "finalizing",
@@ -1161,6 +1298,7 @@ function finishJob(job) {
     speed: null,
     eta_secs: null,
     output_size: out,
+    freed_bytes: shared ? 0 : job.input_size - out,
     validation: validationReport(),
     notes: file ? notesFor(file) : [],
     finished_at: iso(Date.now()),
@@ -1170,20 +1308,32 @@ function finishJob(job) {
     file.original_size_bytes = file.wasDone ? (file.original_size_bytes ?? job.input_size) : job.input_size;
     delete file.wasDone;
     file.size_bytes = out;
-    file.saved_bytes = file.original_size_bytes - out;
+    file.saved_bytes = shared ? 0 : file.original_size_bytes - out;
     file.status = "done";
     file.progress = null;
     file.video_codec = lib?.profile.video_codec ?? file.video_codec;
+    // The tracks the container can't hold are gone from the new file.
+    file.lossTracks = null;
+    renameToGoal(file, job);
     file.updated_at = job.finished_at;
-    const day = job.finished_at.slice(0, 10);
-    const entry = savingsByDay.get(day) ?? { saved_bytes: 0, files: 0 };
-    entry.saved_bytes += file.saved_bytes;
-    entry.files += 1;
-    savingsByDay.set(day, entry);
+    if (!shared) {
+      const day = job.finished_at.slice(0, 10);
+      const entry = savingsByDay.get(day) ?? { saved_bytes: 0, files: 0 };
+      entry.saved_bytes += file.saved_bytes;
+      entry.files += 1;
+      savingsByDay.set(day, entry);
+    }
     broadcast({ type: "file.updated", file: listFile(file) });
   }
   broadcast({ type: "job.updated", job });
-  emitActivity(addActivity("success", `Converted ${job.file_name} and saved ${(job.input_size - out) / 1e9 >= 1 ? ((job.input_size - out) / 1e9).toFixed(1) + " GB" : Math.round((job.input_size - out) / 1e6) + " MB"}.`, { file_id: job.file_id, job_id: job.id, library_id: job.library_id }));
+  const freedText = (bytes) => (bytes / 1e9 >= 1 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`);
+  emitActivity(
+    addActivity("success", shared ? `Converted ${job.file_name}. ${HARD_LINK_NOTE}.` : `Converted ${job.file_name} and saved ${freedText(job.input_size - out)}.`, {
+      file_id: job.file_id,
+      job_id: job.id,
+      library_id: job.library_id,
+    }),
+  );
   if (lib) emitLibrary(lib);
   emitStats();
 }
@@ -1495,8 +1645,12 @@ route("GET", "/api/files", (_p, q) => {
   if (q.get("library")) list = list.filter((f) => f.library_id === q.get("library"));
   if (q.get("status")) list = list.filter((f) => f.status === q.get("status"));
   if (q.get("q")) {
+    // Like the server: the file's name and folder, and the names its jobs recorded
+    // (a conversion that renamed it: q=land1080.mp4 finds land1080.mkv).
     const needle = q.get("q").toLowerCase();
-    list = list.filter((f) => f.relative_path.toLowerCase().includes(needle));
+    const earlier = new Set();
+    for (const j of jobs.values()) if (j.file_name.toLowerCase().includes(needle)) earlier.add(j.file_id);
+    list = list.filter((f) => f.relative_path.toLowerCase().includes(needle) || earlier.has(f.id));
   }
   sortFiles(list, q.get("sort") ?? "name");
   const limit = Math.min(500, Number(q.get("limit") ?? 100));

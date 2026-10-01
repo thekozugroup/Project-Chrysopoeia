@@ -195,6 +195,20 @@ export function middleTruncate(text: string, max = 48): string {
 }
 
 /**
+ * Whether a file listed for a search matched by a name it no longer has. The
+ * server searches a file's name and folder, and also the names it had before
+ * a conversion renamed it (`land1080.mp4` finds `land1080.mkv`), so a
+ * listed file whose own name and folder don't hold the text can only have
+ * matched an earlier one. The text is compared the way the server does, as
+ * typed and ignoring case.
+ */
+export function foundByEarlierName(file: { file_name: string; relative_path: string }, query: string): boolean {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return false;
+  return !file.file_name.toLowerCase().includes(needle) && !file.relative_path.toLowerCase().includes(needle);
+}
+
+/**
  * Where an episode is named: S01E02, 1x02, "Episode 2", E02, an air date
  * (2024-05-01), or an anime-style " - 02".
  */

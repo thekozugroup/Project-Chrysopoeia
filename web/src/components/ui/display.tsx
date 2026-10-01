@@ -296,7 +296,9 @@ export function SectionHeading({
       {action ? (
         // Pulled left so a wrapped borderless button's text lines up with
         // the heading; beside it, the margin only widens the gap.
-        <div className={cn("flex shrink-0 flex-wrap items-center gap-2", quietAction && "-ml-2 sm:ml-0")}>{action}</div>
+        <div className={cn("flex max-w-full shrink-0 flex-wrap items-center gap-2", quietAction && "-ml-2 sm:ml-0")}>
+          {action}
+        </div>
       ) : null}
     </div>
   );

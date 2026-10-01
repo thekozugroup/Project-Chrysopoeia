@@ -227,6 +227,29 @@ async function main() {
     await shot("job-sheet");
     await page.keyboard.press("Escape");
 
+    // 7b. A server that records what each conversion freed and what it named its result (`freed_bytes`,
+    // `output_name`): a converted job has the first, and a conversion that renamed its file (another
+    // extension) is listed by the new name with the old one beside it. An older server sends neither.
+    const finished = await api("/jobs?state=history&limit=50");
+    const converted = finished.items.filter((j) => j.state === "done");
+    if (converted.some((j) => "freed_bytes" in j)) {
+      const missing = converted.filter((j) => typeof j.freed_bytes !== "number");
+      if (missing.length) throw new StepError(`${missing.length} converted job(s) have no freed_bytes, e.g. ${missing[0].file_name}`);
+      const replaced = (await api("/settings")).output_mode === "replace";
+      const renamed = converted.filter((j) => typeof j.output_name === "string" && j.output_name !== j.file_name);
+      if (replaced) {
+        for (const job of renamed.slice(0, 3)) {
+          await page.getByText(`Was ${job.file_name}`, { exact: true }).first().waitFor({ timeout: 10_000 }).catch(() => {
+            throw new StepError(`History doesn't list ${job.output_name} with "Was ${job.file_name}"`);
+          });
+        }
+        log(`History lists ${renamed.length} renamed file(s) by their new name, with the old one beside it`);
+        await shot("history-renamed");
+      }
+    } else {
+      log("This server doesn't record freed_bytes or output_name; those checks are skipped");
+    }
+
     // 8. Hardware page reads without errors.
     await page.goto(`${opts.url}/#/settings/hardware`);
     await page.getByRole("heading", { name: "This machine" }).waitFor({ timeout: 20_000 });

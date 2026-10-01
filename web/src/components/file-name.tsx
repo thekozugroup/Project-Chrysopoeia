@@ -8,6 +8,20 @@
 import { splitFileName } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
+/**
+ * The name a file had before a conversion renamed it ("Was land1080.mp4"),
+ * as secondary text under its new name. A list row names the result, since
+ * that is what the file is called now, and says what it was called before so
+ * the old name still finds its row.
+ */
+export function WasName({ name, className }: { name: string; className?: string }) {
+  return (
+    <span className={cn("block min-w-0 truncate text-xs text-muted", className)} title={`Was ${name}`}>
+      Was {name}
+    </span>
+  );
+}
+
 export function FileName({ name, className }: { name: string; className?: string }) {
   const split = splitFileName(name);
   if (!split) {

@@ -4,9 +4,10 @@
  * against the mock API with every file given a long, Plex/Sonarr-style name
  * (about 90 characters). It fails when a screen scrolls sideways, when a
  * running job's Stop or Details button is off screen, when those buttons
- * aren't named after their file, when a name's late episode is cut off, or
- * when a stacked quality option on a touch screen is shorter than the 24 px
- * WCAG 2.2 target size.
+ * aren't named after their file, when a name's late episode is cut off, when
+ * a stacked quality option on a touch screen is shorter than the 24 px
+ * WCAG 2.2 target size, or when a confirmation's title (Stop, with a dotted
+ * release name that has no place to break) runs past its dialog.
  *
  * Usage (from web/):
  *   pnpm build && node e2e/layout.mjs [--port 18925] [--screenshots <dir>] [--headed]
@@ -84,12 +85,20 @@ function longName(name) {
   return `${base} (Director's Cut, Remastered) Bluray-2160p Remux HDR10 DTS-HD MA 7.1${ext}`;
 }
 
+/** A scene-release name: no space anywhere, so nothing lets a title break. */
+const DOTTED = "Some.Really.Long.Scene.Release.Name.2021.1080p.BluRay.x264.DTS-HD.MA.5.1.REMUX-GROUP.mkv";
+/** While set, running jobs are named `DOTTED` (for the confirmation title check). */
+let dotted = false;
+
 /** Give every `file_name` in an API answer a long name. */
 function lengthen(value) {
   if (Array.isArray(value)) return value.map(lengthen);
   if (value && typeof value === "object") {
     const out = {};
-    for (const [key, v] of Object.entries(value)) out[key] = key === "file_name" && typeof v === "string" ? longName(v) : lengthen(v);
+    for (const [key, v] of Object.entries(value)) {
+      if (key === "file_name" && typeof v === "string") out[key] = dotted && value.state === "running" ? DOTTED : longName(v);
+      else out[key] = lengthen(v);
+    }
     return out;
   }
   return value;
@@ -124,6 +133,8 @@ async function main() {
     const screens = ["#/", "#/queue", "#/queue/next", "#/queue/history", `#/library/${libraries[0].id}`];
     const viewports = [
       { name: "phone", width: 390, height: 844, isMobile: false },
+      // The narrowest screens still in use: the Overview's heading and rows must wrap, not run past the edge.
+      { name: "phone-small", width: 320, height: 640, isMobile: false },
       { name: "tablet", width: 768, height: 1024, isMobile: false },
       // A real phone: an overflowing page would widen the layout viewport instead of scrolling.
       { name: "phone-touch", width: 390, height: 844, isMobile: true, hasTouch: true },
@@ -193,6 +204,39 @@ async function main() {
         if (opts.screenshots) {
           await page.screenshot({ path: join(opts.screenshots, `${vp.name}-${screen.replace(/[#/]+/g, "_") || "overview"}.png`) });
         }
+      }
+      {
+        // A confirmation names the file in its title. A dotted release name has nowhere to break, so the
+        // title must wrap anywhere instead of running past the dialog.
+        dotted = true;
+        await page.goto(`${base}/#/queue`);
+        await page.locator("main h1").first().waitFor({ timeout: 15_000 });
+        const stop = page.locator("article").first().getByRole("button", { name: /^Stop / });
+        await stop.waitFor({ timeout: 15_000 });
+        await stop.click();
+        const dialog = page.getByRole("alertdialog");
+        await dialog.waitFor({ timeout: 10_000 });
+        await page.waitForTimeout(400);
+        const fit = await dialog.evaluate((el) => {
+          const title = el.querySelector("h2") ?? el.querySelector("[id]");
+          let farthest = 0;
+          for (const e of el.querySelectorAll("*")) farthest = Math.max(farthest, e.getBoundingClientRect().right);
+          return {
+            scroll: el.scrollWidth,
+            client: el.clientWidth,
+            titleScroll: title?.scrollWidth ?? 0,
+            titleClient: title?.clientWidth ?? 0,
+            farthest,
+            right: el.getBoundingClientRect().right,
+          };
+        });
+        console.log(`${vp.name} Stop dialog (dotted name): dialog ${fit.scroll}/${fit.client}, title ${fit.titleScroll}/${fit.titleClient}`);
+        if (fit.scroll > fit.client) fail(`${vp.name}: the Stop dialog scrolls sideways (${fit.scroll} > ${fit.client})`);
+        if (fit.titleScroll > fit.titleClient) fail(`${vp.name}: the Stop dialog's title runs past its box (${fit.titleScroll} > ${fit.titleClient})`);
+        if (fit.farthest > fit.right + 0.5) fail(`${vp.name}: something in the Stop dialog runs past its edge`);
+        if (opts.screenshots) await page.screenshot({ path: join(opts.screenshots, `${vp.name}-stop-dialog.png`) });
+        await page.keyboard.press("Escape");
+        dotted = false;
       }
       if (vp.hasTouch) {
         // Stacked quality options stay touch-sized (WCAG 2.2 target size, 24 px; 44 px intended).

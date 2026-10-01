@@ -14,6 +14,7 @@ import {
   countFailures,
   failureGroup,
   jobStanding,
+  newFileName,
   setupProblem,
   type FailureCounts,
   type JobStanding,
@@ -140,6 +141,18 @@ export function useQueueState() {
 
 export function useSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: ({ signal }) => api.settings(signal) });
+}
+
+/**
+ * The name a finished job gave its file when it isn't the one the job
+ * started with (see `newFileName`), for a sheet's title. The job says it
+ * itself; the file is only read for a job from a server that doesn't.
+ */
+export function useNewFileName(job: Job | undefined): string | null {
+  const settings = useSettings();
+  const needsFile = job !== undefined && job.state === "done" && job.output_name === undefined;
+  const file = useFile(job?.file_id ?? null, needsFile);
+  return job ? newFileName(job, file.data?.file, settings.data?.output_mode) : null;
 }
 
 /**

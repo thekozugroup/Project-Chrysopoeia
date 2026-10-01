@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { doneSavings, trackTitle } from "./files";
 import { rootOf } from "./folder-picker";
-import { skipFollowsSettings } from "@/lib/convertible";
+import { leftOutText, planBulkConvert, skipFollowsSettings } from "@/lib/convertible";
 import type { MediaFile, ProbeInfo, StreamInfo } from "@/lib/types";
 
 function stream(partial: Partial<StreamInfo>): StreamInfo {
@@ -98,6 +98,42 @@ describe("skipFollowsSettings", () => {
     expect(skipFollowsSettings(file({ skip_reason: "HDR video would lose its colours as H.264 — left unchanged" }))).toBe(false);
     expect(skipFollowsSettings(file({ skip_reason: "The new file was 7% larger — kept the original" }))).toBe(true);
     expect(skipFollowsSettings(file({ status: "done" }))).toBe(false);
+  });
+
+  it("is true for a file left unchanged because the goal's container can't hold its tracks", () => {
+    // Replace mode: the worker's sentence names what would be lost and says Convert anyway converts it without them.
+    const loss =
+      "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them";
+    expect(skipFollowsSettings(file({ skip_reason: loss }))).toBe(true);
+    expect(
+      skipFollowsSettings(
+        file({
+          skip_reason: "MP4 can't hold this file's 1 attached file, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them",
+        }),
+      ),
+    ).toBe(true);
+    // A file with other hard links says the same words about itself.
+    expect(
+      skipFollowsSettings(
+        file({
+          skip_reason:
+            "This file has another hard link (for example a torrent that is still seeding), so replacing it would use more space instead of saving it. It was left unchanged; Convert anyway converts it all the same",
+        }),
+      ),
+    ).toBe(true);
+    // Still never for a file with no video, or the user's own skip.
+    expect(skipFollowsSettings(file({ skip_reason: loss, video_codec: null, probe: probe([stream({ kind: "audio" })]) }))).toBe(false);
+    expect(skipFollowsSettings(file({ skip_reason: loss, status: "failed" }))).toBe(false);
+  });
+
+  it("leaves such a file out of a bulk Convert and says to use Convert anyway", () => {
+    const loss =
+      "MP4 can't hold this file's 1 picture-based subtitle, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them";
+    const plan = planBulkConvert([file({ skip_reason: loss }), file({ status: "pending", skip_reason: null })], undefined);
+    expect(plan.settings).toBe(1);
+    expect(plan.unconvertible).toBe(0);
+    expect(plan.ids).toHaveLength(1);
+    expect(leftOutText(plan)).toMatch(/choose Convert anyway/);
   });
 });
 

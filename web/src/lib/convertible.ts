@@ -9,7 +9,7 @@
 
 import { plural } from "./format";
 import { skippedByUser } from "./labels";
-import { isUnreadable } from "./outcomes";
+import { isUnreadable, offersConvertAnyway } from "./outcomes";
 import type { Container, Job, MediaFile, TranscodeProfile, VideoCodec } from "./types";
 
 /**
@@ -18,7 +18,10 @@ import type { Container, Job, MediaFile, TranscodeProfile, VideoCodec } from "./
  * format, or not enough smaller ("Only 4% smaller — kept the original",
  * "The new file was 7% larger — kept the original"). Safety skips (Dolby
  * Vision without a standard layer, HDR to H.264, unreadable picture size or
- * audio) always apply, so they don't match.
+ * audio) always apply, so they don't match. Neither does the skip for a
+ * track the goal's container can't hold, nor one for a shared original;
+ * the server's own sentence for those ends "Convert anyway converts it …"
+ * (see `offersConvertAnyway`), and `skipFollowsSettings` reads that too.
  */
 const SETTINGS_SKIP = /^already\b|\d+(?:\.\d+)?\s*% (?:smaller|larger)|kept the original/i;
 
@@ -32,7 +35,9 @@ export function skipFollowsSettings(file: MediaFile): boolean {
   const hasVideo = file.probe
     ? file.probe.streams.some((s) => s.kind === "video" && !s.is_attached_pic)
     : Boolean(file.video_codec);
-  return hasVideo && (file.duration_secs ?? 0) >= 1 && SETTINGS_SKIP.test(file.skip_reason?.trim() ?? "");
+  if (!hasVideo || (file.duration_secs ?? 0) < 1) return false;
+  const reason = file.skip_reason?.trim() ?? "";
+  return SETTINGS_SKIP.test(reason) || offersConvertAnyway(reason);
 }
 
 /**
@@ -269,7 +274,7 @@ export function nothingToConvertText(plan: LeftOut): string {
   return `Nothing to convert: ${groups.map((g) => `${plural(g.n, "file")} ${g.n === 1 ? g.one : g.many}`).join(", ")}.${hint}`;
 }
 
-/** "Waiting for 3 files to finish copying" (see `settlingCount`). */
+/** "Waiting for 3 files to finish copying" (`LibraryStats.settling` counts them). */
 export function settlingText(copying: number): string {
   return `Waiting for ${plural(copying, "file")} to finish copying`;
 }

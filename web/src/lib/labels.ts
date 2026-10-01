@@ -82,7 +82,8 @@ export const GOAL_LABEL: Record<Goal, string> = {
 export const GOAL_SUMMARY: Record<Goal, string> = {
   save_space: "Smallest files. Plays on recent TVs, phones and browsers.",
   balanced: "Much smaller files that play on most TVs.",
-  compatible: "Works on every device. Files shrink less, and files with styled subtitles are left as they are.",
+  compatible:
+    "Works on every device. Files shrink less. When replacing originals, files with picture or styled subtitles or attached fonts are left unchanged.",
   archive: "Near-original quality in less space.",
   custom: "Your own combination of format and quality.",
 };
