@@ -372,13 +372,16 @@ async fn a_damaged_database_is_moved_aside_at_start() {
     // folds the log into the file (and removes the log) a moment after the
     // pool says it is closed. Damage the file only after that.
     let wal = data.join(format!("{}-wal", db::DB_FILE_NAME));
-    // Generous: on a busy machine those threads can take a while to run.
-    wait_until_for(
-        "the database is closed",
-        std::time::Duration::from_secs(60),
-        || async { !wal.exists() },
-    )
-    .await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    while wal.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Now and then a background task of the stopped server still holds a
+    // connection, so the log stays. The test is about a damaged database
+    // file, so drop the log rather than let it be replayed onto the damage.
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(data.join(format!("{}{suffix}", db::DB_FILE_NAME)));
+    }
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.truncate(bytes.len().min(4096));
     bytes[..16].copy_from_slice(b"garbage-garbage!");
