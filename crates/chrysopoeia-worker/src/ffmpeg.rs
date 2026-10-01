@@ -859,14 +859,30 @@ async fn next_segment<R: AsyncBufRead + Unpin>(reader: &mut Option<Split<R>>) ->
 /// Kill the child at once and reap it. Its output is discarded, so a
 /// graceful stop would only keep the caller (and a user pressing Cancel)
 /// waiting while the encoder flushes frames nobody will use.
+///
+/// A process stuck in a read from a share that stopped answering may not
+/// die until the share answers (the kernel holds it), so the wait for it is
+/// bounded: past [`REAP_WAIT`] it is left to be reaped in the background.
 async fn kill_child(child: &mut Child) {
     if let Err(e) = child.start_kill() {
         tracing::debug!("could not kill ffmpeg: {e}");
     }
-    if let Err(e) = child.wait().await {
-        tracing::debug!("could not reap ffmpeg: {e}");
+    match tokio::time::timeout(REAP_WAIT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::debug!("could not reap ffmpeg: {e}"),
+        Err(_) => tracing::warn!(
+            "ffmpeg didn't end within {} seconds of being stopped (its files may be on a share \
+             that isn't responding); it is left to end by itself",
+            REAP_WAIT.as_secs()
+        ),
     }
 }
+
+/// How long a killed ffmpeg may take to end before it is left to end by
+/// itself. One that has its files on a share that stopped answering can't
+/// end until the share answers (closing a file there waits for it); Cancel
+/// and Stop don't wait for that.
+const REAP_WAIT: Duration = Duration::from_secs(2);
 
 static NICE_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 
@@ -1663,7 +1679,9 @@ total_size=48000\\nspeed=0.5x\\nprogress=continue\\n'; echo 'decoder error' >&2;
 sleep 0.05; done";
         let args = vec!["-c".to_string(), stuck.to_string()];
         let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
-        cmd.stall_timeout = Duration::from_millis(500);
+        // Long enough for several blocks even on a loaded machine (each
+        // one starts a `sleep` process).
+        cmd.stall_timeout = Duration::from_secs(3);
         let mut blocks = 0;
         let started = std::time::Instant::now();
         let exit = run_ffmpeg(
@@ -1675,14 +1693,14 @@ sleep 0.05; done";
         .await;
         assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
         assert!(blocks > 3, "{blocks} blocks");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(started.elapsed() < Duration::from_secs(60));
 
         // The same pace with the position moving is progress.
         let working = "i=0; while [ $i -lt 30 ]; do i=$((i+1)); printf \"frame=$i\\n\
 out_time_us=${i}00000\\nprogress=continue\\n\"; sleep 0.05; done";
         let args = vec!["-c".to_string(), working.to_string()];
         let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
-        cmd.stall_timeout = Duration::from_millis(500);
+        cmd.stall_timeout = Duration::from_secs(3);
         let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
         assert!(matches!(exit, FfmpegExit::Success { .. }), "{exit:?}");
     }

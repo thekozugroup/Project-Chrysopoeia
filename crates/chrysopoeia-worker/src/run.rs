@@ -16,15 +16,24 @@
 //! 4. **Verifying** — [`crate::validate_output`]. A hardware result that
 //!    fails verification moves on to the next attempt (GPU encoders can
 //!    produce corrupt output); any other failure fails the job.
-//! 5. **Finalizing** — [`finalize`] puts the file in place.
+//! 5. **Finalizing** — [`crate::finalize::finalize`] puts the file in place.
 //!
 //! The original is only touched by a successful finalize. The temp file is
 //! removed on every other path, including cancellation and the job future
 //! being dropped (a drop guard).
+//!
+//! Every look at the original, the temp file's folder and the destination
+//! is bounded ([`crate::slow_fs`]), and the long steps (the encode, the
+//! checks, putting the new file in place) keep an eye on them: when one
+//! stops answering (a network share whose server went away), the job ends
+//! with [`JobOutcome::NotResponding`] instead of waiting for it. Putting
+//! the new file in place is never abandoned half way: it goes on by itself
+//! and reports how it ended through [`take_unfinished`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrysopoeia_core::plain::io_reason;
@@ -41,10 +50,12 @@ use crate::ffmpeg::{
     is_input_damage, lower_first, run_ffmpeg,
 };
 use crate::finalize::{
-    FileIdentity, FinalizeRequest, OriginalChanged, PlaceError, destination_conflict,
-    destination_name, final_output_path, finalize, temp_output_path,
+    FileIdentity, FinalizeRequest, Finalized, OriginalChanged, PlaceError, Undone,
+    destination_conflict, destination_name, final_output_path, joined, start_finalize,
+    temp_output_path,
 };
 use crate::plan::{Decision, FfmpegPlan, PlanRequest, where_encoded};
+use crate::slow_fs::{self, FOLDER_CHECK_TIMEOUT, NotAnswering, WATCH_INTERVAL};
 use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
 
 /// Settings that apply to every job.
@@ -145,6 +156,15 @@ pub enum JobOutcome {
     },
     /// Stopped on request; no files changed.
     Cancelled,
+    /// A file or folder the job works with stopped answering (a network
+    /// share whose server went away, a stuck mount), so the job stopped
+    /// and nothing was changed. Worth trying again once it answers. When it
+    /// stopped answering while the new file was being put in place, that
+    /// step goes on by itself (see [`take_unfinished`]).
+    NotResponding {
+        /// What didn't answer.
+        path: PathBuf,
+    },
 }
 
 /// Builds the ffmpeg command for one attempt (normally [`crate::plan::build_plan`]).
@@ -231,6 +251,9 @@ fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
             tracing::debug!(job = %spec.job_id, %file, "failed: {error}");
         }
         JobOutcome::Cancelled => tracing::debug!(job = %spec.job_id, %file, "cancelled"),
+        JobOutcome::NotResponding { path } => tracing::debug!(
+            job = %spec.job_id, %file, "{} isn't responding", path.display()
+        ),
     }
 }
 
@@ -250,6 +273,9 @@ struct Prepared {
     /// The original has other hard links (a seeding torrent's copy), so
     /// replacing it frees no space.
     shared: bool,
+    /// What long steps keep an eye on (see [`slow_fs::first_unanswered`]):
+    /// the original and the temp file's folder.
+    watched: Vec<PathBuf>,
 }
 
 /// The reason given when the original changed during the job.
@@ -266,19 +292,161 @@ async fn original_moved_on(
     encoder: &str,
     output_size: u64,
 ) -> Option<JobOutcome> {
-    match FileIdentity::read(input).await {
-        Ok(now) if now == identity => None,
-        Ok(_) => Some(JobOutcome::Skipped {
+    match slow_fs::metadata(input, FOLDER_CHECK_TIMEOUT).await {
+        None => Some(NotAnswering::at(input).into()),
+        Some(Ok(now)) if FileIdentity::of(&now) == identity => None,
+        Some(Ok(_)) => Some(JobOutcome::Skipped {
             reason: original_changed(),
             encoder: Some(encoder.to_string()),
             output_size: Some(output_size),
         }),
-        Err(_) => Some(failed(
+        Some(Err(_)) => Some(failed(
             ProblemKind::SourceChanged,
             "The file is no longer there. It was moved or deleted while it was being converted. \
              If it was moved, scan the library again to find it.",
         )),
     }
+}
+
+/// How long Cancel or Stop waits for the new file's placing to stop at its
+/// next safe point before the job ends without it (see [`take_unfinished`]).
+const PLACE_STOP_WAIT: Duration = Duration::from_secs(3);
+
+/// What a job that is putting its new file in place reports once that is
+/// done.
+#[derive(Debug, Clone)]
+struct Placing {
+    output_path: PathBuf,
+    output_size: u64,
+    original_size: u64,
+    encoder: String,
+    hw_api: HwApi,
+    attempt: u32,
+    validation: Option<ValidationReport>,
+    command: String,
+    /// The plan's notes; the finalize's own follow them.
+    notes: Vec<String>,
+    /// Notes after the finalize's.
+    later_notes: Vec<String>,
+}
+
+impl Placing {
+    /// The job's outcome once [`crate::finalize::finalize`] has ended with `placed`.
+    fn outcome(self, placed: anyhow::Result<Finalized>, job_id: Uuid) -> JobOutcome {
+        match placed {
+            Ok(placed) => {
+                let mut notes = self.notes;
+                notes.extend(placed.notes);
+                notes.extend(self.later_notes);
+                JobOutcome::Done {
+                    output_path: self.output_path,
+                    output_size: placed.size,
+                    original_size: self.original_size,
+                    encoder: self.encoder,
+                    hw_api: self.hw_api,
+                    attempt: self.attempt,
+                    validation: self.validation,
+                    command: self.command,
+                    notes,
+                }
+            }
+            Err(e) if e.is::<Undone>() => JobOutcome::Cancelled,
+            Err(e) if e.is::<OriginalChanged>() => JobOutcome::Skipped {
+                reason: original_changed(),
+                encoder: Some(self.encoder),
+                output_size: Some(self.output_size),
+            },
+            Err(e) => {
+                let (problem, error) = match e.downcast_ref::<PlaceError>() {
+                    Some(placing) => (placing.problem, placing.message.clone()),
+                    None => {
+                        tracing::warn!(job = %job_id, "could not put the new file in place: {e:#}");
+                        (
+                            ProblemKind::Other,
+                            "The new file couldn't be put in place, so the original was kept. \
+                             The details are in the server log."
+                                .to_string(),
+                        )
+                    }
+                };
+                JobOutcome::Failed {
+                    error,
+                    problem,
+                    log_tail: None,
+                    command: Some(self.command),
+                    encoder: Some(self.encoder),
+                    attempt: self.attempt,
+                    validation: self.validation,
+                }
+            }
+        }
+    }
+}
+
+/// Putting a job's new file in place, still under way after the job ended:
+/// a rename on a share that stopped answering can't be called back once it
+/// has started, so it is left to finish (see
+/// [`crate::finalize::start_finalize`]) and reports how it ended here.
+#[derive(Debug)]
+pub struct Unfinished {
+    outcome: tokio::sync::oneshot::Receiver<JobOutcome>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Unfinished {
+    /// A placing that is asked to stop through `stop`, and ends with what
+    /// is sent on the returned sender (tests and fakes make their own).
+    pub fn new(stop: Arc<AtomicBool>) -> (Self, tokio::sync::oneshot::Sender<JobOutcome>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self { outcome: rx, stop }, tx)
+    }
+
+    /// Ask it to undo what it did at its next safe point, if the new file
+    /// hasn't taken its final name yet (Cancel after the job ended).
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether it was asked to stop.
+    pub fn is_stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// What [`Self::stop`] sets, to ask it to stop while waiting for
+    /// [`Self::outcome`].
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    /// Wait for it to end: `Done` when the new file was put in place,
+    /// `Cancelled` when it was undone, `Skipped` or `Failed` (the original
+    /// kept) otherwise.
+    pub async fn outcome(self) -> JobOutcome {
+        self.outcome.await.unwrap_or_else(|_| {
+            failed(
+                ProblemKind::Other,
+                "Putting the new file in place stopped unexpectedly. The details are in the \
+                 server log.",
+            )
+        })
+    }
+}
+
+static UNFINISHED: LazyLock<Mutex<HashMap<Uuid, Unfinished>>> = LazyLock::new(Mutex::default);
+
+fn lock_unfinished() -> std::sync::MutexGuard<'static, HashMap<Uuid, Unfinished>> {
+    UNFINISHED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The new file of job `job_id` was still being put in place when the job
+/// ended (it returned `Cancelled` or `NotResponding`): how that goes on.
+/// Taken once; `None` when it finished with the job.
+pub fn take_unfinished(job_id: Uuid) -> Option<Unfinished> {
+    lock_unfinished().remove(&job_id)
+}
+
+fn has_unfinished(job_id: Uuid) -> bool {
+    lock_unfinished().contains_key(&job_id)
 }
 
 /// A failed attempt, kept so the final error can describe it.
@@ -304,6 +472,12 @@ impl Failure {
             attempt: self.attempt,
             validation: self.validation,
         }
+    }
+}
+
+impl From<NotAnswering> for JobOutcome {
+    fn from(e: NotAnswering) -> Self {
+        Self::NotResponding { path: e.path }
     }
 }
 
@@ -384,28 +558,44 @@ impl Job<'_> {
         let outcome = self.attempts(&prepared, &guard).await;
         match &outcome {
             JobOutcome::Done { .. } => guard.disarm(),
-            _ => {
-                guard.discard().await;
-                remove_empty_dirs(&prepared.created_dirs).await;
+            // Putting the new file in place goes on by itself, and cleans
+            // up after itself.
+            _ if has_unfinished(self.spec.job_id) => guard.disarm(),
+            // Cleaning up would wait for the share too: it is tried in the
+            // background (and the next run, or crash recovery, removes what
+            // is left).
+            JobOutcome::NotResponding { .. } => {
+                clean_up_later(guard, prepared.created_dirs.clone());
             }
+            // A moment for the usual cleanup (Cancel and Stop answer within
+            // seconds); a folder that doesn't answer by then is cleaned up
+            // in the background.
+            _ => match guard.discard_within(CLEANUP_WAIT).await {
+                Ok(()) => remove_empty_dirs(&prepared.created_dirs, CLEANUP_WAIT).await,
+                Err(guard) => {
+                    tracing::debug!(job = %self.spec.job_id, "the temp file's folder isn't responding");
+                    clean_up_later(guard, prepared.created_dirs.clone());
+                }
+            },
         }
         outcome
     }
 
     async fn prepare(&self) -> Result<Prepared, JobOutcome> {
         let (cfg, spec) = (self.cfg, self.spec);
-        let looked = tokio::time::timeout(INPUT_CHECK_TIMEOUT, tokio::fs::metadata(&spec.input));
-        let input_meta = match looked.await {
-            Err(_) => return Err(failed(ProblemKind::UnreadableSource, not_answering())),
-            Ok(Ok(m)) if m.is_file() => m,
-            Ok(Ok(_)) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
-            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+        // A share that stopped answering: the job goes back to the queue
+        // (and Cancel or Stop still ends it at once, see `run`).
+        let input_meta = match slow_fs::metadata(&spec.input, FOLDER_CHECK_TIMEOUT).await {
+            None => return Err(NotAnswering::at(&spec.input).into()),
+            Some(Ok(m)) if m.is_file() => m,
+            Some(Ok(_)) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
+            Some(Err(std::io::ErrorKind::NotFound)) => {
                 return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE));
             }
-            Ok(Err(e)) => {
+            Some(Err(kind)) => {
                 return Err(failed(
                     ProblemKind::UnreadableSource,
-                    unreadable_original(&e),
+                    unreadable_original(&std::io::Error::from(kind)),
                 ));
             }
         };
@@ -478,8 +668,13 @@ impl Job<'_> {
             cfg.output_folder.as_deref(),
             &spec.library_root,
         );
-        if let Some(conflict) =
-            destination_conflict(&spec.input, &final_path, cfg.output_mode).await
+        if let Some(conflict) = destination_conflict(
+            &spec.input,
+            &final_path,
+            cfg.output_mode,
+            FOLDER_CHECK_TIMEOUT,
+        )
+        .await?
         {
             return Err(failed(ProblemKind::Destination, conflict));
         }
@@ -488,7 +683,7 @@ impl Job<'_> {
         // of encoding.
         if let Some(dir) = final_path.parent()
             && let Some(problem) =
-                folder_not_writable(dir, Place::Destination, cfg.output_mode).await
+                folder_not_writable(dir, Place::Destination, cfg.output_mode).await?
         {
             return Err(failed(ProblemKind::Destination, problem));
         }
@@ -507,7 +702,7 @@ impl Job<'_> {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         let place = self.temp_place();
-        let created_dirs = match create_dirs(&temp_dir).await {
+        let created_dirs = match create_dirs(&temp_dir).await? {
             Ok(created) => created,
             Err(e) => {
                 let (problem, error) = folder_unusable(&temp_dir, place, cfg.output_mode, &e);
@@ -516,21 +711,29 @@ impl Job<'_> {
         };
         // A work folder of its own must take new files too (the folder the
         // new file goes to was checked above).
-        if place == Place::WorkFolder
-            && let Some(problem) = folder_not_writable(&temp_dir, place, cfg.output_mode).await
-        {
-            remove_empty_dirs(&created_dirs).await;
-            return Err(failed(ProblemKind::WorkFolder, problem));
+        let writable = if place == Place::WorkFolder {
+            folder_not_writable(&temp_dir, place, cfg.output_mode).await
+        } else {
+            Ok(None)
+        };
+        match writable {
+            Ok(None) => {}
+            Ok(Some(problem)) => {
+                remove_empty_dirs(&created_dirs, FOLDER_CHECK_TIMEOUT).await;
+                return Err(failed(ProblemKind::WorkFolder, problem));
+            }
+            Err(e) => return Err(e.into()),
         }
         let size = input_meta.len();
         let space = match self.reserve_space(size, &temp, &final_path).await {
             Ok(space) => space,
             Err(outcome) => {
-                remove_empty_dirs(&created_dirs).await;
+                remove_empty_dirs(&created_dirs, FOLDER_CHECK_TIMEOUT).await;
                 return Err(outcome);
             }
         };
 
+        let watched = vec![spec.input.clone(), temp_dir];
         Ok(Prepared {
             original_size: size,
             identity: FileIdentity::of(&input_meta),
@@ -539,6 +742,7 @@ impl Job<'_> {
             created_dirs,
             _space: space,
             shared,
+            watched,
         })
     }
 
@@ -588,11 +792,7 @@ impl Job<'_> {
         ];
         let mut waiting = false;
         loop {
-            let attempt = needs.clone();
-            let result = tokio::task::spawn_blocking(move || try_reserve(&attempt))
-                .await
-                .unwrap_or(Ok(SpaceGuard::default()));
-            match result {
+            match reserve(&needs).await? {
                 Ok(guard) => return Ok(guard),
                 Err(Shortfall::Never { dir, bytes }) => {
                     return Err(failed(
@@ -668,11 +868,16 @@ impl Job<'_> {
             self.reporter
                 .set_attempt(&candidate.name, candidate.api, attempt);
             self.reporter.stage(JobStage::Transcoding, 0.0).await;
-            guard.clear().await;
+            if let Err(e) = guard.clear().await {
+                return e.into();
+            }
             let command = display_command(&cfg.ffmpeg, &args);
             tracing::debug!(job = %spec.job_id, attempt, "running {command}");
 
-            let run = self.encode(&args).await;
+            let run = match self.encode(&args, &prepared.watched).await {
+                Ok(run) => run,
+                Err(e) => return e.into(),
+            };
             let exit = run.exit;
             let failure = |problem: ProblemKind, error: String, log_tail: Option<String>| Failure {
                 error,
@@ -711,14 +916,17 @@ impl Job<'_> {
                     };
                     tracing::debug!(job = %spec.job_id, attempt, "{}{next}", f.error);
                     last_failure = Some(f);
-                    guard.clear().await;
+                    if let Err(e) = guard.clear().await {
+                        return e.into();
+                    }
                     continue;
                 }
             }
 
-            let output_size = match tokio::fs::metadata(&prepared.temp).await {
-                Ok(m) if m.len() > 0 => m.len(),
-                _ => {
+            let output_size = match slow_fs::metadata(&prepared.temp, FOLDER_CHECK_TIMEOUT).await {
+                None => return NotAnswering::at(&prepared.temp).into(),
+                Some(Ok(m)) if m.len() > 0 => m.len(),
+                Some(_) => {
                     last_failure = Some(failure(
                         ProblemKind::Encoder,
                         format!(
@@ -728,7 +936,9 @@ impl Job<'_> {
                         ),
                         exit.tail().map(str::to_string),
                     ));
-                    guard.clear().await;
+                    if let Err(e) = guard.clear().await {
+                        return e.into();
+                    }
                     continue;
                 }
             };
@@ -763,7 +973,9 @@ impl Job<'_> {
                     candidate.name
                 );
                 last_failure = Some(f);
-                guard.clear().await;
+                if let Err(e) = guard.clear().await {
+                    return e.into();
+                }
                 continue;
             }
 
@@ -791,25 +1003,31 @@ impl Job<'_> {
             } else {
                 self.reporter.stage(JobStage::Verifying, 0.0).await;
                 let verify_started = Instant::now();
-                let report = validate_output_at(
-                    &ValidateRequest {
-                        ffmpeg: &cfg.ffmpeg,
-                        ffprobe: &cfg.ffprobe,
-                        source: &spec.input,
-                        source_probe: &spec.probe,
-                        output: &prepared.temp,
-                        profile: &spec.profile,
-                        level: cfg.validation,
-                        expected: plan.expected,
-                    },
-                    cfg.low_priority,
-                    self.cancel,
-                    &|pct| {
-                        let eta = verify_eta(pct, verify_started.elapsed());
-                        self.reporter.tick(pct, None, None, eta);
-                    },
-                )
-                .await;
+                let request = ValidateRequest {
+                    ffmpeg: &cfg.ffmpeg,
+                    ffprobe: &cfg.ffprobe,
+                    source: &spec.input,
+                    source_probe: &spec.probe,
+                    output: &prepared.temp,
+                    profile: &spec.profile,
+                    level: cfg.validation,
+                    expected: plan.expected,
+                };
+                let on_progress = |pct| {
+                    let eta = verify_eta(pct, verify_started.elapsed());
+                    self.reporter.tick(pct, None, None, eta);
+                };
+                let checks =
+                    validate_output_at(&request, cfg.low_priority, self.cancel, &on_progress);
+                // The checks read the original and the new file again; a
+                // share that stops answering meanwhile ends them (dropping
+                // them kills their decoders).
+                let report = tokio::select! {
+                    report = checks => report,
+                    path = slow_fs::first_unanswered(&prepared.watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
+                        return NotAnswering { path }.into();
+                    }
+                };
                 if self.cancel.is_cancelled() {
                     return JobOutcome::Cancelled;
                 }
@@ -851,7 +1069,9 @@ impl Job<'_> {
                         "{} output failed verification; trying the next option", candidate.name
                     );
                     last_failure = Some(f);
-                    guard.clear().await;
+                    if let Err(e) = guard.clear().await {
+                        return e.into();
+                    }
                     continue;
                 }
                 return f.into_outcome();
@@ -861,56 +1081,14 @@ impl Job<'_> {
                 return JobOutcome::Cancelled;
             }
             self.reporter.stage(JobStage::Finalizing, 0.0).await;
-            let placed = finalize(&FinalizeRequest {
-                input: &spec.input,
-                temp: &prepared.temp,
-                final_path: &prepared.final_path,
-                mode: cfg.output_mode,
-                job_id: spec.job_id,
-                keep_dates: cfg.keep_file_dates,
-                original: Some(prepared.identity),
-                force_copy: false,
-            })
-            .await;
-            let placed = match placed {
-                Ok(placed) => placed,
-                Err(e) if e.is::<OriginalChanged>() => {
-                    return JobOutcome::Skipped {
-                        reason: original_changed(),
-                        encoder: Some(candidate.name.clone()),
-                        output_size: Some(output_size),
-                    };
-                }
-                Err(e) => {
-                    let (problem, error) = match e.downcast_ref::<PlaceError>() {
-                        Some(placing) => (placing.problem, placing.message.clone()),
-                        None => {
-                            tracing::warn!(job = %spec.job_id, "could not put the new file in place: {e:#}");
-                            (
-                                ProblemKind::Other,
-                                "The new file couldn't be put in place, so the original was kept. \
-                                 The details are in the server log."
-                                    .to_string(),
-                            )
-                        }
-                    };
-                    let mut f = failure(problem, error, None);
-                    f.validation = validation;
-                    return f.into_outcome();
-                }
-            };
-            let output_size = placed.size;
-            self.reporter.stage(JobStage::Finalizing, 100.0).await;
-
-            let mut notes = plan.notes;
-            notes.extend(placed.notes);
+            let mut later_notes = Vec::new();
             if prepared.shared && cfg.output_mode == OutputMode::Replace {
-                notes.push(SHARED_ORIGINAL_NOTE.to_string());
+                later_notes.push(SHARED_ORIGINAL_NOTE.to_string());
             }
             if let Some(first) = first.filter(|_| attempt > 1) {
-                notes.push(fallback_note(first, candidate));
+                later_notes.push(fallback_note(first, candidate));
             }
-            return JobOutcome::Done {
+            let placing = Placing {
                 output_path: prepared.final_path.clone(),
                 output_size,
                 original_size: prepared.original_size,
@@ -919,8 +1097,14 @@ impl Job<'_> {
                 attempt,
                 validation,
                 command,
-                notes,
+                notes: plan.notes,
+                later_notes,
             };
+            let outcome = self.place(prepared, placing).await;
+            if matches!(outcome, JobOutcome::Done { .. }) {
+                self.reporter.stage(JobStage::Finalizing, 100.0).await;
+            }
+            return outcome;
         }
 
         match last_failure {
@@ -941,8 +1125,91 @@ impl Job<'_> {
         }
     }
 
-    /// Run ffmpeg for one attempt, reporting transcoding progress.
-    async fn encode(&self, args: &[String]) -> EncodeRun {
+    /// Put the verified new file in place (see [`crate::finalize::finalize`]). It runs on its
+    /// own thread; a share that stops answering, or Cancel and Stop, end the
+    /// job without waiting for it (see [`take_unfinished`]).
+    async fn place(&self, prepared: &Prepared, placing: Placing) -> JobOutcome {
+        let (cfg, spec) = (self.cfg, self.spec);
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut thread = start_finalize(
+            &FinalizeRequest {
+                input: &spec.input,
+                temp: &prepared.temp,
+                final_path: &prepared.final_path,
+                mode: cfg.output_mode,
+                job_id: spec.job_id,
+                keep_dates: cfg.keep_file_dates,
+                original: Some(prepared.identity),
+                force_copy: false,
+            },
+            Arc::clone(&stop),
+        );
+        let mut watched = vec![spec.input.clone()];
+        if let Some(dir) = prepared.final_path.parent() {
+            watched.push(dir.to_path_buf());
+        }
+        let ended = tokio::select! {
+            placed = &mut thread => placed,
+            () = self.cancel.cancelled() => {
+                // Undone at the next safe point, which on a healthy disk is
+                // a moment away.
+                stop.store(true, Ordering::SeqCst);
+                match tokio::time::timeout(PLACE_STOP_WAIT, &mut thread).await {
+                    Ok(placed) => placed,
+                    Err(_) => {
+                        self.leave_unfinished(thread, stop, placing, prepared);
+                        return JobOutcome::Cancelled;
+                    }
+                }
+            }
+            path = slow_fs::first_unanswered(&watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
+                // The step under way goes on once the share answers.
+                tracing::info!(
+                    job = %spec.job_id,
+                    "{} isn't responding; the new file is put in place once it answers",
+                    path.display()
+                );
+                self.leave_unfinished(thread, stop, placing, prepared);
+                return NotAnswering { path }.into();
+            }
+        };
+        placing.outcome(joined(ended), spec.job_id)
+    }
+
+    /// Hand a finalize that hasn't finished to the registry (see
+    /// [`take_unfinished`]): it ends by itself, cleaning up its temp file
+    /// unless the new file was put in place.
+    fn leave_unfinished(
+        &self,
+        thread: tokio::task::JoinHandle<anyhow::Result<Finalized>>,
+        stop: Arc<AtomicBool>,
+        placing: Placing,
+        prepared: &Prepared,
+    ) {
+        let job_id = self.spec.job_id;
+        let (unfinished, tx) = Unfinished::new(stop);
+        let temp = TempGuard::new(prepared.temp.clone());
+        let created_dirs = prepared.created_dirs.clone();
+        tokio::spawn(async move {
+            let outcome = placing.outcome(joined(thread.await), job_id);
+            if matches!(outcome, JobOutcome::Done { .. }) {
+                temp.disarm();
+            } else {
+                clean_up_later(temp, created_dirs);
+            }
+            tracing::debug!(job = %job_id, "putting the new file in place ended: {outcome:?}");
+            let _ = tx.send(outcome);
+        });
+        lock_unfinished().insert(job_id, unfinished);
+    }
+
+    /// Run ffmpeg for one attempt, reporting transcoding progress. Stops it
+    /// when one of `watched` stops answering.
+    async fn encode(
+        &self,
+        args: &[String],
+        watched: &[PathBuf],
+    ) -> Result<EncodeRun, NotAnswering> {
         let duration = self
             .spec
             .probe
@@ -958,28 +1225,34 @@ impl Job<'_> {
         };
         let mut encoded_secs: Option<f64> = None;
         let mut input_damage: Option<String> = None;
-        let exit = run_ffmpeg(
-            &cmd,
-            self.cancel,
-            &mut |block| {
-                if let Some(t) = block.out_time_secs {
-                    encoded_secs = Some(t);
-                }
-                let p = compute_progress(block, duration, started.elapsed().as_secs_f64());
-                self.reporter.tick(p.percent, p.fps, p.speed, p.eta_secs);
-            },
-            &mut |line| {
-                if input_damage.is_none() && is_input_damage(line) {
-                    input_damage = Some(line.trim().to_string());
-                }
-            },
-        )
-        .await;
-        EncodeRun {
+        let mut on_progress = |block: &crate::ffmpeg::ProgressBlock| {
+            if let Some(t) = block.out_time_secs {
+                encoded_secs = Some(t);
+            }
+            let p = compute_progress(block, duration, started.elapsed().as_secs_f64());
+            self.reporter.tick(p.percent, p.fps, p.speed, p.eta_secs);
+        };
+        let mut on_stderr = |line: &str| {
+            if input_damage.is_none() && is_input_damage(line) {
+                input_damage = Some(line.trim().to_string());
+            }
+        };
+        let encoding = run_ffmpeg(&cmd, self.cancel, &mut on_progress, &mut on_stderr);
+        // ffmpeg reading from (or writing to) a share that stopped answering
+        // would wait for its stall timeout; the share is noticed sooner.
+        // Dropping `encoding` kills ffmpeg.
+        let exit = tokio::select! {
+            exit = encoding => exit,
+            path = slow_fs::first_unanswered(watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
+                tracing::info!(job = %self.spec.job_id, "{} isn't responding; stopping the encode", path.display());
+                return Err(NotAnswering { path });
+            }
+        };
+        Ok(EncodeRun {
             exit,
             encoded_secs,
             input_damage,
-        }
+        })
     }
 }
 
@@ -1159,9 +1432,18 @@ enum Place {
 
 /// Why new files can't be written in `dir` (or, when it doesn't exist yet,
 /// in the closest folder above it that does), if they can't.
-async fn folder_not_writable(dir: &Path, place: Place, mode: OutputMode) -> Option<String> {
+async fn folder_not_writable(
+    dir: &Path,
+    place: Place,
+    mode: OutputMode,
+) -> Result<Option<String>, NotAnswering> {
+    let key = dir.to_path_buf();
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    let kind = match place {
+        Place::WorkFolder => "writable_work_folder",
+        Place::Destination => "writable_destination",
+    };
+    slow_fs::guarded(kind, &key, FOLDER_CHECK_TIMEOUT, move || {
         let existing = dir.ancestors().find(|d| d.is_dir())?;
         let blocked = write_access(existing).err()?;
         let shown = existing.display();
@@ -1179,8 +1461,7 @@ async fn folder_not_writable(dir: &Path, place: Place, mode: OutputMode) -> Opti
         })
     })
     .await
-    .ok()
-    .flatten()
+    .ok_or_else(|| NotAnswering::at(&key))
 }
 
 /// The message when the folder the new file goes to (`dir`) doesn't take
@@ -1355,18 +1636,6 @@ fn hard_links(meta: &std::fs::Metadata) -> u64 {
         let _ = meta;
         1
     }
-}
-
-/// How long the original may take to answer when the job starts.
-const INPUT_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Why the job stopped when the original didn't answer at the start.
-fn not_answering() -> String {
-    format!(
-        "This file didn't answer for {} seconds, so it wasn't converted. If it's on a network \
-         share or an external drive, check the connection, then try again.",
-        INPUT_CHECK_TIMEOUT.as_secs()
-    )
 }
 
 /// Why the original couldn't be read when the job started.
@@ -1546,31 +1815,62 @@ fn encode_failure(
 }
 
 /// Create `dir` and any missing parents. Returns the folders that were
-/// created, outermost first.
-async fn create_dirs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let mut missing = Vec::new();
-    let mut current = Some(dir);
-    while let Some(d) = current {
-        if d.as_os_str().is_empty() || tokio::fs::try_exists(d).await.unwrap_or(true) {
-            break;
+/// created, outermost first. A folder that doesn't answer is reported (an
+/// abandoned `mkdir` at worst leaves an empty folder behind).
+async fn create_dirs(
+    dir: &Path,
+) -> Result<Result<Vec<PathBuf>, Arc<std::io::Error>>, NotAnswering> {
+    let key = dir.to_path_buf();
+    let dir = dir.to_path_buf();
+    slow_fs::guarded("create_dirs", &key, FOLDER_CHECK_TIMEOUT, move || {
+        let mut missing = Vec::new();
+        let mut current = Some(dir.as_path());
+        while let Some(d) = current {
+            if d.as_os_str().is_empty() || d.try_exists().unwrap_or(true) {
+                break;
+            }
+            missing.push(d.to_path_buf());
+            current = d.parent();
         }
-        missing.push(d.to_path_buf());
-        current = d.parent();
-    }
-    tokio::fs::create_dir_all(dir).await?;
-    missing.reverse();
-    Ok(missing)
+        std::fs::create_dir_all(&dir).map_err(Arc::new)?;
+        missing.reverse();
+        Ok(missing)
+    })
+    .await
+    .ok_or_else(|| NotAnswering::at(&key))
 }
 
 /// Remove folders created by [`create_dirs`] again, innermost first, as
-/// long as they are empty.
-async fn remove_empty_dirs(created: &[PathBuf]) {
+/// long as they are empty (and answer).
+async fn remove_empty_dirs(created: &[PathBuf], timeout: Duration) {
     for dir in created.iter().rev() {
-        if tokio::fs::remove_dir(dir).await.is_err() {
+        let d = dir.clone();
+        let removed = slow_fs::guarded("remove_dir", dir, timeout, move || {
+            std::fs::remove_dir(&d).is_ok()
+        })
+        .await;
+        if removed != Some(true) {
             break;
         }
     }
 }
+
+/// Clean up after a job whose folders stopped answering, in the background:
+/// the temp file and the folders made for it go once they answer again.
+fn clean_up_later(guard: TempGuard, created_dirs: Vec<PathBuf>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        if guard.discard_patiently().await {
+            remove_empty_dirs(&created_dirs, FOLDER_CHECK_TIMEOUT).await;
+        }
+    });
+}
+
+/// How long the cleanup after a job that ended may wait for its folders
+/// before it is left to the background.
+const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 
 /// What to do after a failed verification; the job's error ends with it.
 const VERIFICATION_FIX: &str =
@@ -1693,6 +1993,7 @@ struct Reservation {
     file: Option<PathBuf>,
 }
 
+#[cfg(test)]
 impl Reservation {
     /// Bytes the job has written so far.
     fn written(&self) -> u64 {
@@ -1747,35 +2048,101 @@ impl Drop for SpaceGuard {
 
 /// Reserve every need at once, or none. Needs on the same filesystem as an
 /// earlier one are merged into it (a temp file beside its destination needs
-/// the room only once). Blocking: stats files and filesystems.
-fn try_reserve(needs: &[SpaceNeed]) -> Result<SpaceGuard, Shortfall> {
-    try_reserve_with(needs, &crate::finalize::filesystem_of)
+/// the room only once). The disks are looked at with bounded checks (see
+/// [`slow_fs`]) and never while the reservations are locked, so a disk that
+/// stopped answering holds up neither this job for good nor other jobs'
+/// reservations: it is reported as not answering.
+async fn reserve(needs: &[SpaceNeed]) -> Result<Result<SpaceGuard, Shortfall>, NotAnswering> {
+    let mut disks = Vec::with_capacity(needs.len());
+    for need in needs {
+        let dir = need.dir.clone();
+        let looked = slow_fs::guarded("free_space", &need.dir, FOLDER_CHECK_TIMEOUT, move || {
+            crate::finalize::filesystem_of(&dir)
+        })
+        .await;
+        disks.push(looked.ok_or_else(|| NotAnswering::at(&need.dir))?);
+    }
+    let devices: Vec<u64> = disks.iter().flatten().map(|(device, _)| *device).collect();
+    for _ in 0..RESERVE_TRIES {
+        let seen = reservations_on(&devices);
+        let mut written = HashMap::new();
+        for r in &seen {
+            if let Some(file) = r.file.clone() {
+                // Same disk as this job's own folders, which just answered.
+                let size = slow_fs::guarded("file_size", &file, FOLDER_CHECK_TIMEOUT, {
+                    let file = file.clone();
+                    move || std::fs::metadata(&file).map_or(0, |m| m.len())
+                })
+                .await
+                .unwrap_or(0);
+                written.insert(r.id, size);
+            }
+        }
+        let ids: Vec<u64> = seen.iter().map(|r| r.id).collect();
+        if let Some(result) = place_reservation(needs, &disks, &written, Some(&ids)) {
+            return Ok(result);
+        }
+    }
+    // Other jobs keep changing theirs: go by what is reserved now.
+    Ok(
+        place_reservation(needs, &disks, &HashMap::new(), None).unwrap_or_else(|| {
+            Err(Shortfall::Busy {
+                dir: needs.first().map(|n| n.dir.clone()).unwrap_or_default(),
+            })
+        }),
+    )
 }
 
-/// [`try_reserve`] with the filesystem lookup supplied (tests).
-fn try_reserve_with(
+/// How often [`reserve`] measures again when other jobs' reservations
+/// changed while it looked at their files.
+const RESERVE_TRIES: usize = 5;
+
+/// The reservations on these filesystems now.
+fn reservations_on(devices: &[u64]) -> Vec<Reservation> {
+    let all = RESERVATIONS.lock().unwrap_or_else(PoisonError::into_inner);
+    all.iter()
+        .filter(|r| devices.contains(&r.device))
+        .cloned()
+        .collect()
+}
+
+/// Reserve `needs` (each on the disk `disks` gives for it: device id and
+/// free bytes, `None` when unknown) with `written` bytes already in other
+/// jobs' files, by reservation id. `None` when the reservations on these
+/// disks are no longer `seen` (by id); with `seen` `None` they are taken as
+/// they are now. Only memory is looked at while the reservations are locked.
+fn place_reservation(
     needs: &[SpaceNeed],
-    filesystem_of: &dyn Fn(&Path) -> Option<(u64, u64)>,
-) -> Result<SpaceGuard, Shortfall> {
-    // (device, need) with duplicates on one filesystem dropped.
-    let mut distinct: Vec<(u64, &SpaceNeed)> = Vec::with_capacity(needs.len());
-    for need in needs {
-        let Some((device, _)) = filesystem_of(&need.dir) else {
+    disks: &[Option<(u64, u64)>],
+    written: &HashMap<u64, u64>,
+    seen: Option<&[u64]>,
+) -> Option<Result<SpaceGuard, Shortfall>> {
+    // (device, free, need) with duplicates on one filesystem dropped.
+    let mut distinct: Vec<(u64, u64, &SpaceNeed)> = Vec::with_capacity(needs.len());
+    for (need, disk) in needs.iter().zip(disks) {
+        let Some((device, free)) = *disk else {
             continue;
         };
-        if !distinct.iter().any(|(d, _)| *d == device) {
-            distinct.push((device, need));
+        if !distinct.iter().any(|(d, _, _)| *d == device) {
+            distinct.push((device, free, need));
         }
     }
     let mut all = RESERVATIONS.lock().unwrap_or_else(PoisonError::into_inner);
-    for (device, need) in &distinct {
-        let Some((_, free)) = filesystem_of(&need.dir) else {
-            continue;
-        };
+    if let Some(seen) = seen {
+        let now: Vec<u64> = all
+            .iter()
+            .filter(|r| distinct.iter().any(|(d, _, _)| *d == r.device))
+            .map(|r| r.id)
+            .collect();
+        if now.len() != seen.len() || now.iter().any(|id| !seen.contains(id)) {
+            return None;
+        }
+    }
+    for (device, free, need) in &distinct {
         let others: Vec<(u64, u64)> = all
             .iter()
             .filter(|r| r.device == *device)
-            .map(|r| (r.bytes, r.written()))
+            .map(|r| (r.bytes, written.get(&r.id).copied().unwrap_or(0)))
             .collect();
         let held: u64 = others.iter().map(|(b, w)| b.saturating_sub(*w)).sum();
         let written: u64 = others.iter().map(|(_, w)| *w).sum();
@@ -1785,19 +2152,19 @@ fn try_reserve_with(
         // Other jobs' promises (and the files they are writing) are released
         // when they end, so wait for them if that would be enough.
         if !others.is_empty() && (held > 0 || free.saturating_add(written) >= need.bytes) {
-            return Err(Shortfall::Busy {
+            return Some(Err(Shortfall::Busy {
                 dir: need.dir.clone(),
-            });
+            }));
         }
         if need.strict && free.saturating_sub(held) < need.floor {
-            return Err(Shortfall::Never {
+            return Some(Err(Shortfall::Never {
                 dir: need.dir.clone(),
                 bytes: need.floor,
-            });
+            }));
         }
     }
     let mut guard = SpaceGuard::default();
-    for (device, need) in distinct {
+    for (device, _, need) in distinct {
         let id = NEXT_RESERVATION.fetch_add(1, Ordering::Relaxed);
         all.push(Reservation {
             id,
@@ -1807,7 +2174,26 @@ fn try_reserve_with(
         });
         guard.ids.push(id);
     }
-    Ok(guard)
+    Some(Ok(guard))
+}
+
+/// [`reserve`] with the filesystem lookup supplied and blocking calls
+/// (tests).
+#[cfg(test)]
+fn try_reserve_with(
+    needs: &[SpaceNeed],
+    filesystem_of: &dyn Fn(&Path) -> Option<(u64, u64)>,
+) -> Result<SpaceGuard, Shortfall> {
+    let disks: Vec<Option<(u64, u64)>> = needs.iter().map(|n| filesystem_of(&n.dir)).collect();
+    let devices: Vec<u64> = disks.iter().flatten().map(|(device, _)| *device).collect();
+    loop {
+        let seen = reservations_on(&devices);
+        let written: HashMap<u64, u64> = seen.iter().map(|r| (r.id, r.written())).collect();
+        let ids: Vec<u64> = seen.iter().map(|r| r.id).collect();
+        if let Some(result) = place_reservation(needs, &disks, &written, Some(&ids)) {
+            return result;
+        }
+    }
 }
 
 /// Sends [`JobProgress`] updates, throttled to [`PROGRESS_INTERVAL`].
@@ -1910,6 +2296,26 @@ impl Reporter {
     }
 }
 
+/// Delete a job's temp file if it exists, giving up after `timeout` when
+/// its folder doesn't answer.
+async fn remove_temp(path: &Path, timeout: Duration) -> Result<(), NotAnswering> {
+    let p = path.to_path_buf();
+    let removed = slow_fs::guarded(
+        "remove_temp",
+        path,
+        timeout,
+        move || match std::fs::remove_file(&p) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %p.display(), "could not delete the temp file: {e}");
+            }
+        },
+    )
+    .await;
+    removed.ok_or_else(|| NotAnswering::at(path))
+}
+
 /// Deletes the temp file when a job ends without placing it.
 struct TempGuard {
     path: PathBuf,
@@ -1921,21 +2327,41 @@ impl TempGuard {
         Self { path, armed: true }
     }
 
-    /// Delete the temp file if it exists (between attempts).
-    async fn clear(&self) {
-        match tokio::fs::remove_file(&self.path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!(path = %self.path.display(), "could not delete the temp file: {e}");
-            }
-        }
+    /// Delete the temp file if it exists (between attempts). Fails when its
+    /// folder doesn't answer.
+    async fn clear(&self) -> Result<(), NotAnswering> {
+        remove_temp(&self.path, FOLDER_CHECK_TIMEOUT).await
     }
 
     /// Delete the temp file and stand down.
-    async fn discard(mut self) {
-        self.clear().await;
+    #[cfg(test)]
+    async fn discard(mut self) -> Result<(), NotAnswering> {
         self.armed = false;
+        self.clear().await
+    }
+
+    /// Delete the temp file and stand down, if its folder answers within
+    /// `wait`; otherwise the guard comes back, still armed.
+    async fn discard_within(mut self, wait: Duration) -> Result<(), Self> {
+        match remove_temp(&self.path, wait).await {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(_) => Err(self),
+        }
+    }
+
+    /// Delete the temp file, waiting for its folder however long it takes
+    /// to answer, and stand down. Returns whether it is gone.
+    async fn discard_patiently(mut self) -> bool {
+        self.armed = false;
+        loop {
+            match remove_temp(&self.path, Duration::from_secs(3600)).await {
+                Ok(()) => return true,
+                Err(_) => tokio::time::sleep(WATCH_INTERVAL).await,
+            }
+        }
     }
 
     /// The file was moved into place; nothing to clean up.
@@ -1950,20 +2376,22 @@ impl Drop for TempGuard {
             return;
         }
         // Reached only when the job future is dropped mid-way. Delete off the
-        // async threads when a runtime is available.
+        // async threads when a runtime is available (one stuck thread at
+        // most when the folder stopped answering, see `slow_fs`).
         let path = std::mem::take(&mut self.path);
-        let remove = move || {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!(path = %path.display(), "could not delete the temp file: {e}");
-            }
-        };
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(remove);
+                handle.spawn(async move {
+                    let _ = remove_temp(&path, Duration::from_secs(3600)).await;
+                });
             }
-            Err(_) => remove(),
+            Err(_) => {
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), "could not delete the temp file: {e}");
+                }
+            }
         }
     }
 }
@@ -2187,6 +2615,35 @@ mod tests {
             Err(Shortfall::Never { bytes, .. }) => assert_eq!(bytes, 2000),
             other => panic!("expected Never, got {other:?}"),
         }
+    }
+
+    /// A disk that stopped answering holds up neither other jobs'
+    /// reservations (disks are never looked at while the reservations are
+    /// locked) nor its own job for good: it is reported as not answering.
+    #[tokio::test]
+    async fn a_hung_disk_holds_up_no_other_reservation() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hung_dir, fine_dir) = (dir.path().join("hung"), dir.path().join("fine"));
+        std::fs::create_dir_all(&hung_dir).unwrap();
+        std::fs::create_dir_all(&fine_dir).unwrap();
+        let need_at = |dir: &Path| SpaceNeed {
+            dir: dir.to_path_buf(),
+            bytes: 1,
+            floor: 1,
+            file: None,
+            strict: true,
+        };
+        let hung = crate::slow_fs::hang::hang(&hung_dir);
+        let stuck = tokio::spawn({
+            let need = need_at(&hung_dir);
+            async move { reserve(&[need]).await.map(|r| r.is_ok()) }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fine = reserve(&[need_at(&fine_dir)]).await;
+        assert!(matches!(fine, Ok(Ok(_))), "{fine:?}");
+        assert!(!stuck.is_finished(), "didn't wait for the hung disk");
+        assert_eq!(stuck.await.unwrap(), Err(NotAnswering::at(&hung_dir)));
+        drop(hung);
     }
 
     #[test]
@@ -2725,7 +3182,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".x.chrysopoeia-00000000.tmp.mkv");
         tokio::fs::write(&path, b"data").await.unwrap();
-        TempGuard::new(path.clone()).discard().await;
+        TempGuard::new(path.clone()).discard().await.unwrap();
         assert!(!path.exists());
 
         tokio::fs::write(&path, b"data").await.unwrap();
@@ -2734,7 +3191,7 @@ mod tests {
 
         // Dropped while armed: removed in the background.
         drop(TempGuard::new(path.clone()));
-        for _ in 0..100 {
+        for _ in 0..3000 {
             if !path.exists() {
                 break;
             }

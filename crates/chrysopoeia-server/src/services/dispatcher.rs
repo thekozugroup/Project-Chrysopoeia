@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,8 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_scanner::WatchEvent;
 use chrysopoeia_worker::finalize::{Interrupted, final_output_path};
+use chrysopoeia_worker::run::Unfinished;
+use chrysopoeia_worker::slow_fs::{self, NotAnswering, WATCH_INTERVAL};
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -68,8 +71,21 @@ const INPUT_CHECK_TIMEOUT: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(30)
 };
+/// How long the last looks at a finished job's new file may still take
+/// once the job is cancelled.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// How long a folder may take to list a job's leftovers.
 const LEFTOVER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a file or folder that stopped answering may take to answer
+/// when it is checked again (every [`OFFLINE_RECHECK`]).
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long start-up recovery waits for a folder before it leaves the job
+/// to look for itself when it runs again.
+const STARTUP_CHECK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(10)
+};
 /// Hard upper bound on concurrent jobs.
 pub const MAX_JOBS_LIMIT: u32 = 32;
 
@@ -102,6 +118,18 @@ struct RunningJob {
 struct Offline {
     reason: String,
     next_check: Instant,
+    /// What stopped answering, when it isn't the library folder itself (a
+    /// file in it, the work folder, the output folder): it must answer too
+    /// before the jobs go on.
+    check: Option<PathBuf>,
+}
+
+/// A job that ended while its new file was still being put in place (see
+/// `chrysopoeia_worker::run::take_unfinished`).
+struct PlacingJob {
+    file_id: Uuid,
+    /// Asks it to undo what it did at its next safe point.
+    stop: Arc<AtomicBool>,
 }
 
 /// Shared queue state and the running jobs.
@@ -126,6 +154,9 @@ pub struct DispatcherHandle {
     /// Jobs put back once after the disk filled up while other jobs were
     /// writing to it too (see [`space_was_shared`]).
     disk_retried: std::sync::Mutex<HashSet<Uuid>>,
+    /// Jobs whose new file was still being put in place when they ended, by
+    /// job id: their file isn't converted again until that is over.
+    placing: std::sync::Mutex<HashMap<Uuid, PlacingJob>>,
 }
 
 impl DispatcherHandle {
@@ -142,6 +173,7 @@ impl DispatcherHandle {
             hardware_wait: std::sync::Mutex::new(HashSet::new()),
             hardware_wait_announced: AtomicBool::new(false),
             disk_retried: std::sync::Mutex::new(HashSet::new()),
+            placing: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -152,17 +184,57 @@ impl DispatcherHandle {
             .map(|o| o.reason.clone())
     }
 
-    /// Mark a library's folder offline. Returns true when it wasn't already.
-    fn mark_offline(&self, library_id: Uuid, reason: String) -> bool {
+    /// Mark a library's folder offline (and `check`, when what stopped
+    /// answering is something else). Returns true when it wasn't already.
+    fn mark_offline(&self, library_id: Uuid, reason: String, check: Option<PathBuf>) -> bool {
         lock(&self.offline)
             .insert(
                 library_id,
                 Offline {
                     reason,
                     next_check: Instant::now() + OFFLINE_RECHECK,
+                    check,
                 },
             )
             .is_none()
+    }
+
+    /// Ask the new file of job `job_id`, still being put in place after the
+    /// job ended, to be undone at its next safe point (the job was
+    /// cancelled). Returns false when it isn't being put in place.
+    pub fn stop_placing(&self, job_id: Uuid) -> bool {
+        match lock(&self.placing).get(&job_id) {
+            Some(p) => {
+                p.stop.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether job `job_id`'s new file is still being put in place after the
+    /// job ended.
+    pub fn is_placing(&self, job_id: Uuid) -> bool {
+        lock(&self.placing).contains_key(&job_id)
+    }
+
+    /// Files whose earlier job's new file is still being put in place.
+    fn placing_files(&self) -> Vec<Uuid> {
+        lock(&self.placing).values().map(|p| p.file_id).collect()
+    }
+
+    /// Check an offline library again the next time the queue looks for
+    /// work (tests; normally every [`OFFLINE_RECHECK`]).
+    #[cfg(test)]
+    pub(crate) fn recheck_now(&self, library_id: Uuid) {
+        if let Some(o) = lock(&self.offline).get_mut(&library_id) {
+            o.next_check = Instant::now();
+        }
+    }
+
+    /// The recorded cancel intent of a running job.
+    pub(crate) fn intent_of(&self, job_id: Uuid) -> Option<CancelIntent> {
+        lock(&self.running).get(&job_id).and_then(|j| j.intent)
     }
 
     /// A library's folder answered again: its jobs may run. Returns true when
@@ -318,14 +390,6 @@ struct RunningGuard {
     job_id: Uuid,
 }
 
-impl RunningGuard {
-    fn intent(&self) -> Option<CancelIntent> {
-        lock(&self.state.dispatcher.running)
-            .get(&self.job_id)
-            .and_then(|j| j.intent)
-    }
-}
-
 impl Drop for RunningGuard {
     fn drop(&mut self) {
         lock(&self.state.dispatcher.running).remove(&self.job_id);
@@ -452,7 +516,12 @@ async fn fill_slots(state: &AppState) -> anyhow::Result<()> {
         // queue is already `queued` in the database: never start it twice.
         let mut skip_jobs = deferred.clone();
         skip_jobs.extend(lock(&d.running).keys().copied());
-        let Some(job) = db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs).await? else {
+        // Nor a file whose earlier job is still putting its new file in
+        // place (on a share that stopped answering).
+        let skip_files = d.placing_files();
+        let Some(job) =
+            db::jobs::claim_next(&state.db, &skip_libraries, &skip_jobs, &skip_files).await?
+        else {
             break;
         };
         let software = software_libraries.contains(&job.library_id);
@@ -499,15 +568,15 @@ async fn software_libraries(state: &AppState, settings: &Settings) -> sqlx::Resu
 /// Check offline library folders that are due, and let the jobs of those
 /// that are back run again.
 async fn recheck_offline(state: &AppState) {
-    let due: Vec<Uuid> = {
+    let due: Vec<(Uuid, Option<PathBuf>)> = {
         let now = Instant::now();
         lock(&state.dispatcher.offline)
             .iter()
             .filter(|(_, o)| o.next_check <= now)
-            .map(|(id, _)| *id)
+            .map(|(id, o)| (*id, o.check.clone()))
             .collect()
     };
-    for id in due {
+    for (id, check) in due {
         let lib = match db::libraries::get(state.db.pool(), id).await {
             Ok(Some(lib)) => lib,
             Ok(None) => {
@@ -519,7 +588,17 @@ async fn recheck_offline(state: &AppState) {
                 continue;
             }
         };
-        match library::root_unavailable(&lib.path).await {
+        let problem = match library::root_unavailable(&lib.path).await {
+            Some(reason) => Some(reason),
+            // What stopped answering inside it (or elsewhere) answers too.
+            None => match &check {
+                Some(path) if fs_guard::metadata(path, RECHECK_TIMEOUT).await.is_none() => {
+                    Some(stuck_reason(&lib.path, path))
+                }
+                _ => None,
+            },
+        };
+        match problem {
             Some(reason) => {
                 if let Some(o) = lock(&state.dispatcher.offline).get_mut(&id) {
                     o.reason = reason;
@@ -565,9 +644,17 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         state.broadcast_queue_state().await;
         tracing::debug!(job = %job.id, file = %job.file_path, "job started");
 
-        let (disposition, ctx) = execute(&state, &job, cancel).await;
+        let (disposition, mut ctx) = execute(&state, &job, cancel.clone()).await;
+        // Its new file may still be being put in place (a share stopped
+        // answering, or Cancel came meanwhile): that goes on by itself.
+        let unfinished = state.toolkit.take_unfinished(job.id);
         let disposition = space_was_shared(&state, &job, disposition);
-        let intent = guard.intent();
+        // Every look at the disk from here on is bounded and gives way to
+        // Cancel and Stop: the job holds its slot until it is recorded.
+        let disposition = after_failure(&disposition, &mut ctx, &cancel)
+            .await
+            .unwrap_or(disposition);
+        prepare_record(&state, &disposition, &mut ctx, &cancel).await;
         // A file moved during its conversion (a folder renamed by Sonarr or
         // Radarr, say) leaves the temp file written next to it in the
         // folder's new place, where this job can't find it (the converter
@@ -577,12 +664,22 @@ fn start_job(state: &AppState, job: Job, software: bool) {
             &disposition,
             Disposition::Finished(JobOutcome::Failed { .. })
         ) && ctx.worker_ran
+            && ctx.input_gone
             && run_config(&state, &state.settings()).temp_dir.is_none();
+        let offline = matches!(
+            &disposition,
+            Disposition::Requeue(Requeue::LibraryOffline { .. })
+        );
         // The slot stays taken until the result is recorded.
-        record(&state, &job, disposition, intent, &ctx).await;
+        let recorded = record(&state, &job, disposition, &ctx).await;
+        if let Some(unfinished) = unfinished {
+            // Before the slot is freed, so the file isn't started again
+            // while its new file may still be moving in.
+            hold_placing(&state, &job, unfinished, ctx.clone(), &recorded).await;
+        }
         // Free the slot before announcing, so the queue state is current.
         drop(guard);
-        if may_have_left_files && !state.shutdown.is_cancelled() && input_vanished(&ctx).await {
+        if may_have_left_files && !state.shutdown.is_cancelled() {
             let (state, library_id, job_id) = (state.clone(), job.library_id, job.id);
             tokio::spawn(async move {
                 library::sweep_job_leftovers(&state, library_id, job_id).await;
@@ -595,8 +692,10 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         state.broadcast_queue_state().await;
         // Watch events for the file were ignored while it was being
         // converted (an upgrade that replaced it, for instance); look at it
-        // again now. Nothing happens when it is as the database says.
+        // again now. Nothing happens when it is as the database says (and
+        // a library that stopped answering is left alone).
         if let Some(file) = &ctx.file
+            && !offline
             && !state.shutdown.is_cancelled()
             && let Err(e) =
                 library::handle_watch_event(&state, WatchEvent::Upserted(PathBuf::from(&file.path)))
@@ -604,6 +703,219 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         {
             tracing::debug!(job = %job.id, "could not look at the file again: {e:#}");
         }
+    });
+}
+
+/// A job that failed while its share stopped answering (which may well be
+/// why it failed) goes back to the queue with its library offline instead;
+/// one whose file is gone is noted in `ctx`. Cancel and Stop win over the
+/// check (the job then ends as they say). `None` keeps `disposition`.
+async fn after_failure(
+    disposition: &Disposition,
+    ctx: &mut ExecContext,
+    cancel: &CancellationToken,
+) -> Option<Disposition> {
+    let Disposition::Finished(JobOutcome::Failed { error, .. }) = disposition else {
+        return None;
+    };
+    if error.starts_with(MISSING_INPUT_ERROR) {
+        return None;
+    }
+    let now = tokio::select! {
+        now = input_now(ctx) => now,
+        () = cancel.cancelled() => return Some(Disposition::Finished(JobOutcome::Cancelled)),
+    };
+    match now {
+        InputNow::There => None,
+        InputNow::Gone => {
+            ctx.input_gone = true;
+            None
+        }
+        InputNow::Unreachable { reason, check } => {
+            Some(Disposition::Requeue(Requeue::LibraryOffline {
+                reason,
+                check,
+            }))
+        }
+    }
+}
+
+/// Look at the disk once for what recording `disposition` needs (the new
+/// file of a finished replacement), so that retries of the record, and the
+/// transaction, never wait for a share.
+async fn prepare_record(
+    state: &AppState,
+    disposition: &Disposition,
+    ctx: &mut ExecContext,
+    cancel: &CancellationToken,
+) {
+    if let Disposition::Finished(JobOutcome::Done {
+        output_path,
+        output_size,
+        ..
+    }) = disposition
+    {
+        ctx.replaced = replaced_file(state, ctx, output_path, *output_size, cancel).await;
+    }
+}
+
+/// The new file after a replacement, as the file list should show it. Its
+/// size and date come from the disk and its contents from a fresh probe,
+/// when the disk answers in time (else from the job: the next scan reads
+/// the rest). Cancel only cuts the looking short: the file is in place.
+async fn replaced_file(
+    state: &AppState,
+    ctx: &ExecContext,
+    output_path: &Path,
+    output_size: u64,
+    cancel: &CancellationToken,
+) -> Option<ReplacedFile> {
+    if ctx.output_mode != OutputMode::Replace {
+        return None;
+    }
+    let p = output_path.to_str()?;
+    // A Cancel that came too late (the file is in place) still gets the
+    // usual look, unless the disk is slow to give it.
+    let cut_short = async {
+        cancel.cancelled().await;
+        tokio::time::sleep(CANCEL_GRACE).await;
+    };
+    tokio::pin!(cut_short);
+    let meta = tokio::select! {
+        m = fs_guard::metadata(output_path, INPUT_CHECK_TIMEOUT) => m.and_then(Result::ok),
+        () = &mut cut_short => None,
+    };
+    let probe = if meta.is_some() {
+        let watched = [output_path.to_path_buf()];
+        tokio::select! {
+            p = state.toolkit.probe_file(output_path.to_path_buf(), PROBE_TIMEOUT) => p.ok(),
+            () = &mut cut_short => None,
+            _ = slow_fs::first_unanswered(&watched, WATCH_INTERVAL, INPUT_CHECK_TIMEOUT) => None,
+        }
+    } else {
+        None
+    };
+    Some(ReplacedFile {
+        path: p.to_string(),
+        relative_path: relative_to(ctx.library_root.as_deref(), output_path),
+        file_name: output_path
+            .file_name()
+            .map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned()),
+        size_bytes: meta.as_ref().map_or(output_size, std::fs::Metadata::len),
+        modified_at: meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .map_or_else(Utc::now, DateTime::<Utc>::from),
+        probe,
+    })
+}
+
+/// A job ended while its new file was still being put in place: a share
+/// stopped answering in the middle of it, or the job was cancelled then.
+/// A rename that has started can't be called back, and abandoning it would
+/// leave the files out of step with the database, so it is left to finish
+/// on its own thread. Meanwhile the job's file is held back (no other job
+/// starts on it), and when it ends:
+///
+/// - the new file took its place: the job is recorded as done (whatever it
+///   was recorded as before, since that is what happened to the file);
+/// - it was undone (the job was cancelled or stopped before the new file
+///   took its place), or it failed with the original kept: nothing more to
+///   record; a job back in the queue converts the file again.
+///
+/// If the server stops first, the next start finds the job's backup next to
+/// the new file and finishes the record (see [`complete_interrupted`], and
+/// the job's own look when it runs again in [`execute`]).
+async fn hold_placing(
+    state: &AppState,
+    job: &Job,
+    unfinished: Unfinished,
+    ctx: ExecContext,
+    recorded: &Disposition,
+) {
+    let stop = unfinished.stop_flag();
+    // Cancelled or stopped: undo it if it isn't too late.
+    if matches!(recorded, Disposition::Finished(JobOutcome::Cancelled)) {
+        stop.store(true, Ordering::SeqCst);
+    }
+    lock(&state.dispatcher.placing).insert(
+        job.id,
+        PlacingJob {
+            file_id: job.file_id,
+            stop: Arc::clone(&stop),
+        },
+    );
+    let name = ctx
+        .file
+        .as_ref()
+        .map_or(job.file_name.as_str(), |f| f.file_name.as_str())
+        .to_string();
+    if let Disposition::Requeue(Requeue::LibraryOffline { .. }) = recorded {
+        state
+            .activity(
+                ActivityLevel::Warning,
+                format!(
+                    "The converted {name} was being put in place when its folder stopped \
+                     answering. It is finished when the folder answers again; until then the \
+                     original is kept safe."
+                ),
+                ActivityRefs {
+                    file_id: Some(job.file_id),
+                    job_id: Some(job.id),
+                    library_id: Some(job.library_id),
+                },
+            )
+            .await;
+    }
+    let (state, job) = (state.clone(), job.clone());
+    tokio::spawn(async move {
+        let outcome = unfinished.outcome().await;
+        if let JobOutcome::Done {
+            output_path,
+            output_size,
+            original_size,
+            encoder,
+            hw_api,
+            attempt,
+            validation,
+            command,
+            mut notes,
+        } = outcome
+        {
+            notes.push(if stop.load(Ordering::SeqCst) {
+                "It was stopped while the new file was being put in place, but that had gone \
+                 too far to undo, so it was finished"
+                    .to_string()
+            } else {
+                "Its folder stopped answering while the new file was being put in place; that \
+                 was finished when the folder answered again"
+                    .to_string()
+            });
+            let mut ctx = ctx;
+            let never = CancellationToken::new();
+            ctx.replaced = replaced_file(&state, &ctx, &output_path, output_size, &never).await;
+            let outcome = JobOutcome::Done {
+                output_path,
+                output_size,
+                original_size,
+                encoder,
+                hw_api,
+                attempt,
+                validation,
+                command,
+                notes,
+            };
+            record(&state, &job, Disposition::Finished(outcome), &ctx).await;
+        } else {
+            tracing::debug!(job = %job.id, "the new file wasn't put in place: {outcome:?}");
+        }
+        lock(&state.dispatcher.placing).remove(&job.id);
+        state.dispatcher.wake();
+        state.broadcast_job(job.id).await;
+        state.broadcast_file(job.file_id).await;
+        state.broadcast_library(job.library_id).await;
+        state.broadcast_stats().await;
+        state.broadcast_queue_state().await;
     });
 }
 
@@ -649,6 +961,12 @@ struct ExecContext {
     /// The original has other hard links and is being replaced: its data
     /// stays on disk through them, so the conversion saves no space.
     shared_original: bool,
+    /// The job failed and its file is gone (moved or deleted meanwhile)
+    /// while its library folder is there.
+    input_gone: bool,
+    /// After a replacement: the new file as the file list should show it
+    /// (see [`prepare_record`]).
+    replaced: Option<ReplacedFile>,
 }
 
 impl ExecContext {
@@ -664,8 +982,13 @@ impl ExecContext {
 /// Why a job goes back to the queue without running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Requeue {
-    /// The library folder can't be reached (the reason says why).
-    LibraryOffline(String),
+    /// The library folder can't be reached (the reason says why), or
+    /// `check` stopped answering (a file in it, the work folder, the output
+    /// folder).
+    LibraryOffline {
+        reason: String,
+        check: Option<PathBuf>,
+    },
     /// The disk filled up while other jobs were writing to it too.
     DiskShared,
     /// The file changed moments ago and may still be being copied.
@@ -742,6 +1065,8 @@ async fn execute(
         output_mode: settings.output_mode,
         worker_ran: false,
         shared_original: false,
+        input_gone: false,
+        replaced: None,
     };
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
@@ -779,40 +1104,64 @@ async fn execute(
     ctx.library_name = Some(lib.name.clone());
 
     let input = PathBuf::from(&file.path);
+    let offline = |reason: String, check: Option<PathBuf>, ctx: ExecContext| {
+        (
+            Disposition::Requeue(Requeue::LibraryOffline { reason, check }),
+            ctx,
+        )
+    };
+    // Every look at the disk below gives way to Cancel and Stop: a share
+    // that stopped answering would otherwise keep this job (and its slot)
+    // "preparing" for as long as it hangs.
+    macro_rules! or_cancelled {
+        ($e:expr) => {
+            tokio::select! {
+                v = $e => v,
+                () = cancel.cancelled() => return done(JobOutcome::Cancelled, ctx),
+            }
+        };
+    }
+
+    // An earlier run of this job may have ended while its new file was
+    // being put in place (the server stopped, or its share stopped
+    // answering then): what is on the disk tells whether it got there.
+    match or_cancelled!(resume_earlier_run(state, job, &input, &lib.path)) {
+        Resumed::NotPlaced => {}
+        Resumed::Placed(outcome) => return done(outcome, ctx),
+        Resumed::Unreachable { reason, check } => return offline(reason, check, ctx),
+    }
+
     let mut restored = false;
     let meta = loop {
-        // A share that stopped answering would keep this job (and its slot)
-        // "preparing" forever, and deaf to Cancel and Stop.
-        let looked = tokio::select! {
-            m = fs_guard::metadata(&input, INPUT_CHECK_TIMEOUT) => m,
-            () = cancel.cancelled() => return done(JobOutcome::Cancelled, ctx),
-        };
+        let looked = or_cancelled!(fs_guard::metadata(&input, INPUT_CHECK_TIMEOUT));
         match looked {
             None => {
-                let reason = library::root_unavailable(&lib.path)
-                    .await
-                    .unwrap_or_else(|| library::not_responding(&lib.path));
-                return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
+                let reason = or_cancelled!(offline_reason(&lib.path, &input));
+                return offline(reason, Some(input.clone()), ctx);
             }
             Some(Ok(m)) if m.is_file() => break m,
             Some(_) => {
                 // A whole library missing is a disconnected drive or share,
                 // not a deleted file: wait for it instead of failing every
                 // job.
-                if let Some(reason) = library::root_unavailable(&lib.path).await {
-                    return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
+                if let Some(reason) = or_cancelled!(library::root_unavailable(&lib.path)) {
+                    return offline(reason, None, ctx);
                 }
                 // This job's own earlier run may have left the original
                 // moved aside when the server stopped (its folder was out of
                 // reach at the start): put it back and go on.
-                if !restored
-                    && let Some(dir) = input.parent()
-                    && recover_job_leftovers(state, job.id, &[dir.to_path_buf()])
-                        .await
-                        .contains(&input)
-                {
-                    restored = true;
-                    continue;
+                let dirs: Vec<PathBuf> =
+                    input.parent().map(Path::to_path_buf).into_iter().collect();
+                if !restored && !dirs.is_empty() {
+                    let recovered = or_cancelled!(recover_job_leftovers(state, job.id, &dirs));
+                    let Some(recovered) = recovered else {
+                        let reason = or_cancelled!(offline_reason(&lib.path, &dirs[0]));
+                        return offline(reason, Some(dirs[0].clone()), ctx);
+                    };
+                    if recovered.contains(&input) {
+                        restored = true;
+                        continue;
+                    }
                 }
                 return done(
                     failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
@@ -842,18 +1191,34 @@ async fn execute(
     }
     let probe = match file.probe.clone() {
         Some(p) if unchanged && !lacks_hdr10_metadata(&p) => p,
-        _ => match state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT).await {
-            Ok(p) => {
-                if let Err(e) =
-                    db::files::update_probe(state.db.pool(), file.id, meta.len(), modified, &p)
-                        .await
-                {
-                    tracing::warn!(job = %job.id, "could not store the new probe: {e}");
+        _ => {
+            // ffprobe reading a file whose share stopped answering would
+            // only give up after its own timeout; the share is noticed
+            // sooner.
+            let watched = [input.clone()];
+            let probed = or_cancelled!(async {
+                tokio::select! {
+                    p = state.toolkit.probe_file(input.clone(), PROBE_TIMEOUT) => Ok(p),
+                    stuck = slow_fs::first_unanswered(&watched, WATCH_INTERVAL, INPUT_CHECK_TIMEOUT) => Err(stuck),
                 }
-                p
+            });
+            match probed {
+                Ok(Ok(p)) => {
+                    if let Err(e) =
+                        db::files::update_probe(state.db.pool(), file.id, meta.len(), modified, &p)
+                            .await
+                    {
+                        tracing::warn!(job = %job.id, "could not store the new probe: {e}");
+                    }
+                    p
+                }
+                Ok(Err(e)) => return done(failed(probe_problem(&e), probe_error_message(&e)), ctx),
+                Err(stuck) => {
+                    let reason = or_cancelled!(offline_reason(&lib.path, &stuck));
+                    return offline(reason, Some(stuck), ctx);
+                }
             }
-            Err(e) => return done(failed(probe_problem(&e), probe_error_message(&e)), ctx),
-        },
+        }
     };
 
     let hw = state.hardware.current();
@@ -941,7 +1306,7 @@ async fn execute(
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
     let forwarder = tokio::spawn(forward_progress(state.clone(), rx));
     ctx.worker_ran = true;
-    let outcome = match state.toolkit.run_job(cfg, spec, tx, cancel).await {
+    let outcome = match state.toolkit.run_job(cfg, spec, tx, cancel.clone()).await {
         Ok(outcome) => outcome,
         Err(_) => failed(
             ProblemKind::Other,
@@ -989,6 +1354,15 @@ async fn execute(
         .is_err()
     {
         tracing::debug!(job = %job.id, "progress forwarder did not finish in time");
+    }
+    // A file or folder that stopped answering made the job stop: it waits
+    // in the queue, with its library offline, until it answers again.
+    if let JobOutcome::NotResponding { path } = &outcome {
+        let reason = tokio::select! {
+            reason = offline_reason(&lib.path, path) => reason,
+            () = cancel.cancelled() => stuck_reason(&lib.path, path),
+        };
+        return offline(reason, Some(path.clone()), ctx);
     }
     done(outcome, ctx)
 }
@@ -1072,18 +1446,31 @@ fn relative_to(root: Option<&Path>, path: &Path) -> String {
 /// and a job left `running` would hold its file forever. Gives up only at
 /// shutdown (start-up recovery re-queues the job) or, for errors that
 /// retrying can't fix, after closing the job with a plain error.
+///
+/// A cancel recorded for the job (Cancel, Skip, a removed library) wins
+/// over putting it back in the queue: a job the user cancelled ends
+/// cancelled, even when its share stopped answering at the same moment.
+/// The intent is read again on every try, so one that comes while the
+/// result is being recorded counts too. Returns what was recorded.
 async fn record(
     state: &AppState,
     job: &Job,
     disposition: Disposition,
-    intent: Option<CancelIntent>,
     ctx: &ExecContext,
-) {
+) -> Disposition {
     let mut delay = OUTCOME_RETRY_FIRST;
     let mut hard_failures = 0u32;
     let mut attempts = 0u32;
     let mut give_up_at: Option<Instant> = None;
     loop {
+        let intent = state.dispatcher.intent_of(job.id);
+        let disposition = match (&disposition, intent) {
+            (
+                Disposition::Requeue(_),
+                Some(CancelIntent::User | CancelIntent::Skip | CancelIntent::Removed),
+            ) => Disposition::Finished(JobOutcome::Cancelled),
+            (d, _) => d.clone(),
+        };
         let result = match &disposition {
             Disposition::Finished(outcome) => {
                 apply_outcome(state, job, outcome.clone(), intent, ctx).await
@@ -1094,7 +1481,7 @@ async fn record(
             if attempts > 0 {
                 tracing::info!(job = %job.id, attempts, "job result recorded after retrying");
             }
-            return;
+            return disposition;
         };
         attempts += 1;
         let transient = e
@@ -1106,7 +1493,7 @@ async fn record(
             if hard_failures >= OUTCOME_HARD_ATTEMPTS {
                 tracing::error!(job = %job.id, "could not record the job result: {e:#}");
                 close_unrecorded(state, job).await;
-                return;
+                return disposition;
             }
         }
         if attempts == 1 || attempts.is_multiple_of(10) {
@@ -1125,7 +1512,7 @@ async fn record(
                     "shutting down before the job result could be recorded; the job will be \
                      checked again on the next start"
                 );
-                return;
+                return disposition;
             }
         }
         tokio::time::sleep(delay).await;
@@ -1178,9 +1565,11 @@ async fn apply_requeue(
     // Hold it back first, so the dispatcher can't pick it up again between
     // the commit and here.
     let newly_offline = match why {
-        Requeue::LibraryOffline(reason) => state
-            .dispatcher
-            .mark_offline(job.library_id, reason.clone()),
+        Requeue::LibraryOffline { reason, check } => {
+            state
+                .dispatcher
+                .mark_offline(job.library_id, reason.clone(), check.clone())
+        }
         Requeue::Settling => {
             state
                 .dispatcher
@@ -1205,7 +1594,7 @@ async fn apply_requeue(
     db::files::set_status(&mut tx, job.file_id, FileStatus::Queued, None, None).await?;
     tx.commit().await?;
     match why {
-        Requeue::LibraryOffline(reason) if newly_offline => {
+        Requeue::LibraryOffline { reason, .. } if newly_offline => {
             let name = ctx.library_name.as_deref().unwrap_or("A library");
             state
                 .library_activity(
@@ -1219,7 +1608,7 @@ async fn apply_requeue(
                 .await;
             state.broadcast_library(job.library_id).await;
         }
-        Requeue::LibraryOffline(_) => {}
+        Requeue::LibraryOffline { .. } => {}
         Requeue::Settling => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
         }
@@ -1275,7 +1664,7 @@ async fn apply_outcome(
         .to_string();
     let outcome = match outcome {
         JobOutcome::Failed { error, .. }
-            if !error.starts_with(MISSING_INPUT_ERROR) && input_vanished(ctx).await =>
+            if !error.starts_with(MISSING_INPUT_ERROR) && ctx.input_gone =>
         {
             return remove_vanished(state, job, ctx, &name).await;
         }
@@ -1283,7 +1672,8 @@ async fn apply_outcome(
     };
     match outcome {
         JobOutcome::Done {
-            output_path,
+            // Where it is was looked at before (see `prepare_record`).
+            output_path: _,
             output_size,
             original_size,
             encoder,
@@ -1294,30 +1684,7 @@ async fn apply_outcome(
             notes,
         } => {
             let verified = validation.as_ref().is_some_and(|v| v.passed);
-            // Filesystem work before the transaction keeps it short.
-            let replaced = if ctx.output_mode == OutputMode::Replace {
-                let meta = tokio::fs::metadata(&output_path).await.ok();
-                let probe = state
-                    .toolkit
-                    .probe_file(output_path.clone(), PROBE_TIMEOUT)
-                    .await
-                    .ok();
-                output_path.to_str().map(|p| ReplacedFile {
-                    path: p.to_string(),
-                    relative_path: relative_to(ctx.library_root.as_deref(), &output_path),
-                    file_name: output_path
-                        .file_name()
-                        .map_or_else(|| p.to_string(), |n| n.to_string_lossy().into_owned()),
-                    size_bytes: meta.as_ref().map_or(output_size, std::fs::Metadata::len),
-                    modified_at: meta
-                        .as_ref()
-                        .and_then(|m| m.modified().ok())
-                        .map_or_else(Utc::now, DateTime::<Utc>::from),
-                    probe,
-                })
-            } else {
-                None
-            };
+            let replaced = ctx.replaced.clone();
 
             let mut tx = state.db.write_tx().await?;
             let exists = db::jobs::finish(
@@ -1517,6 +1884,14 @@ async fn apply_outcome(
                 state.activity(ActivityLevel::Error, message, refs).await;
             }
         }
+        // Mapped to a requeue before it is recorded (see `execute`); should
+        // one come here, it goes back to the queue all the same.
+        JobOutcome::NotResponding { .. } => {
+            let mut tx = state.db.write_tx().await?;
+            db::jobs::requeue(&mut tx, job.id).await?;
+            db::files::set_status(&mut tx, job.file_id, FileStatus::Queued, None, None).await?;
+            tx.commit().await?;
+        }
         JobOutcome::Cancelled => {
             let intent = intent.unwrap_or(if state.shutdown.is_cancelled() {
                 CancelIntent::Shutdown
@@ -1650,20 +2025,145 @@ async fn remove_vanished(
     Ok(())
 }
 
-/// Whether the file a job worked on is gone while its library folder is
-/// there (a disconnected share is not a deleted file).
-async fn input_vanished(ctx: &ExecContext) -> bool {
+/// The file of a job that failed, as it is now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputNow {
+    /// It is there, and so is its library folder.
+    There,
+    /// It is gone while its library folder is there: moved or deleted.
+    Gone,
+    /// It, or its library folder, can't be reached (a disconnected share
+    /// is not a deleted file): `check` is what didn't answer, if not the
+    /// library folder.
+    Unreachable {
+        reason: String,
+        check: Option<PathBuf>,
+    },
+}
+
+/// Look at the file of a job that failed, with bounded checks (see
+/// [`fs_guard`]).
+async fn input_now(ctx: &ExecContext) -> InputNow {
     let (Some(file), Some(root)) = (&ctx.file, &ctx.library_root) else {
-        return false;
+        return InputNow::There;
     };
-    let missing = matches!(
-        tokio::fs::symlink_metadata(&file.path).await,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound
-    );
-    missing
-        && library::root_unavailable(&root.to_string_lossy())
-            .await
-            .is_none()
+    let root = root.to_string_lossy();
+    let path = Path::new(&file.path);
+    let looked = fs_guard::symlink_metadata(path, INPUT_CHECK_TIMEOUT).await;
+    let Some(looked) = looked else {
+        return InputNow::Unreachable {
+            reason: offline_reason(&root, path).await,
+            check: Some(path.to_path_buf()),
+        };
+    };
+    if let Some(reason) = library::root_unavailable(&root).await {
+        return InputNow::Unreachable {
+            reason,
+            check: None,
+        };
+    }
+    match looked {
+        Err(std::io::ErrorKind::NotFound) => InputNow::Gone,
+        _ => InputNow::There,
+    }
+}
+
+/// Why a library's jobs wait when `stuck` (in it, or a folder the jobs use)
+/// didn't answer: the library folder's own problem, if it has one, else
+/// that `stuck`'s folder isn't responding.
+async fn offline_reason(lib_path: &str, stuck: &Path) -> String {
+    match library::root_unavailable(lib_path).await {
+        Some(reason) => reason,
+        None => stuck_reason(lib_path, stuck),
+    }
+}
+
+/// That the folder of `stuck` isn't responding: the library folder for
+/// anything in the library, else the folder itself (the work folder, the
+/// output folder).
+fn stuck_reason(lib_path: &str, stuck: &Path) -> String {
+    if stuck.starts_with(lib_path) {
+        return library::not_responding(lib_path);
+    }
+    // A file (the temp file, say) is shown by its folder.
+    let folder = match stuck.parent() {
+        Some(parent) if stuck.extension().is_some() => parent,
+        _ => stuck,
+    };
+    library::not_responding(&folder.to_string_lossy())
+}
+
+/// What an earlier run of a job left in place, as far as its new file goes.
+#[derive(Debug)]
+enum Resumed {
+    /// Its new file isn't in place (or it never got that far).
+    NotPlaced,
+    /// Its new file was in place: the job is done.
+    Placed(JobOutcome),
+    /// Its folder doesn't answer.
+    Unreachable {
+        reason: String,
+        check: Option<PathBuf>,
+    },
+}
+
+/// An earlier run of `job` that stopped while its new file was being put in
+/// place (the server stopped, or the share stopped answering then and the
+/// server stopped before it answered again) left the original's backup
+/// next to the new file: finish the record instead of converting the file
+/// again. Replacements only (folder mode never touches the original, so it
+/// leaves no backup to go by).
+async fn resume_earlier_run(state: &AppState, job: &Job, input: &Path, lib_path: &str) -> Resumed {
+    let Ok(Some(final_path)) = db::jobs::final_path(state.db.pool(), job.id).await else {
+        return Resumed::NotPlaced;
+    };
+    let target = PathBuf::from(&final_path);
+    if target.parent() != input.parent() {
+        return Resumed::NotPlaced;
+    }
+    let checked = state
+        .toolkit
+        .resume_replace(
+            input.to_path_buf(),
+            target.clone(),
+            job.id,
+            INPUT_CHECK_TIMEOUT,
+        )
+        .await;
+    match checked {
+        Ok(Interrupted::Placed {
+            size,
+            original_size,
+        }) => {
+            tracing::debug!(job = %job.id, "an earlier run of this job had already put its new file in place");
+            Resumed::Placed(resumed_outcome(job, target, size, original_size))
+        }
+        Ok(Interrupted::NotPlaced) => Resumed::NotPlaced,
+        Err(e) if e.is::<NotAnswering>() => Resumed::Unreachable {
+            reason: offline_reason(lib_path, input).await,
+            check: Some(input.to_path_buf()),
+        },
+        Err(e) => {
+            tracing::warn!(job = %job.id, "could not check an earlier run of this job: {e:#}");
+            Resumed::NotPlaced
+        }
+    }
+}
+
+/// The outcome of a job whose earlier run turned out to have put its new
+/// file at `target` before it was interrupted.
+fn resumed_outcome(job: &Job, target: PathBuf, size: u64, original_size: u64) -> JobOutcome {
+    JobOutcome::Done {
+        output_path: target,
+        output_size: size,
+        original_size,
+        encoder: job.encoder.clone().unwrap_or_default(),
+        hw_api: job.hw_api.unwrap_or(HwApi::Software),
+        attempt: job.attempt.max(1),
+        validation: None,
+        command: String::new(),
+        notes: vec![RESUMED_NOTE.to_string()],
+    }
 }
 
 /// Note on a conversion finished by start-up recovery.
@@ -1718,10 +2218,13 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         }
         let target = PathBuf::from(&final_path);
         let replace = target.parent() == input.parent();
+        // A folder that doesn't answer now is looked at when the job runs
+        // again (replacements, see `resume_earlier_run`); start-up doesn't
+        // wait for it.
         let placed = if replace {
             match state
                 .toolkit
-                .resume_replace(input.clone(), target.clone(), job.id)
+                .resume_replace(input.clone(), target.clone(), job.id, STARTUP_CHECK_TIMEOUT)
                 .await
             {
                 Ok(Interrupted::Placed {
@@ -1738,9 +2241,9 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             // Folder mode never touches the original, so there is no backup
             // to go by: the job had reached its last step, and the file is
             // in the output folder (the name was free when the job started).
-            let there = tokio::fs::metadata(&target)
+            let there = fs_guard::metadata(&target, STARTUP_CHECK_TIMEOUT)
                 .await
-                .ok()
+                .and_then(Result::ok)
                 .filter(std::fs::Metadata::is_file);
             let claimed = db::jobs::other_done_at(state.db.pool(), job.id, &final_path)
                 .await
@@ -1759,7 +2262,7 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             .await
             .ok()
             .flatten();
-        let ctx = ExecContext {
+        let mut ctx = ExecContext {
             file,
             library_root: lib.as_ref().map(|l| PathBuf::from(&l.path)),
             library_name: lib.map(|l| l.name),
@@ -1770,27 +2273,23 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             },
             worker_ran: true,
             shared_original: false,
+            input_gone: false,
+            replaced: None,
         };
-        let outcome = JobOutcome::Done {
-            output_path: target,
-            output_size: size,
-            original_size,
-            encoder: job.encoder.clone().unwrap_or_default(),
-            hw_api: job.hw_api.unwrap_or(HwApi::Software),
-            attempt: job.attempt.max(1),
-            validation: None,
-            command: String::new(),
-            notes: vec![RESUMED_NOTE.to_string()],
-        };
+        let outcome = resumed_outcome(&job, target, size, original_size);
         tracing::debug!(job = %job.id, file = %job.file_path, "finished a conversion the last stop interrupted");
-        record(state, &job, Disposition::Finished(outcome), None, &ctx).await;
+        let disposition = Disposition::Finished(outcome);
+        prepare_record(state, &disposition, &mut ctx, &CancellationToken::new()).await;
+        record(state, &job, disposition, &ctx).await;
         completed += 1;
     }
     // Whatever the last stop recorded and wherever the library search gets
     // to, an original the crash left moved aside is put back now (and its
     // job's temp files go), so the job finds its file when it runs again.
     for (job_id, dirs) in leftover_dirs {
-        recover_job_leftovers(state, job_id, &dirs).await;
+        if recover_job_leftovers(state, job_id, &dirs).await.is_none() {
+            tracing::info!(job = %job_id, "a folder didn't answer; the job's leftovers are looked for later");
+        }
     }
     completed
 }
@@ -1798,7 +2297,14 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
 /// Hand what a job left in `dirs` (its temp files, its backup of the
 /// original) to crash recovery: the backup is put back when the original's
 /// name is free. Folders that don't answer are left for the library search.
-async fn recover_job_leftovers(state: &AppState, job_id: Uuid, dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// Returns the originals put back; `None` when putting them back didn't end
+/// in time (the share stopped answering: a rename that started goes on by
+/// itself and only puts an original back).
+async fn recover_job_leftovers(
+    state: &AppState,
+    job_id: Uuid,
+    dirs: &[PathBuf],
+) -> Option<Vec<PathBuf>> {
     let mut found = Vec::new();
     for dir in dirs {
         let d = dir.clone();
@@ -1822,9 +2328,14 @@ async fn recover_job_leftovers(state: &AppState, job_id: Uuid, dirs: &[PathBuf])
         found.extend(listed.unwrap_or_default());
     }
     if found.is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
-    library::recover_leftovers(state, found, Some(job_id)).await
+    tokio::time::timeout(
+        LEFTOVER_CHECK_TIMEOUT,
+        library::recover_leftovers(state, found, Some(job_id)),
+    )
+    .await
+    .ok()
 }
 
 /// Stop starting jobs, cancel the running ones (they go back to the queue)

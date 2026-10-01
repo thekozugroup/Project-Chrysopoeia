@@ -352,12 +352,14 @@ pub async fn create_many(
 
 /// Claim the next queued job of an enabled library: mark it running and its
 /// file processing, atomically. Jobs of `skip_libraries` (folders that are
-/// offline) and `skip_jobs` (waiting for a file to settle) are passed over.
-/// Returns the claimed job.
+/// offline), `skip_jobs` (waiting for a file to settle) and jobs of
+/// `skip_files` (an earlier job's new file is still being put in place)
+/// are passed over. Returns the claimed job.
 pub async fn claim_next(
     db: &Db,
     skip_libraries: &[Uuid],
     skip_jobs: &[Uuid],
+    skip_files: &[Uuid],
 ) -> sqlx::Result<Option<Job>> {
     let mut tx = db.write_tx().await?;
     let now = now_ts();
@@ -382,6 +384,14 @@ pub async fn claim_next(
         qb.push(" AND j.id NOT IN (");
         let mut sep = qb.separated(", ");
         for id in skip_jobs {
+            sep.push_bind(id.to_string());
+        }
+        qb.push(")");
+    }
+    if !skip_files.is_empty() {
+        qb.push(" AND j.file_id NOT IN (");
+        let mut sep = qb.separated(", ");
+        for id in skip_files {
             sep.push_bind(id.to_string());
         }
         qb.push(")");
@@ -696,6 +706,17 @@ pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
 
 /// Remember where a running job will put its result (see
 /// [`interrupted`]).
+/// Where an earlier run of job `id` was going to put its result, if it got
+/// that far (see [`set_final_path`]).
+pub async fn final_path(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<String>> {
+    let path: Option<Option<String>> =
+        sqlx::query_scalar("SELECT final_path FROM jobs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(path.flatten())
+}
+
 pub async fn set_final_path(pool: &SqlitePool, id: Uuid, path: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE jobs SET final_path = ? WHERE id = ? AND state = 'running'")
         .bind(path)

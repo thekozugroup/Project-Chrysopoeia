@@ -6,6 +6,7 @@ mod durability;
 mod files;
 mod followups;
 mod fs_browse;
+mod hung_share;
 mod libraries;
 mod polish;
 mod problems;

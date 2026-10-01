@@ -89,9 +89,16 @@ media files were not touched. Add your libraries and settings again."), so a
 container set to restart doesn't loop. Other open errors still stop the
 start with the data-folder advice.
 
-At stop, after the HTTP server and the jobs have wound down, the process
-waits at most 2 s for work still on blocking threads (a system call stuck on
-a share that stopped answering never returns), so `docker stop` ends cleanly.
+At stop, after the HTTP server and the jobs have wound down (jobs get 7 s;
+one putting its new file in place on a hung share is left to the next
+start, see "Putting the new file in place on a share that stops
+answering"), the process waits at most 2 s for work still on blocking
+threads (a system call stuck on a share that stopped answering never
+returns), so `docker stop` ends cleanly. A killed ffmpeg that doesn't end
+within 2 s (one with files on such a share can't end until it answers:
+closing a file there waits for it) is left to end by itself, and cleaning
+up after a stopped job waits at most 2 s before it is left to the
+background.
 
 **HTTP server** (`http.rs`, hyper with a timer instead of `axum::serve`): a
 request's headers must arrive within 30 s (which also closes a kept-open
@@ -311,17 +318,47 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   enabled library; marked running in the same transaction.
 - Jobs of a library whose folder is offline (missing, unreadable or empty)
   wait, and the folder is checked again every 15 s; a job whose file changed
-  moments ago waits for it to settle. A job whose file doesn't answer within
-  30 s (a share whose server went away) goes back to the queue with its
-  library offline ("The folder … isn't responding…"), so it doesn't hold its
-  slot; Cancel and Stop end such a job at once.
-- Folder checks that may hang (`services::fs_guard`): library checks, the
-  job's look at its file, leftover searches and the folder picker run on a
-  blocking thread, one at a time per folder and kind of check (a caller that
+  moments ago waits for it to settle.
+- **A share that stops answering** (an NFS hard mount whose server went
+  away, a stuck FUSE mount) never holds a slot for good, whenever it stops:
+  every look at a library, work or output path on a job's way is bounded,
+  and when one gets no answer the job goes back to the queue with its
+  library offline ("The folder … isn't responding…"; not failed, and its
+  file not taken for deleted), so other libraries' queues move. The bounds:
+  30 s for the job's look at its file when it starts (and when it ends
+  having failed: a failure while the share hangs is not recorded as one,
+  and a file that answers "gone" while its library folder answers is taken
+  for moved or deleted as before), 30 s for each of the worker's checks
+  (the destination, folder permissions, creating the temp folder, free
+  space, the temp file, the original's identity), and while ffprobe, the
+  encode, the checks or putting the new file in place run, their files and
+  folders are looked at every 5 s and must answer within 30 s (ffmpeg is
+  then stopped well before its own 10 min stall timeout). When what stopped
+  answering is not the library folder itself (one file in it, the work
+  folder, the output folder), the library waits until that answers too.
+  Every await before the encode starts (the look at the file, ffprobe,
+  leftover searches, the library folder check) gives way to Cancel and
+  Stop, so they end such a job within seconds (the encode and the checks
+  already did).
+- A cancel recorded for a job (Cancel, Skip, removing its library) wins
+  over putting it back in the queue: a job the user cancelled ends
+  cancelled even when its share stopped answering in the same moment (the
+  intent is read again on every try to record the result, and
+  `POST /jobs/{id}/cancel` and Skip cancel a job that went back to the
+  queue while they waited for it). Cancel answers before the other
+  `*.updated` events go out (they follow in the background), so a library
+  on a hung share, which takes seconds to describe, doesn't slow it.
+- Folder checks that may hang (`chrysopoeia_worker::slow_fs`, used through
+  `services::fs_guard`): library checks, every check of a job (server and
+  worker share them), leftover searches and the folder picker run on a
+  blocking thread, one at a time per path and kind of check (a caller that
   comes while one is running waits for its answer, up to its own timeout),
   and at most 64 at once; a check that can't start counts as not
-  responding. A hung share therefore costs one thread, not one per page
-  load.
+  responding (the watch over a long step ignores those, so other stuck
+  shares can't stop a healthy encode). A hung share therefore costs one
+  thread per thing looked at, not one per page load or per retry.
+  Reserving disk space looks at the disks without holding the reservations'
+  lock, so a disk that hangs holds up no other job's reservation.
 - A job that runs out of disk space (`disk_full`) while other jobs are
   running is put back in the queue once and tried again a minute later (the
   space reservation then makes it wait its turn); alone, it fails.
@@ -331,8 +368,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   cancels its jobs (media untouched). ffmpeg is killed at once, so
   `POST /jobs/{id}/cancel` answers within a moment with the job's final
   state; the job leaves the running set (and `queue.state`) only after its
-  result is recorded. A job being put in place (finalizing) is not
-  interrupted; the call then waits up to 8 s and returns the job as it is.
+  result is recorded. A job being put in place (finalizing) is asked to
+  undo it at its next safe point (see finalize below); if that doesn't come
+  within 3 s (a rename waiting for a share) the job ends anyway and the
+  step goes on by itself, its file held back until it ends.
   A job the database shows as running but that has no task (it finished a
   moment ago, or a stale row) is closed directly only while it is still
   `running`, so a result recorded in the meantime is never overwritten.
@@ -438,7 +477,9 @@ with `JobSpec.force` uses it when `decide` says skip.
   returned as plain-language `notes`.
 
 **run_job**:
-1. Preparing: the input exists (answering within 60 s), `decide` agrees
+1. Preparing: the input exists (answering within 30 s; otherwise the job
+   ends with `JobOutcome::NotResponding { path }`, which the dispatcher
+   turns into a requeue with the library offline), `decide` agrees
    (`decide_forced` with `force`), the destination is free and its folder
    writable (a new name longer than 255 bytes, or one that can't be checked,
    is refused here, not after the encode), and the temp folder has room.
@@ -532,6 +573,50 @@ child is started with `core::process::end_with_parent` (Linux
   the error, and every error ends with what to do: "The original was kept.
   Try again, or choose lighter checks in Settings › Output." Track counts
   name each kind ("1 video track and 2 audio tracks").
+
+**Putting the new file in place on a share that stops answering.** A
+rename that has started can't be called back, and abandoning it half way
+would leave the files out of step with the database, so `finalize` runs on
+its own thread (`finalize::start_finalize`) and is never abandoned. It
+checks a stop flag at its safe points: before anything, after the staging
+copy (before the original is touched), right after the original was moved
+aside (it is put back) and before the new file takes its name; stopped
+there, it undoes what it did and fails with `finalize::Undone` (the
+original is where it was). Once the new file has its final name it
+finishes. The job watches the original and the destination folder while
+it runs:
+
+- The share stops answering: the job ends with `NotResponding` at once
+  (its slot free, its library offline, the job back in the queue) and the
+  step goes on, not stopped: when the share answers it finishes.
+- Cancel, Stop or shutdown: the stop flag is set; the job waits up to 3 s
+  for the next safe point, then ends (`Cancelled`) and leaves the step to
+  go on.
+
+The step then reports how it ended through `run::take_unfinished(job_id)`.
+Meanwhile the dispatcher holds the job's file back (no job starts on it),
+the feed says "The converted … was being put in place when its folder
+stopped answering. It is finished when the folder answers again; until then
+the original is kept safe.", and Cancel or Skip of the job (back in the
+queue) asks the step to undo itself. When it ends: the new file took its
+place → the job is recorded `done` whatever it was recorded as before (that
+is what happened to the file), with a note ("Its folder stopped answering
+while the new file was being put in place; that was finished when the
+folder answered again", or, when it had been stopped, "It was stopped while
+the new file was being put in place, but that had gone too far to undo, so
+it was finished"); undone or failed (the original kept) → nothing more is
+recorded, and a job back in the queue converts the file again. If the
+server stops first, the job's backup next to the new file finishes the
+record on the next start: start-up recovery (`complete_interrupted`, which
+gives a folder 10 s and otherwise leaves it) and, for replacements, the
+job itself before it converts anything when it runs again (its earlier
+`final_path` and its backup next to the new file mean `done`, with the
+note "Chrysopoeia stopped just as the new file was being put in place. The
+new file was already complete, so it was kept"; a backup without the new
+file is put back as before). Folder mode leaves no backup to go by: a file
+already in the output folder then fails the retry with the usual
+"already in the output folder" message (the original is never touched in
+folder mode).
 
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to

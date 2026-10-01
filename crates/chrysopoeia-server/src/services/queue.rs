@@ -104,6 +104,15 @@ pub async fn skip_file(state: &AppState, file_id: Uuid) -> ApiResult<MediaFile> 
     match file.status {
         FileStatus::Processing => {
             let ids = state.dispatcher.cancel_file(file.id, CancelIntent::Skip);
+            if !ids.is_empty() {
+                state.dispatcher.wait_finished(&ids, CANCEL_WAIT).await;
+                // Put back in the queue just as it was skipped (its share
+                // stopped answering then): skip it there.
+                for id in &ids {
+                    cancel_if_queued(state, *id, FileStatus::Skipped, Some(USER_SKIP_REASON))
+                        .await?;
+                }
+            }
             if ids.is_empty() {
                 // Not actually running (stale row): fix it directly.
                 let mut tx = state.db.write_tx().await?;
@@ -116,14 +125,15 @@ pub async fn skip_file(state: &AppState, file_id: Uuid) -> ApiResult<MediaFile> 
                 )
                 .await?;
                 tx.commit().await?;
-            } else {
-                state.dispatcher.wait_finished(&ids, CANCEL_WAIT).await;
             }
         }
         FileStatus::Queued => {
             let mut tx = state.db.write_tx().await?;
             let cancelled = match file.job_id {
                 Some(job_id) => {
+                    // Its earlier run's new file may still be moving in:
+                    // undone if it isn't too late.
+                    state.dispatcher.stop_placing(job_id);
                     db::jobs::cancel_queued(
                         &mut tx,
                         job_id,
@@ -366,9 +376,27 @@ async fn cancel_running(state: &AppState, id: Uuid) -> bool {
     }
 }
 
+/// Cancel job `id` if it is queued (it went back to the queue just as it
+/// was cancelled: its share stopped answering at that moment). Its file
+/// goes to `file_status`. Returns whether it was.
+async fn cancel_if_queued(
+    state: &AppState,
+    id: Uuid,
+    file_status: FileStatus,
+    skip_reason: Option<&str>,
+) -> ApiResult<bool> {
+    state.dispatcher.stop_placing(id);
+    let mut tx = state.db.write_tx().await?;
+    let cancelled = db::jobs::cancel_queued(&mut tx, id, file_status, skip_reason).await?;
+    tx.commit().await?;
+    Ok(cancelled)
+}
+
 /// Cancel a queued or running job. Its file goes back to `pending`, or to
 /// `done` when Chrysopoeia converted it before (the file on disk is still
-/// the converted one).
+/// the converted one). A job whose new file is still being put in place
+/// on a share that stopped answering (it is back in the queue meanwhile)
+/// has that undone, if it isn't too late.
 pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
     let job = db::jobs::get(state.db.pool(), id)
         .await?
@@ -380,9 +408,7 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
     };
     match job.state {
         JobState::Queued => {
-            let mut tx = state.db.write_tx().await?;
-            let cancelled = db::jobs::cancel_queued(&mut tx, id, FileStatus::Pending, None).await?;
-            tx.commit().await?;
+            let cancelled = cancel_if_queued(state, id, FileStatus::Pending, None).await?;
             if cancelled {
                 state
                     .activity(
@@ -396,6 +422,17 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
         JobState::Running => {
             if cancel_running(state, id).await {
                 state.dispatcher.wait_finished(&[id], CANCEL_WAIT).await;
+                // A cancel wins over going back to the queue: the job is
+                // cancelled even if it went back there at that moment.
+                if cancel_if_queued(state, id, FileStatus::Pending, None).await? {
+                    state
+                        .activity(
+                            ActivityLevel::Info,
+                            format!("Cancelled {}", job.file_name),
+                            refs,
+                        )
+                        .await;
+                }
             } else {
                 // No task: the job either finished a moment ago (its result
                 // is recorded and must stay) or is a row marked running
@@ -417,10 +454,16 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> ApiResult<Job> {
         .await?
         .ok_or_else(job_not_found)?;
     state.emit(Event::JobUpdated { job: job.clone() });
-    state.broadcast_file(job.file_id).await;
-    state.broadcast_library(job.library_id).await;
-    state.broadcast_stats().await;
-    state.broadcast_queue_state().await;
+    // The rest of the news goes out in the background: a library on a share
+    // that stopped answering takes seconds to describe, and Cancel answers
+    // at once.
+    let (s, file_id, library_id) = (state.clone(), job.file_id, job.library_id);
+    tokio::spawn(async move {
+        s.broadcast_file(file_id).await;
+        s.broadcast_library(library_id).await;
+        s.broadcast_stats().await;
+        s.broadcast_queue_state().await;
+    });
     Ok(job)
 }
 

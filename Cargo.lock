@@ -357,6 +357,7 @@ dependencies = [
  "chrono",
  "chrysopoeia-core",
  "chrysopoeia-scanner",
+ "chrysopoeia-worker",
  "filetime",
  "rustix",
  "serde",

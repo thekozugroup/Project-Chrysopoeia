@@ -553,15 +553,24 @@ async fn probe_limited(state: &AppState, path: PathBuf) -> Result<ProbeInfo, Pro
 }
 
 /// Whether a probe failed only because the file disappeared in the meantime
-/// (moved, renamed, or replaced by a conversion). Such files are not
-/// reported as broken; the next scan sees them as they are.
+/// (moved, renamed, or replaced by a conversion), or because it stopped
+/// answering (a share whose server went away). Such files are not reported
+/// as broken; the next scan sees them as they are.
 async fn vanished(probe: &Result<ProbeInfo, ProbeError>, path: &Path) -> bool {
     probe.is_err()
         && matches!(
-            tokio::fs::symlink_metadata(path).await,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+            fs_guard::symlink_metadata(path, FILE_CHECK_TIMEOUT).await,
+            None | Some(Err(std::io::ErrorKind::NotFound))
         )
 }
+
+/// How long a single file may take to answer a look at it (a watch event,
+/// a probe that failed) before it counts as not responding.
+const FILE_CHECK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(5)
+} else {
+    Duration::from_secs(30)
+};
 
 /// Whether a file was modified so recently that it may still be being
 /// copied. Modification times far in the future (a clock that is off) don't
@@ -1298,7 +1307,9 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
     {
         return Ok(Single::Handled);
     }
-    let Ok(meta) = tokio::fs::metadata(path).await else {
+    // A file on a share that stopped answering is left for later (one
+    // stuck thread at most, however often it is asked about).
+    let Some(Ok(meta)) = fs_guard::metadata(path, FILE_CHECK_TIMEOUT).await else {
         return Ok(Single::Handled);
     };
     if !meta.is_file() {
