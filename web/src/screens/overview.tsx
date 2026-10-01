@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { SavingsChart, worthCharting } from "@/components/charts";
-import { FileName } from "@/components/file-name";
+import { FileName, WasName } from "@/components/file-name";
 import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
 import { LibraryBar, LibraryLegend, finishedPercent, remainingCount } from "@/components/library-bar";
 import { QueueControls } from "@/components/queue-controls";
@@ -35,7 +35,7 @@ import { useFileActions, useQueueActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { settlingText } from "@/lib/convertible";
 import { formatBytes, formatCount, formatHour, formatPercent, formatRelative, plural, splitBytes } from "@/lib/format";
-import { SETUP_PROBLEMS, reasonsFor, setupFix, type SetupProblem } from "@/lib/outcomes";
+import { SETUP_PROBLEMS, newFileName, reasonsFor, setupFix, type SetupProblem } from "@/lib/outcomes";
 import {
   useFailures,
   useHardwareInfo,
@@ -569,7 +569,8 @@ function NeedsAttention() {
                   </ul>
                 ) : null}
               </div>
-              <div className={cn("flex shrink-0 gap-2", two && "max-sm:ml-[1.875rem]")}>
+              {/* Under the text on a phone, wrapping rather than running past the screen's edge (320 px). */}
+              <div className={cn("flex shrink-0 flex-wrap gap-2", two && "max-sm:ml-[1.875rem] max-sm:max-w-[calc(100%-1.875rem)]")}>
                 {p.action ? (
                   <a href={p.action.href} className={buttonVariants({ variant: "secondary", size: "sm" })}>
                     {p.action.label}
@@ -769,14 +770,16 @@ function Libraries() {
 }
 
 /** The latest results (the layout gives them a column only when there are some). */
-function RecentResults() {
+export function RecentResults() {
   const history = useJobs(RECENT_QUERY);
   const libraries = useLibraries();
+  const settings = useSettings();
   const items = history.data?.items ?? EMPTY_JOBS;
   const standings = useJobStandings(items);
   if (!history.isPending && items.length === 0) return null;
   const libraryName = (id: string) => libraries.data?.find((l) => l.id === id)?.name;
   const minSavings = (id: string) => libraries.data?.find((l) => l.id === id)?.profile.min_savings_pct;
+  const outputMode = settings.data?.output_mode;
   return (
     <section aria-labelledby="recent-heading">
       <SectionHeading
@@ -800,6 +803,8 @@ function RecentResults() {
         <ul className="divide-y divide-line rounded-lg border border-line bg-surface">
           {items.map((job) => {
             const standing = standings.get(job.id) ?? "current";
+            // A conversion that changed the file's extension is listed by the new name, the old one secondary.
+            const renamed = newFileName(job, undefined, outputMode);
             return (
               <li key={job.id}>
                 <button
@@ -808,7 +813,10 @@ function RecentResults() {
                   className="flex w-full flex-col gap-1.5 px-4 py-3 text-left transition-colors hover:bg-raised/60"
                 >
                   <span className="flex w-full items-center justify-between gap-3">
-                    <FileName name={job.file_name} className="text-sm font-medium text-fg" />
+                    <span className="min-w-0 flex-1">
+                      <FileName name={renamed ?? job.file_name} className="text-sm font-medium text-fg" />
+                      {renamed ? <WasName name={job.file_name} className="mt-0.5" /> : null}
+                    </span>
                     <JobStateBadge job={job} standing={standing} />
                   </span>
                   <span className="flex w-full items-baseline justify-between gap-3 text-[0.8125rem]">

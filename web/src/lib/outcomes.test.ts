@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  convertAnywayDetails,
   countFailures,
+  entryIsUnreadable,
   failedFilterLabel,
   failureGroup,
   failureNote,
@@ -11,8 +13,10 @@ import {
   jobStanding,
   keptAsConverted,
   newFileName,
+  offersConvertAnyway,
   problemKind,
   reasonsFor,
+  replaceLoss,
   retryableCount,
   setupFix,
   setupProblem,
@@ -309,6 +313,19 @@ describe("newFileName", () => {
     expect(newFileName(job, file("Old Home Video.mkv"), "replace")).toBe("Old Home Video.mkv");
   });
 
+  it("goes by the name the job recorded, without reading the file", () => {
+    const recorded = { ...job, output_name: "Old Home Video.mkv" };
+    expect(newFileName(recorded, undefined, "replace")).toBe("Old Home Video.mkv");
+    // Even when the file has been renamed since (converted again), this job's result had that name.
+    expect(newFileName(recorded, file("Old Home Video.mp4", "j2"), "replace")).toBe("Old Home Video.mkv");
+    // Recorded as unchanged: the file is never asked, whatever its name says.
+    expect(newFileName({ ...job, output_name: null }, file("Old Home Video.mkv"), "replace")).toBeNull();
+    expect(newFileName({ ...job, output_name: job.file_name }, undefined, "replace")).toBeNull();
+    // Saved to a separate folder: the library's file keeps its name.
+    expect(newFileName(recorded, undefined, "folder")).toBeNull();
+    expect(newFileName({ ...recorded, state: "failed" }, undefined, "replace")).toBeNull();
+  });
+
   it("says nothing when the name is the same, the file moved on, or the result went elsewhere", () => {
     expect(newFileName(job, file("Old Home Video.avi"), "replace")).toBeNull();
     // A later conversion made the file what it is now.
@@ -319,6 +336,89 @@ describe("newFileName", () => {
     expect(newFileName({ ...job, state: "failed" }, file("Old Home Video.mkv"), "replace")).toBeNull();
     // Settings not loaded yet.
     expect(newFileName(job, file("Old Home Video.mkv"), undefined)).toBeNull();
+  });
+});
+
+// The worker's sentence for a goal whose container can't hold some of a file's tracks (plan::replace_loss).
+const LOSS =
+  "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them";
+const LOSS_ONE =
+  "MP4 can't hold this file's 1 attached file, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them";
+// The worker's sentence for a file with other hard links (SHARED_ORIGINAL).
+const SHARED =
+  "This file has another hard link (for example a torrent that is still seeding), so replacing it would use more space instead of saving it. It was left unchanged; Convert anyway converts it all the same";
+
+describe("a skip for tracks the new container can't hold", () => {
+  it("reads what would be lost, and how many things that is", () => {
+    expect(replaceLoss(LOSS)).toEqual({
+      container: "MP4",
+      lost: "2 picture-based subtitles and 1 subtitle font",
+      them: "them",
+    });
+    expect(replaceLoss(LOSS_ONE)).toEqual({ container: "MP4", lost: "1 attached file", them: "it" });
+    expect(replaceLoss(LOSS.replace("MP4", "WebM"))?.container).toBe("WebM");
+    expect(replaceLoss("Already HEVC")).toBeNull();
+    expect(replaceLoss(SHARED)).toBeNull();
+    expect(replaceLoss(null)).toBeNull();
+  });
+
+  it("is a skip the server says Convert anyway can set aside", () => {
+    expect(offersConvertAnyway(LOSS)).toBe(true);
+    expect(offersConvertAnyway(SHARED)).toBe(true);
+    expect(offersConvertAnyway("Already HEVC")).toBe(false);
+    expect(offersConvertAnyway("Dolby Vision profile 5 can't be converted without losing its colours — left unchanged")).toBe(
+      false,
+    );
+    expect(offersConvertAnyway(null)).toBe(false);
+  });
+
+  it("tells the user plainly what Convert anyway leaves out, and that it's gone for good", () => {
+    const details = convertAnywayDetails(LOSS);
+    expect(details).toEqual([
+      "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font.",
+      "Converting it anyway leaves them out of the new file. The original is replaced, so they are gone for good.",
+      "To keep them, save converted files to a separate folder instead (Settings › Output).",
+    ]);
+    expect(convertAnywayDetails(LOSS_ONE)?.[1]).toBe(
+      "Converting it anyway leaves it out of the new file. The original is replaced, so it is gone for good.",
+    );
+    // No sentence is cut off, and none shows the server's closing advice twice.
+    expect(details?.join(" ")).not.toMatch(/Convert anyway converts it|was left unchanged/);
+  });
+
+  it("shows the server's own sentence for another skip it words itself, and nothing for the library's rules", () => {
+    expect(convertAnywayDetails(SHARED)).toEqual([
+      "This file has another hard link (for example a torrent that is still seeding), so replacing it would use more space instead of saving it.",
+    ]);
+    expect(convertAnywayDetails("Already HEVC")).toBeNull();
+    expect(convertAnywayDetails("Only 4% smaller — kept the original")).toBeNull();
+    expect(convertAnywayDetails(null)).toBeNull();
+  });
+
+  it("says it briefly in a list and fully in the file's sheet, in plain words", () => {
+    expect(skipNote(LOSS)).toBe("MP4 can't hold its 2 picture-based subtitles and 1 subtitle font");
+    expect(skipSummary(LOSS, false)).toEqual({
+      title: "Left unchanged",
+      body: "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font, so it was left as it is. Replacing the original would lose them for good.",
+    });
+    expect(skipSummary(LOSS_ONE, false).body).toMatch(/would lose it for good\.$/);
+  });
+});
+
+describe("entryIsUnreadable", () => {
+  const damaged = "Failed Truncated.mkv: The original file appears damaged or incomplete (it stops after 0.1 s).";
+
+  it("goes by the entry's code", () => {
+    expect(entryIsUnreadable({ message: "Failed A.mkv: x", problem: "unreadable_source" })).toBe(true);
+    expect(entryIsUnreadable({ message: "Failed A.mkv: x", problem: "verification" })).toBe(false);
+    // A code without a damaged cause wins over a sentence that sounds like one.
+    expect(entryIsUnreadable({ message: damaged, problem: "encoder" })).toBe(false);
+    expect(entryIsUnreadable({ message: damaged, problem: null })).toBe(false);
+  });
+
+  it("reads the sentence only when the server sent no code at all", () => {
+    expect(entryIsUnreadable({ message: damaged })).toBe(true);
+    expect(entryIsUnreadable({ message: "Clip.mkv failed its visual check." })).toBe(false);
   });
 });
 

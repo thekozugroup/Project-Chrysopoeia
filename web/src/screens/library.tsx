@@ -43,7 +43,7 @@ import { ActionMenu, ConfirmDialog } from "@/components/ui/overlays";
 import { useFileActions } from "@/lib/actions";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { leftOutText, nothingToConvertText, planBulkConvert, settlingText } from "@/lib/convertible";
-import { formatBytes, formatCount, formatRelative, plural } from "@/lib/format";
+import { formatBytes, formatCount, formatRelative, foundByEarlierName, plural } from "@/lib/format";
 import { SETUP_PROBLEMS, cantBeReadText, failedFilterLabel, reasonsFor, setupFix, type FailureCounts } from "@/lib/outcomes";
 import { FILE_STATUS_HELP, FILE_STATUS_LABEL, GOAL_LABEL, sourceCodecLabel } from "@/lib/labels";
 import { sameProfile } from "@/lib/profile";
@@ -466,6 +466,15 @@ function SavedCell({ file }: { file: MediaFile }) {
   return <span className="text-accent-ink">{formatBytes(file.saved_bytes)}</span>;
 }
 
+/**
+ * Under a search result whose name and folder don't hold the search text:
+ * the server found it by a name it had before a conversion renamed it, and
+ * this says so, or the row would look like a wrong match.
+ */
+function EarlierNameMatch() {
+  return <span className="mt-0.5 block text-xs text-muted">Found by its name before it was converted</span>;
+}
+
 /** Status with live whole-file progress while converting (see `overallProgress`). */
 function StatusCell({ file }: { file: MediaFile }) {
   const live = useFileLive(file.id);
@@ -548,7 +557,7 @@ function openFile(file: MediaFile) {
   openSheet({ file: file.id });
 }
 
-function FilesTab({ library, route }: { library: Library; route: Route }) {
+export function FilesTab({ library, route }: { library: Library; route: Route }) {
   const statusParam = route.params.get("status");
   const status = FILE_STATUSES.includes(statusParam as FileStatus) ? (statusParam as FileStatus) : null;
   const q = route.params.get("q") ?? "";
@@ -699,6 +708,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                       <button type="button" onClick={() => openFile(file)} className="block max-w-full text-left">
                         <FileName name={file.file_name} className="font-medium text-fg hover:text-accent-ink" />
                         {folder ? <span className="block truncate text-xs text-muted">{folder}</span> : null}
+                        {q && foundByEarlierName(file, q) ? <EarlierNameMatch /> : null}
                       </button>
                     </td>
                     <td className="py-2.5 pr-4 text-right text-fg tabular">{formatBytes(file.size_bytes)}</td>
@@ -733,6 +743,7 @@ function FilesTab({ library, route }: { library: Library; route: Route }) {
                   {formatBytes(file.size_bytes)}
                   {formatLine(file) ? ` · ${formatLine(file)}` : ""}
                 </span>
+                {q && foundByEarlierName(file, q) ? <EarlierNameMatch /> : null}
                 <span className="mt-1.5 flex items-center gap-2">
                   <StatusCell file={file} />
                   {file.status === "done" && file.saved_bytes && file.saved_bytes > 0 ? (

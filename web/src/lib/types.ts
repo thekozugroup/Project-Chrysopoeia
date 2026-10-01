@@ -446,6 +446,20 @@ export interface Job {
   attempt: number;
   input_size: number;
   output_size: number | null;
+  /**
+   * The disk space this conversion released: the input's size minus the
+   * output's in the usual case; 0 when the original's space wasn't released
+   * (it was hard-linked, so replacing it freed nothing) or the output isn't
+   * smaller. `null` for a job that isn't done, or that finished before the
+   * server recorded this: read the sizes instead.
+   */
+  freed_bytes: number | null;
+  /**
+   * The result's file name when it isn't the input's (the format changed
+   * its extension: `land1080.mp4` became `land1080.mkv`). `null` when the
+   * name is the same, or the job isn't done.
+   */
+  output_name: string | null;
   error: string | null;
   /** Machine-readable cause of `error`; set with every `error`. */
   problem: ProblemKind | null;
@@ -489,6 +503,12 @@ export interface ActivityEntry {
   at: Timestamp;
   level: ActivityLevel;
   message: string;
+  /**
+   * The cause, for an entry about a failed or skipped file whose cause is
+   * known (the same codes as `Job.problem`); `null` otherwise, and absent
+   * from entries a server older than this field sent.
+   */
+  problem?: ProblemKind | null;
   file_id: Uuid | null;
   job_id: Uuid | null;
   library_id: Uuid | null;

@@ -4,7 +4,7 @@
  * editor still works, and stays valid, if presets have not loaded.
  */
 
-import { AUDIO_CODEC_LABEL, CONTAINER_LABEL, VIDEO_CODEC_LABEL } from "./labels";
+import { AUDIO_CODEC_LABEL, CONTAINER_LABEL, GOALS, VIDEO_CODEC_LABEL } from "./labels";
 import type {
   AudioCodec,
   Container,
@@ -179,13 +179,58 @@ export function profileWithGoal(
 }
 
 /**
- * Whether the defaults for new libraries were changed from the stock preset
- * of their goal (in Settings › Advanced). Untouched defaults let the goal
- * step recommend a goal from the hardware instead.
+ * The goal a fresh install's defaults for new libraries have (core
+ * `Settings::default`, which is `TranscodeProfile::default`: the Save space
+ * preset).
+ */
+export const FACTORY_DEFAULT_GOAL: Exclude<Goal, "custom"> = "save_space";
+
+/**
+ * Whether the defaults for new libraries were changed from what a fresh
+ * install has (in Settings › Advanced): any other goal counts, even a plain
+ * preset such as Plays everywhere, and so does any other setting. Untouched
+ * defaults let the goal step recommend a goal from the hardware instead;
+ * changed ones are what new libraries start with.
  */
 export function defaultsCustomized(presets: Presets | undefined, defaults: TranscodeProfile): boolean {
-  if (defaults.goal === "custom") return true;
-  return !sameProfile(defaults, presetProfile(presets, defaults.goal));
+  return !sameProfile(defaults, presetProfile(presets, FACTORY_DEFAULT_GOAL));
+}
+
+/**
+ * The goal whose stock preset the defaults are exactly (Plays everywhere,
+ * saved as the default), or `null` when they differ from every preset in
+ * any setting. A new library can then start with that goal's own card
+ * rather than a separate "Your defaults" one.
+ */
+export function defaultsPresetGoal(
+  presets: Presets | undefined,
+  defaults: TranscodeProfile,
+): Exclude<Goal, "custom"> | null {
+  return GOALS.find((goal) => sameProfile(defaults, presetProfile(presets, goal))) ?? null;
+}
+
+/** What Add library offers and preselects (see `newLibraryStart`). */
+export interface NewLibraryStart {
+  /** The card chosen from the start: a goal, or `"defaults"` for the "Your defaults" card. */
+  choice: Exclude<Goal, "custom"> | "defaults";
+  /** Whether "Your defaults" is offered: the defaults changed and aren't exactly one goal's preset. */
+  defaultsCard: boolean;
+}
+
+/**
+ * How Add library starts. Defaults left as a fresh install has them let the
+ * hardware suggest a goal (`recommended`). Defaults that were changed win:
+ * exactly one goal's preset (Plays everywhere saved as the default) starts
+ * with that goal; anything else starts with the "Your defaults" card.
+ */
+export function newLibraryStart(
+  presets: Presets | undefined,
+  defaults: TranscodeProfile | undefined,
+  recommended: Exclude<Goal, "custom">,
+): NewLibraryStart {
+  if (!defaults || !defaultsCustomized(presets, defaults)) return { choice: recommended, defaultsCard: false };
+  const preset = defaultsPresetGoal(presets, defaults);
+  return preset ? { choice: preset, defaultsCard: false } : { choice: "defaults", defaultsCard: true };
 }
 
 /**

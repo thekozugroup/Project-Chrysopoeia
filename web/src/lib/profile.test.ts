@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  FACTORY_DEFAULT_GOAL,
   defaultsCustomized,
+  defaultsPresetGoal,
+  newLibraryStart,
   normalizeProfile,
   parseLanguages,
   parseQualityOverride,
@@ -8,6 +11,7 @@ import {
   profileForNewLibrary,
   sameProfile,
 } from "./profile";
+import type { Presets } from "./types";
 
 describe("normalizeProfile", () => {
   it("keeps valid combinations as they are", () => {
@@ -89,10 +93,62 @@ describe("profiles for new libraries", () => {
     expect(sameProfile(stock, { ...stock, quality: "high" })).toBe(false);
   });
 
-  it("knows whether the defaults were changed from their goal's preset", () => {
+  it("knows whether the defaults were changed from what a fresh install has", () => {
+    // A fresh install's defaults are the Save space preset (core `TranscodeProfile::default`).
+    expect(FACTORY_DEFAULT_GOAL).toBe("save_space");
+    expect(defaultsCustomized(undefined, profileForGoal(FACTORY_DEFAULT_GOAL))).toBe(false);
     expect(defaultsCustomized(undefined, stock)).toBe(false);
     expect(defaultsCustomized(undefined, custom)).toBe(true);
     expect(defaultsCustomized(undefined, { ...stock, goal: "custom" })).toBe(true);
+    expect(defaultsCustomized(undefined, { ...stock, quality: "high" })).toBe(true);
+  });
+
+  it("counts a goal-only change, even to another plain preset, as a change", () => {
+    // Saving Plays everywhere (or Balanced, or Archive) as the default is a choice.
+    for (const goal of ["balanced", "compatible", "archive"] as const) {
+      expect(defaultsCustomized(undefined, profileForGoal(goal))).toBe(true);
+    }
+  });
+
+  it("compares with the server's preset for the factory goal when it sent one", () => {
+    const presets = {
+      goals: [{ goal: "save_space", title: "Save space", summary: "", profile: { ...stock, quality: "small" } }],
+    } as unknown as Presets;
+    expect(defaultsCustomized(presets, { ...stock, quality: "small" })).toBe(false);
+    expect(defaultsCustomized(presets, stock)).toBe(true);
+  });
+
+  it("finds the goal whose preset the defaults are exactly", () => {
+    expect(defaultsPresetGoal(undefined, profileForGoal("compatible"))).toBe("compatible");
+    expect(defaultsPresetGoal(undefined, stock)).toBe("save_space");
+    expect(defaultsPresetGoal(undefined, custom)).toBeNull();
+    expect(defaultsPresetGoal(undefined, { ...profileForGoal("compatible"), max_height: 1080 })).toBeNull();
+    expect(defaultsPresetGoal(undefined, { ...stock, goal: "custom" })).toBeNull();
+  });
+
+  describe("how Add library starts", () => {
+    it("keeps a fresh install's behaviour: the hardware suggests the goal, with no extra card", () => {
+      expect(newLibraryStart(undefined, stock, "balanced")).toEqual({ choice: "balanced", defaultsCard: false });
+      expect(newLibraryStart(undefined, stock, "save_space")).toEqual({ choice: "save_space", defaultsCard: false });
+      // Settings not loaded yet.
+      expect(newLibraryStart(undefined, undefined, "balanced")).toEqual({ choice: "balanced", defaultsCard: false });
+    });
+
+    it("follows defaults saved as another goal, whatever the hardware suggests", () => {
+      expect(newLibraryStart(undefined, profileForGoal("compatible"), "balanced")).toEqual({
+        choice: "compatible",
+        defaultsCard: false,
+      });
+      expect(newLibraryStart(undefined, profileForGoal("compatible"), "save_space").choice).toBe("compatible");
+    });
+
+    it("gives defaults that are no goal's preset a card of their own, chosen from the start", () => {
+      expect(newLibraryStart(undefined, custom, "balanced")).toEqual({ choice: "defaults", defaultsCard: true });
+      expect(newLibraryStart(undefined, { ...stock, goal: "custom" }, "balanced")).toEqual({
+        choice: "defaults",
+        defaultsCard: true,
+      });
+    });
   });
 
   it("uses the defaults as they are when chosen", () => {

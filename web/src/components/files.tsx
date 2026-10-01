@@ -14,8 +14,10 @@ import {
   FailureCallout,
   SkipUnreadableButton,
   SheetSection,
+  noSpaceFreed,
   savingsText,
 } from "@/components/jobs";
+import { WasName } from "@/components/file-name";
 import { FileStatusBadge, JobStateBadge } from "@/components/status";
 import { Button } from "@/components/ui/button";
 import { Badge, Callout, Detail, Disclosure, Meter, Skeleton } from "@/components/ui/display";
@@ -31,8 +33,16 @@ import {
   middleTruncate,
 } from "@/lib/format";
 import { channelsLabel, JOB_STAGE_LABEL, languageLabel, skippedByUser, sourceCodecLabel } from "@/lib/labels";
-import { hdrSummary, hdrTechnical, isUnreadable, jobStanding, skippedUnreadable, skipSummary } from "@/lib/outcomes";
-import { useFile, useLibrary } from "@/lib/queries";
+import {
+  hdrSummary,
+  hdrTechnical,
+  isUnreadable,
+  jobStanding,
+  newFileName,
+  skippedUnreadable,
+  skipSummary,
+} from "@/lib/outcomes";
+import { useFile, useLibrary, useSettings } from "@/lib/queries";
 import { openSheet } from "@/lib/router";
 import { useFileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo, TranscodeProfile } from "@/lib/types";
@@ -374,6 +384,7 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
   const detail = query.data;
   const file = detail?.file;
   const { library } = useLibrary(file?.library_id);
+  const settings = useSettings();
   const video = file?.probe?.streams.find((s) => s.kind === "video" && !s.is_attached_pic);
   return (
     <Sheet
@@ -417,7 +428,9 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
             <SheetSection title="History">
               <ul className="divide-y divide-line rounded-lg border border-line">
                 {detail.jobs.map((job) => {
-                  const savings = savingsText(job.input_size, job.output_size);
+                  // The server's figure for what was freed beats the sizes (0 for a hard-linked original).
+                  const savings = savingsText(job.input_size, job.output_size, job.freed_bytes);
+                  const renamed = newFileName(job, undefined, settings.data?.output_mode);
                   return (
                     <li key={job.id}>
                       <button
@@ -431,7 +444,10 @@ export function FileSheet({ fileId, onClose }: { fileId: string | null; onClose:
                         </span>
                         {savings && job.state === "done" ? (
                           <span className="ml-auto text-[0.8125rem] text-fg tabular">{savings.text}</span>
+                        ) : job.state === "done" && noSpaceFreed(job) ? (
+                          <span className="ml-auto text-[0.8125rem] text-muted">No space freed</span>
                         ) : null}
+                        {renamed ? <WasName name={job.file_name} className="w-full" /> : null}
                       </button>
                     </li>
                   );

@@ -10,14 +10,23 @@
 
 import { formatCount, formatPercent, plural } from "./format";
 import { HDR_LABEL, skippedByUser } from "./labels";
-import { PROBLEM_KINDS, type Job, type MediaFile, type OutputMode, type ProblemKind, type StreamInfo } from "./types";
+import {
+  PROBLEM_KINDS,
+  type ActivityEntry,
+  type Job,
+  type MediaFile,
+  type OutputMode,
+  type ProblemKind,
+  type StreamInfo,
+} from "./types";
 
 /**
  * Sentences the server uses when the original itself can't be read:
  * `chrysopoeia-scanner` probe errors ("This file can't be read as a video:
  * …", "The disk reported a read error…") and the worker's "The original
- * file appears damaged or incomplete (it stops after 0.1 s)." Only for the
- * activity log, whose entries carry no code.
+ * file appears damaged or incomplete (it stops after 0.1 s)." Only for an
+ * activity entry that carries no `problem` code (one from a server older
+ * than the field); every other reading goes by the code.
  */
 const UNREADABLE = [
   /can't be read as a video/i,
@@ -27,10 +36,21 @@ const UNREADABLE = [
   /not really a video/i,
 ];
 
-/** Whether an activity entry says the original is damaged or isn't a video (entries carry no code). */
+/** Whether a sentence says the original is damaged or isn't a video (the reading for entries without a code). */
 export function isUnreadableSource(error: string | null | undefined): boolean {
   const text = error?.trim();
   return Boolean(text && UNREADABLE.some((re) => re.test(text)));
+}
+
+/**
+ * Whether an activity entry is about a damaged original or a file that isn't
+ * a video: by its `problem` code when the server sent one (null means no
+ * known cause), and by its sentence only when the field is missing, as
+ * from a server older than it.
+ */
+export function entryIsUnreadable(entry: Pick<ActivityEntry, "message" | "problem">): boolean {
+  if (entry.problem !== undefined) return entry.problem === "unreadable_source";
+  return isUnreadableSource(entry.message);
 }
 
 /** A failed file or job: its sentence and its code. */
@@ -105,17 +125,22 @@ export function skippedUnreadable(
 /**
  * The name a conversion gave the file, when it isn't the original's: the
  * goal's format has another extension ("Old Home Video.avi" became "Old
- * Home Video.mkv"). Jobs keep the original's name, so it's read from the
- * file, and only while this job's result is what the file is now. `null`
- * when the name didn't change, isn't known, or the result went to a
- * separate folder (the original is still where it was).
+ * Home Video.mkv"). The job records it (`output_name`, which is `null`
+ * while the name stayed the same); for a job from a server that doesn't,
+ * it's read from the file instead, and only while this job's result is
+ * what the file is now. `null` when the name didn't change, isn't known, or
+ * the result went to a separate folder (the original is still where it was).
  */
 export function newFileName(
-  job: Pick<Job, "id" | "state" | "file_name">,
+  job: Pick<Job, "id" | "state" | "file_name"> & Partial<Pick<Job, "output_name">>,
   file: Pick<MediaFile, "job_id" | "file_name"> | null | undefined,
   outputMode: OutputMode | undefined,
 ): string | null {
-  if (job.state !== "done" || outputMode !== "replace" || !file || file.job_id !== job.id) return null;
+  if (job.state !== "done" || outputMode !== "replace") return null;
+  if (job.output_name !== undefined) {
+    return job.output_name && job.output_name !== job.file_name ? job.output_name : null;
+  }
+  if (!file || file.job_id !== job.id) return null;
   return file.file_name !== job.file_name ? file.file_name : null;
 }
 
@@ -305,17 +330,81 @@ export function failureNote(item: Failure): string {
   }
 }
 
+/**
+ * What a skip for a track the new container can't hold says (the worker's
+ * `replace_loss`): "MP4 can't hold this file's 2 picture-based subtitles and
+ * 1 subtitle font, so it was left unchanged. To convert it, …; Convert
+ * anyway converts it without them". Replacing the original would lose
+ * those tracks for good, so the file is left alone.
+ */
+export interface ReplaceLoss {
+  /** The container that can't hold them, as the server names it ("MP4"). */
+  container: string;
+  /** What would be lost: "2 picture-based subtitles and 1 subtitle font". */
+  lost: string;
+  /** "it" for one thing, "them" for more. */
+  them: "it" | "them";
+}
+
+const REPLACE_LOSS = /^(\S+) can't hold this file's (.+?), so it was left unchanged\b/i;
+
+/** The loss behind a skip, or `null` when the reason is about something else. */
+export function replaceLoss(reason: string | null | undefined): ReplaceLoss | null {
+  const match = REPLACE_LOSS.exec(reason?.trim() ?? "");
+  if (!match) return null;
+  const lost = match[2].trim();
+  // "2 picture-based subtitles and 1 subtitle font": count the things lost.
+  const things = lost.split(/\s+and\s+|,\s*/).reduce((sum, part) => sum + (Number.parseInt(part, 10) || 1), 0);
+  return { container: match[1], lost, them: things === 1 ? "it" : "them" };
+}
+
+/** Skip reasons that end "Convert anyway converts it …": the file is left alone until the user chooses otherwise. */
+const OFFERS_CONVERT_ANYWAY = /\bConvert anyway converts it\b/i;
+
+/** Whether the server's own skip reason offers "Convert anyway" (a lost track, a shared original). */
+export function offersConvertAnyway(reason: string | null | undefined): boolean {
+  return OFFERS_CONVERT_ANYWAY.test(reason?.trim() ?? "");
+}
+
+/**
+ * What "Convert anyway" will do, one short paragraph at a time, for the
+ * confirmation. A skip for a track that can't be kept says plainly what is
+ * left out and that it can't be brought back; another skip the server
+ * words itself shows its own sentence. `null` for the library's own rules
+ * (already efficient, not smaller enough), which the confirmation words
+ * itself.
+ */
+export function convertAnywayDetails(reason: string | null | undefined): string[] | null {
+  const loss = replaceLoss(reason);
+  if (loss) {
+    const they = loss.them === "it" ? "it is" : "they are";
+    return [
+      `${loss.container} can't hold this file's ${loss.lost}.`,
+      `Converting it anyway leaves ${loss.them} out of the new file. The original is replaced, so ${they} gone for good.`,
+      `To keep ${loss.them}, save converted files to a separate folder instead (Settings › Output).`,
+    ];
+  }
+  const text = reason?.trim() ?? "";
+  if (!offersConvertAnyway(text)) return null;
+  // The server's sentence without its closing "It was left unchanged; Convert anyway …".
+  const said = text.replace(/\s*(?:So )?it was left unchanged[;.,]?\s*Convert anyway converts it.*$/i, "").trim();
+  const cut = said || text.replace(/[;.]?\s*Convert anyway converts it.*$/i, "").trim();
+  return cut ? [cut.replace(/[.,;]?$/, ".")] : null;
+}
+
 /** The one name for "a new file was made and thrown away" (the badge says "Kept original"). */
 const KEPT_TITLE = "Kept the original";
 
 /**
  * A skip in a few words for a list row, beside its badge: "6% smaller
- * (needs at least 10%)", "7% larger than the original", "Already HEVC".
- * `null` without a reason.
+ * (needs at least 10%)", "7% larger than the original", "Already HEVC",
+ * "MP4 can't hold its 2 picture-based subtitles". `null` without a reason.
  */
 export function skipNote(reason: string | null | undefined, minSavingsPct?: number | null): string | null {
   const text = reason?.trim() ?? "";
   if (!text) return null;
+  const loss = replaceLoss(text);
+  if (loss) return `${loss.container} can't hold its ${loss.lost}`;
   const verdict = sizeVerdict(text);
   if (verdict?.kind === "smaller") {
     // In the words of the library's own setting ("At least 10% smaller").
@@ -372,6 +461,13 @@ export function skipSummary(
   const text = reason?.trim() ?? "";
   if (skippedByUser(text)) {
     return { title: "Skipped by you", body: "It's left as it is. You can convert it whenever you like." };
+  }
+  const loss = replaceLoss(text);
+  if (loss) {
+    return {
+      title: "Left unchanged",
+      body: `${loss.container} can't hold this file's ${loss.lost}, so it was left as it is. Replacing the original would lose ${loss.them} for good.`,
+    };
   }
   const verdict = sizeVerdict(text);
   if (verdict?.kind === "smaller") {

@@ -45,7 +45,8 @@ export function QueueControls({ queue, compact = false }: { queue: QueueState; c
   const [confirmStop, setConfirmStop] = useState(false);
   const size = compact ? "sm" : "md";
   return (
-    <div className="flex items-center gap-2">
+    // Wraps rather than runs past a narrow screen's edge (Stop now, then Pause).
+    <div className="flex flex-wrap items-center gap-2">
       {queue.running > 0 ? (
         <Button variant="quiet" size={size} onClick={() => setConfirmStop(true)} needsServer>
           <CircleStop aria-hidden />

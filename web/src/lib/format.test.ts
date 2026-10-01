@@ -6,6 +6,7 @@ import {
   formatDuration,
   formatEta,
   formatRelative,
+  foundByEarlierName,
   plural,
   splitFileName,
 } from "./format";
@@ -119,6 +120,24 @@ describe("sourceCodecLabel", () => {
     expect(sourceCodecLabel("No video")).toBe("No video");
     expect(sourceCodecLabel("No audio")).toBe("No audio");
     expect(sourceCodecLabel(null)).toBe("Unknown");
+  });
+});
+
+describe("foundByEarlierName", () => {
+  const renamed = { file_name: "land1080.mkv", relative_path: "Clips/land1080.mkv" };
+
+  it("sees that a result matched by a name the file no longer has", () => {
+    // The server found land1080.mkv for q=land1080.mp4 through the name its job recorded.
+    expect(foundByEarlierName(renamed, "land1080.mp4")).toBe(true);
+    expect(foundByEarlierName(renamed, "  LAND1080.MP4 ")).toBe(true);
+  });
+
+  it("says nothing when the file's own name or folder holds the text, or there is no search", () => {
+    expect(foundByEarlierName(renamed, "land1080")).toBe(false);
+    expect(foundByEarlierName(renamed, "LAND1080.mkv")).toBe(false);
+    expect(foundByEarlierName(renamed, "clips")).toBe(false);
+    expect(foundByEarlierName(renamed, "")).toBe(false);
+    expect(foundByEarlierName(renamed, "   ")).toBe(false);
   });
 });
 

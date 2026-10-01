@@ -3,7 +3,17 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
 import type { Job, ValidationCheck, ValidationReport } from "@/lib/types";
-import { JobCard, StopJobButton, checkValueText, checksLead, errorLinesFirst, historyNote, jobOverall, savingsText } from "./jobs";
+import {
+  JobCard,
+  StopJobButton,
+  checkValueText,
+  checksLead,
+  errorLinesFirst,
+  historyNote,
+  jobOverall,
+  noSpaceFreed,
+  savingsText,
+} from "./jobs";
 
 const check = (id: string, value: number | null, status: ValidationCheck["status"] = "pass"): ValidationCheck => ({
   id,
@@ -45,6 +55,8 @@ function job(partial: Partial<Job>): Job {
     attempt: 1,
     input_size: 10e9,
     output_size: 4e9,
+    freed_bytes: 6e9,
+    output_name: null,
     error: null,
     problem: null,
     skip_reason: null,
@@ -113,6 +125,37 @@ describe("job summaries", () => {
     expect(savingsText(10e9, 4e9)).toEqual({ text: "Saved 6 GB (60%)", saved: true });
     expect(savingsText(1e9, 1.5e9)).toEqual({ text: "500 MB larger", saved: false });
     expect(savingsText(1e9, null)).toBeNull();
+  });
+
+  it("goes by what the server says was freed, not by the two sizes", () => {
+    // A hard-linked original: the new file is smaller, but its old data stays on disk through the other link.
+    expect(savingsText(718_000, 402_000)).toEqual({ text: "Saved 316 KB (44%)", saved: true });
+    expect(savingsText(718_000, 402_000, 0)).toBeNull();
+    // A number is the saving; a server that didn't record it (null, or no field) leaves the sizes to say.
+    expect(savingsText(718_000, 402_000, 316_000)).toEqual({ text: "Saved 316 KB (44%)", saved: true });
+    expect(savingsText(10e9, 4e9, null)).toEqual({ text: "Saved 6 GB (60%)", saved: true });
+    expect(savingsText(10e9, 4e9, undefined)).toEqual({ text: "Saved 6 GB (60%)", saved: true });
+    // A result that grew is still said, and nothing is claimed saved.
+    expect(savingsText(1e9, 1.5e9, 0)).toEqual({ text: "500 MB larger", saved: false });
+    expect(savingsText(1e9, null, 0)).toBeNull();
+  });
+
+  it("knows when a new file freed no space", () => {
+    expect(noSpaceFreed({ input_size: 718_000, output_size: 402_000, freed_bytes: 0 })).toBe(true);
+    expect(noSpaceFreed({ input_size: 718_000, output_size: 402_000, freed_bytes: 316_000 })).toBe(false);
+    expect(noSpaceFreed({ input_size: 718_000, output_size: 402_000, freed_bytes: null })).toBe(false);
+    // A file that grew says so itself; it isn't "no space freed".
+    expect(noSpaceFreed({ input_size: 1e9, output_size: 1.5e9, freed_bytes: 0 })).toBe(false);
+    expect(noSpaceFreed({ input_size: 1e9, output_size: null, freed_bytes: 0 })).toBe(false);
+  });
+
+  it("claims no saving for a converted hard-linked file, in the list rows too", () => {
+    const linked = job({ input_size: 718_000, output_size: 402_000, freed_bytes: 0 });
+    expect(historyNote(linked)).toBe("Converted, no space freed");
+    expect(historyNote(job({ input_size: 718_000, output_size: 402_000, freed_bytes: 316_000 }))).toBe("Saved 316 KB (44%)");
+    // Jobs from before the server recorded it read the sizes, as before.
+    expect(historyNote(job({ input_size: 718_000, output_size: 402_000, freed_bytes: null }))).toBe("Saved 316 KB (44%)");
+    expect(historyNote(job({ input_size: 1e9, output_size: 1.5e9, freed_bytes: 0 }))).toBe("500 MB larger");
   });
 
   it("notes each finished job briefly, and a damaged original as such", () => {

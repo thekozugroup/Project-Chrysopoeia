@@ -42,11 +42,13 @@ import {
   CHANGED_FALLBACK,
   CHANGED_TITLE,
   KEPT_CONVERTED,
+  convertAnywayDetails,
   failureGroup,
   failureNote,
   isUnreadable,
   jobStanding,
   newFileName,
+  replaceLoss,
   setupFix,
   setupProblem,
   skipNote,
@@ -57,7 +59,7 @@ import {
   type SetupProblem,
 } from "@/lib/outcomes";
 import { overallProgress } from "@/lib/progress";
-import { useFile, useJob, useLibraries, useLibrary, useSettings } from "@/lib/queries";
+import { useFile, useJob, useLibraries, useLibrary, useNewFileName, useSettings } from "@/lib/queries";
 import { href } from "@/lib/router";
 import { useLiveJob } from "@/lib/store";
 import type { Job, JobStage, MediaFile, TranscodeProfile, ValidationCheck, ValidationReport } from "@/lib/types";
@@ -282,14 +284,37 @@ export function JobCardSkeleton() {
   );
 }
 
-/** "Saved 1.2 GB (38%)" or "1.1 GB larger" for a finished job. */
-export function savingsText(input: number, output: number | null): { text: string; saved: boolean } | null {
+/**
+ * "Saved 1.2 GB (38%)" or "1.1 GB larger" for a finished job. `freed` is
+ * what the server says the conversion released (`Job.freed_bytes`): 0 means
+ * nothing was (the original was hard-linked, so replacing it freed no
+ * space), and then no saving is claimed however the two sizes compare; a
+ * number is the saving; `null` or nothing (a job from before the server
+ * recorded it) reads the sizes. A result that grew is still said, whatever
+ * `freed` is.
+ */
+export function savingsText(
+  input: number,
+  output: number | null,
+  freed?: number | null,
+): { text: string; saved: boolean } | null {
   if (output === null) return null;
   const diff = input - output;
-  if (diff >= 0) {
-    return { text: `Saved ${formatBytes(diff)} (${Math.round(percentOf(diff, input))}%)`, saved: true };
+  if (freed === 0 && diff >= 0) return null;
+  const gained = typeof freed === "number" && freed > 0 ? freed : diff;
+  if (gained >= 0) {
+    return { text: `Saved ${formatBytes(gained)} (${Math.round(percentOf(gained, input))}%)`, saved: true };
   }
-  return { text: `${formatBytes(-diff)} larger`, saved: false };
+  return { text: `${formatBytes(-gained)} larger`, saved: false };
+}
+
+/**
+ * Whether a finished job made a new file but freed no disk space: the
+ * server's figure is 0 and the file didn't grow (a result that did says so
+ * by itself, see `savingsText`).
+ */
+export function noSpaceFreed(job: Pick<Job, "input_size" | "output_size" | "freed_bytes">): boolean {
+  return job.freed_bytes === 0 && job.output_size !== null && job.output_size <= job.input_size;
 }
 
 /** "The disk is full" → "the disk is full", to follow a colon; "NVENC …" and "HEVC" stay as they are. */
@@ -312,7 +337,10 @@ export function historyNote(job: Job, minSavingsPct?: number | null, standing: J
   const since = standing === "converted" ? " · now converted" : standing === "queued" ? " · queued again" : "";
   switch (job.state) {
     case "done":
-      return savingsText(job.input_size, job.output_size)?.text ?? "Converted";
+      return (
+        savingsText(job.input_size, job.output_size, job.freed_bytes)?.text ??
+        (noSpaceFreed(job) ? "Converted, no space freed" : "Converted")
+      );
     case "failed": {
       const note = failureNote(job);
       if (standing === "kept") return setupProblem(job) ? `${note} · converted file kept` : note;
@@ -341,7 +369,7 @@ export function SheetSection({ title, children }: { title: string; children: Rea
 /** Before and after sizes; only for jobs that produced a new file. */
 function BeforeAfter({ job, output }: { job: Job; output: number }) {
   const kept = job.state === "done";
-  const savings = savingsText(job.input_size, output);
+  const savings = savingsText(job.input_size, output, kept ? job.freed_bytes : null);
   return (
     <div className="rounded-lg border border-line bg-sunken/50 p-4">
       <div className="flex items-center justify-between gap-3">
@@ -370,6 +398,9 @@ function BeforeAfter({ job, output }: { job: Job; output: number }) {
             </p>
           ) : null}
         </>
+      ) : kept && noSpaceFreed(job) ? (
+        // The server's figure beats the two sizes: a hard-linked original's data stays on disk.
+        <p className="mt-3 text-sm font-medium text-muted">No space was freed.</p>
       ) : null}
     </div>
   );
@@ -751,9 +782,9 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
           <Detail label={renamed ? "Original" : "File"} mono>
             {job.file_path}
           </Detail>
-          {renamed && file ? (
+          {renamed ? (
             <Detail label="Now" mono>
-              {file.path}
+              {job.file_path.slice(0, job.file_path.lastIndexOf("/") + 1) + renamed}
             </Detail>
           ) : null}
           {job.hw_api ? <Detail label="Converted on">{HW_API_LABEL[job.hw_api]}</Detail> : null}
@@ -839,12 +870,16 @@ export function ConvertAgainAction({
 
 /**
  * "Convert anyway" for a file the library's settings skip (already
- * efficient, or kept because the result wasn't smaller): one conversion
- * without those rules, after a one-line confirmation.
+ * efficient, kept because the result wasn't smaller, or left unchanged
+ * because the new format can't hold some of its tracks): one conversion
+ * without those rules, after a confirmation. When tracks would be lost, it
+ * says plainly which, and that they're gone for good.
  */
 export function ConvertAnywayButton({ file, variant = "secondary" }: { file: MediaFile; variant?: "secondary" | "primary" }) {
   const { convertAnyway } = useFileActions();
   const [confirm, setConfirm] = useState(false);
+  const details = convertAnywayDetails(file.skip_reason);
+  const loses = replaceLoss(file.skip_reason) !== null;
   return (
     <>
       <Button variant={variant} size="sm" onClick={() => setConfirm(true)} needsServer>
@@ -859,10 +894,15 @@ export function ConvertAnywayButton({ file, variant = "secondary" }: { file: Med
         loading={convertAnyway.isPending}
         onConfirm={() => convertAnyway.mutate(file, { onSettled: () => setConfirm(false) })}
       >
-        <p>
-          It&apos;s converted once, ignoring this library&apos;s rules for skipping files. The usual checks still run
-          before anything is replaced.
-        </p>
+        {details?.map((line) => <p key={line}>{line}</p>)}
+        {loses ? null : (
+          <p>
+            {details
+              ? "It's converted once anyway."
+              : "It's converted once, ignoring this library's rules for skipping files."}{" "}
+            The usual checks still run before anything is replaced.
+          </p>
+        )}
       </ConfirmDialog>
     </>
   );
@@ -969,12 +1009,24 @@ export function JobSheet({ jobId, onClose }: { jobId: string | null; onClose: ()
   const shownId = useRetained(jobId);
   const query = useJob(shownId, Boolean(jobId));
   const job = query.data;
+  // A result with a new name is called by it, the old one secondary: "land1080.mkv", "was land1080.mp4".
+  const renamed = useNewFileName(job);
   return (
     <Sheet
       open={Boolean(jobId)}
       onOpenChange={(open) => !open && onClose()}
-      title={job ? middleTruncate(job.file_name, 80) : "Loading…"}
-      description={job ? "Conversion details" : undefined}
+      title={job ? middleTruncate(renamed ?? job.file_name, 80) : "Loading…"}
+      description={
+        job ? (
+          renamed ? (
+            <>
+              Conversion details · <span className="break-all">was {job.file_name}</span>
+            </>
+          ) : (
+            "Conversion details"
+          )
+        ) : undefined
+      }
       footer={job ? <JobSheetActions job={job} /> : undefined}
     >
       {job ? (

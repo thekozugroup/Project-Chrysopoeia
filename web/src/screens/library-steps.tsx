@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Field, Input } from "@/components/ui/controls";
 import { ApiError, api, errorMessage } from "@/lib/api";
 import { recommendedGoal } from "@/lib/hardware";
-import { defaultsCustomized, profileForNewLibrary } from "@/lib/profile";
+import { FACTORY_DEFAULT_GOAL, newLibraryStart, profileForNewLibrary } from "@/lib/profile";
 import { keys, useHardwareInfo, useLibraries, usePresets, useSettings } from "@/lib/queries";
 import type { Goal, Library } from "@/lib/types";
 import { titleFromFolder } from "@/lib/utils";
@@ -141,12 +141,11 @@ export function GoalStep({
   const [name, setName] = useState(titleFromFolder(path));
   const [error, setError] = useState<string | null>(null);
   const defaults = settings.data?.default_profile;
-  // Defaults changed in Settings › Advanced win; untouched ones let the
-  // hardware suggest a goal.
-  const customized = defaults ? defaultsCustomized(presets.data, defaults) : false;
-  const choice: Exclude<Goal, "custom"> | "defaults" =
-    chosen ?? (customized ? "defaults" : recommendedGoal(hardware.hw));
-  const goal: Goal = choice === "defaults" ? (defaults?.goal ?? "save_space") : choice;
+  // Defaults changed in Settings › Advanced win (even a plain goal, such as
+  // Plays everywhere); untouched ones let the hardware suggest a goal.
+  const start = newLibraryStart(presets.data, defaults, recommendedGoal(hardware.hw));
+  const choice = chosen ?? start.choice;
+  const goal: Goal = choice === "defaults" ? (defaults?.goal ?? FACTORY_DEFAULT_GOAL) : choice;
 
   const create = useMutation({
     mutationFn: async () => {
@@ -210,7 +209,7 @@ export function GoalStep({
         hardwarePending={hardware.pending}
         preference={settings.data?.hardware}
         defaults={
-          defaults && customized
+          defaults && start.defaultsCard
             ? { profile: defaults, selected: choice === "defaults", onSelect: () => setChosen("defaults") }
             : undefined
         }
