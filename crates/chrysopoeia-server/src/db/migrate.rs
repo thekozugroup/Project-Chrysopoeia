@@ -339,7 +339,11 @@ async fn migrate_to(pool: &SqlitePool, last: i64) -> anyhow::Result<()> {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
-        tracing::info!(version = target, "database updated");
+        tracing::debug!(version = target, "database updated");
+    }
+    // A new database is simply created; only an upgrade is worth a line.
+    if version >= 1 {
+        tracing::info!(from = version, to = last, "database updated");
     }
     Ok(())
 }
