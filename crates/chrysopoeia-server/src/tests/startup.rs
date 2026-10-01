@@ -372,7 +372,13 @@ async fn a_damaged_database_is_moved_aside_at_start() {
     // folds the log into the file (and removes the log) a moment after the
     // pool says it is closed. Damage the file only after that.
     let wal = data.join(format!("{}-wal", db::DB_FILE_NAME));
-    wait_until("the database is closed", || async { !wal.exists() }).await;
+    // Generous: on a busy machine those threads can take a while to run.
+    wait_until_for(
+        "the database is closed",
+        std::time::Duration::from_secs(60),
+        || async { !wal.exists() },
+    )
+    .await;
     let mut bytes = std::fs::read(&path).unwrap();
     bytes.truncate(bytes.len().min(4096));
     bytes[..16].copy_from_slice(b"garbage-garbage!");
