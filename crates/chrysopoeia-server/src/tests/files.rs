@@ -434,6 +434,7 @@ async fn scan_writes_never_touch_busy_rows() {
         skip_reason: Some("nope".into()),
         error: None,
         problem: None,
+        verdict_profile: None,
     };
     let mut tx = app.state.db.write_tx().await.unwrap();
     let seen = crate::db::files::find_by_path_conn(&mut tx, &upsert.path)
@@ -483,6 +484,7 @@ async fn scan_writes_never_touch_rows_changed_since_they_were_read() {
         skip_reason: None,
         error: Some("stale".into()),
         problem: Some(chrysopoeia_core::ProblemKind::Other),
+        verdict_profile: None,
     };
     let mut tx = app.state.db.write_tx().await.unwrap();
     assert!(!update_scanned(&mut tx, &seen, &upsert).await.unwrap());

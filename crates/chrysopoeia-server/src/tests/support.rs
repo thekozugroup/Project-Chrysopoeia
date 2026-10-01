@@ -55,6 +55,9 @@ pub enum Behavior {
     Hold,
     /// Wait until cancelled, or until released (then fail with this error).
     HoldFail(String),
+    /// Wait until cancelled, or until released (then behave like the inner
+    /// behaviour).
+    HoldThen(Box<Behavior>),
     /// Panic inside the transcoder.
     Panic,
     /// The file stopped answering: `NotResponding` at once.
@@ -164,6 +167,9 @@ pub struct FakeToolkit {
     pub placing_stops: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
     /// What each `StuckPlacing` job would have put in place, by job id.
     pub placing_specs: Mutex<HashMap<Uuid, (RunConfig, JobSpec)>>,
+    /// Refuse a destination already taken, as the worker does (before the
+    /// encode, and again before the new file is written).
+    pub check_destination: AtomicBool,
 }
 
 impl Default for FakeToolkit {
@@ -194,6 +200,7 @@ impl Default for FakeToolkit {
             placing_ends: Mutex::new(HashMap::new()),
             placing_stops: Mutex::new(HashMap::new()),
             placing_specs: Mutex::new(HashMap::new()),
+            check_destination: AtomicBool::new(false),
         }
     }
 }
@@ -641,6 +648,9 @@ impl MediaToolkit for Arc<FakeToolkit> {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
+            // Read before the job counts as started, so a test that saw it
+            // start may change what the next run does.
+            let mut behavior = me.behavior_for(&name);
             me.started.lock().unwrap().push(name.clone());
             me.run_configs.lock().unwrap().push(cfg.clone());
             me.run_specs.lock().unwrap().push(spec.clone());
@@ -686,7 +696,49 @@ impl MediaToolkit for Arc<FakeToolkit> {
                 },
                 other => other,
             };
-            match me.behavior_for(&name) {
+            // The worker's check of the destination, before the encode.
+            let taken = || async {
+                if !me.check_destination.load(Ordering::SeqCst) {
+                    return None;
+                }
+                let target = final_path(&cfg, &spec);
+                chrysopoeia_worker::finalize::destination_conflict(
+                    &spec.input,
+                    &target,
+                    cfg.output_mode,
+                    Duration::from_secs(5),
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|error| JobOutcome::Failed {
+                    error,
+                    problem: ProblemKind::Destination,
+                    log_tail: None,
+                    command: None,
+                    encoder: None,
+                    attempt: 0,
+                    validation: None,
+                })
+            };
+            if let Some(refused) = taken().await {
+                return refused;
+            }
+            while let Behavior::HoldThen(then) = behavior {
+                tokio::select! {
+                    () = cancel.cancelled() => return JobOutcome::Cancelled,
+                    permit = me.release.acquire() => {
+                        if let Ok(p) = permit { p.forget(); }
+                    }
+                }
+                // ... and again before the new file is put in place.
+                if let Some(refused) = taken().await {
+                    return refused;
+                }
+                behavior = *then;
+            }
+            match behavior {
+                Behavior::HoldThen(_) => unreachable!("held above"),
                 Behavior::Done { ratio } => with_notes(fake_done(&cfg, &spec, ratio).await),
                 Behavior::Skip(reason) => JobOutcome::Skipped {
                     reason,

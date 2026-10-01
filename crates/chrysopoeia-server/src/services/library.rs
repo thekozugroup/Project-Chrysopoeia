@@ -236,6 +236,7 @@ async fn store_moved(
         skip_reason: None,
         error: None,
         problem: None,
+        verdict_profile: None,
     };
     let mut tx = state.db.write_tx().await?;
     let id = db::files::insert_moved(&mut tx, &upsert, from).await?;
@@ -441,7 +442,9 @@ fn row_names(root: &Path, file: &DiscoveredFile) -> Option<(String, String, Stri
     Some((path, relative_path, file_name))
 }
 
-/// The row to store for a probed and decided file.
+/// The row to store for a probed and decided file. `goal` is the stored
+/// form of the goal the verdict was decided with
+/// (`db::files::profile_json`).
 fn build_upsert(
     library_id: Uuid,
     root: &Path,
@@ -449,8 +452,10 @@ fn build_upsert(
     probe: Result<ProbeInfo, ProbeError>,
     verdict: Verdict,
     auto_queue: bool,
+    goal: &str,
 ) -> Option<FileUpsert> {
     let (path, relative_path, file_name) = row_names(root, file)?;
+    let verdict_profile = (!matches!(verdict, Verdict::Broken(..))).then(|| goal.to_string());
     let (status, skip_reason, error, problem) = match verdict {
         Verdict::Transcode if auto_queue => (FileStatus::Queued, None, None, None),
         Verdict::Transcode => (FileStatus::Pending, None, None, None),
@@ -469,6 +474,7 @@ fn build_upsert(
         skip_reason,
         error,
         problem,
+        verdict_profile,
     })
 }
 
@@ -758,14 +764,12 @@ struct Probed {
 
 /// What [`flush`] did.
 struct Flushed {
-    /// The profile the batch was decided with.
-    profile: TranscodeProfile,
     broken: u64,
     jobs: usize,
 }
 
 /// Decide a batch of probed files with the library's current profile and
-/// store it.
+/// store it (with that profile as the goal of each verdict).
 async fn flush(
     state: &AppState,
     lib: &LibraryRow,
@@ -775,6 +779,7 @@ async fn flush(
     let profile = db::libraries::get(state.db.pool(), lib.id)
         .await?
         .map_or_else(|| lib.profile.clone(), |l| l.profile);
+    let goal = db::files::profile_json(&profile)?;
     let auto_queue = state.settings().auto_queue;
     let root = Path::new(&lib.path);
     let mut broken = 0;
@@ -784,7 +789,7 @@ async fn flush(
         if matches!(v, Verdict::Broken(..)) {
             broken += 1;
         }
-        if let Some(upsert) = build_upsert(lib.id, root, &p.file, p.probe, v, auto_queue) {
+        if let Some(upsert) = build_upsert(lib.id, root, &p.file, p.probe, v, auto_queue, &goal) {
             analyzed.push(Analyzed {
                 existing: p.existing,
                 upsert,
@@ -792,11 +797,7 @@ async fn flush(
         }
     }
     let (_, jobs) = write_batch(state, analyzed, read_at).await?;
-    Ok(Flushed {
-        profile,
-        broken,
-        jobs,
-    })
+    Ok(Flushed { broken, jobs })
 }
 
 /// How long a library folder may take to answer before it is reported as
@@ -1121,7 +1122,6 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     // Probe new and changed files, then decide and store them in batches.
     // Each batch is decided with the profile read right before it is
     // written, so a goal changed during a long scan applies to the rest.
-    let mut profile = lib.profile.clone();
     let total = to_analyze.len() as u64;
     state.emit(scan_progress(
         &lib,
@@ -1164,7 +1164,6 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
             let flushed = flush(state, &lib, std::mem::take(&mut batch), &read_at).await?;
             broken += flushed.broken;
             jobs_created += flushed.jobs;
-            profile = flushed.profile;
             // Big libraries: start converting while the scan goes on.
             if flushed.jobs > 0 {
                 state.dispatcher.wake();
@@ -1186,19 +1185,18 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         let flushed = flush(state, &lib, batch, &read_at).await?;
         broken += flushed.broken;
         jobs_created += flushed.jobs;
-        profile = flushed.profile;
     }
     if cancel.is_cancelled() {
         return Ok(());
     }
 
-    // The goal changed after the last batch was decided (the change itself
-    // re-decided only the files that were stored by then).
+    // Verdicts decided with another goal than the library's current one:
+    // batches decided before the goal changed during this scan (the change
+    // itself re-decided only the files stored by then), and any verdict an
+    // earlier goal left (or whose goal isn't known).
     let mut redecided = 0;
-    if let Some(current) = db::libraries::get(state.db.pool(), id).await?
-        && current.profile != profile
-    {
-        redecided = redecide(state, &current, Some(&profile)).await?;
+    if let Some(current) = db::libraries::get(state.db.pool(), id).await? {
+        redecided = redecide(state, &current, None).await?;
     }
 
     db::libraries::set_last_scan(state.db.pool(), id, Utc::now()).await?;
@@ -1399,7 +1397,9 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
         return Ok(Single::Handled);
     }
     let v = verdict(state, &probe, &lib.profile);
-    let Some(upsert) = build_upsert(lib.id, &root, &file, probe, v, settings.auto_queue) else {
+    let goal = db::files::profile_json(&lib.profile)?;
+    let Some(upsert) = build_upsert(lib.id, &root, &file, probe, v, settings.auto_queue, &goal)
+    else {
         return Ok(Single::Handled);
     };
     let file_name = upsert.file_name.clone();
@@ -1434,7 +1434,7 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
 /// Profile fields that change how big a conversion's result is. A file a job
 /// skipped because the result was not small enough is only worth trying
 /// again when one of these changed.
-fn affects_output_size(old: &TranscodeProfile, new: &TranscodeProfile) -> bool {
+pub(crate) fn affects_output_size(old: &TranscodeProfile, new: &TranscodeProfile) -> bool {
     old.video_codec != new.video_codec
         || old.audio_codec != new.audio_codec
         || old.quality != new.quality
@@ -1445,28 +1445,69 @@ fn affects_output_size(old: &TranscodeProfile, new: &TranscodeProfile) -> bool {
         || old.audio_languages != new.audio_languages
 }
 
-/// Re-decide the `pending` and `skipped` files of a library after its profile
-/// changed from `previous` (when known). Files a job skipped as not worth
-/// keeping stay skipped unless the change affects output size. Works in
-/// chunks of [`REDECIDE_CHUNK`] files, each read and written in one short
-/// transaction. Returns how many files changed status.
+/// Re-decide the `pending` and `skipped` files of a library whose verdict
+/// was decided with another goal than its current one (`lib.profile`), or
+/// with a goal that isn't known: after a goal change, and at the end of
+/// every scan (a verdict a job, a watch event or a scan wrote under an
+/// earlier goal). Files the user skipped stay skipped.
+///
+/// A file a job skipped as not worth keeping (the size rule) stays skipped
+/// unless the change affects the output size, judged from the goal its
+/// verdict was decided with, else from `previous` (the goal before a
+/// change); with neither, it is decided again. Pending files stay pending
+/// when the goal would convert them (the user may have taken them out of
+/// the queue on purpose); skipped ones are queued (or pending, without
+/// auto-queue). Every file looked at records the current goal as its
+/// verdict's.
+///
+/// Works in chunks of [`REDECIDE_CHUNK`] files, each read and written in one
+/// short transaction, and stops when the goal changes again meanwhile (that
+/// change re-decides the files itself). Returns how many files changed
+/// status.
 pub async fn redecide(
     state: &AppState,
     lib: &LibraryRow,
     previous: Option<&TranscodeProfile>,
 ) -> anyhow::Result<u64> {
-    let size_matters = previous.is_none_or(|p| affects_output_size(p, &lib.profile));
+    let goal = db::files::profile_json(&lib.profile)?;
+    let decided_with_current =
+        |stored: Option<&str>| db::files::parse_profile(stored).is_some_and(|p| p == lib.profile);
+    let stale: Vec<Option<String>> =
+        db::files::verdict_profiles(state.db.pool(), lib.id, USER_SKIP_REASON)
+            .await?
+            .into_iter()
+            .filter(|v| !decided_with_current(v.as_deref()))
+            .collect();
+    if stale.is_empty() {
+        return Ok(0);
+    }
+    let ids = db::files::redecide_candidate_ids(state.db.pool(), lib.id, USER_SKIP_REASON, &stale)
+        .await?;
     let auto_queue = state.settings().auto_queue;
-    let ids = db::files::redecide_candidate_ids(state.db.pool(), lib.id, USER_SKIP_REASON).await?;
     let mut changed = 0u64;
     let mut jobs = 0u64;
     let mut decider_broken = false;
     for chunk in ids.chunks(REDECIDE_CHUNK) {
         let mut tx = state.db.write_tx().await?;
+        if db::libraries::profile_conn(&mut tx, lib.id).await?.as_ref() != Some(&lib.profile) {
+            tx.rollback().await?;
+            break;
+        }
         let candidates = db::files::redecide_candidates(&mut tx, chunk, USER_SKIP_REASON).await?;
         let mut to_queue = Vec::new();
         for c in candidates {
-            if c.size_rule_skip && !size_matters {
+            let decided_with = db::files::parse_profile(c.verdict_profile.as_deref());
+            // Decided with the current goal meanwhile (a job that ended).
+            if decided_with.as_ref() == Some(&lib.profile) {
+                continue;
+            }
+            if c.size_rule_skip
+                && decided_with
+                    .as_ref()
+                    .or(previous)
+                    .is_some_and(|before| !affects_output_size(before, &lib.profile))
+            {
+                db::files::confirm_verdict(&mut tx, c.id, &goal).await?;
                 continue;
             }
             let (status, reason) = match state.toolkit.decide(&c.probe, &lib.profile) {
@@ -1492,12 +1533,15 @@ pub async fn redecide(
                     c.id,
                     status,
                     reason.as_deref(),
+                    Some(&goal),
                     &[FileStatus::Pending, FileStatus::Skipped],
                 )
                 .await?;
                 if status != c.status {
                     changed += 1;
                 }
+            } else {
+                db::files::confirm_verdict(&mut tx, c.id, &goal).await?;
             }
         }
         let queued = db::jobs::create_many(&mut tx, &to_queue, &[FileStatus::Skipped]).await?;

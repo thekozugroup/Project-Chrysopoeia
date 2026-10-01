@@ -130,14 +130,14 @@ files(id TEXT PK, library_id FK→libraries ON DELETE CASCADE, path UNIQUE, rela
       file_name, size_bytes INT, modified_at TEXT, status TEXT, probe TEXT JSON NULL,
       container, video_codec, audio_codec, resolution, hdr, duration_secs REAL, bit_rate INT,
       original_size_bytes INT NULL, saved_bytes INT NULL, skip_reason, error,
-      problem TEXT NULL, job_id TEXT NULL, scanned_at, updated_at)
+      problem TEXT NULL, job_id TEXT NULL, verdict_profile TEXT JSON NULL, scanned_at, updated_at)
       INDEX(library_id, status), INDEX(status)
 jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, file_path,
      state TEXT, stage TEXT, priority INT, progress REAL, fps REAL, speed REAL, eta_secs INT,
      encoder, hw_api, attempt INT, input_size INT, output_size INT, error, problem TEXT NULL,
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
-     freed_bytes INT NULL)
+     freed_bytes INT NULL, profile TEXT JSON NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
@@ -175,7 +175,13 @@ lifecycle). 9 = `jobs.freed_bytes` (the space a conversion released, not
 guessed for conversions finished before) and `activity.problem` (the kind of
 problem an entry about a failed file is about; the error entries already in
 the feed take it from the failed job they refer to); see Contract additions
-(round 5).
+(round 5). 10 = `files.verdict_profile` (the goal a `pending` or `skipped`
+verdict was decided with, see "Verdicts and goal changes") and
+`jobs.profile` (the goal a job ran with, written when it starts, with
+`final_path`; `NULL` for jobs from before). Verdicts recorded before are
+taken to be the library's current goal's, except a file a job skipped by
+the size rule in a library whose goal has no size rule now (an earlier
+goal's verdict): it is left unknown, so the next scan decides it again.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -272,6 +278,9 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   (1 MB = 1 000 000 bytes). The minimum size only decides which files are
   added: files already listed stay while they are on disk (a conversion often
   ends up below the minimum).
+- Every scan ends by deciding again the `pending` and `skipped` files whose
+  verdict came from another goal than the library's current one, or from
+  an unknown one (see "Verdicts and goal changes").
 - Files `queued`/`processing` are not touched by scans or watch events. Files
   `done` whose size/mtime still match are left alone. A file in `failed` is
   not re-queued automatically; the user retries.
@@ -295,6 +304,50 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   library or output folder that was out of reach (missing, not responding,
   or a library with files that is empty now), keeps it due, and a scan that
   reaches such a library does the search there.
+
+## Verdicts and goal changes
+
+- Every automatic verdict (a scan's or watch event's `pending`/`skipped`, a
+  job's skip, a re-decision) records the goal it was decided with
+  (`files.verdict_profile`, the profile's JSON, compared by value). A
+  status set without a decision (a cancelled job, a file taken out of the
+  queue) forgets it, so the next scan decides that file.
+- A goal change (`PATCH /libraries/{id}`) and the end of every scan decide
+  again the `pending` and `skipped` files whose verdict's goal isn't the
+  current one (files skipped by the user stay skipped). A file a job
+  skipped by the size rule stays skipped, with the current goal as its
+  verdict's, unless the change affects the output size (codec, audio,
+  quality, speed, size limit, minimum saving, audio languages), judged from
+  its verdict's goal, else the goal before the change; with neither, it is
+  decided again. Skipped files the goal now converts are queued (`pending`
+  without auto-queue); pending ones stay pending. Each transaction re-reads
+  the library's goal and stops when it changed again meanwhile (that
+  change decides the files itself).
+- A job runs with the goal read when it starts (`jobs.profile`). When it
+  ends under another one (the goal changed while it ran, once or more), its
+  file is decided again against the current goal in the transaction that
+  records the end:
+  - skipped, or failed by the goal's own rule (`hardware_unavailable`: the
+    chosen hardware can't make its codec): queued again when the current
+    goal converts it (`pending` without auto-queue), else skipped with the
+    current goal's reason; a size-rule skip stays (current goal recorded)
+    when the change doesn't affect the output size;
+  - converted, or kept as converted (`done`), in replace mode and with
+    auto-queue on: queued again when the current goal would convert the
+    new file as it is (from its fresh probe; the usual rules skip files
+    already in an efficient format); otherwise it stays `done`. In folder
+    mode it stays `done`: its result is in the output folder already, and
+    converting it again would need that name;
+  - other failures stay failed (the user retries), and a cancelled or
+    requeued job changes nothing (a requeued job runs with the current
+    goal; a cancelled one's file is decided by the next scan).
+  "Convert anyway" applies to the goal it was given: the new decision uses
+  the usual rules and creates a normal job. A job that ran with the current
+  goal (or whose goal isn't known) is never decided again, so nothing
+  loops. The feed says what happened ("The goal of Movies changed while
+  a.mkv was being converted, so it was queued again for the new goal." /
+  "… Under the new goal it is left as it is: Already H.264 in an MP4 or
+  MOV file.").
 
 ## Folder watching
 
@@ -425,6 +478,33 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   conversions are waiting.
 - `jobs.force` is passed to the worker as `JobSpec.force` and echoed as
   `Job.force`.
+- Two files converted to one name. In folder mode every library's folders
+  are mirrored in the one output folder without the library's name (the
+  layout stays so), so the same relative path in two libraries
+  (`/media/movies/Movies/Frozen (2013)/Frozen.mkv` and
+  `/media/kids/Movies/Frozen (2013)/Frozen.mkv`) gives one output file;
+  two originals that differ only by extension do too, in either mode.
+  Nothing is ever overwritten: a job starting while a job of another file
+  aims at the same name (`jobs.final_path` of a running job, checked and
+  taken in one transaction with `db::jobs::claim_destination`) fails at
+  once, before encoding (`destination`); one that finds the name taken in
+  the output folder fails as the worker says (before encoding, or when a
+  file appeared meanwhile), and the error then names whose file has it
+  (`finalize::output_name_taken`, `db::jobs::destination_owner`: the
+  running or last finished job of another file with that `final_path`).
+  Another library: "Another library's converted file, from Kids, already
+  uses the name "Movies/Frozen (2013)/Frozen.mkv" in the output folder
+  /out, so this file wasn't converted and that file wasn't overwritten.
+  Rename one of the two files, or convert one library at a time, each to a
+  different output folder chosen in Settings › Output." (while that one is
+  converting: "Another library's file, from Kids, is being converted to the
+  same name, … so this file wasn't converted. …"). The same library:
+  "Another file in this library, "Frozen.avi", was converted (is being
+  converted) to the same name, …. Rename one of the two files, then
+  convert this one again." Replacing originals: "Another file in the same
+  folder, "Movie.avi", is being converted to the same name, "Movie.mkv",
+  so this file wasn't converted. …". When no such job is on record (a file
+  someone else put there), the worker's message stays.
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
   start (older versions didn't read it).
 - A failure is logged once, at WARN, through its activity entry.
@@ -523,7 +603,9 @@ with `JobSpec.force` uses it when `decide` says skip.
 1. Preparing: the input exists (answering within 30 s; otherwise the job
    ends with `JobOutcome::NotResponding { path }`, which the dispatcher
    turns into a requeue with the library offline), `decide` agrees
-   (`decide_forced` with `force`), the destination is free and its folder
+   (`decide_forced` with `force`), the destination is free (another
+   running job of another file aiming at the same name is checked by the
+   server first, see Dispatcher) and its folder
    writable (a new name longer than 255 bytes, or one that can't be checked,
    is refused here, not after the encode), and the temp folder has room.
    The room reserved is what the encode may grow to: 1.1× the original,
@@ -688,7 +770,11 @@ original's identity is checked again right before it is touched. Replace mode
 checked to be the file the job read, a new name must still be free when the
 new file moves in, and any failure puts the backup back. (A backup name longer
 than 255 bytes: the new file is renamed in first, then a renamed original is
-deleted.) Folder mode: create folders, never overwrite, never touch the
+deleted.) A new name (folder mode, or a new extension) is claimed in the
+process for the whole step, so two jobs aiming at one name can't both find
+it free: the second fails with the usual "appeared in the output folder"
+/ "appeared next to the original" message, and the first's file is never
+overwritten. Folder mode: create folders, never overwrite, never touch the
 original. The new file gets the original's permission bits, its owner and
 group where allowed (the group alone when only that is), and, with
 `keep_file_dates`, its times; a new file that couldn't keep the owner or
@@ -723,7 +809,7 @@ and picks the fix by this code, never by reading sentences.
 |---|---|---|
 | `unreadable_source` | The original can't be read as a video, or stops early | ffprobe rejects it at scan time; a cut-off download ("The original file appears damaged or incomplete (it stops after 0.1 s)…"); no readable audio track; no read permission |
 | `work_folder` | The work folder (`settings.temp_dir` / `TEMP_DIR`) can't be used | a file in the way of its name; no write permission; a read-only drive |
-| `destination` | The new file can't be put where it belongs | a read-only library or no write permission (checked before encoding); a file already using the new name; a new name too long for the disk; folder mode without an output folder |
+| `destination` | The new file can't be put where it belongs | a read-only library or no write permission (checked before encoding); a file already using the new name (another library's converted file with the same relative path in the output folder); a new name too long for the disk; folder mode without an output folder |
 | `disk_full` | Not enough room | the work folder can't hold ~1.1× the original even with no other job running; the disk filled up while encoding or copying (with other jobs running, the job is first tried again once) |
 | `encoder` | The encoder failed on every attempt | ffmpeg stops with an error, stops making progress for 10 min, or writes nothing |
 | `hardware_unavailable` | The hardware chosen in Settings can't make the codec and CPU fallback is off | also a worker given no encoder at all |
@@ -777,7 +863,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline) |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. Starts a scan. |
 | `GET /libraries/{id}` | | `Library` |
-| `PATCH /libraries/{id}` | `{"name"?, "enabled"?, "profile"?}` (profile is normalized; response includes it) | `Library`. Profile changes re-decide `pending`/`skipped` files (not done/failed; files skipped by the user stay skipped). |
+| `PATCH /libraries/{id}` | `{"name"?, "enabled"?, "profile"?}` (profile is normalized; response includes it) | `Library`. Profile changes re-decide `pending`/`skipped` files (not done/failed; files skipped by the user stay skipped); a file being converted is decided again when its job ends (see "Verdicts and goal changes"). |
 | `DELETE /libraries/{id}` | | 204. Removes DB rows only (files, jobs and its share of the savings history), never media. Cancels its running jobs. |
 | `POST /libraries/{id}/scan` | | 202 `{"started":true}` (409 `scan_running`, 409 `library_disabled`) |
 | `POST /scan` | | 202, scans all enabled libraries |
