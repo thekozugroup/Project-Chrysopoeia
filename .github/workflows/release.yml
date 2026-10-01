@@ -10,8 +10,9 @@ name: Release
 #                 -> :edge and :sha-<short>   (image version <branch>-<short sha>)
 #     so an image can be tried (e.g. on Unraid, Repository set to :edge)
 #     before the branch is merged. It never moves :latest.
-# The amd64 image must pass the entrypoint and end-to-end tests before anything
-# is pushed.
+# The amd64 image must pass the entrypoint tests and both end-to-end tests (API
+# and browser) before anything is pushed. The arm64 image is cross-compiled and
+# is not run here.
 # The first image ever published, including a first :edge from a manual run on
 # a branch, creates the package as private. Make it public once (GitHub ->
 # Packages -> chrysopoeia -> Package settings -> Change visibility) so Unraid
@@ -31,10 +32,15 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Drives web/e2e/smoke.mjs (scripts/e2e-browser.sh) against the built image.
+  PLAYWRIGHT_VERSION: "1.56.1"
+
 jobs:
   image:
     name: Build, test and push
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +50,7 @@ jobs:
 
       - name: Version string
         # The image version: shown in the first line of the container log
-        # ("Chrysopoeia 0.2.0 (image main-1a2b3c4)") and in the OCI version
+        # ("Chrysopoeia 0.2.0 (build main-1a2b3c4)") and in the OCI version
         # label. Tags: v1.2.3 -> 1.2.3. Branches: <branch>-<short sha>, so a
         # bug report from a :latest image names the exact commit. The server
         # itself (API, "is running" log line) reports Cargo.toml's version.
@@ -68,6 +74,10 @@ jobs:
           platforms: arm64
 
       - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - uses: docker/login-action@v3
         with:
@@ -124,8 +134,16 @@ jobs:
       - name: Entrypoint tests
         run: docker/test-entrypoint.sh chrysopoeia:release-test
 
-      - name: End-to-end smoke test
+      - name: End-to-end smoke test (API)
         run: scripts/e2e-smoke.sh chrysopoeia:release-test
+
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --global "playwright@${PLAYWRIGHT_VERSION}"
+          playwright install --with-deps chromium
+
+      - name: End-to-end smoke test (first run in a browser)
+        run: scripts/e2e-browser.sh chrysopoeia:release-test
 
       - name: Build and push linux/amd64 + linux/arm64
         uses: docker/build-push-action@v6

@@ -7,8 +7,9 @@
 #   2. adds the user to the groups that own the GPU device nodes it can see
 #      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes), except root,
 #   3. hands that user Chrysopoeia's own files in /config (the database and its
-#      lock) and the top of /config and /temp when those are new or empty,
-#      without ever re-owning other files or folders (the folder may be shared),
+#      lock), the top folder of /config when it is new, empty or already holds
+#      the database, and the top folder of /temp, without ever re-owning other
+#      files or folders (the folder may be shared),
 #   4. prints a short banner and drops privileges with setpriv.
 # Started as any other user (docker run --user ...), it only applies UMASK
 # and the path defaults, then runs the command directly.
@@ -159,13 +160,13 @@ banner() {
         temp_line="next to each file (mount /temp to use an SSD instead)"
     fi
     # The server reports its own version (Cargo.toml) in the log and API; the
-    # image version (a release tag, or <branch>-<commit>) names the build.
+    # build label (a release tag, or <branch>-<commit>) names the image.
     image_version=${CHRYSOPOEIA_VERSION:-dev}
     app_version=$(chrysopoeia --version 2>/dev/null | awk 'NR == 1 { print $NF }') || app_version=""
     if [ -z "$app_version" ] || [ "$app_version" = "$image_version" ]; then
         title="Chrysopoeia $image_version"
     else
-        title="Chrysopoeia $app_version (image $image_version)"
+        title="Chrysopoeia $app_version (build $image_version)"
     fi
     log "------------------------------------------------------------"
     log "$title"

@@ -8,7 +8,7 @@ IMAGE ?= chrysopoeia:dev
 PLATFORM ?= linux/amd64
 
 .DEFAULT_GOAL := help
-.PHONY: help dev-api dev-web web-install build run test lint fmt docker test-docker e2e test-media clean
+.PHONY: help dev-api dev-web web-install build run test lint fmt docker test-docker e2e e2e-browser test-media clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -51,8 +51,11 @@ docker: ## Build the Docker image (IMAGE=chrysopoeia:dev, PLATFORM=linux/amd64)
 test-docker: docker ## Build the image, then test its entrypoint (PUID/PGID, GPU groups)
 	docker/test-entrypoint.sh $(IMAGE)
 
-e2e: docker ## Build the image, then run the end-to-end smoke test against it
+e2e: docker ## Build the image, then run the end-to-end smoke test (API) against it
 	scripts/e2e-smoke.sh $(IMAGE)
+
+e2e-browser: docker ## Build the image, then drive its first run in a real browser (needs Playwright)
+	scripts/e2e-browser.sh $(IMAGE)
 
 test-media: ## Generate a small synthetic media library in ./media (MEDIA_DIR=...)
 	scripts/make-test-media.sh $(MEDIA_DIR)

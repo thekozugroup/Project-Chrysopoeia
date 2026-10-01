@@ -8,18 +8,28 @@ original before it is allowed to replace it.
 It runs as one Docker container with one web page, on Unraid or any Linux,
 Windows or macOS machine that runs Docker (or natively on a Mac).
 
-![The Overview: the space saved so far, what is converting now, how far each library has come and the latest results](docs/screenshots/overview.png)
+![The Overview: the space saved so far, a conversion running now, how far each library has come and the latest results](docs/screenshots/overview.png)
 
 <table>
   <tr>
     <td width="50%"><img src="docs/screenshots/queue.png" alt="The Queue: a running conversion with its current step, progress and time left, under the Running, Up next and History tabs"></td>
-    <td width="50%"><img src="docs/screenshots/hardware.png" alt="Settings, Hardware: this machine's processor, memory and graphics, setup tips, and which formats its encoders can produce"></td>
+    <td width="50%"><img src="docs/screenshots/job.png" alt="A finished file's details: Verified and replaced, the checks that passed, and the size before and after"></td>
   </tr>
   <tr>
     <td align="center"><sub>The Queue, with a conversion running</sub></td>
-    <td align="center"><sub>Settings › Hardware</sub></td>
+    <td align="center"><sub>A finished file, with the checks that let it replace the original</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/hardware.png" alt="Settings, Hardware: This machine's processor, memory and graphics card, and which formats its encoders can produce"></td>
+    <td width="50%"><img src="docs/screenshots/setup.png" alt="First run: the goal step, with the Movies folder chosen and four goals to pick from, the best fit for this machine marked"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Settings › Hardware, <em>This machine</em></sub></td>
+    <td align="center"><sub>First run: choose a folder, then a goal</sub></td>
   </tr>
 </table>
+
+<p align="center"><img src="docs/screenshots/phone.png" alt="The Overview on a phone" width="260"></p>
 
 ## Why Chrysopoeia
 
@@ -29,20 +39,22 @@ while asking far less of you:
 
 - **Goals instead of plugins.** Choose *Save space*, *Balanced*, *Plays
   everywhere* or *Archive*. Codec, container, quality and audio handling follow
-  from that; every setting can still be changed under Advanced.
+  from that; every setting can still be changed under *More format options*.
 - **One container, nothing to wire up.** The server, the job queue, the workers
   and the web UI are a single process on port 8080. No nodes, no separate
   database.
 - **Hardware set up for you.** On start it finds your GPUs, runs a one-second
   test encode on each hardware encoder, and only uses the ones that actually
-  work. The number of jobs to run at once is worked out from your CPU cores,
-  memory, container limits and GPU.
+  work. The number of files to convert at once is worked out from your CPU
+  cores, memory, container limits and GPU.
 - **Verified before replaced.** Each result must decode cleanly from start to
   finish, keep the expected streams and duration, and match the original
   visually (SSIM at several points in the file). Only then is the original
   swapped out, in a way that survives crashes and power loss.
 - **Plain explanations.** Every skipped or failed file says why, in a sentence.
-  GPU setup problems are shown in the app with the exact setting to change.
+  Setup problems, such as a GPU the container cannot see or a read-only media
+  folder, are listed under *Needs your attention* on the Overview with the
+  exact setting to change.
 
 ## Features
 
@@ -60,10 +72,14 @@ while asking far less of you:
   images in MP4 or WebM), the original is left as it is. An MKV goal keeps it
   all; with an output folder or Convert anyway the file is converted and each
   loss is noted on the job.
-- Watches folders and picks up new files, with an optional schedule (active
-  hours), pause, priorities and retry.
+- Watches folders and picks up new files, with an optional schedule (*When to
+  convert*), pause, priorities and retry.
 - Replaces originals in place, or writes to a separate output folder and leaves
-  originals alone.
+  originals alone. The converted file gets the new container's extension, so
+  `Movie.mp4` becomes `Movie.mkv`: Plex, Jellyfin and Emby pick that up at their
+  next scan, while Sonarr and Radarr see the old file as missing until their next
+  disk scan or a *Refresh & Scan* of the series or movie (see the
+  [FAQ](#faq)).
 
 ### Goals
 
@@ -74,7 +90,26 @@ while asking far less of you:
 | Plays everywhere | H.264 | AAC | MP4 | always (compatibility is the point) |
 | Archive | AV1, highest quality | original | MKV | at least 5% smaller |
 
+The first-run screen suggests the goal that suits the machine (the *Best fit*
+badge) and shows how fast each goal converts on it.
+
 ## Quick start
+
+> **Installing before the first release, or from a branch?** The addresses and
+> the image in this section belong to the `main` branch and to the image
+> `ghcr.io/thekozugroup/chrysopoeia:latest` that its Release workflow publishes.
+> Until the project is merged to `main`, that workflow has run, and the package
+> has been made public, the template and icon addresses answer *404*, the compose
+> file address may still serve an older, incompatible file, and pulling
+> `:latest` is *denied*. Until then, do one of these:
+>
+> - **Use the branch.** In every `raw.githubusercontent.com` address, replace
+>   `main` with the branch's name (a pushed branch serves the same files), and
+>   use the image `ghcr.io/thekozugroup/chrysopoeia:edge` instead of `:latest`.
+>   Run **Actions › Release › Run workflow** on the branch to publish it, and
+>   make the package public once (see [Which image](#which-image)).
+> - **[Build the image yourself](#build-it-yourself)**, about 15 minutes, and
+>   use the local image (`chrysopoeia:local`) wherever `:latest` appears below.
 
 ### Unraid
 
@@ -117,7 +152,7 @@ docker run -d --name chrysopoeia --restart unless-stopped \
 
 Use the owner of your media for `PUID`/`PGID` (`stat -c '%u %g' /srv/media`).
 Optional: `-v /fast/ssd/chrysopoeia-temp:/temp` keeps in-progress files on a
-fast disk. Add a GPU with one extra flag:
+fast disk. Add a GPU with one extra flag (more in [GPU setup](#gpu-setup)):
 
 ```sh
 # Intel or AMD
@@ -139,12 +174,100 @@ curl -o .env https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/
 docker compose up -d
 ```
 
+To run another image than `:latest` (the `:edge` test build, or one you
+[built yourself](#build-it-yourself)), add a line to `.env`, for example
+`CHRYSOPOEIA_IMAGE=chrysopoeia:local`.
+
 With a GPU, download the matching overlay file too and name both files:
 
 ```sh
 docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d      # NVIDIA
 docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d   # Intel / AMD
 ```
+
+### The first run
+
+Open the web UI. The welcome page says which GPU was found (or that your CPU
+will do the work). **Choose a folder** opens a folder browser at `/media`: open
+the folder you want converted and click the button that names it, **Use
+“Movies”**. Then pick a goal and click **Start**. Chrysopoeia scans the folder,
+queues the files that need work and starts converting; the Overview shows the
+space saved and what is happening now. Add more folders later with **Add
+library**.
+
+### Which image
+
+Images are published to `ghcr.io/thekozugroup/chrysopoeia` for `linux/amd64`
+and `linux/arm64`:
+
+| Tag | What it is |
+|---|---|
+| `latest` | The newest tested build of the `main` branch. |
+| `1.2.3`, `1.2`, `1` | A release (a `v1.2.3` tag); `1` follows the newest 1.x. |
+| `edge` | A test build of a branch that is not merged yet. It is published when someone runs **Actions › Release › Run workflow** on that branch, and never changes `latest`. |
+| `sha-<commit>` | One exact commit. |
+
+Versions before 1.0 are tagged `0.2.3` and `0.2` only; the `1` tag starts with
+version 1.0.
+
+To try a branch before it is merged, run the Release workflow on it, then pull
+`ghcr.io/thekozugroup/chrysopoeia:edge` (Unraid: set the container's
+*Repository* to that). After the merge to `main`, switch back to `:latest`. The
+very first image creates the package as private; make it public once in
+GitHub › Packages › chrysopoeia › Package settings.
+
+The Unraid template's `Icon` and `TemplateURL` point at the `main` branch, so
+the icon and the template's own updates appear only once the template is on
+`main`. The image itself does not depend on that.
+
+### Build it yourself
+
+When the published image is not available yet (see the note at the top of
+[Quick start](#quick-start)), or you want to run your own changes, build the
+image from the source. You need Docker 23 or newer (it includes BuildKit). The
+first build takes 10 to 15 minutes on a four-core machine and needs about 8 GB
+of free disk space while it runs (build tools and their cache; afterwards
+`docker builder prune -af` gives back about 3 GB of it). The finished image is
+about 600 MB (150 MB compressed). Later builds reuse the cached steps: a change
+to the web pages alone takes a couple of minutes.
+
+```sh
+git clone https://github.com/thekozugroup/Project-Chrysopoeia.git
+cd Project-Chrysopoeia          # for a branch that is not merged yet: git checkout <branch>
+docker build -t chrysopoeia:local --build-arg VERSION=local .
+```
+
+No `git`? Download the branch as an archive instead (replace `main` with the
+branch name):
+
+```sh
+curl -L https://github.com/thekozugroup/Project-Chrysopoeia/archive/refs/heads/main.tar.gz | tar xz
+cd Project-Chrysopoeia-*
+docker build -t chrysopoeia:local --build-arg VERSION=local .
+```
+
+Then use `chrysopoeia:local` in place of `ghcr.io/thekozugroup/chrysopoeia:latest`
+in the `docker run` command, or as `CHRYSOPOEIA_IMAGE` for Compose. An image
+built without `--build-arg VERSION=...` shows *dev* as its build in *About* and
+in the first log line. Building for a server with a different kind of
+processor than the build machine (an Apple Silicon Mac for an Intel or AMD
+server)? Add `--platform linux/amd64` (or `linux/arm64`).
+
+**On Unraid** the easiest way is to build on another machine that has Docker
+and send the image over:
+
+```sh
+docker save chrysopoeia:local | ssh root@tower docker load
+```
+
+You can also run the commands above in the Unraid terminal, but Docker keeps
+the build and its cache in `docker.img`, which also holds all your other
+containers and may be only 20 GB: do it only when `docker.img` has about 10 GB
+free, and run `docker builder prune -af` afterwards.
+
+Then **Edit** the container (or Add Container) and set **Repository** to
+`chrysopoeia:local`. There is no registry to check for a local image, so to
+update it, build again and then recreate the container with **Edit › Apply**.
 
 ## GPU setup
 
@@ -166,6 +289,10 @@ No GPU at all is fine: CPU encoding is slower but gives the smallest files. The
 detailed support matrix, including older GPUs and ARM boards, is in
 [docs/HARDWARE.md](docs/HARDWARE.md).
 
+`HW_ACCEL=auto` (the default) uses the best encoder that passes its test and
+the CPU otherwise. To pin one kind, set `HW_ACCEL` to `nvenc`, `qsv` or
+`vaapi`, or choose it in Settings › Hardware under *Use for converting*.
+
 ## Configuration
 
 Almost everything is set in the web UI. The container reads these environment
@@ -174,18 +301,22 @@ variables; empty values count as not set.
 | Variable | Default | What it does |
 |---|---|---|
 | `PUID` / `PGID` | `1000` / `1000` | User and group Chrysopoeia runs as and writes files as. Use the owner of your media (Unraid: `99` / `100`). |
-| `UMASK` | `002` | Permissions for new files (`002`: the group can edit them; `022`: only the owner). |
+| `UMASK` | `002` | Permissions for what Chrysopoeia creates itself, such as work files and folders in an output folder (`002`: the group can edit them; `022`: only the owner). A converted file keeps the permissions of the original it replaces. |
 | `TZ` | `UTC` | Time zone (e.g. `Europe/London`) for the *When to convert* schedule in Settings › Processing. Unraid sets it for you. Log lines are always stamped in UTC. |
 | `HW_ACCEL` | `auto` | Hardware preference: `auto`, `cpu`, `nvenc` (NVIDIA), `qsv` (Intel), `vaapi` (Intel or AMD), `amf` (AMD's proprietary driver, not in the image), `rkmpp` (Rockchip), `v4l2m2m` (Raspberry Pi 4) or `videotoolbox` (native macOS only). A GPU choice uses only that kind of GPU; files go to the CPU when it is missing or cannot encode the chosen format (Settings › Hardware, under *Details: encoders and ffmpeg*, shows *Works* for each format its test encode passed). Applied on the first start, and again on the next start whenever you change its value; in between, the choice in Settings › Hardware is kept. `auto` never overrides a choice made in the app. |
 | `MAX_JOBS` | automatic | Files converted at once, 1 to 32. Stands in for the automatic count while *Files at once* is *Automatic* in Settings › Processing; a number chosen there wins. |
-| `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. |
+| `LIBRARIES` | none | Comma-separated folders (container paths) to add as libraries on first start, e.g. `/media/Movies,/media/TV`. They start with the *Save space* goal and begin converting at once; change a library's goal in its own Settings tab. Leave it empty to choose folder and goal in the first-run screens. |
 | `ALLOWED_HOSTS` | none | Domain names the web UI may be opened at, comma-separated, e.g. `transcode.example.com`. Only needed behind a reverse proxy; see [below](#behind-a-reverse-proxy). |
-| `TEMP_DIR` | `/temp` if mounted | Where in-progress files go. Unset and no `/temp` mount: next to each original. Settings › Output can choose another folder. |
+| `TEMP_DIR` | `/temp` if mounted | Where in-progress files go. Unset and no `/temp` mount: next to each original. Settings › Output, under *Work folder*, can choose another folder. |
 | `BROWSE_ROOTS` | `/media,/` if `/media` is mounted | Folders the in-app folder picker starts from. |
 | `NVIDIA_VISIBLE_DEVICES` | unset | NVIDIA with `--runtime=nvidia` (Unraid): `all` or a GPU UUID. With `--gpus` or the compose overlay, Docker sets it from the GPUs chosen there. |
 | `NVIDIA_DRIVER_CAPABILITIES` | `compute,video,utility` | Already set in the image; `video` is what enables NVENC. |
-| `PORT` | `8080` | Port inside the container. |
+| `PORT` | `8080` | The port the server listens on inside the container; leave it alone unless you also change what you publish (`-p 9000:9000`). To use another port on the host, change the left number of `-p` (`-p 9000:8080`), the Unraid *Web UI port*, or, for the compose file, `PORT` in `.env`: that one is the host port, and the container stays on 8080. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |
+| `CHRYSOPOEIA_VERSION` | set by the image | The build label (a release such as `1.2.3`, or `<branch>-<commit>`; *dev* for an image built without `--build-arg VERSION`). Shown in the first log line and under *About* at the bottom of Settings, both as the *build*; do not set it. |
+
+The image also sets `DATA_DIR`, `WEB_DIR`, `FFMPEG_PATH` and `FFPROBE_PATH`;
+leave them as they are.
 
 | Path | Purpose |
 |---|---|
@@ -228,6 +359,40 @@ location / {
 }
 ```
 
+## Upgrading
+
+Pull the new image and recreate the container. Your libraries, settings and
+history live in `/config` and are kept.
+
+- **Unraid:** Docker tab › *Check for Updates* › *apply update*.
+- **docker run:** `docker pull ghcr.io/thekozugroup/chrysopoeia:latest`, then
+  `docker rm -f chrysopoeia` and run the same `docker run` command again.
+- **Compose:** `docker compose pull && docker compose up -d`.
+
+Files that were converting are stopped, their work files removed, and they
+start again from the beginning; an original is never left half-replaced. The
+database is upgraded in place on the first start of a newer version. A newer
+database is refused by an older image with a plain message, so to go back to an
+older version, restore a backup of `/config` taken before the upgrade. To see
+which build is running, open the bottom of Settings (*About*) or the first
+lines of the container log; `docker ps` shows *healthy* once the web UI answers
+again.
+
+## Backing up
+
+Everything Chrysopoeia keeps is in `/config`: the database with your libraries,
+settings and history (`chrysopoeia.db`, plus its `-wal` and `-shm` files while
+it runs). Copy the folder while the container is stopped, or use your usual
+appdata backup (Unraid: the *Appdata Backup* plugin stops containers while it
+copies). Your media is not stored there, and nothing in it changes if `/config`
+is lost: add the libraries again, with the same goal as before, and files that
+were already converted are recognised as efficient and skipped. Only history
+and statistics are lost. Files that had been tried but kept as originals
+because the result was not enough smaller are tried again, and converting them
+again takes as long as the first time; a different goal converts everything
+again. Chrysopoeia is not a backup tool either: keep a backup of media you
+cannot replace.
+
 ## FAQ
 
 **Are my originals safe?**
@@ -236,10 +401,23 @@ to a hidden temporary file; after it passes verification, the original is
 renamed to a hidden backup, the new file is moved into place, and only then is
 the backup deleted. If the power fails or the container stops halfway, the
 next start finds the backup and puts it back. A failed or stopped job leaves
-the original untouched. If you would rather keep originals, choose *Save to a
-separate folder* in Settings › Output and Chrysopoeia will never modify your
-library. As with any tool that rewrites files, keep a backup of media you
-cannot replace.
+the original untouched, and so does a file that was replaced or deleted while
+it was converting (for example by Sonarr or Radarr). If you would rather keep
+originals, choose *Save to a separate folder* in Settings › Output and
+Chrysopoeia will never modify your library. As with any tool that rewrites
+files, keep a backup of media you cannot replace.
+
+**Why did the file extension change?**
+The converted file is named for the container the goal writes: `.mkv` for *Save
+space*, *Balanced* and *Archive*, `.mp4` for *Plays everywhere*, or whatever you
+chose under *More format options*. `Movie.mp4` becomes `Movie.mkv`, and an
+`.mkv` becomes `.mp4` under *Plays everywhere*; a file that is already in that
+container keeps its name. Because the old path then no longer exists, Plex,
+Jellyfin and Emby pick up the new name at their next library scan, while Sonarr
+and Radarr show the file as missing until their next disk scan or until you
+run *Refresh & Scan* on the series or movie. To keep names as they are, choose
+a goal whose container matches your files (*Balanced* for a library of `.mkv`
+files), or *Save to a separate folder*.
 
 **What does "Verified" mean?**
 The new file was opened and checked before it replaced the original. With the
@@ -251,26 +429,54 @@ with the original (SSIM, a standard measure of visual similarity), catching
 green frames, blocking and other corruption. *Thorough* samples ten points and
 also checks for added black or frozen frames; *Quick* only checks streams and
 duration. To see what was checked for a file, open it in the Queue (under
-*History*).
+*History*): the **Checks** list shows each one. If a check fails, the original
+is kept and the file says why.
+
+**What does "Needs your attention" mean?**
+It appears on the Overview only when something needs you, grouped by cause,
+each with its fix and, where trying again can help, a **Try again** button:
+
+- *Hardware setup needs a fix*, or *Nothing can be converted until setup is
+  fixed*: a GPU the container cannot see, or ffmpeg missing. Settings ›
+  Hardware has the exact steps.
+- *The work folder can't be used*, *Finished files can't be saved*, *The disk
+  is full*, *The hardware you chose isn't working*: a setup problem. Fix it
+  once, then **Try again** queues every file that waited on it.
+- *N files can't be read*: the original looks damaged or is not a video. It is
+  left alone.
+- *N files couldn't be converted*: the encoder or the checks failed. The
+  originals are untouched; the file's page says why.
+- *N files changed or moved while being converted*: nothing was replaced.
+- *Movies: the folder can't be read* (a library's name comes first): the folder is missing or offline.
 
 **Why was a file skipped?**
 The reason is shown next to the file. The usual ones: the video is already as
 efficient as the target (for example it is already AV1); it is audio-only; it
 could not be read or is shorter than a second; the converted file was not
 enough smaller to be worth keeping (the original is kept); it is HDR and the
-goal is H.264 (tone mapping is not supported yet); or you skipped it.
+goal is H.264 (tone mapping is not supported yet); it is Dolby Vision profile 5,
+whose colours cannot be kept; the goal saves to MP4 or WebM (for example
+*Plays everywhere*) and the file has something that format cannot hold
+(picture-based subtitles, styled subtitles, subtitle fonts or other attached
+files, or a cover image MP4 can't store), so replacing it would lose it; or you
+skipped it. *Convert anyway* on a skipped file converts it once, ignoring the
+library's rules for skipping (the usual checks still run); in the subtitle case
+what the format cannot hold is left out and noted on the job. An MKV goal keeps
+everything, and *Save to a separate folder* converts the file while the
+original stays.
 
-**How many jobs run at once?**
-By default it is automatic. On the CPU: one job per four cores (1 to 8),
-limited so each job has about 1.5 GB of memory, and respecting any CPU or
-memory limit set on the container. With a GPU: 3 per NVIDIA GPU, 2 per Intel or
-AMD GPU, 2 on Apple Silicon. You can set a fixed number in Settings ›
-Processing, or with `MAX_JOBS`.
+**How many files convert at once?**
+By default it is automatic (*Files at once* in Settings › Processing). On the
+CPU: one per four cores (1 to 8), limited so each has about 1.5 GB of memory,
+and respecting any CPU or memory limit set on the container. With a GPU: 3 per
+NVIDIA GPU, 2 per Intel or AMD GPU, 2 on Apple Silicon. You can choose a number
+in Settings › Processing, or set `MAX_JOBS`.
 
 **What happens if I restart or update the container mid-conversion?**
 Running jobs are stopped and their temporary files removed; the original is
 never left half-replaced. After the restart those files are back in the queue
-and start again from the beginning.
+and start again from the beginning. `docker stop` waits for them to wind down,
+normally a few seconds.
 
 **A job's ffmpeg log says `set_mempolicy: Operation not permitted`.**
 Harmless. The x265 (HEVC) encoder asks the kernel where to place its memory,
@@ -287,7 +493,7 @@ proxy that adds authentication.
 See [CONTRIBUTING.md](CONTRIBUTING.md). In short: `make dev-api` and
 `make dev-web` run the backend and a hot-reloading UI, `make test` and
 `make lint` run the checks, and `make e2e` builds the image and runs the
-end-to-end smoke test. The design contract is
+end-to-end smoke tests. The design contract is
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
