@@ -213,7 +213,10 @@ async fn nothing_is_written_into_an_unmounted_output_share() {
     .await;
     let specs = app.fake.run_specs.lock().unwrap().clone();
     assert!(
-        specs.iter().all(|s| s.mounts.contains(&out)),
+        specs.iter().all(|s| s
+            .mounts
+            .iter()
+            .any(|m| m.point == out && m.identity == Some(hang::share_at(&out)))),
         "the worker checks the output share: {:?}",
         specs.iter().map(|s| &s.mounts).collect::<Vec<_>>()
     );

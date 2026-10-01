@@ -104,13 +104,16 @@ pub struct JobSpec {
     /// keep the result whatever its size (`min_savings_pct` is not applied).
     /// Verification still applies.
     pub force: bool,
-    /// The mount points the library folder, the work folder and the output
-    /// folder were seen on. While one of them isn't mounted, its folder is
-    /// an ordinary folder on the disk below (an unmounted share leaves its
-    /// mount point behind): the job then writes nothing, and ends with
-    /// [`JobOutcome::NotResponding`] for it, before it creates its temp
-    /// file and before it puts the new file in place.
-    pub mounts: Vec<PathBuf>,
+    /// The mount points the library folder, the work folder, the output
+    /// folder and the folder the new file goes into were seen on, with what
+    /// was mounted there. While one of them isn't mounted, or something
+    /// else is mounted there (a tmpfs, the bare folder bind-mounted in its
+    /// place), its folder is not the share it was: an unmounted share leaves
+    /// its mount point behind as an ordinary folder on the disk below. The
+    /// job then writes nothing, and ends with [`JobOutcome::NotResponding`]
+    /// for it, before it creates its temp file and before it puts the new
+    /// file in place.
+    pub mounts: Vec<slow_fs::KnownMount>,
 }
 
 /// How a job ended.
@@ -1262,12 +1265,13 @@ impl Job<'_> {
     /// job without waiting for it (see [`take_unfinished`]).
     async fn place(&self, prepared: &Prepared, placing: Placing) -> JobOutcome {
         let (cfg, spec) = (self.cfg, self.spec);
-        // A share unmounted during the encode: its mount point is an
-        // ordinary folder now, and the new file must not go there.
+        // A share unmounted during the encode (or another filesystem
+        // mounted in its place): its mount point is an ordinary folder now,
+        // and the new file must not go there.
         if let Some(gone) = slow_fs::first_unmounted(&spec.mounts).await {
             tracing::info!(
                 job = %spec.job_id,
-                "{} is no longer mounted; the new file wasn't put in place",
+                "{} is no longer mounted as it was; the new file wasn't put in place",
                 gone.display()
             );
             return NotAnswering::at(&gone).into();

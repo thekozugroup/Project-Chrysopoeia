@@ -1,7 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { profileForGoal } from "./profile";
-import { changedKeys, errorsFrom, profileFieldOf, saveBarMessage, sectionFor, settingForField } from "./settings-form";
+import {
+  changedKeys,
+  errorsFrom,
+  keysToSave,
+  profileFieldOf,
+  rechosenAfter,
+  saveBarMessage,
+  sectionFor,
+  settingForField,
+} from "./settings-form";
 import type { Settings } from "./types";
 
 const base: Settings = {
@@ -41,6 +50,31 @@ describe("changedKeys", () => {
     expect(changedKeys({ ...base, default_profile: { ...reordered, quality: "best" } }, base)).toEqual([
       "default_profile",
     ]);
+  });
+});
+
+describe("a folder picked again as it was", () => {
+  const saved: Settings = { ...base, output_mode: "folder", output_folder: "/out", temp_dir: "/work" };
+
+  it("is saved again, so the drive mounted there now is taken as the usual one", () => {
+    const again = rechosenAfter([], { output_folder: "/out" }, saved);
+    expect(again).toEqual(["output_folder"]);
+    expect(keysToSave(changedKeys({ ...saved }, saved), again)).toEqual(["output_folder"]);
+    expect(rechosenAfter(again, { temp_dir: "/work" }, saved).sort()).toEqual(["output_folder", "temp_dir"]);
+  });
+
+  it("isn't, once another folder or another setting is chosen instead", () => {
+    const again = rechosenAfter([], { output_folder: "/out" }, saved);
+    expect(rechosenAfter(again, { output_folder: "/elsewhere" }, saved)).toEqual([]);
+    expect(rechosenAfter(again, { max_jobs: 2 }, saved)).toEqual(["output_folder"]);
+    // Automatic (no folder) is no folder picked again.
+    expect(rechosenAfter([], { temp_dir: null }, { ...saved, temp_dir: null })).toEqual([]);
+    expect(rechosenAfter([], { temp_dir: "" }, saved)).toEqual([]);
+  });
+
+  it("is sent once, next to what changed", () => {
+    expect(keysToSave(["output_folder", "max_jobs"], ["output_folder"])).toEqual(["output_folder", "max_jobs"]);
+    expect(keysToSave([], [])).toEqual([]);
   });
 });
 

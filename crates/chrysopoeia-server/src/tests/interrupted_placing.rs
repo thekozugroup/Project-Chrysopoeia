@@ -477,6 +477,17 @@ fn mend(folder: &Path, away: &Path) {
     std::fs::rename(away, folder).unwrap();
 }
 
+/// The job waits: back in the queue, or looking again for a moment (a scan
+/// that finds the library's files lets it run again, and it goes straight
+/// back), never done, failed or cancelled.
+async fn assert_waiting(app: &TestApp, id: &str, kind: Kind) {
+    let j = job(app, id).await;
+    assert!(
+        matches!(j["state"].as_str(), Some("queued" | "running")),
+        "{kind:?}: {j}"
+    );
+}
+
 async fn placing(app: &TestApp, job: &str) -> i64 {
     sqlx::query_scalar("SELECT placing FROM jobs WHERE id = ?")
         .bind(job)
@@ -565,24 +576,25 @@ async fn a_job_waits_while_its_share_answers_with_errors() {
         let (app, fake) = restart(dir).await;
         let libs = app.get("/api/libraries").await.json;
         let lib_id = libs[0]["id"].as_str().unwrap().to_string();
-        wait("the library to wait for its share", async || {
-            app.get(&format!("/api/libraries/{lib_id}")).await.json["path_error"]
+        // The job runs as soon as the server is ready, finds it can't tell,
+        // and goes back to the queue with its library waiting (a scan that
+        // finds the library's files may let it run again meanwhile; it
+        // waits again, the same way).
+        wait("the job to wait for its share", async || {
+            let reason = app.get(&format!("/api/libraries/{lib_id}")).await.json["path_error"]
                 .as_str()
-                .is_some()
+                .map(str::to_string);
+            // The library folder itself is the share for a replacement (its
+            // own problem is shown); in folder mode the output folder is.
+            let says_why = reason.is_some_and(|r| {
+                kind != Kind::Folder
+                    || (r.contains("can't read the folder") && r.contains("check that it's"))
+            });
+            says_why
+                && app.state.dispatcher.offline_reason(uuid(&lib_id)).is_some()
+                && job(&app, &s.job).await["state"] == "queued"
         })
         .await;
-        let lib = app.get(&format!("/api/libraries/{lib_id}")).await.json;
-        let reason = lib["path_error"].as_str().unwrap_or_default().to_string();
-        // The library folder itself is the share for a replacement (its
-        // own problem is shown); in folder mode the output folder is.
-        if kind == Kind::Folder {
-            assert!(
-                reason.contains("can't read the folder") && reason.contains("check that it's"),
-                "{kind:?}: {reason}"
-            );
-        }
-        let j = job(&app, &s.job).await;
-        assert_eq!(j["state"], "queued", "{kind:?}: {j}");
         assert!(fake.started().is_empty(), "{kind:?}: not converted again");
         assert_eq!(placing(&app, &s.job).await, 1, "{kind:?}");
         assert_eq!(names(&away), before, "{kind:?}: nothing touched");
@@ -652,7 +664,7 @@ async fn an_unmounted_share_is_never_taken_for_its_mount_point() {
         );
         // A moment for anything that would still go wrong.
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert_eq!(job(&app, &s.job).await["state"], "queued", "{kind:?}");
+        assert_waiting(&app, &s.job, kind).await;
         assert_eq!(placing(&app, &s.job).await, 1, "{kind:?}");
         assert!(fake.started().is_empty(), "{kind:?}: not converted again");
         assert_eq!(names(&share), bare, "{kind:?}: nothing written there");
@@ -679,6 +691,190 @@ async fn an_unmounted_share_is_never_taken_for_its_mount_point() {
         .await;
         app.wait_queue_idle().await;
         assert_finished(&app, &fake, &s, kind).await;
+        drop(s.held);
+    }
+}
+
+/// The share put the new file in place after the stop, and at the restart
+/// another filesystem is mounted where it was: a tmpfs, or the bare folder
+/// bind-mounted onto itself (what a Docker bind mount shows when the
+/// container started before the host mounted the share; on Unraid, a
+/// remote share mounted by Unassigned Devices after the array started).
+/// It isn't taken for the share: the job keeps its mark, waits with "A
+/// different drive is mounted at …", nothing is written there and a scan
+/// restores nothing. Once the usual share is mounted again, the job is
+/// recorded as done. Before, any filesystem at that place counted as the
+/// share: start-up settled the job as "not in place"; in folder mode the
+/// file was converted again into the other filesystem (and the job failed
+/// once the share was back), and for a replacement over a folder with
+/// files of its own the scan later restored the original next to the new
+/// file.
+#[tokio::test]
+async fn another_filesystem_at_the_share_is_never_taken_for_it() {
+    for kind in [Kind::Folder, Kind::NewName] {
+        let (dir, mut s) = stopped_on_share(kind, true, true).await;
+        let share = share_of(&s, kind);
+        let before = names(&share);
+        // The share is gone, and the folder below it (with a file of its
+        // own for the library) is mounted in its place.
+        let away = break_share(&share, Broken::Unmounted);
+        if kind == Kind::NewName {
+            std::fs::write(share.join("README.txt"), "the disk below").unwrap();
+        }
+        let bare = names(&share);
+        drop(s.mounted.take());
+        let other = hang::mount_other(&share, "the bare folder");
+
+        let (app, fake) = restart(dir).await;
+        assert_eq!(placing(&app, &s.job).await, 1, "{kind:?}: still marked");
+        assert_eq!(job(&app, &s.job).await["state"], "queued", "{kind:?}");
+        let lib_id = only_library(&app).await;
+        app.rescan(&lib_id).await;
+        app.resume().await;
+        let different = format!(
+            "A different drive is mounted at {} than before",
+            share.display()
+        );
+        wait("the library to wait for its share", async || {
+            app.get(&format!("/api/libraries/{lib_id}")).await.json["path_error"]
+                .as_str()
+                .is_some_and(|e| e.contains(&different))
+        })
+        .await;
+        let lib = app.get(&format!("/api/libraries/{lib_id}")).await.json;
+        assert_eq!(
+            lib["changed_mount"],
+            share.to_str().unwrap(),
+            "{kind:?}: {lib}"
+        );
+        // A moment for anything that would still go wrong.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_waiting(&app, &s.job, kind).await;
+        assert_eq!(placing(&app, &s.job).await, 1, "{kind:?}");
+        assert!(fake.started().is_empty(), "{kind:?}: not converted again");
+        assert_eq!(names(&share), bare, "{kind:?}: nothing written there");
+        assert_eq!(names(&away), before, "{kind:?}: nothing touched");
+
+        // The usual share mounted again (over the other one, unmounted).
+        drop(other);
+        if kind == Kind::NewName {
+            std::fs::remove_file(share.join("README.txt")).unwrap();
+        }
+        mend(&share, &away);
+        let _mounted = hang::mount(&share);
+        app.rescan(&lib_id).await;
+        let left = names(&share);
+        assert!(
+            left.contains(&"film.mkv".to_string()) && !left.contains(&"film.mp4".to_string()),
+            "{kind:?}: the scan restored nothing: {left:?}"
+        );
+        app.state.dispatcher.recheck_now(uuid(&lib_id));
+        wait("the job to be recorded as done", async || {
+            job(&app, &s.job).await["state"] == "done"
+        })
+        .await;
+        app.wait_queue_idle().await;
+        assert_finished(&app, &fake, &s, kind).await;
+        drop(s.held);
+    }
+}
+
+/// Folder mode, with a share mounted inside the output folder, where the
+/// new file goes (`out/Sub`): the share put the new file in place after the
+/// stop, and was unmounted cleanly while the server was down (or another
+/// filesystem was mounted in its place). The mount the new file went into
+/// was noted when the job started (and the worker was told to check it):
+/// at the restart the job keeps its mark and waits ("isn't connected", or
+/// "A different drive …"), nothing is written into that folder, and once
+/// the share is mounted again the job is recorded as done. Before, only the
+/// output folder's own mounts were remembered: start-up settled the job as
+/// "not in place" and the file was converted again into the bare folder.
+#[tokio::test]
+async fn a_share_inside_the_output_folder_is_never_taken_for_its_mount_point() {
+    for other_there in [false, true] {
+        let app = TestApp::new().await;
+        app.pause().await;
+        let out = app.dir.path().join("out");
+        let sub = out.join("Sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let mounted = hang::mount(&sub);
+        let r = app
+            .patch(
+                "/api/settings",
+                json!({ "output_mode": "folder", "output_folder": out.to_str().unwrap() }),
+            )
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+        let original = std::fs::canonicalize(app.write("Movies/Sub/film.mp4", h264())).unwrap();
+        app.fake.set_behavior("film.mp4", Behavior::RealPlacing);
+        app.add_library("Movies", json!({})).await;
+        let job_id = job_of(&app, "film.mp4").await;
+        let held = hold::hold(uuid(&job_id), Step::Committed);
+        app.resume().await;
+        wait("the new file to be on its way", async || held.reached()).await;
+        let specs = app.fake.run_specs.lock().unwrap().clone();
+        assert!(
+            specs[0]
+                .mounts
+                .iter()
+                .any(|m| m.point == sub && m.identity == Some(hang::share_at(&sub))),
+            "the worker checks the share the new file goes into: {:?}",
+            specs[0].mounts
+        );
+        app.pause().await;
+        let dir = app.stop().await;
+        let mut s = Stopped {
+            job: job_id,
+            original,
+            target: std::fs::canonicalize(&sub).unwrap().join("film.mkv"),
+            held,
+            mounted: Some(mounted),
+        };
+
+        let before = names(&sub);
+        let away = break_share(&sub, Broken::Unmounted);
+        drop(s.mounted.take());
+        let other = other_there.then(|| hang::mount_other(&sub, "tmpfs"));
+        let (app, fake) = restart(dir).await;
+        assert_eq!(placing(&app, &s.job).await, 1, "still marked");
+        assert_eq!(job(&app, &s.job).await["state"], "queued");
+        let lib_id = only_library(&app).await;
+        app.rescan(&lib_id).await;
+        app.resume().await;
+        let expected = if other_there {
+            format!(
+                "A different drive is mounted at {} than before",
+                sub.display()
+            )
+        } else {
+            format!(
+                "The drive or share mounted at {} isn't connected",
+                sub.display()
+            )
+        };
+        wait("the library to wait for the share", async || {
+            app.get(&format!("/api/libraries/{lib_id}")).await.json["path_error"]
+                .as_str()
+                .is_some_and(|e| e.contains(&expected))
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_waiting(&app, &s.job, Kind::Folder).await;
+        assert_eq!(placing(&app, &s.job).await, 1);
+        assert!(fake.started().is_empty(), "not converted again");
+        assert!(names(&sub).is_empty(), "nothing written: {:?}", names(&sub));
+        assert_eq!(names(&away), before, "nothing touched");
+
+        drop(other);
+        mend(&sub, &away);
+        let _mounted = hang::mount(&sub);
+        app.state.dispatcher.recheck_now(uuid(&lib_id));
+        wait("the job to be recorded as done", async || {
+            job(&app, &s.job).await["state"] == "done"
+        })
+        .await;
+        app.wait_queue_idle().await;
+        assert_finished(&app, &fake, &s, Kind::Folder).await;
         drop(s.held);
     }
 }

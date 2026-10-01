@@ -227,6 +227,9 @@ export const api = {
   deleteLibrary: (id: string) => request<void>(`/libraries/${seg(id)}`, { method: "DELETE" }),
   scanLibrary: (id: string) =>
     request<{ started: boolean }>(`/libraries/${seg(id)}/scan`, { method: "POST" }),
+  /** Take the drive mounted now where the library's drive was as the usual one. */
+  relearnMounts: (id: string) =>
+    request<Library>(`/libraries/${seg(id)}/relearn-mounts`, { method: "POST" }),
   scanAll: () => request<{ started: boolean }>("/scan", { method: "POST" }),
 
   files: (query: FileQuery, signal?: AbortSignal) =>

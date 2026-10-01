@@ -121,5 +121,12 @@ pub struct Library {
     pub last_scan_at: Option<DateTime<Utc>>,
     /// Set when the folder is missing or unreadable.
     pub path_error: Option<String>,
+    /// Set (with `path_error`) when the problem is that something else is
+    /// mounted where a folder this library's jobs use was seen mounted from
+    /// (another drive, a tmpfs, the bare folder bind-mounted in the share's
+    /// place): that mount point. `POST /api/libraries/{id}/relearn-mounts`
+    /// takes what is mounted there now as the usual one.
+    #[serde(default)]
+    pub changed_mount: Option<String>,
     pub created_at: DateTime<Utc>,
 }

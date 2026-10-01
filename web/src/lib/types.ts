@@ -370,6 +370,13 @@ export interface Library {
   scanning: boolean;
   last_scan_at: Timestamp | null;
   path_error: string | null;
+  /**
+   * Set (with `path_error`) when the problem is another drive mounted where
+   * a folder this library's jobs use was seen mounted from: that place.
+   * `POST /libraries/{id}/relearn-mounts` takes the drive there now as the
+   * usual one. Absent from servers before it was added.
+   */
+  changed_mount?: string | null;
   created_at: Timestamp;
 }
 

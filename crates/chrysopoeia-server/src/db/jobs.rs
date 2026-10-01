@@ -3,6 +3,7 @@
 use chrysopoeia_core::{
     FileStatus, HwApi, Job, JobProgress, JobStage, JobState, ProblemKind, ValidationReport,
 };
+use chrysopoeia_worker::slow_fs::{KnownMount, MountIdentity};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use uuid::Uuid;
@@ -819,17 +820,21 @@ async fn owner_of(
 
 /// A running job (of file `file_id`) starts with the goal `profile` (JSON),
 /// and is about to put its result at `final_path` (`None`: it won't convert
-/// anything). Remember both (the place for start-up recovery, see
-/// [`interrupted`]), unless a conversion of another file running right now
-/// puts its result at the same place: that one is returned instead, and
-/// nothing is written. One transaction, so two jobs starting at the same
-/// moment can't both take the place.
+/// anything), in a folder on the mount `final_mount` (`None`: on none but
+/// `/`). Remember them (the place for start-up recovery, see
+/// [`interrupted`], and the mount its new file is only looked for on when
+/// its placing is settled, see [`PlacingJob::final_mount`]), unless a
+/// conversion of another file running right now puts its result at the
+/// same place: that one is returned instead, and nothing is written. One
+/// transaction, so two jobs starting at the same moment can't both take
+/// the place.
 pub async fn claim_destination(
     db: &Db,
     id: Uuid,
     file_id: Uuid,
     final_path: Option<&str>,
     profile: Option<&str>,
+    final_mount: Option<&KnownMount>,
 ) -> sqlx::Result<Option<DestinationOwner>> {
     let mut tx = db.write_tx().await?;
     let owner = match final_path {
@@ -838,16 +843,117 @@ pub async fn claim_destination(
     };
     if owner.is_none() {
         sqlx::query(
-            "UPDATE jobs SET final_path = ?, profile = ? WHERE id = ? AND state = 'running'",
+            "UPDATE jobs SET final_path = ?, profile = ?, final_mount = ? \
+             WHERE id = ? AND state = 'running'",
         )
         .bind(final_path)
         .bind(profile)
+        .bind(
+            final_mount
+                .filter(|_| final_path.is_some())
+                .and_then(mount_json),
+        )
         .bind(id.to_string())
         .execute(&mut *tx)
         .await?;
     }
     tx.commit().await?;
     Ok(owner)
+}
+
+/// A mount a job's new file goes into, as stored in `jobs.final_mount`.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredMount {
+    point: String,
+    fstype: String,
+    source: String,
+    root: String,
+}
+
+/// `mount` as stored in `jobs.final_mount` (`None` when it can't be: a
+/// mount point that isn't text, or nothing known about what is mounted).
+fn mount_json(mount: &KnownMount) -> Option<String> {
+    let identity = mount.identity.as_ref()?;
+    serde_json::to_string(&StoredMount {
+        point: mount.point.to_str()?.to_string(),
+        fstype: identity.fstype.clone(),
+        source: identity.source.clone(),
+        root: identity.root.clone(),
+    })
+    .ok()
+}
+
+/// A mount stored in `jobs.final_mount` (`None` when nothing was, or it
+/// can't be read).
+fn mount_from_json(text: Option<&str>) -> Option<KnownMount> {
+    let stored: StoredMount = serde_json::from_str(text?).ok()?;
+    Some(KnownMount {
+        point: std::path::PathBuf::from(stored.point),
+        identity: Some(MountIdentity {
+            fstype: stored.fstype,
+            source: stored.source,
+            root: stored.root,
+        }),
+    })
+}
+
+/// Take what is mounted now (`identity`) as the mount the new files of the
+/// marked jobs of library `library_id` go into, for those whose mount at
+/// `point` had something else mounted (the user said to use the drive
+/// there now). Returns how many jobs that was.
+pub async fn relearn_final_mounts(
+    pool: &SqlitePool,
+    library_id: Uuid,
+    point: &std::path::Path,
+    identity: &MountIdentity,
+) -> sqlx::Result<u64> {
+    let rows = sqlx::query(
+        "SELECT id, final_mount FROM jobs WHERE placing > 0 AND library_id = ? \
+         AND final_mount IS NOT NULL",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut changed = 0;
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let stored: Option<String> = row.try_get("final_mount")?;
+        let Some(mut mount) = mount_from_json(stored.as_deref()) else {
+            continue;
+        };
+        if mount.point != point || mount.identity.as_ref() == Some(identity) {
+            continue;
+        }
+        mount.identity = Some(identity.clone());
+        sqlx::query("UPDATE jobs SET final_mount = ? WHERE id = ?")
+            .bind(mount_json(&mount))
+            .bind(id)
+            .execute(pool)
+            .await?;
+        changed += 1;
+    }
+    Ok(changed)
+}
+
+/// The mounts the new files of the marked jobs (see [`mark_placing`]) of
+/// library `library_id` go into.
+pub async fn placing_final_mounts(
+    pool: &SqlitePool,
+    library_id: Uuid,
+) -> sqlx::Result<Vec<KnownMount>> {
+    let stored: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT final_mount FROM jobs WHERE placing > 0 AND library_id = ? \
+         AND final_mount IS NOT NULL",
+    )
+    .bind(library_id.to_string())
+    .fetch_all(pool)
+    .await?;
+    let mut mounts: Vec<KnownMount> = stored
+        .iter()
+        .filter_map(|s| mount_from_json(s.as_deref()))
+        .collect();
+    mounts.dedup();
+    Ok(mounts)
 }
 
 /// The conversion of another file than `file_id` that is putting, or last
@@ -883,6 +989,11 @@ pub struct PlacingJob {
     pub size: Option<u64>,
     /// The original's size, when known.
     pub original_size: Option<u64>,
+    /// The mount the folder its new file goes into was on when the job
+    /// started, with what was mounted there (`None`: on none but `/`, or a
+    /// job from before this was noted). Its new file is only looked for
+    /// while that is mounted there as it was.
+    pub final_mount: Option<KnownMount>,
 }
 
 /// Mark job `id` as one whose new file may be put in place by a step that
@@ -948,11 +1059,12 @@ fn placing_from_row(row: &SqliteRow) -> sqlx::Result<PlacingJob> {
         placed: placing == 2,
         size: opt_u64_col(row, "placing_size")?,
         original_size: opt_u64_col(row, "placing_original_size")?,
+        final_mount: mount_from_json(row.try_get::<Option<String>, _>("final_mount")?.as_deref()),
     })
 }
 
 /// The extra columns of a [`PlacingJob`].
-const PLACING_COLUMNS: &str = "placing, placing_size, placing_original_size";
+const PLACING_COLUMNS: &str = "placing, placing_size, placing_original_size, final_mount";
 
 /// The jobs marked with [`mark_placing`]: all of them, or those of one file.
 pub async fn placing(pool: &SqlitePool, file_id: Option<Uuid>) -> sqlx::Result<Vec<PlacingJob>> {

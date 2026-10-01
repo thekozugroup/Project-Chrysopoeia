@@ -535,10 +535,21 @@ folder for the share: the library shows *The drive or share mounted at
 /mnt/remotes/nas isn't connected. Reconnect it, and its conversions continue.*,
 its conversions (and every one that uses the output or work folder) wait,
 nothing is written into the bare folder, and the files stay listed. Mount the
-share again and they continue. If you removed the share for good, tell
-Chrysopoeia: remove the library and add it again, or choose the output or work
-folder again in Settings (pick another folder, save, and pick the old one again
-if it keeps its path).
+share again and they continue. It also remembers *what* was mounted there, so
+another drive in the share's place isn't taken for it either: a tmpfs, or the
+bare folder itself, which is what a Docker bind mount shows when the container
+started before the host mounted the share (on Unraid, a remote share that
+Unassigned Devices mounts after the array started). The library then shows *A
+different drive is mounted at /mnt/remotes/nas than before. Reconnect the usual
+one, or tell Chrysopoeia to use the one there now.* Restart the container once
+the share is mounted on the host (or map the share with the *RW/Slave* access
+mode, `rslave` in Docker, so a share mounted later reaches the container), or,
+if you swapped the drive on purpose, press **Use the drive that's there now**
+on the library's page. Folders given as links are followed to the share
+they lead to, and a share mounted inside the output folder (`/output/Movies`
+on a drive of its own) is remembered with it. If you removed the share for
+good, tell Chrysopoeia: remove the library and add it again, or choose the
+output or work folder again in Settings (pick the same folder again and save).
 
 **What happens to files when I change a library's goal?**
 Files that were skipped or are waiting are decided again under the new goal; a

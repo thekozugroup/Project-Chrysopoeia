@@ -71,6 +71,10 @@ pub fn router() -> Router<AppState> {
                 .delete(libraries::delete),
         )
         .route("/libraries/{id}/scan", post(libraries::scan))
+        .route(
+            "/libraries/{id}/relearn-mounts",
+            post(libraries::relearn_mounts),
+        )
         .route("/scan", post(libraries::scan_all))
         .route("/files", get(files::list))
         .route("/files/bulk", post(files::bulk))

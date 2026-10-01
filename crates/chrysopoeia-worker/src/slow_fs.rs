@@ -8,9 +8,12 @@
 //! (512 threads) is used up and everything that touches a disk stops,
 //! healthy folders included.
 //!
-//! [`guarded`] runs one check per path (and kind of check) at a time: a
-//! caller that comes while the same check is still running waits for its
-//! answer, up to its own timeout, instead of starting another. Checks are
+//! [`guarded`] runs one check per path (and kind of check) on one mount at a
+//! time: a caller that comes while the same check of the same mount is
+//! still running waits for its answer, up to its own timeout, instead of
+//! starting another. A check of a share mounted again at the same place
+//! (after a hung one was unmounted lazily, `umount -l`) is another check,
+//! which doesn't wait for the one stuck on the old mount. Checks are
 //! counted by the mount they are on (the longest mount point in
 //! `/proc/self/mountinfo` above the path, which is read without touching the
 //! share; see [`group_of`]):
@@ -30,7 +33,10 @@
 //!   Mounts are told apart by their id, so a share mounted again at the
 //!   same place is another mount. When the list of mounts is read again
 //!   (whenever a check gets no answer in time or finds no room on its
-//!   mount, at most once a second), only a mount that appeared since,
+//!   mount, in the background, and right away before a check is refused
+//!   because the checks of its mount are stuck, so the first look at a
+//!   share mounted again where one hung goes to the new mount; at most
+//!   once a second), only a mount that appeared since,
 //!   between the one a check is counted by and its path, takes it over: a
 //!   share mounted after the list was read soon has its stuck checks
 //!   counted by its own mount. A check whose mount is gone from the list (a
@@ -42,8 +48,9 @@
 //!   and it is never taken for one that stopped answering.
 //!
 //! [`first_unmounted`] tells whether the mount points a job's folders sit
-//! on are all still mounted (an unmounted share leaves its mount point
-//! behind as an ordinary folder on the disk below).
+//! on are all still mounted, with what was mounted there before (an
+//! unmounted share leaves its mount point behind as an ordinary folder on
+//! the disk below, and another filesystem may be mounted in its place).
 //!
 //! The server and the worker share these checks.
 
@@ -160,7 +167,11 @@ impl std::fmt::Display for NotAnswering {
 impl std::error::Error for NotAnswering {}
 
 type Answer = Arc<dyn Any + Send + Sync>;
-type Flights = HashMap<(&'static str, PathBuf), watch::Receiver<Option<Answer>>>;
+/// A check under way: its kind, its path, and the mount it was started on
+/// (a share mounted again at one place is another mount, whose checks
+/// don't wait for one stuck on the old mount).
+type FlightKey = (&'static str, PathBuf, Mount);
+type Flights = HashMap<FlightKey, watch::Receiver<Option<Answer>>>;
 
 static FLIGHTS: LazyLock<Mutex<Flights>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static SLOTS: LazyLock<Mutex<Slots>> = LazyLock::new(|| Mutex::new(Slots::default()));
@@ -193,7 +204,7 @@ struct Slots {
 }
 
 /// A mount checks are counted by.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Mount {
     /// Its id in `/proc/self/mountinfo`, which tells it from another mount
     /// at the same place (a share unmounted, and another one mounted there
@@ -399,7 +410,7 @@ impl Drop for SlotGuard {
 /// A running check's flight, forgotten when the check ends (on its thread,
 /// even if it panics: later callers then start a fresh check instead of
 /// waiting for an answer that never comes).
-struct FlightGuard((&'static str, PathBuf));
+struct FlightGuard(FlightKey);
 
 impl Drop for FlightGuard {
     fn drop(&mut self) {
@@ -452,39 +463,41 @@ where
     }
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + timeout;
-    let key = (kind, path.to_path_buf());
     current_mounts().await;
     let mut work = Some(work);
+    // The list of mounts was read again for this check (see below).
+    let mut reread = false;
     let mut rx = loop {
-        // Join the check of the same thing under way, or take room for a
-        // new one; no lock is held once this block ends.
+        // Join the check of the same thing on the same mount under way, or
+        // take room for a new one; no lock is held once this block ends.
         let started_flight = {
             let mut flights = lock(&FLIGHTS);
-            if let Some(rx) = flights.get(&key) {
+            let mut slots = lock(&SLOTS);
+            let key: FlightKey = (kind, path.to_path_buf(), slots.group(path));
+            match flights.get(&key) {
                 // Its mount has as many stuck checks as it may (this one
                 // among them, likely): it isn't answering.
-                if lock(&SLOTS).is_stuck(path, Instant::now(), LIMITS) {
-                    return Checked::TimedOut;
-                }
-                break rx.clone();
+                Some(_) if slots.is_stuck(path, Instant::now(), LIMITS) => Err(Refused::GroupStuck),
+                Some(rx) => break rx.clone(),
+                None => slots
+                    .take(path, Instant::now(), started + timeout, LIMITS)
+                    .map(|id| {
+                        let (tx, rx) = watch::channel(None);
+                        flights.insert(key.clone(), rx.clone());
+                        (id, key, tx, rx)
+                    }),
             }
-            let taken = lock(&SLOTS).take(path, Instant::now(), started + timeout, LIMITS);
-            taken.map(|id| {
-                let (tx, rx) = watch::channel(None);
-                flights.insert(key.clone(), rx.clone());
-                (id, tx, rx)
-            })
         };
         match started_flight {
-            Ok((id, tx, rx)) => {
+            Ok((id, key, tx, rx)) => {
                 let slot = SlotGuard(id);
-                let flight = FlightGuard(key.clone());
+                let flight = FlightGuard(key);
                 // Taken only here, and the loop ends with it.
                 let Some(work) = work.take() else {
                     return Checked::TimedOut;
                 };
                 tokio::task::spawn_blocking(move || {
-                    hang::wait_while_hung(&flight.0.1);
+                    hang::wait_while_hung(&flight.0.1, flight.0.2.id);
                     let answer: Answer = Arc::new(work());
                     // Forget the flight first: a caller arriving after this
                     // starts a fresh check, one arriving before gets this
@@ -496,6 +509,17 @@ where
                 break rx;
             }
             Err(Refused::GroupStuck) => {
+                // The list of mounts may be out of date: the stuck share may
+                // have been unmounted (lazily) and mounted again at the same
+                // place, a mount of its own whose checks start afresh. Read
+                // it again (unless that was done a moment ago) before
+                // answering "not answering" at once.
+                if !reread {
+                    reread = true;
+                    if reread_mounts_now().await {
+                        continue;
+                    }
+                }
                 tracing::debug!(path = %path.display(), "too many checks of its mount are stuck");
                 return Checked::TimedOut;
             }
@@ -559,6 +583,42 @@ pub async fn symlink_metadata(
     .await
 }
 
+/// Where `path` really is, with every link on the way followed: a folder
+/// given as a link to a share's mount point is on that share. A part at
+/// the end that doesn't exist yet (a folder a job will create) is kept as
+/// it is, below the real place of the part that does. `None` when that
+/// can't be told within `timeout` (or the path answers with an error).
+pub async fn real_path(path: &Path, timeout: Duration) -> Option<PathBuf> {
+    let p = path.to_path_buf();
+    guarded("real_path", path, timeout, move || real_path_now(&p))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// [`real_path`], with blocking calls.
+fn real_path_now(path: &Path) -> Option<PathBuf> {
+    let mut missing = Vec::new();
+    let mut existing = path;
+    loop {
+        match std::fs::canonicalize(existing) {
+            Ok(real) => {
+                return Some(
+                    missing
+                        .iter()
+                        .rev()
+                        .fold(real, |p: PathBuf, name| p.join(name)),
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 /// Wait until one of `paths` stops answering, and return it. Each is looked
 /// at (its metadata) now and then every `every`; one that gives no answer
 /// within `timeout` hasn't answered. Any answer counts, a missing file
@@ -615,6 +675,41 @@ fn group_in(mounts: &[Mount], path: &Path, fallback: usize) -> Mount {
         })
 }
 
+/// What is mounted somewhere, as `/proc/self/mountinfo` describes it: the
+/// filesystem's type, where it comes from (a device, `server:/export`,
+/// `//server/share`, a FUSE program's name) and the folder of that
+/// filesystem that is mounted (`/` for the whole of it; a bind mount of a
+/// folder names that folder). A share mounted again later is the same; a
+/// tmpfs, another disk, or the bare folder bind-mounted in its place (what
+/// a Docker bind mount shows when the container started before the share
+/// was mounted on the host) is not. The mount's id and device number are
+/// left out: they are handed out again to whatever is mounted next.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct MountIdentity {
+    /// The filesystem type (`nfs4`, `cifs`, `fuse.shfs`, `ext4`).
+    pub fstype: String,
+    /// Where it comes from.
+    pub source: String,
+    /// The folder of that filesystem mounted there.
+    pub root: String,
+}
+
+impl std::fmt::Display for MountIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {} {}", self.fstype, self.source, self.root)
+    }
+}
+
+/// A mount point a folder was seen on, and what was mounted there then
+/// (`None`: not known yet, from an older version; any mount there counts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownMount {
+    /// Where it is mounted.
+    pub point: PathBuf,
+    /// What was mounted there.
+    pub identity: Option<MountIdentity>,
+}
+
 /// A mount point listed in `/proc/self/mountinfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MountPoint {
@@ -623,43 +718,92 @@ pub struct MountPoint {
     /// Mounted on demand by an automounter (on an `autofs` mount): it comes
     /// and goes by itself, and a look at its folder mounts it again.
     pub on_demand: bool,
+    /// What is mounted there.
+    pub identity: MountIdentity,
 }
 
 /// The mount points listed now, read afresh (without touching any share),
-/// or `None` when the list can't be read.
+/// or `None` when the list can't be read. Of several mounts at one place,
+/// only the one on top is listed: the one its folder shows.
 pub async fn mount_points() -> Option<Vec<MountPoint>> {
     Some(points_of(fresh_mounts().await?))
 }
 
-/// The mount points of the mounts `listed`.
+/// The mount points of the mounts `listed`: the one on top at each place,
+/// and the shares an automounter mounted (on an `autofs` mount), which come
+/// and go by themselves and hide nothing for good.
 fn points_of(listed: Vec<Listed>) -> Vec<MountPoint> {
     let autofs: Vec<u64> = listed
         .iter()
-        .filter(|l| l.fstype == "autofs")
+        .filter(|l| l.identity.fstype == "autofs")
         .filter_map(|l| l.mount.id)
+        .collect();
+    let on_demand: Vec<bool> = listed
+        .iter()
+        .map(|l| l.parent.is_some_and(|p| autofs.contains(&p)))
+        .collect();
+    // A mount another one at the same place sits on (its parent) is covered
+    // by it; of those left at one place (which the list can't tell apart),
+    // the one listed last is on top.
+    let covered: Vec<bool> = listed
+        .iter()
+        .map(|l| {
+            l.mount.id.is_some_and(|id| {
+                listed.iter().zip(&on_demand).any(|(other, auto)| {
+                    !auto && other.mount.point == l.mount.point && other.parent == Some(id)
+                })
+            })
+        })
+        .collect();
+    let shown: Vec<bool> = (0..listed.len())
+        .map(|i| {
+            on_demand[i]
+                || (!covered[i]
+                    && !(i + 1..listed.len()).any(|j| {
+                        !on_demand[j]
+                            && !covered[j]
+                            && listed[j].mount.point == listed[i].mount.point
+                    }))
+        })
         .collect();
     listed
         .into_iter()
-        .map(|l| MountPoint {
-            on_demand: l.parent.is_some_and(|p| autofs.contains(&p)),
+        .zip(on_demand)
+        .zip(shown)
+        .filter(|(_, shown)| *shown)
+        .map(|((l, on_demand), _)| MountPoint {
+            on_demand,
             path: l.mount.point,
+            identity: l.identity,
         })
         .collect()
 }
 
-/// The first of `points` (mount points a job's folders sit on) that isn't
-/// mounted now: its folder is then an ordinary folder on the disk below
-/// (an unmounted share leaves its mount point behind), where nothing may
-/// be written. `None` when they all are, or the list can't be read.
-pub async fn first_unmounted(points: &[PathBuf]) -> Option<PathBuf> {
-    if points.is_empty() {
+/// The first of `known` (mount points a job's folders sit on) that isn't
+/// mounted now, or has something else mounted there than before: its
+/// folder is then an ordinary folder on the disk below (an unmounted share
+/// leaves its mount point behind), or another filesystem, where nothing
+/// may be written. `None` when they all are as they were, or the list
+/// can't be read.
+pub async fn first_unmounted(known: &[KnownMount]) -> Option<PathBuf> {
+    if known.is_empty() {
         return None;
     }
     let now = mount_points().await?;
-    points
+    known
         .iter()
-        .find(|p| !now.iter().any(|m| m.path == **p))
-        .cloned()
+        .find(|k| !mounted_as(&now, k))
+        .map(|k| k.point.clone())
+}
+
+/// Whether `known` is mounted among `now` (the mount points listed, the one
+/// on top at each place), with what was mounted there before when that is
+/// known.
+pub fn mounted_as(now: &[MountPoint], known: &KnownMount) -> bool {
+    match now.iter().rfind(|m| m.path == known.point && !m.on_demand) {
+        None => false,
+        Some(m) => known.identity.as_ref().is_none_or(|id| *id == m.identity),
+    }
 }
 
 /// One line of `/proc/self/mountinfo`.
@@ -668,8 +812,8 @@ struct Listed {
     mount: Mount,
     /// The id of the mount it is on.
     parent: Option<u64>,
-    /// Its filesystem type.
-    fstype: String,
+    /// What is mounted.
+    identity: MountIdentity,
 }
 
 /// The mounts checks are counted by, from the list.
@@ -723,6 +867,33 @@ async fn fresh_mounts() -> Option<Vec<Listed>> {
     Some(listed)
 }
 
+/// Read the list of mounts again now, unless it was read moments ago
+/// ([`MOUNTS_MIN_AGE`]), and count checks by it: a check about to be
+/// refused because the checks of its mount are stuck may be going by a
+/// list from before that share was unmounted and mounted again. Whether
+/// it was read.
+#[cfg(not(any(test, feature = "test-hooks")))]
+async fn reread_mounts_now() -> bool {
+    let asked = Instant::now();
+    {
+        let mut slots = lock(&SLOTS);
+        if slots
+            .mounts_read
+            .is_some_and(|at| at.elapsed() < MOUNTS_MIN_AGE)
+        {
+            return false;
+        }
+        // Another check refused meanwhile waits for the next second.
+        slots.mounts_read = Some(asked);
+    }
+    let listed = tokio::task::spawn_blocking(read_mounts)
+        .await
+        .ok()
+        .flatten();
+    note_mounts(listed.as_deref(), asked);
+    listed.is_some()
+}
+
 /// Read the list of mounts again in the background, unless it was read
 /// moments ago: a check that got no answer, or no room on its mount, may
 /// be counted with the wrong mount (a share mounted since the list was
@@ -773,24 +944,25 @@ async fn current_mounts() {
 
 #[cfg(any(test, feature = "test-hooks"))]
 fn refresh_mounts() {
-    let mounts = hang::mounts();
+    let mounts = hang::listed().into_iter().map(|l| l.mount).collect();
     lock(&SLOTS).set_mounts(mounts, Instant::now());
+}
+
+/// Tests read the list afresh, also where it is frozen (see
+/// [`hang::freeze_mounts`]).
+#[cfg(any(test, feature = "test-hooks"))]
+async fn reread_mounts_now() -> bool {
+    let mounts = hang::listed_now().into_iter().map(|l| l.mount).collect();
+    lock(&SLOTS).set_mounts(mounts, Instant::now());
+    true
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 async fn fresh_mounts() -> Option<Vec<Listed>> {
-    let mounts = hang::mounts();
-    lock(&SLOTS).set_mounts(mounts.clone(), Instant::now());
-    Some(
-        mounts
-            .into_iter()
-            .map(|mount| Listed {
-                mount,
-                parent: None,
-                fstype: "test".to_string(),
-            })
-            .collect(),
-    )
+    let listed = hang::listed();
+    let mounts = listed.iter().map(|l| l.mount.clone()).collect();
+    lock(&SLOTS).set_mounts(mounts, Instant::now());
+    Some(listed)
 }
 
 /// The mounts in `/proc/self/mountinfo` (`None` when it can't be read).
@@ -815,28 +987,34 @@ pub fn parse_mountinfo(text: &[u8]) -> Vec<PathBuf> {
 }
 
 /// The lines of `/proc/self/mountinfo`: the mount's id is the first field,
-/// the id of the mount it is on the second, the mount point the fifth, and
-/// the filesystem type the field after the lone `-`.
+/// the id of the mount it is on the second, the folder of the filesystem
+/// mounted the fourth, the mount point the fifth, and the filesystem type
+/// and its source the two fields after the lone `-`.
 fn parse_listed(text: &[u8]) -> Vec<Listed> {
     let number = |field: &[u8]| std::str::from_utf8(field).ok().and_then(|i| i.parse().ok());
+    let text_of = |field: &[u8]| String::from_utf8_lossy(&unescape(field)).into_owned();
     text.split(|b| *b == b'\n')
         .filter_map(|line| {
             let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
             let point = fields.get(4).filter(|f| !f.is_empty())?;
-            let fstype = fields
+            let mut after = fields
                 .iter()
                 .skip(6)
                 .skip_while(|f| **f != b"-".as_slice())
-                .nth(1)
-                .map(|f| String::from_utf8_lossy(f).into_owned())
-                .unwrap_or_default();
+                .skip(1);
+            let fstype = after.next().map(|f| text_of(f)).unwrap_or_default();
+            let source = after.next().map(|f| text_of(f)).unwrap_or_default();
             Some(Listed {
                 mount: Mount {
                     id: fields.first().and_then(|f| number(f)),
                     point: path_from_bytes(unescape(point)),
                 },
                 parent: fields.get(1).and_then(|f| number(f)),
-                fstype,
+                identity: MountIdentity {
+                    fstype,
+                    source,
+                    root: fields.get(3).map(|f| text_of(f)).unwrap_or_default(),
+                },
             })
         })
         .collect()
@@ -887,7 +1065,7 @@ pub mod hang {
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
-    use super::{Mount, lock};
+    use super::{Listed, Mount, MountIdentity, lock};
 
     /// Marked paths, each with the id of its mark.
     type Marks = Mutex<Vec<(PathBuf, u64)>>;
@@ -895,6 +1073,19 @@ pub mod hang {
     static HUNG: LazyLock<Marks> = LazyLock::new(Mutex::default);
     static BUSY: LazyLock<Marks> = LazyLock::new(Mutex::default);
     static MOUNTS: LazyLock<Marks> = LazyLock::new(Mutex::default);
+    /// What tests mounted with [`mount_other`], by the id of its mark.
+    static OTHERS: LazyLock<Mutex<Vec<(u64, MountIdentity)>>> = LazyLock::new(Mutex::default);
+    /// Mounts made hung with [`hang_mount`]: (the id of the mark, the
+    /// mount's id), and the marks themselves, by mount point.
+    static HUNG_MOUNTS: LazyLock<Mutex<Vec<(u64, u64)>>> = LazyLock::new(Mutex::default);
+    static MOUNT_HANGS: LazyLock<Marks> = LazyLock::new(Mutex::default);
+    /// A place the list of mounts is frozen under (see [`freeze_mounts`]):
+    /// the id of its mark, and the mounts listed there when it was frozen
+    /// (`None` once the list was read again).
+    type Freeze = (u64, Option<Vec<Listed>>);
+
+    static FROZEN: LazyLock<Mutex<Vec<Freeze>>> = LazyLock::new(Mutex::default);
+    static FREEZES: LazyLock<Marks> = LazyLock::new(Mutex::default);
     static NEXT_MARK: AtomicU64 = AtomicU64::new(1);
 
     /// Make every check of `path`, and of anything under it, hang until
@@ -902,6 +1093,25 @@ pub mod hang {
     /// would otherwise wait for the stuck thread forever).
     pub fn hang(path: &Path) -> Marked {
         mark(&HUNG, path)
+    }
+
+    /// Make every check that starts on the mount `mounted` (see [`mount`])
+    /// hang until the returned guard is dropped, also once that mount is
+    /// unmounted (lazily, `umount -l`): a check of the same place on a
+    /// share mounted there again answers.
+    pub fn hang_mount(mounted: &Marked) -> Marked {
+        let marked = mark(&MOUNT_HANGS, &mounted_point(mounted));
+        lock(&HUNG_MOUNTS).push((marked.id, mounted.id));
+        marked
+    }
+
+    /// Where the mount `mounted` is (or was) mounted.
+    fn mounted_point(mounted: &Marked) -> PathBuf {
+        lock(mounted.list)
+            .iter()
+            .find(|(_, id)| *id == mounted.id)
+            .map(|(point, _)| point.clone())
+            .unwrap_or_default()
     }
 
     /// Make every check of `path`, and of anything under it, find no room
@@ -914,9 +1124,34 @@ pub mod hang {
     /// as checks of one mount (tests otherwise count by a path's first
     /// folders), and it is listed as mounted ([`super::mount_points`]),
     /// until the guard is dropped (unmounted). Each mount is another one,
-    /// also at a place where one was mounted before.
+    /// also at a place where one was mounted before, but the same share
+    /// ([`share_at`]) whenever it is mounted at one place.
     pub fn mount(path: &Path) -> Marked {
         mark(&MOUNTS, path)
+    }
+
+    /// Mount another filesystem at `path` than [`mount`] does (a tmpfs, or
+    /// the bare folder bind-mounted onto itself), named `name`.
+    pub fn mount_other(path: &Path, name: &str) -> Marked {
+        let marked = mark(&MOUNTS, path);
+        lock(&OTHERS).push((
+            marked.id,
+            MountIdentity {
+                fstype: "other".to_string(),
+                source: name.to_string(),
+                root: "/".to_string(),
+            },
+        ));
+        marked
+    }
+
+    /// What [`mount`] mounts at `path`.
+    pub fn share_at(path: &Path) -> MountIdentity {
+        MountIdentity {
+            fstype: "test".to_string(),
+            source: path.display().to_string(),
+            root: "/".to_string(),
+        }
     }
 
     fn mark(list: &'static Marks, path: &Path) -> Marked {
@@ -938,6 +1173,9 @@ pub mod hang {
     impl Drop for Marked {
         fn drop(&mut self) {
             lock(self.list).retain(|(_, id)| *id != self.id);
+            lock(&OTHERS).retain(|(id, _)| *id != self.id);
+            lock(&HUNG_MOUNTS).retain(|(id, _)| *id != self.id);
+            lock(&FROZEN).retain(|(id, _)| *id != self.id);
         }
     }
 
@@ -951,20 +1189,75 @@ pub mod hang {
         lock(&BUSY).iter().any(|(p, _)| path.starts_with(p))
     }
 
-    /// The mounts tests made up, in the order they were mounted.
-    pub(super) fn mounts() -> Vec<Mount> {
+    /// Keep the list of mounts checks go by under `path` as it is now, as a
+    /// list read some time ago would be (the real one is read every 30 s),
+    /// until the guard is dropped or a check reads it again because it is
+    /// about to be refused (see [`super::guarded`]).
+    pub fn freeze_mounts(path: &Path) -> Marked {
+        let marked = mark(&FREEZES, path);
+        let now: Vec<Listed> = live()
+            .into_iter()
+            .filter(|l| l.mount.point.starts_with(path))
+            .collect();
+        lock(&FROZEN).push((marked.id, Some(now)));
+        marked
+    }
+
+    /// The mounts checks go by: those tests made up, but where the list is
+    /// frozen, those listed when it was frozen (see [`freeze_mounts`]).
+    pub(super) fn listed() -> Vec<Listed> {
+        let frozen: Vec<(PathBuf, Vec<Listed>)> = {
+            let points = lock(&FREEZES).clone();
+            lock(&FROZEN)
+                .iter()
+                .filter_map(|(id, snapshot)| {
+                    let point = points.iter().find(|(_, mark)| mark == id)?.0.clone();
+                    Some((point, snapshot.clone()?))
+                })
+                .collect()
+        };
+        let mut listed: Vec<Listed> = live()
+            .into_iter()
+            .filter(|l| !frozen.iter().any(|(p, _)| l.mount.point.starts_with(p)))
+            .collect();
+        listed.extend(frozen.into_iter().flat_map(|(_, snapshot)| snapshot));
+        listed
+    }
+
+    /// The mounts tests made up, read afresh: a frozen list is thawed.
+    pub(super) fn listed_now() -> Vec<Listed> {
+        for (_, snapshot) in lock(&FROZEN).iter_mut() {
+            *snapshot = None;
+        }
+        live()
+    }
+
+    /// The mounts tests made up, in the order they were mounted (the later
+    /// of two at one place on top).
+    fn live() -> Vec<Listed> {
+        let others = lock(&OTHERS).clone();
         lock(&MOUNTS)
             .iter()
-            .map(|(point, id)| Mount {
-                id: Some(*id),
-                point: point.clone(),
+            .map(|(point, id)| Listed {
+                mount: Mount {
+                    id: Some(*id),
+                    point: point.clone(),
+                },
+                parent: None,
+                identity: others
+                    .iter()
+                    .find(|(other, _)| other == id)
+                    .map_or_else(|| share_at(point), |(_, identity)| identity.clone()),
             })
             .collect()
     }
 
-    /// Block while `path` is marked hung.
-    pub fn wait_while_hung(path: &Path) {
-        while is_hung(path) {
+    /// Block while `path` is marked hung, or the mount the check started on
+    /// (its id, `mount`) is.
+    pub fn wait_while_hung(path: &Path, mount: Option<u64>) {
+        let mount_hung =
+            || mount.is_some_and(|m| lock(&HUNG_MOUNTS).iter().any(|(_, hung)| *hung == m));
+        while is_hung(path) || mount_hung() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -987,7 +1280,7 @@ mod hang {
     use std::path::Path;
 
     #[inline]
-    pub(super) fn wait_while_hung(_: &Path) {}
+    pub(super) fn wait_while_hung(_: &Path, _: Option<u64>) {}
 
     #[inline]
     pub(super) fn is_busy(_: &Path) -> bool {
@@ -1472,16 +1765,264 @@ mod tests {
         );
         let types: Vec<(Option<u64>, String)> = parse_listed(text)
             .into_iter()
-            .map(|l| (l.parent, l.fstype))
+            .map(|l| (l.parent, l.identity.to_string()))
             .collect();
         assert_eq!(
             types,
             [
-                (Some(1), "ext4".to_string()),
-                (Some(22), "cifs".to_string()),
-                (Some(22), "fuse".to_string()),
+                (Some(1), "ext4 /dev/sda1 /".to_string()),
+                (Some(22), "cifs //nas/share /".to_string()),
+                (Some(22), "fuse x /".to_string()),
             ]
         );
+    }
+
+    /// What is mounted is told by its type, source and the folder of it
+    /// that is mounted, whatever its id and device number (both handed out
+    /// again to whatever is mounted next): a share mounted again is the
+    /// same, a tmpfs or the bare folder bind-mounted onto itself in its
+    /// place is not.
+    #[test]
+    fn what_is_mounted_is_told_by_type_source_and_root() {
+        let share = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+            52 22 0:60 / /mnt/nas rw,nosuid - fuse.hangfs hangfs rw,user_id=0\n";
+        let again = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+            61 22 0:71 / /mnt/nas rw,nosuid - fuse.hangfs hangfs rw,user_id=0\n";
+        let tmpfs = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+            52 22 0:60 / /mnt/nas rw - tmpfs otherfs rw\n";
+        let bind = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+            52 22 8:1 /mnt/nas /mnt/nas rw - ext4 /dev/vda rw\n";
+        let at_nas = |text: &[u8]| {
+            points_of(parse_listed(text))
+                .into_iter()
+                .find(|m| m.path == Path::new("/mnt/nas"))
+                .unwrap()
+                .identity
+        };
+        let known = KnownMount {
+            point: PathBuf::from("/mnt/nas"),
+            identity: Some(at_nas(share)),
+        };
+        assert_eq!(
+            known.identity,
+            Some(MountIdentity {
+                fstype: "fuse.hangfs".to_string(),
+                source: "hangfs".to_string(),
+                root: "/".to_string(),
+            })
+        );
+        let listed = |text: &[u8]| points_of(parse_listed(text));
+        assert!(mounted_as(&listed(share), &known));
+        assert!(mounted_as(&listed(again), &known), "mounted again");
+        assert!(!mounted_as(&listed(tmpfs), &known), "a tmpfs");
+        assert!(!mounted_as(&listed(bind), &known), "the bare folder");
+        assert_eq!(at_nas(bind).root, "/mnt/nas");
+        let gone = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n";
+        assert!(!mounted_as(&listed(gone), &known), "not mounted");
+        // Not known yet (an older version): any mount there counts.
+        let unknown = KnownMount {
+            point: PathBuf::from("/mnt/nas"),
+            identity: None,
+        };
+        assert!(mounted_as(&listed(tmpfs), &unknown));
+        assert!(!mounted_as(&listed(gone), &unknown));
+    }
+
+    /// Of several mounts at one place, the one on top is the one its folder
+    /// shows: another filesystem mounted over a share hides it. A share an
+    /// automounter mounts on its own mount point (a direct map) hides
+    /// nothing for good.
+    #[test]
+    fn the_mount_on_top_is_the_one_shown() {
+        let share = KnownMount {
+            point: PathBuf::from("/mnt/nas"),
+            identity: Some(MountIdentity {
+                fstype: "nfs4".to_string(),
+                source: "nas:/export".to_string(),
+                root: "/".to_string(),
+            }),
+        };
+        // A tmpfs mounted over the share (it sits on it), listed first or
+        // last.
+        for text in [
+            &b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                40 22 0:40 / /mnt/nas rw - nfs4 nas:/export rw\n\
+                41 40 0:41 / /mnt/nas rw - tmpfs tmpfs rw\n"[..],
+            &b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+                41 40 0:41 / /mnt/nas rw - tmpfs tmpfs rw\n\
+                40 22 0:40 / /mnt/nas rw - nfs4 nas:/export rw\n"[..],
+        ] {
+            let now = points_of(parse_listed(text));
+            assert_eq!(
+                now.iter()
+                    .filter(|m| m.path == Path::new("/mnt/nas"))
+                    .count(),
+                1
+            );
+            assert!(!mounted_as(&now, &share), "hidden by the tmpfs");
+        }
+        // The share mounted over the bare folder bind-mounted there (what
+        // a container sees when its host mounts the share after it
+        // started): the share shows.
+        let text = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            40 22 8:1 /mnt/nas /mnt/nas rw - ext4 /dev/sda1 rw\n\
+            41 40 0:41 / /mnt/nas rw - nfs4 nas:/export rw\n";
+        assert!(mounted_as(&points_of(parse_listed(text)), &share));
+
+        // A direct automounter map: the share comes and goes on the
+        // automounter's own mount point, which is what is remembered.
+        let trigger = KnownMount {
+            point: PathBuf::from("/mnt/auto/nas"),
+            identity: Some(MountIdentity {
+                fstype: "autofs".to_string(),
+                source: "/etc/auto.direct".to_string(),
+                root: "/".to_string(),
+            }),
+        };
+        let idle = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            30 22 0:40 / /mnt/auto/nas rw - autofs /etc/auto.direct rw\n";
+        let in_use = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            30 22 0:40 / /mnt/auto/nas rw - autofs /etc/auto.direct rw\n\
+            31 30 0:41 / /mnt/auto/nas rw - nfs4 nas:/export rw\n";
+        assert!(mounted_as(&points_of(parse_listed(idle)), &trigger));
+        assert!(mounted_as(&points_of(parse_listed(in_use)), &trigger));
+    }
+
+    /// A share that hung was unmounted lazily (`umount -l`) and mounted
+    /// again at the same place: a check of a path on it starts afresh on
+    /// the new mount and answers, instead of waiting for the check stuck on
+    /// the old mount, which never answers. Before, it joined that check,
+    /// and the folder stayed "not responding" for as long as the old mount
+    /// hung. While the share stays mounted, a check of a stuck path still
+    /// joins the stuck one (no new thread).
+    #[tokio::test]
+    async fn a_share_mounted_again_doesnt_wait_for_checks_stuck_on_the_old_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("share");
+        let path = share.join("Movies");
+        let started = Arc::new(AtomicUsize::new(0));
+        // The stuck check ends when this goes (also when the test fails, so
+        // its runtime doesn't wait for it forever).
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let old = hang::mount(&share);
+        let stuck = {
+            let started = Arc::clone(&started);
+            guarded("remount", &path, Duration::from_millis(200), move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = held.recv();
+                false
+            })
+            .await
+        };
+        assert_eq!(stuck, Err(NoAnswer::NotAnswering));
+        // Still mounted: the same check, still stuck.
+        let joined = {
+            let started = Arc::clone(&started);
+            guarded("remount", &path, Duration::from_millis(200), move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .await
+        };
+        assert_eq!(joined, Err(NoAnswer::NotAnswering));
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        // Unmounted lazily, and mounted again at the same place.
+        drop(old);
+        let _new = hang::mount(&share);
+        let fresh = {
+            let started = Arc::clone(&started);
+            guarded("remount", &path, Duration::from_secs(20), move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+            .await
+        };
+        assert_eq!(fresh, Ok(true), "a check on the new mount answers");
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        // The stuck check is still counted by the old mount, not the new
+        // (the answered one gives its room back a moment after answering).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while hang::running_checks_on(&share).await > 0 {
+            assert!(Instant::now() < deadline, "the new mount counts checks");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(release);
+    }
+
+    /// A share whose checks are stuck (as many as its mount may hold) is
+    /// unmounted lazily and mounted again at the same place, and the list
+    /// of mounts checks go by is from before (it is read again every 30 s):
+    /// a check there is about to be refused at once, as one of the stuck
+    /// mount's, so the list is read again first, and the check starts
+    /// afresh on the new mount and answers. Before, every check there was
+    /// refused at once until the list happened to be read again.
+    #[tokio::test]
+    async fn a_check_about_to_be_refused_reads_the_list_of_mounts_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join("share");
+        let old = hang::mount(&share);
+        let hung = hang::hang_mount(&old);
+        let timeout = Duration::from_millis(200);
+        let mut asks = Vec::new();
+        for i in 0..MAX_STUCK_PER_MOUNT {
+            let folder = share.join(format!("folder {i}"));
+            asks.push(tokio::spawn(async move {
+                guarded("refused", &folder, timeout, || true).await
+            }));
+        }
+        for ask in asks {
+            assert_eq!(ask.await.unwrap(), Err(NoAnswer::NotAnswering));
+        }
+        let frozen = hang::freeze_mounts(&share);
+        drop(old);
+        let _again = hang::mount(&share);
+        for folder in ["folder 0", "folder 5", "folder 9"] {
+            let asked = Instant::now();
+            let looked = guarded(
+                "refused",
+                &share.join(folder),
+                Duration::from_secs(20),
+                || true,
+            )
+            .await;
+            assert_eq!(looked, Ok(true), "{folder}");
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "{folder}: {:?}",
+                asked.elapsed()
+            );
+        }
+        drop(frozen);
+        drop(hung);
+    }
+
+    /// Where a folder really is: links followed, and a part that doesn't
+    /// exist yet kept below the real place of the part that does.
+    #[tokio::test]
+    async fn real_paths_follow_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let share = base.join("share");
+        std::fs::create_dir(&share).unwrap();
+        let link = base.join("out");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&share, &link).unwrap();
+        let timeout = Duration::from_secs(30);
+        assert_eq!(real_path(&link, timeout).await, Some(share.clone()));
+        assert_eq!(
+            real_path(&link.join("Movies/Film (2001)"), timeout).await,
+            Some(share.join("Movies/Film (2001)"))
+        );
+        assert_eq!(real_path(&share, timeout).await, Some(share.clone()));
+        // A link that leads nowhere is kept as it is.
+        let dangling = base.join("dangling");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("nowhere"), &dangling).unwrap();
+        assert_eq!(real_path(&dangling, timeout).await, Some(dangling));
+        // A folder that doesn't answer: unknown.
+        let _hung = hang::hang(&share);
+        assert_eq!(real_path(&share, Duration::from_millis(200)).await, None);
     }
 
     /// A share an automounter mounted on demand (on an `autofs` mount) is

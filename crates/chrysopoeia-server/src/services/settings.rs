@@ -222,6 +222,9 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
 pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     let _guard = state.settings_write.lock().await;
     let old = state.settings();
+    // A folder sent again as it was is chosen again (see below).
+    let sent = |key: &str| patch.get(key).is_some_and(|v| !v.is_null());
+    let (output_sent, temp_sent) = (sent("output_folder"), sent("temp_dir"));
     let mut new = merge(&old, patch)?;
     validate(state, &old, &mut new).await?;
     db::settings::save(state.db.pool(), &new).await?;
@@ -241,22 +244,27 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     {
         watcher::sync(state).await;
     }
-    // A work or output folder chosen anew (moved off a share, say) has its
-    // drives and shares learned afresh, from now (it was just found
-    // usable); the one it replaces is forgotten.
-    for (before, after) in [
-        (&old.output_folder, &new.output_folder),
-        (&old.temp_dir, &new.temp_dir),
+    // A work or output folder chosen anew (moved off a share, say), or
+    // saved again as it was (another drive put in its share's place on
+    // purpose), has its drives and shares learned afresh, from now (it was
+    // just found usable); the one it replaces is forgotten.
+    for (before, after, sent, output) in [
+        (&old.output_folder, &new.output_folder, output_sent, true),
+        (&old.temp_dir, &new.temp_dir, temp_sent, false),
     ] {
-        if before == after {
+        if before == after && !(sent && after.is_some()) {
             continue;
         }
-        if let Some(before) = before {
+        if let Some(before) = before.as_ref().filter(|_| before != after) {
             share_mounts::forget_unless_used(state, Path::new(before)).await;
         }
         if let Some(after) = after {
             share_mounts::forget(state, Path::new(after)).await;
-            share_mounts::check(state, Path::new(after)).await;
+            if output {
+                share_mounts::check_output(state, Path::new(after)).await;
+            } else {
+                share_mounts::check(state, Path::new(after)).await;
+            }
         }
     }
     state.dispatcher.wake();

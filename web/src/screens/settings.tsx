@@ -37,11 +37,14 @@ import { href, type Route } from "@/lib/router";
 import {
   changedKeys,
   errorsFrom,
+  keysToSave,
   profileFieldOf,
+  rechosenAfter,
   saveBarMessage,
   SECTION_LABEL,
   sectionFor,
   type FieldErrors,
+  type FolderSetting,
   type ProfileErrors,
   type SectionId,
 } from "@/lib/settings-form";
@@ -669,7 +672,9 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
   const [profileErrors, setProfileErrors] = useState<ProfileErrors>({});
   const [valid, setValid] = useState(true);
   const [resetKey, setResetKey] = useState(0);
-  const changed = changedKeys(draft, base);
+  // Folders picked again as they were: saved again (see `rechosenAfter`).
+  const [rechosen, setRechosen] = useState<FolderSetting[]>([]);
+  const changed = keysToSave(changedKeys(draft, base), rechosen);
   const dirty = changed.length > 0;
 
   // Adopt changes from elsewhere (another tab, the server) while nothing is edited.
@@ -680,6 +685,7 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
 
   const onChange = (patch: Partial<Settings>) => {
     setDraft((d) => ({ ...d, ...patch }));
+    setRechosen((r) => rechosenAfter(r, patch, base));
     if ("default_profile" in patch) setProfileErrors({});
     setErrors((e) => {
       const next = { ...e };
@@ -701,6 +707,7 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
       void client.invalidateQueries({ queryKey: keys.queue });
       setBase(next);
       setDraft(next);
+      setRechosen([]);
       setErrors({});
       setProfileErrors({});
       toast.success("Settings saved");
@@ -737,6 +744,7 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
         onSave={() => save.mutate()}
         onDiscard={() => {
           setDraft(base);
+          setRechosen([]);
           setErrors({});
           setProfileErrors({});
           setResetKey((k) => k + 1);
