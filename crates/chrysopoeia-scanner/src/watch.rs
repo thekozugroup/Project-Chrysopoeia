@@ -254,16 +254,26 @@ pub struct LibraryWatcher {
 /// period, when shorter). Cheap to clone; it reads empty once the watcher
 /// has stopped.
 #[derive(Debug, Clone, Default)]
-pub struct WaitingFiles(Arc<Mutex<HashMap<PathBuf, usize>>>);
+pub struct WaitingFiles(Arc<Mutex<HashMap<PathBuf, Vec<PathBuf>>>>);
 
 impl WaitingFiles {
     /// Files waited on, by root (roots without any are left out).
     pub fn counts(&self) -> HashMap<PathBuf, usize> {
+        lock(&self.0)
+            .iter()
+            .map(|(root, files)| (root.clone(), files.len()))
+            .collect()
+    }
+
+    /// The files waited on, by root, each root's in name order (roots
+    /// without any are left out). For a caller that knows some of them are
+    /// not copies in progress, such as the program's own results.
+    pub fn files(&self) -> HashMap<PathBuf, Vec<PathBuf>> {
         lock(&self.0).clone()
     }
 
-    fn set(&self, counts: HashMap<PathBuf, usize>) {
-        *lock(&self.0) = counts;
+    fn set(&self, files: HashMap<PathBuf, Vec<PathBuf>>) {
+        *lock(&self.0) = files;
     }
 }
 
@@ -1243,7 +1253,7 @@ struct Debouncer {
     warned: HashSet<String>,
     /// Media files waited on per root, as last published.
     waiting: WaitingFiles,
-    published: HashMap<PathBuf, usize>,
+    published: HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 impl Debouncer {
@@ -1729,18 +1739,21 @@ impl Debouncer {
     /// Publish how many media files each root has waiting to settle (see
     /// [`WaitingFiles`]), when that changed.
     fn publish_waiting(&mut self, roots: &[(PathBuf, RootEntry)]) {
-        let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+        let mut files: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
         for path in self.pending.keys() {
             if !is_media(path) {
                 continue;
             }
             if let Some((root, _)) = innermost_root(roots, path) {
-                *counts.entry(root.clone()).or_default() += 1;
+                files.entry(root.clone()).or_default().push(path.clone());
             }
         }
-        if counts != self.published {
-            self.waiting.set(counts.clone());
-            self.published = counts;
+        for list in files.values_mut() {
+            list.sort();
+        }
+        if files != self.published {
+            self.waiting.set(files.clone());
+            self.published = files;
         }
     }
 
@@ -2233,6 +2246,13 @@ mod live_tests {
             seen = seen.max(waiting.counts().get(dir.path()).copied().unwrap_or(0));
         }
         assert_eq!(seen, 1, "{:?}", waiting.counts());
+        // The files themselves are there for a caller that knows better.
+        assert_eq!(
+            waiting.files().get(dir.path()),
+            Some(&vec![path.clone()]),
+            "{:?}",
+            waiting.files()
+        );
         // Subtitles aren't media: never counted.
         write_file(&dir.path().join("Movie (2020).srt"), 10).await;
         file.sync_all().await.unwrap();
@@ -2246,6 +2266,7 @@ mod live_tests {
             tokio::time::sleep(SETTLE / 8).await;
         }
         assert!(waiting.counts().is_empty(), "{:?}", waiting.counts());
+        assert!(waiting.files().is_empty(), "{:?}", waiting.files());
         drop(watcher);
         assert!(waiting.counts().is_empty());
     }

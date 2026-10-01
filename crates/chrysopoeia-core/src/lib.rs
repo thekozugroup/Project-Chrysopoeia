@@ -9,6 +9,7 @@ pub mod codec;
 pub mod encoder;
 pub mod error;
 pub mod event;
+pub mod format;
 pub mod hardware;
 pub mod job;
 pub mod library;

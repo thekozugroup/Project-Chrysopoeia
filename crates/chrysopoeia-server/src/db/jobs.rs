@@ -14,7 +14,8 @@ use super::{
 
 const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, stage, priority, \
     progress, fps, speed, eta_secs, encoder, hw_api, attempt, input_size, output_size, error, \
-    problem, skip_reason, validation, command, log_tail, notes, force, created_at, started_at, finished_at";
+    problem, skip_reason, validation, command, log_tail, notes, force, freed_bytes, final_path, \
+    created_at, started_at, finished_at";
 
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
@@ -33,7 +34,12 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let force: i64 = row.try_get("force")?;
     let error: Option<String> = row.try_get("error")?;
     let problem: Option<String> = row.try_get("problem")?;
+    let file_name: String = row.try_get("file_name")?;
+    let final_path: Option<String> = row.try_get("final_path")?;
+    let state: JobState = parse_enum(&state)?;
     Ok(Job {
+        output_name: output_name(state, &file_name, final_path.as_deref()),
+        freed_bytes: opt_u64_col(row, "freed_bytes")?,
         problem: super::problem_of(error.as_deref(), problem.as_deref()),
         error,
         force: force != 0,
@@ -45,9 +51,9 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
         id: uuid_col(row, "id")?,
         file_id: uuid_col(row, "file_id")?,
         library_id: uuid_col(row, "library_id")?,
-        file_name: row.try_get("file_name")?,
+        file_name,
         file_path: row.try_get("file_path")?,
-        state: parse_enum(&state)?,
+        state,
         stage: parse_enum(&stage)?,
         priority: i32::try_from(priority).unwrap_or(0),
         progress: progress as f32,
@@ -70,6 +76,18 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
         started_at: opt_ts_col(row, "started_at")?,
         finished_at: opt_ts_col(row, "finished_at")?,
     })
+}
+
+/// The file name of a done job's result when it isn't the original's name
+/// (a new extension, say), from where the job put it (`final_path`, stored
+/// while the job ran). `None` for a job that isn't done, whose result has
+/// the original's name, or that has no stored destination.
+fn output_name(state: JobState, file_name: &str, final_path: Option<&str>) -> Option<String> {
+    if state != JobState::Done {
+        return None;
+    }
+    let name = std::path::Path::new(final_path?).file_name()?.to_str()?;
+    (name != file_name).then(|| name.to_string())
 }
 
 /// One job.
@@ -464,13 +482,22 @@ pub async fn finish(
     } else {
         Some(to_json(&f.notes)?)
     };
+    // A hard-linked original keeps its data on disk through its other name
+    // (a seeding torrent), so replacing it freed nothing; the worker says so
+    // in a note on the conversion.
+    let shared_original = f
+        .notes
+        .iter()
+        .any(|n| n == chrysopoeia_worker::run::SHARED_ORIGINAL_NOTE);
     let done = sqlx::query(
         "UPDATE jobs SET state = ?, error = ?, problem = ?, skip_reason = ?, \
          encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), \
          attempt = COALESCE(?, attempt), output_size = ?, validation = ?, command = ?, \
          log_tail = ?, notes = ?, eta_secs = NULL, \
-         progress = CASE WHEN ? = 'done' THEN 100 ELSE progress END, finished_at = ? \
-         WHERE id = ?",
+         progress = CASE WHEN ? = 'done' THEN 100 ELSE progress END, \
+         freed_bytes = CASE WHEN ? <> 'done' THEN NULL WHEN ? THEN 0 \
+             ELSE MAX(input_size - ?, 0) END, \
+         finished_at = ? WHERE id = ?",
     )
     .bind(enum_str(&state))
     .bind(&f.error)
@@ -489,6 +516,9 @@ pub async fn finish(
     .bind(&f.log_tail)
     .bind(notes)
     .bind(enum_str(&state))
+    .bind(enum_str(&state))
+    .bind(shared_original)
+    .bind(f.output_size.map(i64_of))
     .bind(now_ts())
     .bind(id.to_string())
     .execute(conn)
@@ -716,7 +746,7 @@ pub struct InterruptedJob {
 /// Jobs left `running` by the previous run (before [`recover_interrupted`]).
 pub async fn interrupted(pool: &SqlitePool) -> sqlx::Result<Vec<InterruptedJob>> {
     let rows = sqlx::query(&format!(
-        "SELECT {COLUMNS}, final_path FROM jobs WHERE state = 'running'"
+        "SELECT {COLUMNS} FROM jobs WHERE state = 'running'"
     ))
     .fetch_all(pool)
     .await?;
@@ -728,6 +758,34 @@ pub async fn interrupted(pool: &SqlitePool) -> sqlx::Result<Vec<InterruptedJob>>
             })
         })
         .collect()
+}
+
+/// Where conversions put their results: the files of jobs running now, and
+/// of jobs that finished at or after `since`. Those are Chrysopoeia's own
+/// files, not copies someone is making (see the folder watcher's count of
+/// files still being copied).
+pub async fn own_outputs(
+    pool: &SqlitePool,
+    since: chrono::DateTime<chrono::Utc>,
+) -> sqlx::Result<std::collections::HashSet<String>> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT final_path FROM jobs WHERE state = 'running' AND final_path IS NOT NULL \
+         UNION SELECT final_path FROM jobs WHERE state = 'done' AND finished_at >= ? \
+         AND final_path IS NOT NULL",
+    )
+    .bind(super::ts(since))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Whether a conversion running now is putting its result at `path`.
+pub async fn is_running_output(pool: &SqlitePool, path: &str) -> sqlx::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM jobs WHERE state = 'running' AND final_path = ? LIMIT 1")
+        .bind(path)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Whether a finished conversion other than `job` put its result at `path`.

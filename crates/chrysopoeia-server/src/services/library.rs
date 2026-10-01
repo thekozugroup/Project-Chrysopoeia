@@ -630,6 +630,42 @@ async fn record_settling(
     Ok(before != after)
 }
 
+/// How long after a conversion finished its result still doesn't count as
+/// a copy in progress, on top of the settle time the watcher waits.
+const OWN_OUTPUT_GRACE: Duration = Duration::from_secs(30);
+
+/// Files the folder watcher waits on (by watched folder) that are copies
+/// still in progress, as counts per folder: without the files Chrysopoeia
+/// itself is writing. A converted file put in place goes through the
+/// watcher's settle wait like any new file, but it is complete, so it must
+/// not make the library say it is waiting for a copy to finish. Those files
+/// are the results of the jobs running now and of the jobs that finished
+/// within the settle time (plus a margin).
+pub async fn settling_copies(
+    state: &AppState,
+    waiting: &HashMap<PathBuf, Vec<PathBuf>>,
+) -> sqlx::Result<HashMap<PathBuf, usize>> {
+    if waiting.values().all(Vec::is_empty) {
+        return Ok(HashMap::new());
+    }
+    let window = chrono::Duration::from_std(state.config.settle + OWN_OUTPUT_GRACE)
+        .unwrap_or(chrono::Duration::MAX);
+    let since = Utc::now()
+        .checked_sub_signed(window)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    let own = db::jobs::own_outputs(state.db.pool(), since).await?;
+    Ok(waiting
+        .iter()
+        .filter_map(|(root, files)| {
+            let copies = files
+                .iter()
+                .filter(|path| !path.to_str().is_some_and(|p| own.contains(p)))
+                .count();
+            (copies > 0).then(|| (root.clone(), copies))
+        })
+        .collect())
+}
+
 /// The folder watcher's count of media files still being written, per
 /// watched folder: store it as the libraries' settling count where it
 /// changed, and tell the UI.
@@ -1296,6 +1332,12 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
     if let Ok(rel) = path.strip_prefix(&root)
         && IgnoreRules::new(&opts.ignore_patterns).excludes_file(rel)
     {
+        return Ok(Single::Handled);
+    }
+    // A result a conversion is still putting in place: the job records it
+    // itself when it ends, so it is neither probed nor added as a new file
+    // here (under a new name it has no row yet).
+    if db::jobs::is_running_output(state.db.pool(), path_str).await? {
         return Ok(Single::Handled);
     }
     let Ok(meta) = tokio::fs::metadata(path).await else {

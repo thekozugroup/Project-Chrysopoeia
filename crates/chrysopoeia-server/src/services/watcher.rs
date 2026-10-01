@@ -108,8 +108,18 @@ async fn start(state: &AppState) -> Result<ActiveWatcher, String> {
                     }
                 }
                 _ = tick.tick(), if waiting.is_some() => {
-                    // Copies in progress show as files still being copied.
-                    let now = waiting.as_ref().map(|w| w.counts()).unwrap_or_default();
+                    // Copies in progress show as files still being copied;
+                    // the files Chrysopoeia puts in place itself are not.
+                    let files = waiting.as_ref().map(|w| w.files()).unwrap_or_default();
+                    let now = match library::settling_copies(&consumer, &files).await {
+                        Ok(now) => now,
+                        Err(e) => {
+                            tracing::debug!(
+                                "could not tell which files are still being copied: {e}"
+                            );
+                            continue;
+                        }
+                    };
                     if now != last {
                         match library::set_watch_settling(&consumer, &now).await {
                             Ok(()) => last = now,

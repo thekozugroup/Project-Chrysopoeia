@@ -119,7 +119,6 @@ pub trait MediaToolkit: Send + Sync + 'static {
     }
 
     /// Start a debounced folder watcher.
-    #[allow(clippy::type_complexity)]
     fn start_watcher(
         &self,
         settle: Duration,
@@ -401,7 +400,6 @@ impl Toolkit {
     }
 
     /// See [`MediaToolkit::start_watcher`].
-    #[allow(clippy::type_complexity)]
     pub fn start_watcher(
         &self,
         settle: Duration,
@@ -463,7 +461,6 @@ mod tests {
         fn recover_artifact(&self, _: PathBuf) -> BoxFuture<'static, anyhow::Result<Recovery>> {
             Box::pin(async { panic!("recovery broke") })
         }
-        #[allow(clippy::type_complexity)]
         fn start_watcher(
             &self,
             _: Duration,

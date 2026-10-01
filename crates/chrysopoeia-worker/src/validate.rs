@@ -2521,20 +2521,10 @@ fn format_time(secs: f64) -> String {
     }
 }
 
-/// Decimal size with one decimal place, e.g. `12.3 GB`.
+/// A size as the job sheet and the rest of the app show it (`3.13 MB`,
+/// `572 KB`): the shared formatter in `chrysopoeia-core`.
 pub(crate) fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1000.0 && unit < UNITS.len() - 1 {
-        value /= 1000.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} bytes")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    chrysopoeia_core::format::bytes(bytes)
 }
 
 /// SSIM and PSNR statistics files for one segment, per searched offset.
@@ -3234,6 +3224,10 @@ mod tests {
         assert_eq!(format_time(6130.0), "1:42:10");
         assert_eq!(human_bytes(512), "512 bytes");
         assert_eq!(human_bytes(12_345_678_901), "12.3 GB");
+        // The check line reads like the rest of the job sheet.
+        assert_eq!(human_bytes(3_130_000), "3.13 MB");
+        assert_eq!(human_bytes(572_400), "572 KB");
+        assert_eq!(human_bytes(999_999_950), "1 GB");
     }
 
     #[test]

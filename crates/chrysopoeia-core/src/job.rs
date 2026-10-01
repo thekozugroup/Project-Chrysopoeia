@@ -90,6 +90,18 @@ pub struct Job {
     pub attempt: u32,
     pub input_size: u64,
     pub output_size: Option<u64>,
+    /// The disk space this conversion actually released: the input's size
+    /// minus the output's in the usual case; 0 when the original's space
+    /// was not released (the original was hard-linked, so replacing it
+    /// freed nothing) or the result is not smaller. `None` for a job that
+    /// is not done, and for one that finished before this was recorded.
+    #[serde(default)]
+    pub freed_bytes: Option<u64>,
+    /// The file name of the result when it differs from the original's
+    /// (for example the extension changed to `.mkv`). `None` when the name
+    /// is the same, when the job is not done, or when it is not known.
+    #[serde(default)]
+    pub output_name: Option<String>,
     pub error: Option<String>,
     /// Machine-readable cause of `error`, so the UI can group problems and
     /// offer the right fix without parsing sentences.
