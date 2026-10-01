@@ -292,7 +292,11 @@ fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Resul
 
 /// How long a folder listing may take before the folder is reported as not
 /// responding (a share whose server went away never answers).
-const BROWSE_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
 
 /// `GET /api/fs/browse`
 pub async fn browse(
@@ -325,12 +329,19 @@ pub async fn browse(
     })
     .await;
     match listed {
-        Some(result) => result.map(Json),
-        None => Err(ApiError::new(
+        Ok(result) => result.map(Json),
+        Err(fs_guard::NoAnswer::NotAnswering) => Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "not_responding",
             "That folder isn't responding. If it's on a network share or an external drive, \
              check the connection.",
+        )),
+        // Nothing is known about the folder itself.
+        Err(fs_guard::NoAnswer::Busy) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "Chrysopoeia is still waiting for other folders that stopped answering, so it \
+             couldn't open this one right now. Try again in a moment.",
         )),
     }
 }

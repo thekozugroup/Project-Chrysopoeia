@@ -566,7 +566,7 @@ async fn vanished(probe: &Result<ProbeInfo, ProbeError>, path: &Path) -> bool {
     probe.is_err()
         && matches!(
             fs_guard::symlink_metadata(path, FILE_CHECK_TIMEOUT).await,
-            None | Some(Err(std::io::ErrorKind::NotFound))
+            Err(_) | Ok(Err(std::io::ErrorKind::NotFound))
         )
 }
 
@@ -994,12 +994,14 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     // Leftovers of interrupted conversions (a temp file left behind when a
     // folder was renamed during a conversion, an original moved aside by a
     // crash): cleaned up, and an original put back is not taken for removed.
+    // Originals a job may still put a new file in place of are not gone
+    // either (see `recover_leftovers`).
     let restored: HashSet<String> = if walk.artifacts.is_empty() {
         HashSet::new()
     } else {
         recover_leftovers(state, walk.artifacts.clone(), None)
             .await
-            .into_iter()
+            .not_gone()
             .filter_map(|p| p.to_str().map(str::to_string))
             .collect()
     };
@@ -1072,10 +1074,22 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         .map(|(p, _)| p.clone())
         .chain(offline_mounts)
         .collect();
+    // A file whose original may be moved aside right now by a conversion
+    // whose new file is still being put in place, or settled after a stop
+    // (see `dispatcher::settle`), is not gone: its job records what became
+    // of it. Read after the walk; once the mark is cleared, the record that
+    // cleared it changed the file's row, which a removal leaves alone.
+    let held: HashSet<Uuid> = match db::jobs::placing(state.db.pool(), None).await {
+        Ok(marked) => marked.into_iter().map(|m| m.job.file_id).collect(),
+        Err(e) => {
+            tracing::warn!(library = %lib.name, "could not look for conversions being put in place: {e}");
+            index.values().map(|e| e.id).collect()
+        }
+    };
     let removed: Vec<IndexEntry> = index
         .values()
         .filter(|e| !seen.contains(e.path.as_str()) && !restored.contains(&e.path))
-        .filter(|e| e.status != FileStatus::Processing)
+        .filter(|e| e.status != FileStatus::Processing && !held.contains(&e.id))
         .filter(|e| !under_unreadable(&e.path, &unreadable))
         .cloned()
         .collect();
@@ -1349,7 +1363,7 @@ async fn upsert_single(state: &AppState, path: &Path) -> anyhow::Result<Single> 
     }
     // A file on a share that stopped answering is left for later (one
     // stuck thread at most, however often it is asked about).
-    let Some(Ok(meta)) = fs_guard::metadata(path, FILE_CHECK_TIMEOUT).await else {
+    let Ok(Ok(meta)) = fs_guard::metadata(path, FILE_CHECK_TIMEOUT).await else {
         return Ok(Single::Handled);
     };
     if !meta.is_file() {
@@ -1559,31 +1573,102 @@ pub async fn redecide(
     Ok(changed)
 }
 
+/// What [`recover_leftovers`] did.
+#[derive(Debug, Default)]
+pub struct Recovered {
+    /// Originals put back from their backup.
+    pub restored: Vec<PathBuf>,
+    /// Originals whose backup was left alone: their job may still put its
+    /// new file in place, or it isn't known yet whether it did. They are
+    /// not gone.
+    pub kept: Vec<PathBuf>,
+}
+
+impl Recovered {
+    /// The originals that are not gone, though not under their name now or
+    /// a moment ago.
+    pub fn not_gone(self) -> impl Iterator<Item = PathBuf> {
+        self.restored.into_iter().chain(self.kept)
+    }
+}
+
 /// Hand leftover temp and backup files (a walk's `artifacts`) to the
 /// worker's crash recovery: temp files are deleted, and an original moved
 /// aside as a backup is put back when its name is free (the backup is
-/// deleted otherwise). Files of jobs running right now are theirs and left
-/// alone, except those of `own_job` (a job looking for what its interrupted
-/// run left, before it starts working). Returns the originals put back.
+/// deleted otherwise). Files of jobs running right now, or whose new file
+/// is still being put in place, are theirs and left alone, except those of
+/// `own_job` (a job looking for what its interrupted run left, before it
+/// starts working). So are those of a job whose new file may have been put
+/// in place after it ended (marked in the database): the disk first tells
+/// whether it got there (see `dispatcher::settle`), which, for a job that
+/// can't run again by itself, is found out now; a job in the queue finds
+/// out when it runs.
 pub async fn recover_leftovers(
     state: &AppState,
     mut artifacts: Vec<PathBuf>,
     own_job: Option<Uuid>,
-) -> Vec<PathBuf> {
+) -> Recovered {
+    use crate::services::dispatcher::{SettleBy, Settled, settle};
+
     artifacts.sort();
     artifacts.dedup();
-    let mut running = state.dispatcher.running_ids();
-    running.retain(|id| Some(*id) != own_job);
-    let mut restored = Vec::new();
+    let mut busy = state.dispatcher.running_ids();
+    busy.extend(state.dispatcher.placing_ids());
+    busy.retain(|id| Some(*id) != own_job);
+    let marked: Vec<Uuid> = match db::jobs::placing(state.db.pool(), None).await {
+        Ok(marked) => marked
+            .into_iter()
+            .map(|m| m.job.id)
+            .filter(|id| Some(*id) != own_job)
+            .collect(),
+        Err(e) => {
+            // Without knowing which backups may still be needed, none is
+            // touched; the next search tries again.
+            tracing::warn!("could not look for interrupted conversions: {e}");
+            return Recovered::default();
+        }
+    };
+    // Per marked job met: whether its files are settled (and so handled).
+    let mut settled: HashMap<Uuid, bool> = HashMap::new();
+    let mut out = Recovered::default();
     for path in artifacts {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        if running
-            .iter()
-            .any(|id| chrysopoeia_core::paths::is_artifact_of(&name, *id))
-        {
+        let owned_by = |id: &Uuid| chrysopoeia_core::paths::is_artifact_of(&name, *id);
+        let original = chrysopoeia_core::paths::is_backup(&name)
+            .then(|| chrysopoeia_core::paths::original_name_from_backup(&name))
+            .flatten()
+            .map(|original| path.with_file_name(original));
+        let left = if busy.iter().any(owned_by) {
+            true
+        } else if let Some(id) = marked.iter().copied().find(owned_by) {
+            // Whatever the settle finds, the original isn't gone: it is
+            // back, or its new file took its place (and the record says so).
+            out.kept.extend(original.clone());
+            if let std::collections::hash_map::Entry::Vacant(entry) = settled.entry(id) {
+                let done = match settle(state, id, SettleBy::Other, PATH_CHECK_TIMEOUT).await {
+                    Settled::Placed(_) => true,
+                    Settled::NotPlaced(restored) => {
+                        out.restored.extend(restored);
+                        true
+                    }
+                    Settled::Unreachable { .. } | Settled::Left => false,
+                };
+                entry.insert(done);
+            }
+            // Settled, its files in its folders were handled with it; the
+            // rest are found by the next search. Not settled: left alone.
+            if settled.get(&id) == Some(&true) {
+                continue;
+            }
+            true
+        } else {
+            false
+        };
+        if left {
+            out.kept.extend(original);
             continue;
         }
         match state.toolkit.recover_artifact(path.clone()).await {
@@ -1598,7 +1683,7 @@ pub async fn recover_leftovers(
                         ActivityRefs::default(),
                     )
                     .await;
-                restored.push(original);
+                out.restored.push(original);
             }
             Ok(r) => tracing::debug!(path = %path.display(), "leftover: {r:?}"),
             Err(e) => {
@@ -1606,7 +1691,7 @@ pub async fn recover_leftovers(
             }
         }
     }
-    restored
+    out
 }
 
 /// Remove what a finished job left anywhere in its library: the temp file
@@ -1647,29 +1732,64 @@ pub fn not_responding(path: &str) -> String {
     )
 }
 
-/// Why a library's folder can't be used right now, if it can't. A folder
-/// that doesn't answer within a few seconds is reported as not responding;
-/// the check itself runs on one thread per folder at a time (see
-/// [`fs_guard`]), so a hung share can't use up the server's threads.
-pub async fn path_problem(path: &str) -> Option<String> {
+/// What a look at a folder found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Folder {
+    /// It can be used.
+    Fine,
+    /// It can't, and why: missing, not allowed, not a folder, empty, or not
+    /// responding.
+    Problem(String),
+    /// It couldn't be looked at right now: checks of other shares that
+    /// stopped answering hold every thread set aside for checks (see
+    /// [`fs_guard::NoAnswer::Busy`]). Nothing is known about it; it is
+    /// never taken for a folder with a problem.
+    Unknown,
+}
+
+impl Folder {
+    /// The problem, if one was found.
+    pub fn problem(self) -> Option<String> {
+        match self {
+            Self::Problem(p) => Some(p),
+            Self::Fine | Self::Unknown => None,
+        }
+    }
+
+    fn from_check(path: &str, looked: Result<Option<String>, fs_guard::NoAnswer>) -> Self {
+        match looked {
+            Ok(None) => Self::Fine,
+            Ok(Some(problem)) => Self::Problem(problem),
+            Err(fs_guard::NoAnswer::NotAnswering) => Self::Problem(not_responding(path)),
+            Err(fs_guard::NoAnswer::Busy) => Self::Unknown,
+        }
+    }
+}
+
+/// Whether a library's folder can be used right now. A folder that doesn't
+/// answer within a few seconds is reported as not responding; the check
+/// itself runs on one thread per folder at a time, and a share that stopped
+/// answering holds only a few (see [`fs_guard`]), so it can't use up the
+/// server's threads or the checks of other folders.
+pub async fn path_problem(path: &str) -> Folder {
     let p = path.to_string();
-    fs_guard::guarded(
+    let looked = fs_guard::guarded(
         "path_problem",
         Path::new(path),
         PATH_CHECK_TIMEOUT,
         move || check_path(&p),
     )
-    .await
-    .unwrap_or_else(|| Some(not_responding(path)))
+    .await;
+    Folder::from_check(path, looked)
 }
 
-/// Why a library folder can't hold the files the queue expects right now:
-/// [`path_problem`], or a folder with nothing in it at all, which for a
+/// Whether a library folder can hold the files the queue expects right now:
+/// [`path_problem`], and a folder with nothing in it at all, which for a
 /// library with files almost always means an unmounted drive or share (the
-/// mount point is left behind empty).
-pub async fn root_unavailable(path: &str) -> Option<String> {
+/// mount point is left behind empty), is a problem too.
+pub async fn root_unavailable(path: &str) -> Folder {
     let p = path.to_string();
-    fs_guard::guarded(
+    let looked = fs_guard::guarded(
         "root_unavailable",
         Path::new(path),
         PATH_CHECK_TIMEOUT,
@@ -1685,8 +1805,8 @@ pub async fn root_unavailable(path: &str) -> Option<String> {
             })
         },
     )
-    .await
-    .unwrap_or_else(|| Some(not_responding(path)))
+    .await;
+    Folder::from_check(path, looked)
 }
 
 /// [`path_problem`]'s check, with blocking calls.
@@ -1745,8 +1865,10 @@ fn assemble(
 /// or the reason the queue is waiting for it (e.g. a share mounted empty).
 async fn library_problem(state: &AppState, row: &LibraryRow) -> Option<String> {
     match path_problem(&row.path).await {
-        Some(p) => Some(p),
-        None => state.dispatcher.offline_reason(row.id),
+        Folder::Problem(p) => Some(p),
+        // Not looked at (too many checks stuck elsewhere): no problem is
+        // claimed for it.
+        Folder::Fine | Folder::Unknown => state.dispatcher.offline_reason(row.id),
     }
 }
 
@@ -1875,7 +1997,7 @@ pub mod mounts {
         })
         .await;
         // A folder that doesn't answer: keep every known mount's files.
-        let (keep, offline) = looked.unwrap_or_else(|| (known.clone(), known.clone()));
+        let (keep, offline) = looked.unwrap_or_else(|_| (known.clone(), known.clone()));
         let keep: Vec<String> = keep
             .iter()
             .filter_map(|p| p.to_str().map(str::to_string))

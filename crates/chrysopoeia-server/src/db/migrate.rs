@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 11;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -287,6 +287,22 @@ const MIGRATION_V10: &[&str] = &[
                  = 'null'))",
 ];
 
+/// Version 11: `jobs.placing` marks a job whose new file was still being
+/// put in place when the job ended (a share that stopped answering, or a
+/// stop, left that step to go on by itself) or when the server stopped
+/// (1), so that what is on the disk tells whether it got there before
+/// anything else touches the job's backup of the original, and one whose
+/// new file was found in place, with only its backup left to remove (2);
+/// see `services::dispatcher::settle`. `jobs.placing_size` is the new
+/// file's size and `jobs.placing_original_size` the original's (`NULL`:
+/// not known). Only marked jobs are indexed.
+const MIGRATION_V11: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN placing INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN placing_size INTEGER",
+    "ALTER TABLE jobs ADD COLUMN placing_original_size INTEGER",
+    "CREATE INDEX idx_jobs_placing ON jobs(placing) WHERE placing > 0",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -298,6 +314,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (8, MIGRATION_V8),
     (9, MIGRATION_V9),
     (10, MIGRATION_V10),
+    (11, MIGRATION_V11),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
