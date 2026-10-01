@@ -1561,10 +1561,14 @@ exit 0"#,
         .collect();
         // Falls back to the second GPU.
         plans.push(test_plan("av1_qsv", &[hung, good]));
+        // Checks time out after 2 s (the working GPU answers in a few
+        // milliseconds, so even a slow machine makes it): the hung GPU's
+        // first wave takes about that long, well before its half minute
+        // and the 20 s deadline.
         let started = std::time::Instant::now();
-        let checks = run_checks(&ffmpeg, plans, quick(400, 20_000)).await;
+        let checks = run_checks(&ffmpeg, plans, quick(2_000, 20_000)).await;
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(15),
             "{:?}",
             started.elapsed()
         );
@@ -1594,10 +1598,14 @@ exit 0"#,
             .iter()
             .map(|n| test_plan(n, &[]))
             .collect();
+        // Each check could wait a minute (and the fake GPU hangs for half
+        // a minute); detection stops at its 0.3 s deadline instead. The
+        // bound leaves a slow machine plenty of room and still tells the two
+        // apart.
         let started = std::time::Instant::now();
-        let checks = run_checks(&ffmpeg, plans, quick(10_000, 300)).await;
+        let checks = run_checks(&ffmpeg, plans, quick(60_000, 300)).await;
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(20),
             "{:?}",
             started.elapsed()
         );

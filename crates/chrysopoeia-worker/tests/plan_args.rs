@@ -111,6 +111,8 @@ fn only_the_primary_video_is_mapped() {
     let plan = plan(&p, &prof, &software(VideoCodec::Hevc));
     assert_eq!(values(&plan.args, "-map"), ["0:0", "0:2"]);
     assert_eq!(plan.expected.video, 1);
+    // The cover is attached to the MKV instead (see the cover tests).
+    assert_eq!(values(&plan.args, "-attach"), ["/tmp/out.cover-1.jpg"]);
 }
 
 #[test]
@@ -1704,5 +1706,298 @@ fn quality_override_of_another_scale_is_ignored_with_a_note() {
         plan.notes.iter().any(|n| n.contains("(60)")),
         "{:?}",
         plan.notes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cover images
+
+fn cover(index: u32, codec: &str, filename: Option<&str>) -> StreamInfo {
+    StreamInfo {
+        is_attached_pic: true,
+        is_default: false,
+        filename: filename.map(Into::into),
+        mimetype: filename.map(|_| "image/jpeg".into()),
+        ..video(index, codec, 600, 600)
+    }
+}
+
+/// A source with a styled subtitle, its font and two cover images (one
+/// named, one not).
+fn covered() -> chrysopoeia_core::ProbeInfo {
+    probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            audio(1, "aac", 2, 48_000, None),
+            subtitle(2, "ass", None),
+            attachment(3),
+            cover(4, "mjpeg", Some("cover.jpg")),
+            cover(5, "png", None),
+        ],
+    )
+}
+
+/// The video's own options: everything between `-map_chapters 0` and the
+/// first audio, subtitle, cover or muxer option.
+fn video_section(args: &[String]) -> Vec<String> {
+    let start = pair_pos(args, "-map_chapters", "0").expect("-map_chapters") + 2;
+    let end = args[start..]
+        .iter()
+        .position(|a| {
+            a.starts_with("-c:a:")
+                || a.starts_with("-c:s:")
+                || a == "-c:v:1"
+                || a == "-max_muxing_queue_size"
+        })
+        .map_or(args.len(), |p| start + p);
+    args[start..end].to_vec()
+}
+
+/// MKV keeps cover images as attachments: they are copied out of the
+/// original first and attached, under their own name (or `cover.<ext>`).
+#[test]
+fn mkv_attaches_cover_images_copied_out_first() {
+    use chrysopoeia_worker::{CoverFile, cover_extract_args};
+    let prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let plan = plan(&covered(), &prof, &software(VideoCodec::Hevc));
+    let a = &plan.args;
+    assert_eq!(values(a, "-map"), ["0:0", "0:1", "0:2", "0:3"]);
+    assert_eq!(
+        plan.covers,
+        [
+            CoverFile {
+                index: 4,
+                path: "/tmp/out.cover-1.jpg".into()
+            },
+            CoverFile {
+                index: 5,
+                path: "/tmp/out.cover-2.png".into()
+            }
+        ]
+    );
+    assert_eq!(
+        values(a, "-attach"),
+        ["/tmp/out.cover-1.jpg", "/tmp/out.cover-2.png"]
+    );
+    assert!(pos(a, "-attach").unwrap() > pos(a, "-map").unwrap());
+    // The font is attachment 0; the covers follow it.
+    assert!(has_pair(a, "-c:t", "copy"));
+    assert_eq!(
+        values(a, "-metadata:s:t:1"),
+        ["mimetype=image/jpeg", "filename=cover.jpg"]
+    );
+    assert_eq!(
+        values(a, "-metadata:s:t:2"),
+        ["mimetype=image/png", "filename=cover.png"]
+    );
+    // Nothing else changes: the video's options are the usual ones.
+    assert!(has_pair(a, "-c:v", "libx265"));
+    assert_absent(a, "-c:v:1");
+    assert!(
+        plan.notes.iter().all(|n| !n.contains("cover")),
+        "{:?}",
+        plan.notes
+    );
+    assert_eq!(plan.expected.video, 1);
+
+    assert_eq!(
+        cover_extract_args(Path::new("/media/in.mkv"), &plan.covers[0]).unwrap(),
+        [
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-i",
+            "/media/in.mkv",
+            "-map",
+            "0:4",
+            "-c",
+            "copy",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "/tmp/out.cover-1.jpg"
+        ]
+    );
+}
+
+/// The copied-out covers are named after the work file, so crash recovery
+/// knows them as this job's leftovers and deletes them.
+#[test]
+fn cover_work_files_are_recognised_leftovers() {
+    use chrysopoeia_core::paths::{is_artifact_of, is_backup};
+    let job = uuid::Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
+    let temp = chrysopoeia_worker::finalize::temp_output_path(
+        Path::new("/media/Movie.mkv"),
+        Container::Mkv,
+        job,
+        Some(Path::new("/work")),
+    );
+    let prof = profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mkv);
+    let plan = build_plan(&PlanRequest {
+        input: Path::new("/media/Movie.mkv"),
+        output: &temp,
+        probe: &covered(),
+        profile: &prof,
+        encoder: &software(VideoCodec::Hevc),
+    })
+    .unwrap();
+    assert_eq!(plan.covers.len(), 2);
+    for cover in &plan.covers {
+        assert_eq!(cover.path.parent(), Some(Path::new("/work")));
+        let name = cover.path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with(".Movie.chrysopoeia-01234567.tmp.cover-"),
+            "{name}"
+        );
+        assert!(is_artifact_of(name, job) && !is_backup(name), "{name}");
+    }
+}
+
+/// MP4 keeps JPEG, PNG and BMP covers as cover art: a copied picture
+/// stream marked as attached. Every video option then names the video
+/// (`v:0`) alone, for every encoder, or ffmpeg would filter, re-encode or
+/// tag the cover too.
+#[test]
+fn mp4_copies_cover_art_and_pins_video_options_to_the_video() {
+    let mut without = covered();
+    without.streams.retain(|s| !s.is_attached_pic);
+    let mut checked = 0;
+    for info in chrysopoeia_core::encoder::VIDEO_ENCODERS {
+        if !Container::Mp4.supports_video(info.codec) {
+            continue;
+        }
+        for (hw_decode, max_height) in [
+            (false, None),
+            (true, None),
+            (false, Some(720)),
+            (true, Some(720)),
+        ] {
+            let encoder = candidate(info.name, hw_decode);
+            let mut prof = profile(info.codec, AudioCodec::Copy, Container::Mp4);
+            prof.max_height = max_height;
+            let plain = plan(&without, &prof, &encoder);
+            let with = plan(&covered(), &prof, &encoder);
+            let a = &with.args;
+            let context = format!(
+                "{} hw_decode={hw_decode} max_height={max_height:?}",
+                info.name
+            );
+            assert_eq!(
+                values(a, "-map"),
+                ["0:0", "0:1", "0:2", "0:4", "0:5"],
+                "{context}"
+            );
+            assert!(has_pair(a, "-c:v:1", "copy"), "{context}");
+            assert!(has_pair(a, "-disposition:v:1", "attached_pic"), "{context}");
+            assert!(has_pair(a, "-c:v:2", "copy"), "{context}");
+            assert!(has_pair(a, "-disposition:v:2", "attached_pic"), "{context}");
+            assert!(with.covers.is_empty(), "{context}");
+            assert_eq!(with.expected, plain.expected, "{context}");
+
+            // Same options, same values, each naming the video.
+            let before = video_section(&plain.args);
+            let after = video_section(a);
+            assert_eq!(
+                before.len(),
+                after.len(),
+                "{context}\n{before:?}\n{after:?}"
+            );
+            assert!(!before.is_empty(), "{context}");
+            for (i, (b, w)) in before.iter().zip(&after).enumerate() {
+                if i % 2 == 1 {
+                    assert_eq!(b, w, "{context}");
+                    continue;
+                }
+                assert!(b.starts_with('-'), "{context}: {b}");
+                let pinned = if b == "-vf" {
+                    w == "-filter:v:0"
+                } else if b.contains(':') && !b.ends_with(":v") {
+                    w == b
+                } else {
+                    w.starts_with(b.as_str()) && w.ends_with(":v:0")
+                };
+                assert!(pinned, "{context}: {b} became {w}");
+                assert!(w.contains(":v:0"), "{context}: {w}");
+            }
+            // The generic forms are gone everywhere.
+            for generic in ["-c:v", "-vf", "-pix_fmt", "-tag:v", "-b:v", "-profile:v"] {
+                assert_absent(a, generic);
+            }
+            checked += 1;
+        }
+    }
+    assert!(checked >= 40, "{checked}");
+    // Quick Sync decoding names its decoder for the video stream alone,
+    // or ffmpeg would read the cover as H.264 too.
+    let qsv = plan(
+        &covered(),
+        &profile(VideoCodec::H264, AudioCodec::Copy, Container::Mp4),
+        &candidate("h264_qsv", true),
+    );
+    assert!(has_pair(&qsv.args, "-c:0", "h264_qsv"), "{:?}", qsv.args);
+    assert!(pos(&qsv.args, "-c:0").unwrap() < input_pos(&qsv.args));
+    let qsv_plain = plan(
+        &without,
+        &profile(VideoCodec::H264, AudioCodec::Copy, Container::Mp4),
+        &candidate("h264_qsv", true),
+    );
+    assert!(has_pair(&qsv_plain.args, "-c:v", "h264_qsv"));
+    // HEVC in MP4: only the video is tagged hvc1.
+    let hevc = plan(
+        &covered(),
+        &profile(VideoCodec::Hevc, AudioCodec::Copy, Container::Mp4),
+        &software(VideoCodec::Hevc),
+    );
+    assert!(has_pair(&hevc.args, "-tag:v:0", "hvc1"));
+    assert!(has_pair(&hevc.args, "-c:v:0", "libx265"));
+}
+
+/// WebM holds no cover image, and MP4 no GIF or WebP one: they are left
+/// out with a note, as are fonts and styling.
+#[test]
+fn covers_the_container_cannot_hold_are_left_out_with_a_note() {
+    let webm = plan(
+        &covered(),
+        &profile(VideoCodec::Vp9, AudioCodec::Opus, Container::Webm),
+        &software(VideoCodec::Vp9),
+    );
+    assert_eq!(values(&webm.args, "-map"), ["0:0", "0:1", "0:2"]);
+    assert_absent(&webm.args, "-attach");
+    assert_absent(&webm.args, "-c:v:1");
+    assert!(webm.covers.is_empty());
+    assert!(has_pair(&webm.args, "-c:v", "libvpx-vp9"));
+    for note in [
+        "Left out 2 cover images because WebM can't hold them",
+        "Left out 1 subtitle font because WebM can't hold attachments",
+        "Converted 1 styled subtitle to plain text because WebM can't keep its styling",
+    ] {
+        assert!(
+            webm.notes.iter().any(|n| n == note),
+            "{note}: {:?}",
+            webm.notes
+        );
+    }
+
+    let mut gif = covered();
+    gif.streams[5].codec = "gif".into();
+    let mp4 = plan(
+        &gif,
+        &profile(VideoCodec::H264, AudioCodec::Copy, Container::Mp4),
+        &software(VideoCodec::H264),
+    );
+    assert_eq!(values(&mp4.args, "-map"), ["0:0", "0:1", "0:2", "0:4"]);
+    assert!(has_pair(&mp4.args, "-c:v:1", "copy"));
+    assert_absent(&mp4.args, "-c:v:2");
+    assert!(
+        mp4.notes
+            .iter()
+            .any(|n| n == "Left out 1 cover image because MP4 can't hold it"),
+        "{:?}",
+        mp4.notes
     );
 }

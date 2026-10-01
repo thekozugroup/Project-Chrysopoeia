@@ -133,6 +133,7 @@ fn fake_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
         args,
         notes: vec!["Test plan".into()],
         expected: support::counts(req.probe),
+        covers: Vec::new(),
     })
 }
 
@@ -142,6 +143,16 @@ fn realtime_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     let mut plan = fake_plan(req)?;
     let at = plan.args.iter().position(|a| a == "-i").unwrap_or(0);
     plan.args.insert(at, "-re".into());
+    Ok(plan)
+}
+
+/// Like [`fake_plan`], but reads the input at a tenth of its native speed,
+/// so a job takes ten times as long as the clip.
+fn slow_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
+    let mut plan = fake_plan(req)?;
+    let at = plan.args.iter().position(|a| a == "-i").unwrap_or(0);
+    plan.args
+        .splice(at..at, ["-readrate".to_string(), "0.1".to_string()]);
     Ok(plan)
 }
 
@@ -541,27 +552,31 @@ async fn cancellation_mid_encode_leaves_no_temp_and_the_original_intact() {
     let trigger = cancel.clone();
     // Cancel once the encode is visibly under way.
     let watcher = tokio::spawn(async move {
-        let mut saw_progress = false;
+        let mut cancelled_at = None;
         while let Some(p) = rx.recv().await {
-            if p.stage == JobStage::Transcoding && p.progress > 0.0 && !saw_progress {
-                saw_progress = true;
+            if p.stage == JobStage::Transcoding && p.progress > 0.0 && cancelled_at.is_none() {
+                cancelled_at = Some(std::time::Instant::now());
                 trigger.cancel();
             }
         }
-        saw_progress
+        cancelled_at
     });
-    let started = std::time::Instant::now();
+    // The encode would take ten times the clip's length (40 s); a
+    // cancelled one stops at once, so even a very slow machine stays far
+    // below that.
     let outcome = tokio::time::timeout(
-        Duration::from_secs(60),
-        run_job_with(&cfg, &spec, &realtime_plan, &transcode, tx, cancel),
+        Duration::from_secs(180),
+        run_job_with(&cfg, &spec, &slow_plan, &transcode, tx, cancel),
     )
     .await
     .expect("job finished");
     assert_eq!(outcome, JobOutcome::Cancelled);
-    assert!(watcher.await.unwrap(), "cancelled mid-encode");
+    let cancelled_at = watcher.await.unwrap().expect("cancelled mid-encode");
+    let full_encode = Duration::from_secs(u64::from(support::CLIP_SECS) * 10);
     assert!(
-        started.elapsed() < Duration::from_secs(u64::from(support::CLIP_SECS) + 2),
-        "stopped early"
+        cancelled_at.elapsed() < full_encode / 2,
+        "stopped {:?} after the cancel",
+        cancelled_at.elapsed()
     );
     assert_eq!(std::fs::read(&input).unwrap(), original);
     assert_eq!(mtime(&input), old);
@@ -1283,4 +1298,206 @@ async fn a_missing_ffmpeg_is_reported_plainly_under_low_priority() {
         "The converter couldn't be started, so nothing was converted. ffmpeg wasn't found at \
          \"/nonexistent/ffmpeg\". Install ffmpeg, or set FFMPEG_PATH to where it is."
     );
+}
+
+/// An MKV with a cover image (a JPEG attachment), made in `dir`; returns
+/// the file and the cover's bytes.
+fn mkv_with_cover(dir: &Path) -> (PathBuf, Vec<u8>) {
+    let jpg = dir.join("art.jpg");
+    let input = dir.join("Covered.mkv");
+    support::ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=orange:size=160x160",
+        "-frames:v",
+        "1",
+        jpg.to_str().unwrap(),
+    ]);
+    support::ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=320x240:rate=25:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=500:duration=3",
+        "-attach",
+        jpg.to_str().unwrap(),
+        "-metadata:s:t:0",
+        "mimetype=image/jpeg",
+        "-metadata:s:t:0",
+        "filename=cover.jpg",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        input.to_str().unwrap(),
+    ]);
+    let bytes = std::fs::read(&jpg).unwrap();
+    std::fs::remove_file(&jpg).unwrap();
+    (input, bytes)
+}
+
+/// The cover image of `path`, byte for byte.
+fn cover_bytes(path: &Path, index: u32, dir: &Path) -> Vec<u8> {
+    let out = dir.join("cover-check.bin");
+    support::ffmpeg(&[
+        "-i",
+        path.to_str().unwrap(),
+        "-map",
+        &format!("0:{index}"),
+        "-c",
+        "copy",
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        out.to_str().unwrap(),
+    ]);
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::remove_file(&out).unwrap();
+    bytes
+}
+
+/// With the real planner: an MKV's cover image is copied out of the
+/// original, attached to the new MKV under its own name, and the copy is
+/// cleaned up. The new file passes verification with the extra picture.
+#[tokio::test]
+async fn an_mkv_cover_image_survives_the_conversion() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let (input, cover) = mkv_with_cover(dir.path());
+    let s = spec(&input, dir.path(), profile());
+    assert!(s.probe.streams.iter().any(|st| st.is_attached_pic));
+    let cfg = config(ValidationLevel::Standard);
+    let (outcome, _) = run(&cfg, &s, &chrysopoeia_worker::build_plan).await;
+    let JobOutcome::Done {
+        output_path,
+        validation,
+        command,
+        ..
+    } = outcome
+    else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(output_path, input);
+    assert!(validation.is_some_and(|v| v.passed));
+    assert!(command.contains("-attach"), "{command}");
+    let probe = support::probe(&input);
+    let covers: Vec<_> = probe
+        .streams
+        .iter()
+        .filter(|st| st.is_attached_pic)
+        .collect();
+    assert_eq!(covers.len(), 1, "{:?}", probe.streams);
+    assert_eq!(covers[0].filename.as_deref(), Some("cover.jpg"));
+    assert_eq!(covers[0].mimetype.as_deref(), Some("image/jpeg"));
+    assert_eq!(cover_bytes(&input, covers[0].index, dir.path()), cover);
+    assert_eq!(support::counts(&probe).video, 1);
+    assert!(
+        support::artifacts_in(dir.path()).is_empty(),
+        "{:?}",
+        support::artifacts_in(dir.path())
+    );
+}
+
+/// A cover image that can't be copied out fails the job: the original is
+/// left exactly as it was, and nothing is left behind.
+#[tokio::test]
+async fn a_cover_that_cannot_be_copied_out_keeps_the_original() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let (input, _) = mkv_with_cover(dir.path());
+    let original = std::fs::read(&input).unwrap();
+    let mut s = spec(&input, dir.path(), profile());
+    // The probe names a cover the file doesn't have (it changed since).
+    for st in &mut s.probe.streams {
+        if st.is_attached_pic {
+            st.index = 40;
+        }
+    }
+    let cfg = config(ValidationLevel::Quick);
+    let (outcome, _) = run(&cfg, &s, &chrysopoeia_worker::build_plan).await;
+    match outcome {
+        JobOutcome::Failed {
+            error,
+            problem,
+            command,
+            ..
+        } => {
+            assert_eq!(problem, ProblemKind::Other);
+            assert!(
+                error.starts_with("The file's cover image couldn't be copied for the new file"),
+                "{error}"
+            );
+            assert!(command.is_some_and(|c| c.contains("0:40")));
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(
+        support::artifacts_in(dir.path()).is_empty(),
+        "{:?}",
+        support::artifacts_in(dir.path())
+    );
+}
+
+/// In MP4 the cover is kept as cover art, and styled subtitles that would
+/// lose their styling keep a Replace-mode job from replacing the original.
+#[tokio::test]
+async fn mp4_keeps_the_cover_and_replace_mode_keeps_styled_subtitles() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let (input, cover) = mkv_with_cover(dir.path());
+    let mp4 = TranscodeProfile {
+        container: Container::Mp4,
+        ..profile()
+    };
+    let cfg = config(ValidationLevel::Standard);
+    let s = spec(&input, dir.path(), mp4.clone());
+    let (outcome, _) = run(&cfg, &s, &chrysopoeia_worker::build_plan).await;
+    let JobOutcome::Done { output_path, .. } = outcome else {
+        panic!("expected Done, got {outcome:?}");
+    };
+    assert_eq!(output_path, dir.path().join("Covered.mp4"));
+    assert!(!input.exists());
+    let probe = support::probe(&output_path);
+    let art: Vec<_> = probe
+        .streams
+        .iter()
+        .filter(|st| st.is_attached_pic)
+        .collect();
+    assert_eq!(art.len(), 1, "{:?}", probe.streams);
+    assert_eq!(cover_bytes(&output_path, art[0].index, dir.path()), cover);
+    assert!(support::artifacts_in(dir.path()).is_empty());
+
+    // A styled ASS track would become plain text: left unchanged.
+    let styled_dir = tempfile::tempdir().unwrap();
+    let (styled, _) = mkv_with_cover(styled_dir.path());
+    let mut s = spec(&styled, styled_dir.path(), mp4);
+    let next = u32::try_from(s.probe.streams.len()).unwrap();
+    s.probe.streams.push(chrysopoeia_core::StreamInfo {
+        index: next,
+        kind: Some(chrysopoeia_core::StreamKind::Subtitle),
+        codec: "ass".into(),
+        ..Default::default()
+    });
+    let before = std::fs::read(&styled).unwrap();
+    let (outcome, _) = run(&cfg, &s, &chrysopoeia_worker::build_plan).await;
+    match outcome {
+        JobOutcome::Skipped { reason, .. } => assert!(
+            reason.starts_with(
+                "MP4 can't hold this file's 1 styled subtitle, so it was left unchanged."
+            ),
+            "{reason}"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&styled).unwrap(), before);
 }

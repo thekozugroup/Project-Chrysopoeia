@@ -391,13 +391,18 @@ async fn a_moved_files_temp_file_is_removed_when_its_job_ends() {
     app.write("Movies/Show/ep.mkv", h264());
     app.write("Movies/other.mkv", h264());
     app.add_library("Movies", json!({})).await;
-    let job = app.get("/api/jobs?state=queued").await.json["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|j| j["file_name"] == "ep.mkv")
-        .unwrap()
-        .clone();
+    // The job is queued by the scan, which a busy machine may still be
+    // finishing up (wait for it rather than assume it).
+    let queued_ep = || async {
+        app.get("/api/jobs?state=queued").await.json["items"]
+            .as_array()
+            .and_then(|jobs| jobs.iter().find(|j| j["file_name"] == "ep.mkv").cloned())
+    };
+    wait_until("the job to be queued", || async {
+        queued_ep().await.is_some()
+    })
+    .await;
+    let job = queued_ep().await.unwrap();
     let job_id: uuid::Uuid = job["id"].as_str().unwrap().parse().unwrap();
     let movies = std::fs::canonicalize(app.media.join("Movies")).unwrap();
     app.fake.set_behavior(
@@ -423,9 +428,13 @@ async fn a_moved_files_temp_file_is_removed_when_its_job_ends() {
     std::fs::write(&other, "another job's").unwrap();
     app.fake.release.add_permits(1);
     app.wait_queue_idle().await;
-    wait_until("the stray temp file is removed", || async {
-        !stray.exists()
-    })
+    // The library is searched once the job has ended, in the background
+    // (generous for a busy machine).
+    wait_until_for(
+        "the stray temp file is removed",
+        Duration::from_secs(60),
+        || async { !stray.exists() },
+    )
     .await;
     assert!(other.exists(), "only that job's files");
     let j = app.get(&format!("/api/jobs/{job_id}")).await;

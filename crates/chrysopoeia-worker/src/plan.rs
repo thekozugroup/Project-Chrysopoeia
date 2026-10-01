@@ -11,7 +11,7 @@
 //! layouts, sample rates, hardware frame formats), the reason is written next
 //! to the rule.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 use chrysopoeia_core::codec::{is_image_subtitle, source_efficiency_rank};
@@ -388,13 +388,36 @@ pub struct FfmpegPlan {
     pub notes: Vec<String>,
     /// What the output should contain; used by verification.
     pub expected: StreamSummary,
+    /// Cover images to copy out of the original (with
+    /// [`cover_extract_args`]) before `args` run: `args` attach them.
+    pub covers: Vec<CoverFile>,
+}
+
+/// A cover image copied out of the original before the conversion runs, so
+/// a new MKV can carry it as an attachment (`-attach`), as MKV stores cover
+/// images. (ffmpeg's MKV writer would store a copied picture stream as a
+/// second video track instead.)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverFile {
+    /// The picture's stream in the original (`-map 0:<index>`).
+    pub index: u32,
+    /// Where it is written: next to the work file and named after it, so
+    /// crash recovery deletes one left behind.
+    pub path: PathBuf,
 }
 
 /// Build the ffmpeg command for one attempt.
 ///
 /// Argument order: global options, hardware devices and decode options,
-/// input options, `-i <input>`, `-map`s, metadata, video, audio, subtitle
-/// and attachment options, muxer options, `-f <muxer> <output>`.
+/// input options, `-i <input>`, `-map`s, `-attach`es, metadata, video,
+/// audio, subtitle, cover and attachment options, muxer options,
+/// `-f <muxer> <output>`.
+///
+/// Cover images are kept where the container can hold them: MP4 gets them
+/// as copied picture streams marked as the cover (the video's options then
+/// name `v:0` alone), MKV as attachments copied out of the original first
+/// ([`FfmpegPlan::covers`]). WebM holds none, and MP4 none but JPEG, PNG
+/// and BMP; those are left out with a note.
 ///
 /// Fails (with a plain sentence) when the file has no video, when the
 /// encoder does not produce the profile's codec, when the container cannot
@@ -467,6 +490,17 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
         }
         Vec::new()
     };
+    let covers = plan_covers(req.probe, container, req.output, &mut notes);
+    let mut video_input_args = video_plan.input_args;
+    let mut video_output_args = video_plan.output_args;
+    if !covers.copied.is_empty() {
+        // The cover is a second (copied) picture stream: every option meant
+        // for the video must name the video alone, or ffmpeg would also try
+        // to filter or tag the cover, or (a decoder named for the input)
+        // read the cover as video and fail to copy it.
+        video_input_args = pin_input_decoder(video_input_args, video.index);
+        video_output_args = pin_to_main_video(video_output_args);
+    }
 
     let mut args: Vec<String> = Vec::with_capacity(96);
     push(
@@ -482,7 +516,7 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
             "pipe:1",
         ],
     );
-    args.extend(video_plan.input_args);
+    args.extend(video_input_args);
     push(
         &mut args,
         &["-analyzeduration", "100M", "-probesize", "100M"],
@@ -496,21 +530,40 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     let mapped = std::iter::once(video.index)
         .chain(audio.tracks.iter().map(|t| t.index))
         .chain(subtitles.iter().map(|s| s.index))
-        .chain(attachments.iter().copied());
+        .chain(attachments.iter().copied())
+        .chain(covers.copied.iter().copied());
     for index in mapped {
         args.push("-map".into());
         args.push(format!("0:{index}"));
     }
+    // Attached files come after the mapped attachments in the output.
+    for cover in &covers.attached {
+        args.push("-attach".into());
+        args.push(path_arg(&cover.file.path)?);
+    }
     push(&mut args, &["-map_metadata", "0", "-map_chapters", "0"]);
 
-    args.extend(video_plan.output_args);
+    args.extend(video_output_args);
     args.extend(audio.args);
     for (n, sub) in subtitles.iter().enumerate() {
         args.push(format!("-c:s:{n}"));
         args.push(sub.codec.to_string());
     }
-    if !attachments.is_empty() {
+    for n in 1..=covers.copied.len() {
+        args.push(format!("-c:v:{n}"));
+        args.push("copy".into());
+        args.push(format!("-disposition:v:{n}"));
+        args.push("attached_pic".into());
+    }
+    if !attachments.is_empty() || !covers.attached.is_empty() {
         push(&mut args, &["-c:t", "copy"]);
+    }
+    for (i, cover) in covers.attached.iter().enumerate() {
+        let n = attachments.len() + i;
+        args.push(format!("-metadata:s:t:{n}"));
+        args.push(format!("mimetype={}", cover.mimetype));
+        args.push(format!("-metadata:s:t:{n}"));
+        args.push(format!("filename={}", cover.filename));
     }
     push(&mut args, &["-max_muxing_queue_size", "9999"]);
     if container == Container::Mp4 {
@@ -538,7 +591,31 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
             audio: count(audio.tracks.len()),
             subtitle: count(subtitles.len()),
         },
+        covers: covers.attached.into_iter().map(|c| c.file).collect(),
     })
+}
+
+/// The ffmpeg arguments that copy one cover image out of `input` into
+/// `cover.path`, byte for byte (the picture is stored whole in one packet).
+pub fn cover_extract_args(input: &Path, cover: &CoverFile) -> anyhow::Result<Vec<String>> {
+    let mut args = strings(&[
+        "-hide_banner",
+        "-nostdin",
+        "-y",
+        "-loglevel",
+        "error",
+        "-nostats",
+        "-i",
+    ]);
+    args.push(path_arg(input)?);
+    args.push("-map".into());
+    args.push(format!("0:{}", cover.index));
+    push(
+        &mut args,
+        &["-c", "copy", "-frames:v", "1", "-f", "rawvideo"],
+    );
+    args.push(path_arg(&cover.path)?);
+    Ok(args)
 }
 
 /// Options that create the hardware device an encoder (and its upload or
@@ -1723,17 +1800,54 @@ fn lost_attachments<'a>(
     })
 }
 
-/// When converting `probe` under `profile` would leave out tracks the
+/// Whether a subtitle codec is ASS or its older form SSA, which carry
+/// styling: positions, colours, fonts, and lines shown at the same time.
+fn is_styled_subtitle_codec(codec: &str) -> bool {
+    matches!(codec, "ass" | "ssa")
+}
+
+/// ASS/SSA subtitle tracks the profile keeps (its language list, plus
+/// forced tracks) that the target container stores as plain text (MP4's
+/// timed text, WebM's WebVTT): their positions, colours and fonts are lost,
+/// and lines shown at the same time are cut short. ffprobe can't tell a
+/// styled track from a plain one without reading the whole track, so every
+/// such track counts.
+fn restyled_subtitles<'a>(
+    probe: &'a ProbeInfo,
+    profile: &TranscodeProfile,
+) -> impl Iterator<Item = &'a StreamInfo> {
+    let keep = profile.subtitles != SubtitlePolicy::Drop;
+    let wanted = wanted_languages(&profile.subtitle_languages);
+    let container = profile.container;
+    probe.subtitle_streams().filter(move |s| {
+        let codec = s.codec.to_ascii_lowercase();
+        keep && (s.is_forced || language_allowed(s.language.as_deref(), &wanted))
+            && is_styled_subtitle_codec(&codec)
+            && matches!(
+                subtitle_action(container, &codec),
+                SubtitleAction::Convert(encoder) if encoder != "ass"
+            )
+    })
+}
+
+/// When converting `probe` under `profile` would lose part of what the
 /// original has, a plain sentence saying so: picture-based subtitles the
-/// new container can't hold (MP4 and WebM hold only text), or attachments
-/// such as the fonts of styled subtitles, which only MKV keeps. Replacing
-/// the original would lose them for good, so such a file is left unchanged
-/// when originals are replaced, unless the user converts it anyway (see
+/// new container can't hold (MP4 and WebM hold only text), the styling of
+/// ASS/SSA subtitles (MP4 and WebM keep only their text), attachments such
+/// as the fonts of styled subtitles (only MKV keeps them), or cover images
+/// (MP4 keeps JPEG, PNG and BMP ones, WebM none). Replacing the original
+/// would lose them for good, so such a file is left unchanged when
+/// originals are replaced, unless the user converts it anyway (see
 /// [`crate::run::run_job`]). `None` when nothing would be lost.
+///
+/// The sentence starts "{container} can't hold this file's {losses}, so it
+/// was left unchanged." (the web UI recognises it by that).
 pub fn replace_loss(probe: &ProbeInfo, profile: &TranscodeProfile) -> Option<String> {
     let pictures = lost_picture_subtitles(probe, profile).count();
+    let styled = restyled_subtitles(probe, profile).count();
     let attachments: Vec<&StreamInfo> = lost_attachments(probe, profile).collect();
     let fonts = attachments.iter().filter(|a| is_font_attachment(a)).count();
+    let covers = lost_covers(probe, profile.container).count();
     let mut lost: Vec<String> = Vec::new();
     if pictures > 0 {
         lost.push(plural(
@@ -1742,12 +1856,18 @@ pub fn replace_loss(probe: &ProbeInfo, profile: &TranscodeProfile) -> Option<Str
             "picture-based subtitles",
         ));
     }
+    if styled > 0 {
+        lost.push(plural(styled, "styled subtitle", "styled subtitles"));
+    }
     if !attachments.is_empty() {
         lost.push(if fonts == attachments.len() {
             plural(fonts, "subtitle font", "subtitle fonts")
         } else {
             plural(attachments.len(), "attached file", "attached files")
         });
+    }
+    if covers > 0 {
+        lost.push(plural(covers, "cover image", "cover images"));
     }
     if lost.is_empty() {
         return None;
@@ -1757,8 +1877,17 @@ pub fn replace_loss(probe: &ProbeInfo, profile: &TranscodeProfile) -> Option<Str
         "{label} can't hold this file's {}, so it was left unchanged. To convert it, choose an \
          MKV goal or save converted files to a separate folder; Convert anyway converts it \
          without them",
-        lost.join(" and ")
+        join_list(&lost)
     ))
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 fn plan_subtitles(
@@ -1788,7 +1917,7 @@ fn plan_subtitles(
                 codec: "copy",
             }),
             SubtitleAction::Convert(encoder) => {
-                if matches!(codec.as_str(), "ass" | "ssa") && encoder != "ass" {
+                if is_styled_subtitle_codec(&codec) && encoder != "ass" {
                     styled_converted += 1;
                 }
                 kept.push(SubtitleTrack {
@@ -1840,6 +1969,215 @@ fn plan_subtitles(
         ));
     }
     kept
+}
+
+// ---------------------------------------------------------------------------
+// Cover images
+
+/// What happens to one cover image under a target container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoverFate {
+    /// MP4: copied as a picture stream marked as the cover.
+    Copy,
+    /// MKV: copied out of the original first, then attached (see
+    /// [`CoverFile`]).
+    Attach,
+    /// The container can't hold it.
+    Lost,
+}
+
+fn cover_fate(container: Container, cover: &StreamInfo) -> CoverFate {
+    match container {
+        Container::Mkv => CoverFate::Attach,
+        // MP4 stores cover art as JPEG, PNG or BMP only.
+        Container::Mp4
+            if matches!(
+                cover.codec.to_ascii_lowercase().as_str(),
+                "mjpeg" | "png" | "bmp"
+            ) =>
+        {
+            CoverFate::Copy
+        }
+        Container::Mp4 | Container::Webm => CoverFate::Lost,
+    }
+}
+
+/// Cover images: pictures stored with the file (an MKV attachment such as
+/// `cover.jpg`, MP4 cover art), which ffprobe shows as one-picture video
+/// streams.
+fn cover_images(probe: &ProbeInfo) -> impl Iterator<Item = &StreamInfo> {
+    probe
+        .streams
+        .iter()
+        .filter(|s| s.kind == Some(StreamKind::Video) && s.is_attached_pic)
+}
+
+/// Cover images the target container can't hold.
+fn lost_covers(probe: &ProbeInfo, container: Container) -> impl Iterator<Item = &StreamInfo> {
+    cover_images(probe).filter(move |c| cover_fate(container, c) == CoverFate::Lost)
+}
+
+/// A cover image attached to a new MKV.
+struct AttachedCover {
+    file: CoverFile,
+    mimetype: String,
+    filename: String,
+}
+
+/// The cover images an output keeps.
+#[derive(Default)]
+struct CoverPlan {
+    /// MP4: source stream indices, mapped after everything else.
+    copied: Vec<u32>,
+    /// MKV: pictures attached from files copied out beforehand.
+    attached: Vec<AttachedCover>,
+}
+
+fn plan_covers(
+    probe: &ProbeInfo,
+    container: Container,
+    output: &Path,
+    notes: &mut Vec<String>,
+) -> CoverPlan {
+    let mut plan = CoverPlan::default();
+    let mut lost = 0usize;
+    let mut names: Vec<String> = Vec::new();
+    for cover in cover_images(probe) {
+        match cover_fate(container, cover) {
+            CoverFate::Copy => plan.copied.push(cover.index),
+            CoverFate::Attach => {
+                let (extension, mimetype) = image_type(cover);
+                let filename = cover_file_name(cover, extension, &names);
+                names.push(filename.clone());
+                plan.attached.push(AttachedCover {
+                    file: CoverFile {
+                        index: cover.index,
+                        path: cover_path(output, plan.attached.len() + 1, extension),
+                    },
+                    mimetype,
+                    filename,
+                });
+            }
+            CoverFate::Lost => lost += 1,
+        }
+    }
+    if lost > 0 {
+        notes.push(format!(
+            "Left out {} because {} can't hold {}",
+            plural(lost, "cover image", "cover images"),
+            container.label(),
+            if lost == 1 { "it" } else { "them" }
+        ));
+    }
+    plan
+}
+
+/// File extension and MIME type for a cover image: its own `mimetype` tag
+/// when it names a picture type, else the one its codec implies.
+fn image_type(cover: &StreamInfo) -> (&'static str, String) {
+    let (extension, implied) = match cover.codec.to_ascii_lowercase().as_str() {
+        "mjpeg" | "jpeg" | "jpg" => ("jpg", "image/jpeg"),
+        "png" | "apng" => ("png", "image/png"),
+        "gif" => ("gif", "image/gif"),
+        "bmp" => ("bmp", "image/bmp"),
+        "webp" => ("webp", "image/webp"),
+        "tiff" => ("tif", "image/tiff"),
+        "jpegxl" => ("jxl", "image/jxl"),
+        _ => ("bin", "application/octet-stream"),
+    };
+    let mimetype = cover
+        .mimetype
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| m.starts_with("image/") && m.chars().all(|c| c.is_ascii_graphic()))
+        .unwrap_or(implied)
+        .to_ascii_lowercase();
+    (extension, mimetype)
+}
+
+/// The name a cover image gets in a new MKV: its own (MKV sources), else
+/// `cover.<ext>` (the name media servers look for), then `cover-2.<ext>`
+/// and so on. Names already used in this file are not used twice.
+fn cover_file_name(cover: &StreamInfo, extension: &str, used: &[String]) -> String {
+    let own = cover.filename.as_deref().map(str::trim).filter(|n| {
+        !n.is_empty()
+            && !n.contains(['/', '\\'])
+            && !n.chars().any(char::is_control)
+            && !used.iter().any(|u| u == n)
+    });
+    if let Some(name) = own {
+        return name.to_string();
+    }
+    (1..)
+        .map(|n| {
+            if n == 1 {
+                format!("cover.{extension}")
+            } else {
+                format!("cover-{n}.{extension}")
+            }
+        })
+        .find(|name| !used.contains(name))
+        .unwrap_or_else(|| format!("cover.{extension}"))
+}
+
+/// Where the `n`th cover image is copied out: next to the work file
+/// `output`, named after it (`.Movie.chrysopoeia-1a2b3c4d.tmp.cover-1.jpg`
+/// for `.Movie.chrysopoeia-1a2b3c4d.tmp.mkv`), so it is a leftover crash
+/// recovery recognises.
+fn cover_path(output: &Path, n: usize, extension: &str) -> PathBuf {
+    let stem = output
+        .file_stem()
+        .map_or_else(|| "output".into(), |s| s.to_string_lossy().into_owned());
+    output.with_file_name(format!("{stem}.cover-{n}.{extension}"))
+}
+
+/// Input options with a decoder named for every video stream (`-c:v
+/// h264_qsv`, Quick Sync decoding) rewritten to name the video's own
+/// stream (`-c:<index>`). ffmpeg would otherwise read a cover image as
+/// that codec too, and copying it would fail.
+fn pin_input_decoder(args: Vec<String>, video_index: u32) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "-c:v"
+            && let Some(decoder) = args.next()
+        {
+            out.push(format!("-c:{video_index}"));
+            out.push(decoder);
+        } else {
+            out.push(arg);
+        }
+    }
+    out
+}
+
+/// Video options rewritten to name the main video (output stream `v:0`)
+/// alone: `-c:v` → `-c:v:0`, `-vf` → `-filter:v:0`, `-crf` → `-crf:v:0`.
+/// Used when the output also holds a copied cover image as a second
+/// picture stream, which must be neither filtered nor re-encoded (ffmpeg
+/// refuses to filter a copied stream). The options come in flag/value
+/// pairs; anything else is returned unchanged.
+fn pin_to_main_video(args: Vec<String>) -> Vec<String> {
+    if !args.len().is_multiple_of(2) || !args.iter().step_by(2).all(|a| a.starts_with('-')) {
+        return args;
+    }
+    args.into_iter()
+        .enumerate()
+        .map(|(i, arg)| {
+            if i % 2 == 1 {
+                arg
+            } else if arg == "-vf" {
+                "-filter:v:0".to_string()
+            } else if arg.ends_with(":v") {
+                format!("{arg}:0")
+            } else if arg.contains(':') {
+                // Already names a stream (`-metadata:s:v:0`, `-c:v:0`).
+                arg
+            } else {
+                format!("{arg}:v:0")
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

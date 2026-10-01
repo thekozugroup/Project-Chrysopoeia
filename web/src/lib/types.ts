@@ -169,6 +169,10 @@ export interface StreamInfo {
   is_default: boolean;
   is_forced: boolean;
   is_attached_pic: boolean;
+  /** Name of an attachment or MKV cover image (e.g. `cover.jpg`). Only sent when known. */
+  filename?: string;
+  /** MIME type of an attachment or MKV cover image (e.g. `image/jpeg`). Only sent when known. */
+  mimetype?: string;
   bit_rate: number | null;
   width: number | null;
   height: number | null;

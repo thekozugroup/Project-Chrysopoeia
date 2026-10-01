@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command;
 
 use chrysopoeia_core::{AudioCodec, Container, TranscodeProfile, VideoCodec};
-use chrysopoeia_worker::{PlanRequest, build_plan};
+use chrysopoeia_worker::{PlanRequest, build_plan, cover_extract_args};
 use common::*;
 
 const MP4_TWO_AAC: &str = "Movies/Big Test (2020)/Big Test (2020).mp4";
@@ -25,6 +25,7 @@ const WEBM_ODD: &str = "Odd Size.webm";
 const MKV_HDR10: &str = "HDR10.mkv";
 const MKV_STYLED_FONT: &str = "Styled.mkv";
 const MP4_COVER_ART: &str = "Cover.mp4";
+const MKV_COVER: &str = "Cover.mkv";
 const TS_LATE_AUDIO: &str = "Late Audio.ts";
 const MOV_LAYOUTS: &str = "Layouts.mov";
 const MOV_CAMERA: &str = "Camera.mov";
@@ -54,6 +55,8 @@ struct Case {
     expect_size: Option<(u32, u32)>,
     /// Font/other attachments the output must carry.
     expect_attachments: usize,
+    /// Cover images the output must carry.
+    expect_covers: usize,
     /// Colour primaries, transfer and matrix the output must be tagged with.
     expect_colour: Option<(&'static str, &'static str, &'static str)>,
     /// Channel count of each output audio track, when it matters.
@@ -79,6 +82,7 @@ impl Case {
             expect_pix_fmt: None,
             expect_size: None,
             expect_attachments: 0,
+            expect_covers: 0,
             expect_colour: None,
             expect_channels: None,
         }
@@ -134,6 +138,12 @@ fn run_case(media: &Path, out_dir: &Path, i: usize, case: &Case) -> Result<(), S
         encoder: &encoder,
     })
     .map_err(|e| format!("build_plan: {e:#}"))?;
+    // Cover images an MKV attaches are copied out of the original first,
+    // as `run_job` does.
+    for cover in &plan.covers {
+        let args = cover_extract_args(&input, cover).map_err(|e| format!("{e:#}"))?;
+        run_ffmpeg(&args).map_err(|e| format!("copying the cover out: {e}\nargs: {args:?}"))?;
+    }
     let warnings = run_ffmpeg(&plan.args).map_err(|e| format!("{e}\nargs: {:?}", plan.args))?;
 
     let out = probe_file(&output);
@@ -191,16 +201,37 @@ fn run_case(media: &Path, out_dir: &Path, i: usize, case: &Case) -> Result<(), S
         }
     }
 
-    // Cover art and data streams are never carried over.
+    // Cover images are kept where the container holds them, as cover
+    // images (never as a second video track); data streams never are.
+    let covers: Vec<_> = out
+        .streams
+        .iter()
+        .filter(|s| s.kind == Some(chrysopoeia_core::StreamKind::Video) && s.is_attached_pic)
+        .collect();
     let all_video = out
         .streams
         .iter()
         .filter(|s| s.kind == Some(chrysopoeia_core::StreamKind::Video))
         .count();
-    if all_video != 1 {
+    if covers.len() != case.expect_covers || all_video != 1 + case.expect_covers {
         return fail(format!(
-            "{all_video} video streams (cover art must be dropped)"
+            "{} cover images and {all_video} video streams, wanted {} cover images",
+            covers.len(),
+            case.expect_covers
         ));
+    }
+    // A cover copied into a new MKV keeps its name (or gets the one media
+    // servers look for).
+    if case.container == Container::Mkv
+        && let Some(cover) = covers.first()
+        && cover.filename.as_deref() != Some("cover.jpg")
+        && cover.filename.as_deref() != Some("cover.png")
+    {
+        return fail(format!("the cover image is named {:?}", cover.filename));
+    }
+    // The work files the covers were copied into are not left behind.
+    for cover in &plan.covers {
+        let _ = std::fs::remove_file(&cover.path);
     }
     // No data or timecode streams (MP4 turns a copied timecode tag into one
     // unless told not to).
@@ -400,6 +431,12 @@ fn svt_av1() {
                 expect_audio: &["aac"],
                 ..Case::new(MKV_PIPED, "libsvtav1", Container::Mkv, AudioCodec::Copy)
             },
+            // AV1 in MP4 with cover art.
+            Case {
+                expect_audio: &["aac"],
+                expect_covers: 1,
+                ..Case::new(MP4_COVER_ART, "libsvtav1", Container::Mp4, AudioCodec::Copy)
+            },
         ],
     );
 }
@@ -455,6 +492,13 @@ fn x265() {
                 expect_pix_fmt: Some("yuv420p10le"),
                 expect_colour: Some(("bt2020", "smpte2084", "bt2020nc")),
                 ..Case::new(MKV_HDR10, "libx265", Container::Mp4, AudioCodec::Copy)
+            },
+            // HEVC in MP4 with cover art: only the video is tagged hvc1.
+            Case {
+                expect_audio: &["aac"],
+                expect_subs: &["mov_text"],
+                expect_covers: 1,
+                ..Case::new(MKV_COVER, "libx265", Container::Mp4, AudioCodec::Copy)
             },
         ],
     );
@@ -515,10 +559,36 @@ fn x264() {
                 expect_subs: &["subrip"],
                 ..Case::new(MKV_SURROUND_SRT, "libx264", Container::Mkv, AudioCodec::Mp3)
             },
-            // Cover art is not a second video stream in the output.
+            // MP4 cover art becomes an MKV cover image (an attachment), not
+            // a second video stream.
             Case {
                 expect_audio: &["opus"],
+                expect_covers: 1,
                 ..Case::new(MP4_COVER_ART, "libx264", Container::Mkv, AudioCodec::Opus)
+            },
+            // MP4 to MP4 keeps its cover art.
+            Case {
+                expect_audio: &["aac"],
+                expect_covers: 1,
+                ..Case::new(MP4_COVER_ART, "libx264", Container::Mp4, AudioCodec::Copy)
+            },
+            // An MKV cover image stays one in a new MKV, next to the font.
+            Case {
+                expect_audio: &["aac"],
+                expect_subs: &["ass"],
+                expect_attachments: 1,
+                expect_covers: 1,
+                ..Case::new(MKV_COVER, "libx264", Container::Mkv, AudioCodec::Copy)
+            },
+            // An MKV cover image becomes MP4 cover art; the picture is
+            // still resized (its filter names the video alone).
+            Case {
+                max_height: Some(180),
+                expect_audio: &["aac"],
+                expect_subs: &["mov_text"],
+                expect_size: Some((320, 180)),
+                expect_covers: 1,
+                ..Case::new(MKV_COVER, "libx264", Container::Mp4, AudioCodec::Copy)
             },
             // The only audio starts late: the quick probe can't read it, but
             // it must not be dropped (a silent file would pass verification).
@@ -558,6 +628,12 @@ fn vpx_vp9() {
             Case {
                 expect_audio: &["opus", "opus"],
                 ..Case::new(MP4_TWO_AAC, "libvpx-vp9", Container::Webm, AudioCodec::Copy)
+            },
+            // WebM can't hold a cover image (or a font): both are left out.
+            Case {
+                expect_audio: &["opus"],
+                expect_subs: &["webvtt"],
+                ..Case::new(MKV_COVER, "libvpx-vp9", Container::Webm, AudioCodec::Opus)
             },
             // AVI to MKV with Vorbis.
             Case {
@@ -722,6 +798,7 @@ fn decide_agrees_with_the_sample_library() {
         MKV_HDR10,
         MKV_STYLED_FONT,
         MP4_COVER_ART,
+        MKV_COVER,
         TS_LATE_AUDIO,
         MOV_CAMERA,
         MP4_ROTATED,

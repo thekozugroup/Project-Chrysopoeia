@@ -547,6 +547,8 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
         is_default: flag(disposition, "default"),
         is_forced: flag(disposition, "forced"),
         is_attached_pic: flag(disposition, "attached_pic"),
+        filename: tag(raw, "filename").map(String::from),
+        mimetype: tag(raw, "mimetype").map(str::to_ascii_lowercase),
         bit_rate: u64_value(raw.get("bit_rate"))
             .filter(|b| *b > 0)
             .or_else(|| statistics_tag(raw, "BPS").and_then(parse_u64_str))
@@ -1160,6 +1162,34 @@ mod tests {
         // avg_frame_rate is 0/0 and r_frame_rate is the 90 kHz timebase.
         assert_eq!(cover.frame_rate, None);
         assert_eq!(cover.color_range.as_deref(), Some("pc"));
+    }
+
+    /// An MKV cover image is an attachment, which ffprobe shows as a picture
+    /// stream; its name and type are kept so a new MKV can carry it on.
+    #[test]
+    fn mkv_cover_image_keeps_its_name_and_type() {
+        let json = br#"{"format": {"format_name": "matroska,webm", "duration": "4.0"},
+            "streams": [
+              {"index": 0, "codec_type": "video", "codec_name": "h264",
+               "width": 640, "height": 360, "disposition": {"attached_pic": 0}},
+              {"index": 1, "codec_type": "attachment", "codec_name": "ttf",
+               "tags": {"filename": "Font.ttf", "mimetype": "application/x-truetype-font"}},
+              {"index": 2, "codec_type": "video", "codec_name": "mjpeg",
+               "width": 300, "height": 300, "disposition": {"attached_pic": 1},
+               "tags": {"FILENAME": "cover.jpg", "MIMETYPE": "Image/JPEG"}}]}"#;
+        let probe = parse(json, 1000).unwrap();
+        let font = &probe.streams[1];
+        assert_eq!(font.filename.as_deref(), Some("Font.ttf"));
+        assert_eq!(
+            font.mimetype.as_deref(),
+            Some("application/x-truetype-font")
+        );
+        let cover = &probe.streams[2];
+        assert!(cover.is_attached_pic);
+        assert_eq!(cover.filename.as_deref(), Some("cover.jpg"));
+        assert_eq!(cover.mimetype.as_deref(), Some("image/jpeg"));
+        assert_eq!(probe.primary_video().map(|v| v.index), Some(0));
+        assert_eq!(probe.streams[0].filename, None);
     }
 
     #[test]

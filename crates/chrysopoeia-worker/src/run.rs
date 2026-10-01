@@ -44,7 +44,7 @@ use crate::finalize::{
     FileIdentity, FinalizeRequest, OriginalChanged, PlaceError, destination_conflict,
     destination_name, final_output_path, finalize, temp_output_path,
 };
-use crate::plan::{Decision, FfmpegPlan, PlanRequest, where_encoded};
+use crate::plan::{CoverFile, Decision, FfmpegPlan, PlanRequest, where_encoded};
 use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
 
 /// Settings that apply to every job.
@@ -381,7 +381,9 @@ impl Job<'_> {
         self.reporter.stage(JobStage::Preparing, 100.0).await;
 
         let guard = TempGuard::new(prepared.temp.clone());
-        let outcome = self.attempts(&prepared, &guard).await;
+        let scratch = ScratchFiles::default();
+        let outcome = self.attempts(&prepared, &guard, &scratch).await;
+        scratch.remove_all().await;
         match &outcome {
             JobOutcome::Done { .. } => guard.disarm(),
             _ => {
@@ -617,9 +619,69 @@ impl Job<'_> {
         }
     }
 
+    /// Copy the cover images a plan attaches out of the original (see
+    /// [`crate::plan::CoverFile`]). Each is copied once per job: every
+    /// attempt attaches the same files. A cover that can't be copied fails
+    /// the job (the original is left unchanged) rather than being lost.
+    async fn extract_covers(
+        &self,
+        covers: &[CoverFile],
+        scratch: &ScratchFiles,
+        attempt: u32,
+    ) -> Result<(), JobOutcome> {
+        for cover in covers {
+            if scratch.contains(&cover.path) {
+                continue;
+            }
+            if self.cancel.is_cancelled() {
+                return Err(JobOutcome::Cancelled);
+            }
+            let args = match crate::plan::cover_extract_args(&self.spec.input, cover) {
+                Ok(args) => args,
+                Err(e) => return Err(failed(ProblemKind::Other, e.to_string())),
+            };
+            scratch.add(cover.path.clone());
+            let cmd = FfmpegCommand {
+                program: &self.cfg.ffmpeg,
+                args: &args,
+                low_priority: self.cfg.low_priority,
+                stall_timeout: DEFAULT_STALL_TIMEOUT,
+            };
+            let exit = run_ffmpeg(&cmd, self.cancel, &mut |_| {}, &mut |_| {}).await;
+            let written = matches!(tokio::fs::metadata(&cover.path).await, Ok(m) if m.len() > 0);
+            match exit {
+                FfmpegExit::Success { .. } if written => {}
+                FfmpegExit::Cancelled => return Err(JobOutcome::Cancelled),
+                other => {
+                    let (problem, error) =
+                        cover_failure(&other, &cover.path, self.temp_place(), self.cfg.output_mode);
+                    tracing::warn!(job = %self.spec.job_id, "could not copy a cover image out of the original: {error}");
+                    return Err(JobOutcome::Failed {
+                        error,
+                        problem,
+                        log_tail: other
+                            .tail()
+                            .map(str::to_string)
+                            .filter(|t| !t.trim().is_empty()),
+                        command: Some(display_command(&self.cfg.ffmpeg, &args)),
+                        encoder: None,
+                        attempt,
+                        validation: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The attempt chain. Returns the job's outcome; the caller cleans up
     /// the temp file unless the outcome is `Done`.
-    async fn attempts(&self, prepared: &Prepared, guard: &TempGuard) -> JobOutcome {
+    async fn attempts(
+        &self,
+        prepared: &Prepared,
+        guard: &TempGuard,
+        scratch: &ScratchFiles,
+    ) -> JobOutcome {
         let (cfg, spec) = (self.cfg, self.spec);
         let chain = attempt_chain(&spec.candidates);
         let mut last_failure: Option<Failure> = None;
@@ -669,6 +731,9 @@ impl Job<'_> {
                 .set_attempt(&candidate.name, candidate.api, attempt);
             self.reporter.stage(JobStage::Transcoding, 0.0).await;
             guard.clear().await;
+            if let Err(outcome) = self.extract_covers(&plan.covers, scratch, attempt).await {
+                return outcome;
+            }
             let command = display_command(&cfg.ffmpeg, &args);
             tracing::debug!(job = %spec.job_id, attempt, "running {command}");
 
@@ -1967,6 +2032,99 @@ impl Drop for TempGuard {
         }
     }
 }
+
+/// Files a job makes besides the encode (cover images copied out of the
+/// original for a new MKV). They are only inputs for the conversion, so
+/// they are deleted when the job ends, however it ends.
+#[derive(Debug, Default)]
+struct ScratchFiles {
+    paths: Mutex<Vec<PathBuf>>,
+}
+
+impl ScratchFiles {
+    fn add(&self, path: PathBuf) {
+        self.paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(path);
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        self.paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|p| p == path)
+    }
+
+    fn take(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.paths.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Delete every file (those already gone are fine).
+    async fn remove_all(&self) {
+        for path in self.take() {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), "could not delete a work file: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ScratchFiles {
+    fn drop(&mut self) {
+        // Reached with files left only when the job future is dropped
+        // mid-way (see `TempGuard`).
+        let paths = self.take();
+        if paths.is_empty() {
+            return;
+        }
+        let remove = move || {
+            for path in paths {
+                if let Err(e) = std::fs::remove_file(&path)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!(path = %path.display(), "could not delete a work file: {e}");
+                }
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(remove);
+            }
+            Err(_) => remove(),
+        }
+    }
+}
+
+/// Why copying a cover image out of the original failed: a full disk or a
+/// folder that can't be written is described like an encode that hits it;
+/// anything else plainly.
+fn cover_failure(
+    exit: &FfmpegExit,
+    cover: &Path,
+    place: Place,
+    mode: OutputMode,
+) -> (ProblemKind, String) {
+    let (problem, error) = encode_failure(exit, HwApi::Software, cover, place, mode);
+    let environment = matches!(
+        problem,
+        ProblemKind::DiskFull | ProblemKind::WorkFolder | ProblemKind::Destination
+    );
+    if environment || matches!(exit, FfmpegExit::NotStarted { .. }) {
+        (problem, error)
+    } else {
+        (ProblemKind::Other, COVER_NOT_COPIED.to_string())
+    }
+}
+
+/// A cover image couldn't be copied out of the original.
+const COVER_NOT_COPIED: &str = "The file's cover image couldn't be copied for the new file, so \
+    the file wasn't converted and the original was left unchanged. The job's log has the details.";
 
 #[cfg(test)]
 mod tests {

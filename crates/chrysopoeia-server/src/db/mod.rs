@@ -68,6 +68,9 @@ impl Db {
                 if is_damaged(&e) {
                     return Err(damaged(path, &e));
                 }
+                if is_disk_full(path, &e).await {
+                    return Err(e.context(disk_full_message(path)));
+                }
                 return Err(e.context(format!(
                     "Could not open the database at {}. Check that the data folder is writable \
                      (in Docker: the /config volume and PUID/PGID)",
@@ -79,6 +82,9 @@ impl Db {
             pool.close().await;
             if is_damaged(&e) {
                 return Err(damaged(path, &e));
+            }
+            if is_disk_full(path, &e).await {
+                return Err(e.context(disk_full_message(path)));
             }
             return Err(e);
         }
@@ -159,6 +165,72 @@ fn damaged(path: &Path, e: &anyhow::Error) -> anyhow::Error {
         path: path.to_path_buf(),
         detail,
     })
+}
+
+/// Free space below which the disk holding the database counts as full
+/// when SQLite fails (it needs room for its write-ahead log and index).
+const FULL_DISK_BYTES: u64 = 1024 * 1024;
+
+/// What to tell the user when the database can't be opened or written
+/// because its disk is full.
+pub fn disk_full_message(path: &Path) -> String {
+    let folder = path.parent().unwrap_or(path);
+    format!(
+        "The disk that holds the data folder ({}) is full, so the database there couldn't be \
+         opened. Free some space on that disk, then start Chrysopoeia again",
+        folder.display()
+    )
+}
+
+/// Whether a database error comes from a full disk: SQLite says so
+/// (`SQLITE_FULL`, or the system's "no space left"), or SQLite failed (a
+/// new database can fail with a disk I/O error instead) while the disk
+/// holding `path` has almost no free space left.
+pub async fn is_disk_full(path: &Path, e: &anyhow::Error) -> bool {
+    let full_code = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<sqlx::Error>())
+        .any(|e| match e {
+            sqlx::Error::Database(d) => sqlite_code(d.code().as_deref()) == Some(13),
+            sqlx::Error::Io(io) => is_no_space(io),
+            _ => false,
+        });
+    let io_full = e
+        .chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(is_no_space);
+    if full_code || io_full {
+        return true;
+    }
+    let dir = path.parent().unwrap_or(path).to_path_buf();
+    tokio::task::spawn_blocking(move || free_bytes(&dir))
+        .await
+        .ok()
+        .flatten()
+        .is_some_and(|free| free < FULL_DISK_BYTES)
+}
+
+/// SQLite's primary result code from an extended one.
+fn sqlite_code(code: Option<&str>) -> Option<i32> {
+    code.and_then(|c| c.parse::<i32>().ok()).map(|c| c & 0xff)
+}
+
+fn is_no_space(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28)
+}
+
+/// Bytes an unprivileged user may still write on the disk holding `dir`
+/// (or its nearest existing parent). `None` when unknown.
+#[cfg(unix)]
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let existing = dir.ancestors().find(|d| d.exists())?;
+    let stat = rustix::fs::statvfs(existing).ok()?;
+    Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_dir: &Path) -> Option<u64> {
+    None
 }
 
 /// Whether an error says the database file itself is damaged
@@ -446,5 +518,65 @@ mod tests {
         let err = Db::open(&missing).await.unwrap_err();
         assert!(err.downcast_ref::<DamagedDatabase>().is_none());
         assert!(format!("{err:#}").contains("Check that the data folder is writable"));
+        assert!(!format!("{err:#}").contains("full"));
+    }
+
+    /// A data folder on a full disk is reported as a full disk (not as a
+    /// folder that can't be written), for a new database and for one that
+    /// exists. Needs permission to mount a small tmpfs; skipped otherwise.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_disk_is_named_as_the_reason_the_database_wont_open() {
+        struct Mounted(PathBuf);
+        impl Drop for Mounted {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("umount")
+                    .arg("-l")
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disk");
+        std::fs::create_dir(&disk).unwrap();
+        let mounted = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", "size=4m", "chrysopoeia-test"])
+            .arg(&disk)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !mounted {
+            eprintln!("skipping: mounting a tmpfs is not permitted here");
+            return;
+        }
+        let _mounted = Mounted(disk.clone());
+
+        // A database made while there was room.
+        let existing = disk.join("old.db");
+        Db::open(&existing).await.unwrap().close().await;
+        // Fill the disk.
+        let filler = disk.join("filler");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::File::create(&filler).unwrap();
+            while f.write_all(&[0u8; 64 * 1024]).is_ok() {}
+            while f.write_all(&[0u8; 512]).is_ok() {}
+        }
+        for path in [disk.join(DB_FILE_NAME), existing.clone()] {
+            let err = Db::open(&path).await.unwrap_err();
+            let text = format!("{err:#}");
+            assert!(
+                text.starts_with(&format!(
+                    "The disk that holds the data folder ({}) is full",
+                    disk.display()
+                )),
+                "{text}"
+            );
+            assert!(!text.contains("writable"), "{text}");
+        }
+        // Room again: it opens.
+        std::fs::remove_file(&filler).unwrap();
+        Db::open(&existing).await.unwrap().close().await;
     }
 }

@@ -52,9 +52,14 @@ while asking far less of you:
 - Hardware encoding: NVIDIA NVENC, Intel Quick Sync, VA-API (Intel and AMD),
   Apple VideoToolbox, plus CPU encoders (SVT-AV1, x265, x264, libvpx). If a
   hardware encode fails, the file is retried on the CPU automatically.
-- Keeps subtitles, chapters, metadata, HDR signalling and 10-bit colour where the
-  target allows; deinterlaces broadcast recordings; skips files that are already
-  efficient.
+- Keeps subtitles, fonts, cover images, chapters, metadata, HDR signalling and
+  10-bit colour where the target allows; deinterlaces broadcast recordings; skips
+  files that are already efficient.
+- Never loses part of a file by replacing it: when the target format can't hold
+  something the original has (picture subtitles, subtitle styling, fonts or cover
+  images in MP4 or WebM), the original is left as it is. An MKV goal keeps it
+  all; with an output folder or Convert anyway the file is converted and each
+  loss is noted on the job.
 - Watches folders and picks up new files, with an optional schedule (active
   hours), pause, priorities and retry.
 - Replaces originals in place, or writes to a separate output folder and leaves
