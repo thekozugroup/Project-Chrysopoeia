@@ -152,13 +152,24 @@ function BootScreen() {
  * ALLOWED_HOSTS variable, or a reverse proxy passing the original Host
  * header. Nothing else on the generic checklist applies.
  */
-function HostNotAllowed({ retrying, onRetry }: { retrying: boolean; onRetry: () => void }) {
-  const host = typeof window === "undefined" ? "" : window.location.hostname;
+export function HostNotAllowed({
+  retrying,
+  onRetry,
+  host = typeof window === "undefined" ? "" : window.location.hostname,
+}: {
+  retrying: boolean;
+  onRetry: () => void;
+  /** The name the page was opened at; the browser's own by default. */
+  host?: string;
+}) {
   return (
     <div className="grid min-h-dvh place-items-center px-5 py-10">
       <div className="w-full max-w-lg">
         <Brand className="mb-10" />
-        <h1 className="font-display text-4xl leading-tight text-fg">Chrysopoeia doesn&apos;t know this address</h1>
+        {/* The wording of the docs and of the server's own error, so searching for either finds this screen. */}
+        <h1 className="font-display text-4xl leading-tight break-words text-fg">
+          {host ? `Chrysopoeia doesn't answer to the address "${host}"` : "Chrysopoeia doesn't answer to this address"}
+        </h1>
         <p className="mt-3 text-sm leading-relaxed text-muted">
           To protect your library, it only answers to addresses it recognises. Add{" "}
           <code className="font-mono text-[0.8125rem] text-fg">{host || "this name"}</code> to the container&apos;s{" "}
@@ -166,8 +177,8 @@ function HostNotAllowed({ retrying, onRetry }: { retrying: boolean; onRetry: () 
         </p>
         <CodeBlock className="mt-5" code={`ALLOWED_HOSTS=${host || "media.example.com"}`} label="Container variable" />
         <p className="mt-4 text-[0.8125rem] leading-relaxed text-muted">
-          Behind a reverse proxy? Make it pass the original Host header (in Nginx:{" "}
-          <code className="font-mono text-xs text-fg">proxy_set_header Host $host;</code>).
+          Behind a reverse proxy? Make it pass the original Host header, port included (in Nginx:{" "}
+          <code className="font-mono text-xs text-fg">proxy_set_header Host $http_host;</code>).
         </p>
         <div className="mt-8 flex items-center gap-3">
           <Button variant="primary" onClick={onRetry} loading={retrying}>

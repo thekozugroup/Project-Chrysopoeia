@@ -682,6 +682,12 @@ export interface FsBrowse {
   media_count?: number | null;
   /** True when counting the browsed folder stopped early ("1,000+"). */
   media_count_capped?: boolean;
+  /**
+   * Why this folder can't be a library, as a sentence: the whole server, the
+   * folder holding the database or the app, a system folder. Absent when it
+   * can. The server refuses such a library too (`folder_not_allowed`).
+   */
+  library_blocked?: string | null;
 }
 
 export type BulkAction = "queue" | "skip" | "retry_failed";

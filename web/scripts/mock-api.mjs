@@ -1550,6 +1550,22 @@ route("GET", "/api/overview", () => overview());
 route("GET", "/api/libraries", () => [...libraries.values()].map(libraryView));
 route("GET", "/api/libraries/:id", ({ id }) => libraryView(getLibrary(id)));
 
+/**
+ * Why a folder can't be a library (library_admin.rs library_folder_refusal):
+ * the whole server, the folder holding the database (this mock's is /config),
+ * the app (/app) and the system folders. Null when it can.
+ */
+const libraryBlocked = (path) => {
+  const instead = "Choose the folder that holds your videos.";
+  const within = (dir) => path === dir || path.startsWith(`${dir}/`);
+  if (path === "/")
+    return `The whole server can't be a library: it includes Chrysopoeia's own files and every share. ${instead}`;
+  for (const dir of ["/proc", "/sys", "/dev"]) if (within(dir)) return `${dir} is a system folder, not a place for videos. ${instead}`;
+  if (within("/config")) return `/config is where Chrysopoeia keeps its database and settings. ${instead}`;
+  if (within("/app")) return `/app holds the Chrysopoeia app itself, which is read-only. ${instead}`;
+  return null;
+};
+
 route("POST", "/api/libraries", async (_p, _q, req) => {
   const body = await readBody(req);
   const raw = String(body.path ?? "").trim();
@@ -1562,6 +1578,8 @@ route("POST", "/api/libraries", async (_p, _q, req) => {
       "path_not_found",
       `The folder ${raw} doesn't exist on the server. In Docker, check that it is mounted into the container.`,
     );
+  const blocked = libraryBlocked(path);
+  if (blocked) throw new HttpError(400, "folder_not_allowed", blocked, "path");
   if (settings.output_mode === "folder" && settings.output_folder && (settings.output_folder === path || settings.output_folder.startsWith(`${path}/`)))
     throw new HttpError(
       400,
@@ -1918,6 +1936,8 @@ route("GET", "/api/fs/browse", (_p, q) => {
     }),
     // Round 4: the browsed folder's own count, by the same rules.
     ...mediaCount(path),
+    // The picker disables "Use" for a library's folder with this.
+    ...(libraryBlocked(path) ? { library_blocked: libraryBlocked(path) } : {}),
   };
 });
 

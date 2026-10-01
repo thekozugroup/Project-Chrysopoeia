@@ -8,6 +8,7 @@ mod followups;
 mod fs_browse;
 mod hung_share;
 mod libraries;
+mod library_folders;
 mod polish;
 mod problems;
 mod regressions;

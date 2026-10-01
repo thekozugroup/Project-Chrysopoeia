@@ -50,12 +50,35 @@ pub struct DataDirLock {
     _file: std::fs::File,
 }
 
+/// What to tell the user when another Chrysopoeia already holds the data
+/// folder. In a container the data folder is set by the image and must be
+/// left alone, so the way out is a different Config folder (the host side of
+/// the `/config` mount); outside one it is the `--data-dir` option.
+pub fn data_dir_in_use_message(dir: &Path, in_container: bool) -> String {
+    let way_out = if in_container {
+        "Stop the other one first, or give this one its own Config folder (Unraid: the Config \
+         path; docker: -v /other/folder:/config)"
+    } else {
+        "Stop the other one first, or give this one its own data folder (--data-dir or DATA_DIR)"
+    };
+    format!(
+        "Another Chrysopoeia is already using the data folder {}. {way_out}",
+        dir.display()
+    )
+}
+
 /// Make sure no other Chrysopoeia uses the data folder: a second one would
 /// put the first one's running jobs back in the queue, start them twice and
 /// delete their temp files. Takes an exclusive lock on a file in the folder,
 /// creating the folder if needed. Where the filesystem can't lock (some
 /// network shares), a warning is logged and the server starts anyway.
 pub fn lock_data_dir(dir: &Path) -> anyhow::Result<DataDirLock> {
+    lock_data_dir_in(dir, crate::services::hardware::in_container())
+}
+
+/// [`lock_data_dir`] for a known surrounding (container or not), which only
+/// changes the advice in the message when the folder is taken.
+pub fn lock_data_dir_in(dir: &Path, in_container: bool) -> anyhow::Result<DataDirLock> {
     std::fs::create_dir_all(dir).with_context(|| {
         format!(
             "Could not create the data folder {}. Check that it exists and is writable",
@@ -77,16 +100,16 @@ pub fn lock_data_dir(dir: &Path) -> anyhow::Result<DataDirLock> {
     #[cfg(unix)]
     match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => {}
-        Err(e) if e == rustix::io::Errno::WOULDBLOCK => anyhow::bail!(
-            "Another Chrysopoeia is already using the data folder {}. Stop it first, or give \
-             this one its own data folder (DATA_DIR)",
-            dir.display()
-        ),
+        Err(e) if e == rustix::io::Errno::WOULDBLOCK => {
+            anyhow::bail!("{}", data_dir_in_use_message(dir, in_container))
+        }
         Err(e) => tracing::warn!(
             "Could not lock the data folder {} ({e}). Make sure only one Chrysopoeia uses it",
             dir.display()
         ),
     }
+    #[cfg(not(unix))]
+    let _ = in_container;
     Ok(DataDirLock { _file: file })
 }
 

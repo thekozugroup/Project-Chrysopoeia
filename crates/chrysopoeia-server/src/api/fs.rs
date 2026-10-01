@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::extract::ApiQuery;
 use crate::error::{ApiError, ApiResult};
 use crate::services::fs_guard;
+use crate::services::library_admin::{OwnFolders, library_folder_refusal};
 use crate::state::AppState;
 use crate::toolkit::Toolkit;
 
@@ -72,6 +73,13 @@ pub struct BrowseResponse {
     /// Present with `media_count`: counting stopped at a limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count_capped: Option<bool>,
+    /// Why the browsed folder can't be a library, in a sentence (the whole
+    /// server, the folder holding the database or the app, a system
+    /// folder); left out when it can. The picker disables "Use" with it
+    /// while a library's folder is being chosen; the server refuses such a
+    /// library whatever the picker does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub library_blocked: Option<String>,
 }
 
 fn outside_roots() -> ApiError {
@@ -309,9 +317,11 @@ pub async fn browse(
         .as_deref()
         .map_or_else(PathBuf::new, lexical_normalize);
     let config_roots = state.config.browse_roots.clone();
+    let data_dir = state.config.data_dir.clone();
+    let web_dir = state.config.web_dir.clone();
     let toolkit = state.toolkit.clone();
     let listed = fs_guard::guarded("browse", &key, BROWSE_TIMEOUT, move || {
-        browse_blocking(requested, &config_roots, &toolkit)
+        browse_blocking(requested, &config_roots, &toolkit, &data_dir, &web_dir)
     })
     .await;
     match listed {
@@ -330,6 +340,8 @@ fn browse_blocking(
     requested: Option<PathBuf>,
     config_roots: &[PathBuf],
     toolkit: &Toolkit,
+    data_dir: &Path,
+    web_dir: &Path,
 ) -> ApiResult<BrowseResponse> {
     let roots = canonical_roots(config_roots);
     let Some(first_root) = roots.first().cloned() else {
@@ -383,6 +395,8 @@ fn browse_blocking(
              PUID/PGID user needs read access).",
         )
     })?;
+    let library_blocked =
+        library_folder_refusal(&canonical, &OwnFolders::resolve(data_dir, web_dir));
     Ok(BrowseResponse {
         path: canonical.to_string_lossy().into_owned(),
         parent,
@@ -393,6 +407,7 @@ fn browse_blocking(
         entries,
         media_count: own.map(|c| c.videos),
         media_count_capped: own.map(|c| c.capped),
+        library_blocked,
     })
 }
 

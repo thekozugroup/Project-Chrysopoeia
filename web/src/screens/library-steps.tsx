@@ -34,6 +34,7 @@ export const FOLDER_ERRORS = new Set([
   "library_exists",
   "library_overlaps",
   "contains_output_folder",
+  "folder_not_allowed",
   "outside_roots",
   "http_403",
 ]);
@@ -103,6 +104,7 @@ export function FolderStep({
         error={error}
         onNavigate={onNavigate}
         libraries={libraries.data}
+        forLibrary
       />
     </div>
   );
