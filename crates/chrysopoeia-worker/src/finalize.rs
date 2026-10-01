@@ -25,9 +25,10 @@
 //! job started (a Sonarr/Radarr upgrade replaced it mid-encode), nothing is
 //! replaced and [`OriginalChanged`] is returned. The new file gets the
 //! original's permission bits (and owner, where allowed) and, when asked, its
-//! modification/access times. After a crash, [`resume_replace`] finishes a
-//! replacement whose new file was already in place, and [`recover_artifact`]
-//! cleans up whatever else was left behind.
+//! modification/access times. After a crash, [`resume_replace`] tells
+//! whether a replacement's new file was already in place (the caller then
+//! records that and removes the backup with [`remove_backup`]), and
+//! [`recover_artifact`] cleans up whatever else was left behind.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -1156,7 +1157,7 @@ pub async fn destination_conflict(
         }
     })
     .await
-    .ok_or_else(|| NotAnswering::at(&key))
+    .map_err(|e| e.at(&key))
 }
 
 /// What [`recover_artifact`] did with a leftover file.
@@ -1230,8 +1231,9 @@ fn recover_blocking(path: &Path) -> anyhow::Result<Recovery> {
 /// file in place (see [`resume_replace`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Interrupted {
-    /// The new file was in place. The leftover backup of the original has
-    /// been deleted, so the replacement is complete.
+    /// The new file was in place. The leftover backup of the original is
+    /// still there: once that is recorded, [`remove_backup`] completes the
+    /// replacement.
     Placed {
         /// Size of the new file in bytes.
         size: u64,
@@ -1244,8 +1246,11 @@ pub enum Interrupted {
 }
 
 /// After a crash, find out whether job `job_id`'s replacement of `input`
-/// by `final_path` (replace mode) had already put the new file in place,
-/// and if so finish it by deleting the backup of the original.
+/// by `final_path` (replace mode) had already put the new file in place.
+/// Only looks: the backup of the original stays, so the answer can be
+/// asked for again until it is recorded (a look whose caller gave up on a
+/// share that stopped answering may still finish by itself); then
+/// [`remove_backup`] completes the replacement.
 ///
 /// The backup is the evidence, because [`finalize`] moves the original
 /// aside before the new file takes its final name and deletes the backup
@@ -1258,7 +1263,7 @@ pub enum Interrupted {
 /// next to the new file.
 ///
 /// Gives up after `timeout` when the folder doesn't answer: the error is
-/// then a [`NotAnswering`] (and the check may still finish by itself).
+/// then a [`NotAnswering`].
 pub async fn resume_replace(
     input: &Path,
     final_path: &Path,
@@ -1272,7 +1277,7 @@ pub async fn resume_replace(
         resume_blocking(&input, &final_path, job_id).map_err(|e| format!("{e:#}"))
     })
     .await
-    .ok_or_else(|| NotAnswering::at(parent_dir(&key).as_path()))?;
+    .map_err(|e| e.at(parent_dir(&key).as_path()))?;
     checked.map_err(|e| anyhow::anyhow!(e))
 }
 
@@ -1296,13 +1301,41 @@ fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Res
     let size = fs::metadata(final_path)
         .with_context(|| format!("Could not read {}", final_path.display()))?
         .len();
-    fs::remove_file(&backup)
-        .with_context(|| format!("Could not delete the backup {}", backup.display()))?;
-    sync_dir(&parent_dir(input));
     Ok(Interrupted::Placed {
         size,
         original_size: backup_meta.len(),
     })
+}
+
+/// Delete job `job_id`'s backup of `input` (see [`backup_file_name`]),
+/// once [`resume_replace`] found the new file in place and that was
+/// recorded. A backup that is gone already is fine.
+///
+/// Gives up after `timeout` when the folder doesn't answer: the error is
+/// then a [`NotAnswering`] (and the deletion may still happen by itself).
+pub async fn remove_backup(input: &Path, job_id: Uuid, timeout: Duration) -> anyhow::Result<()> {
+    let key = parent_dir(input).join(job_id.to_string());
+    let backup = parent_dir(input).join(backup_file_name(&file_name_lossy(input), job_id));
+    let removed =
+        crate::slow_fs::guarded(
+            "remove_backup",
+            &key,
+            timeout,
+            move || match fs::remove_file(&backup) {
+                Ok(()) => {
+                    sync_dir(&parent_dir(&backup));
+                    Ok(())
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!(
+                    "Could not delete the backup {}: {e}",
+                    backup.display()
+                )),
+            },
+        )
+        .await
+        .map_err(|e| e.at(parent_dir(&key).as_path()))?;
+    removed.map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Tests stand in for a share that stops answering while a new file is put
@@ -1984,16 +2017,21 @@ mod tests {
         let new_name = lib.join("Movie.mkv");
         let backup = lib.join(backup_file_name("Movie.mp4", id()));
 
-        // New extension, crash after the new file went in: complete.
+        // New extension, crash after the new file went in: complete. Only
+        // looked at: the backup stays until it is removed.
         fs::write(&backup, OLD).unwrap();
         fs::write(&new_name, NEW).unwrap();
-        assert_eq!(
-            resume_blocking(&input, &new_name, id()).unwrap(),
-            Interrupted::Placed {
-                size: NEW.len() as u64,
-                original_size: OLD.len() as u64
-            }
-        );
+        for _ in 0..2 {
+            assert_eq!(
+                resume_blocking(&input, &new_name, id()).unwrap(),
+                Interrupted::Placed {
+                    size: NEW.len() as u64,
+                    original_size: OLD.len() as u64
+                }
+            );
+        }
+        assert!(backup.exists());
+        fs::remove_file(&backup).unwrap();
         assert_eq!(names(lib), ["Movie.mkv"]);
 
         // New extension, crash before the new file went in: not placed, the
@@ -2028,7 +2066,9 @@ mod tests {
                 original_size: OLD.len() as u64
             }
         );
-        assert_eq!(names(lib), ["Movie.mp4"]);
+        let backup_name = backup.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(names(lib), [backup_name.as_str(), "Movie.mp4"]);
+        fs::remove_file(&backup).unwrap();
 
         // Same name, crash with the original moved aside: not placed.
         fs::rename(&input, &backup).unwrap();

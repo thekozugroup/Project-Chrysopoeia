@@ -165,6 +165,14 @@ pub enum JobOutcome {
         /// What didn't answer.
         path: PathBuf,
     },
+    /// A look the job needed couldn't be made: looks at other shares that
+    /// stopped answering hold every thread set aside for them (see
+    /// [`crate::slow_fs::NoAnswer::Busy`]). Nothing was changed, and nothing
+    /// is known about the job's own files: worth trying again shortly.
+    ChecksBusy {
+        /// What couldn't be looked at.
+        path: PathBuf,
+    },
 }
 
 /// Builds the ffmpeg command for one attempt (normally [`crate::plan::build_plan`]).
@@ -254,6 +262,9 @@ fn log_outcome(spec: &JobSpec, outcome: &JobOutcome) {
         JobOutcome::NotResponding { path } => tracing::debug!(
             job = %spec.job_id, %file, "{} isn't responding", path.display()
         ),
+        JobOutcome::ChecksBusy { path } => tracing::debug!(
+            job = %spec.job_id, %file, "{} couldn't be checked right now", path.display()
+        ),
     }
 }
 
@@ -293,14 +304,14 @@ async fn original_moved_on(
     output_size: u64,
 ) -> Option<JobOutcome> {
     match slow_fs::metadata(input, FOLDER_CHECK_TIMEOUT).await {
-        None => Some(NotAnswering::at(input).into()),
-        Some(Ok(now)) if FileIdentity::of(&now) == identity => None,
-        Some(Ok(_)) => Some(JobOutcome::Skipped {
+        Err(e) => Some(e.at(input).into()),
+        Ok(Ok(now)) if FileIdentity::of(&now) == identity => None,
+        Ok(Ok(_)) => Some(JobOutcome::Skipped {
             reason: original_changed(),
             encoder: Some(encoder.to_string()),
             output_size: Some(output_size),
         }),
-        Some(Err(_)) => Some(failed(
+        Ok(Err(_)) => Some(failed(
             ProblemKind::SourceChanged,
             "The file is no longer there. It was moved or deleted while it was being converted. \
              If it was moved, scan the library again to find it.",
@@ -391,6 +402,7 @@ impl Placing {
 pub struct Unfinished {
     outcome: tokio::sync::oneshot::Receiver<JobOutcome>,
     stop: Arc<AtomicBool>,
+    size: Option<u64>,
 }
 
 impl Unfinished {
@@ -398,7 +410,26 @@ impl Unfinished {
     /// is sent on the returned sender (tests and fakes make their own).
     pub fn new(stop: Arc<AtomicBool>) -> (Self, tokio::sync::oneshot::Sender<JobOutcome>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        (Self { outcome: rx, stop }, tx)
+        (
+            Self {
+                outcome: rx,
+                stop,
+                size: None,
+            },
+            tx,
+        )
+    }
+
+    /// The new file is `size` bytes.
+    #[must_use]
+    pub fn with_size(mut self, size: u64) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    /// The size of the new file being put in place, when known.
+    pub fn size(&self) -> Option<u64> {
+        self.size
     }
 
     /// Ask it to undo what it did at its next safe point, if the new file
@@ -477,7 +508,11 @@ impl Failure {
 
 impl From<NotAnswering> for JobOutcome {
     fn from(e: NotAnswering) -> Self {
-        Self::NotResponding { path: e.path }
+        if e.busy {
+            Self::ChecksBusy { path: e.path }
+        } else {
+            Self::NotResponding { path: e.path }
+        }
     }
 }
 
@@ -566,7 +601,7 @@ impl Job<'_> {
             // Cleaning up would wait for the share too: it is tried in the
             // background (and the next run, or crash recovery, removes what
             // is left).
-            JobOutcome::NotResponding { .. } => {
+            JobOutcome::NotResponding { .. } | JobOutcome::ChecksBusy { .. } => {
                 clean_up_later(guard, prepared.created_dirs.clone());
             }
             // A moment for the usual cleanup (Cancel and Stop answer within
@@ -588,13 +623,13 @@ impl Job<'_> {
         // A share that stopped answering: the job goes back to the queue
         // (and Cancel or Stop still ends it at once, see `run`).
         let input_meta = match slow_fs::metadata(&spec.input, FOLDER_CHECK_TIMEOUT).await {
-            None => return Err(NotAnswering::at(&spec.input).into()),
-            Some(Ok(m)) if m.is_file() => m,
-            Some(Ok(_)) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
-            Some(Err(std::io::ErrorKind::NotFound)) => {
+            Err(e) => return Err(e.at(&spec.input).into()),
+            Ok(Ok(m)) if m.is_file() => m,
+            Ok(Ok(_)) => return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE)),
+            Ok(Err(std::io::ErrorKind::NotFound)) => {
                 return Err(failed(ProblemKind::SourceChanged, SOURCE_GONE));
             }
-            Some(Err(kind)) => {
+            Ok(Err(kind)) => {
                 return Err(failed(
                     ProblemKind::UnreadableSource,
                     unreadable_original(&std::io::Error::from(kind)),
@@ -857,13 +892,13 @@ impl Job<'_> {
             let exit = tokio::select! {
                 exit = extracting => exit,
                 path = slow_fs::first_unanswered(watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
-                    return Err(NotAnswering { path }.into());
+                    return Err(NotAnswering::at(&path).into());
                 }
             };
             let written = match slow_fs::metadata(&cover.path, FOLDER_CHECK_TIMEOUT).await {
-                None => return Err(NotAnswering::at(&cover.path).into()),
-                Some(Ok(m)) => m.len() > 0,
-                Some(Err(_)) => false,
+                Err(e) => return Err(e.at(&cover.path).into()),
+                Ok(Ok(m)) => m.len() > 0,
+                Ok(Err(_)) => false,
             };
             match exit {
                 FfmpegExit::Success { .. } if written => {}
@@ -1008,9 +1043,9 @@ impl Job<'_> {
             }
 
             let output_size = match slow_fs::metadata(&prepared.temp, FOLDER_CHECK_TIMEOUT).await {
-                None => return NotAnswering::at(&prepared.temp).into(),
-                Some(Ok(m)) if m.len() > 0 => m.len(),
-                Some(_) => {
+                Err(e) => return e.at(&prepared.temp).into(),
+                Ok(Ok(m)) if m.len() > 0 => m.len(),
+                Ok(_) => {
                     last_failure = Some(failure(
                         ProblemKind::Encoder,
                         format!(
@@ -1109,7 +1144,7 @@ impl Job<'_> {
                 let report = tokio::select! {
                     report = checks => report,
                     path = slow_fs::first_unanswered(&prepared.watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
-                        return NotAnswering { path }.into();
+                        return NotAnswering::at(&path).into();
                     }
                 };
                 if self.cancel.is_cancelled() {
@@ -1254,7 +1289,7 @@ impl Job<'_> {
                     path.display()
                 );
                 self.leave_unfinished(thread, stop, placing, prepared);
-                return NotAnswering { path }.into();
+                return NotAnswering::at(&path).into();
             }
         };
         placing.outcome(joined(ended), spec.job_id)
@@ -1272,6 +1307,7 @@ impl Job<'_> {
     ) {
         let job_id = self.spec.job_id;
         let (unfinished, tx) = Unfinished::new(stop);
+        let unfinished = unfinished.with_size(placing.output_size);
         let temp = TempGuard::new(prepared.temp.clone());
         let created_dirs = prepared.created_dirs.clone();
         tokio::spawn(async move {
@@ -1329,7 +1365,7 @@ impl Job<'_> {
             exit = encoding => exit,
             path = slow_fs::first_unanswered(watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
                 tracing::info!(job = %self.spec.job_id, "{} isn't responding; stopping the encode", path.display());
-                return Err(NotAnswering { path });
+                return Err(NotAnswering::at(&path));
             }
         };
         Ok(EncodeRun {
@@ -1545,7 +1581,7 @@ async fn folder_not_writable(
         })
     })
     .await
-    .ok_or_else(|| NotAnswering::at(&key))
+    .map_err(|e| e.at(&key))
 }
 
 /// The message when the folder the new file goes to (`dir`) doesn't take
@@ -1921,7 +1957,7 @@ async fn create_dirs(
         Ok(missing)
     })
     .await
-    .ok_or_else(|| NotAnswering::at(&key))
+    .map_err(|e| e.at(&key))
 }
 
 /// Remove folders created by [`create_dirs`] again, innermost first, as
@@ -1933,7 +1969,7 @@ async fn remove_empty_dirs(created: &[PathBuf], timeout: Duration) {
             std::fs::remove_dir(&d).is_ok()
         })
         .await;
-        if removed != Some(true) {
+        if removed != Ok(true) {
             break;
         }
     }
@@ -2144,7 +2180,7 @@ async fn reserve(needs: &[SpaceNeed]) -> Result<Result<SpaceGuard, Shortfall>, N
             crate::finalize::filesystem_of(&dir)
         })
         .await;
-        disks.push(looked.ok_or_else(|| NotAnswering::at(&need.dir))?);
+        disks.push(looked.map_err(|e| e.at(&need.dir))?);
     }
     let devices: Vec<u64> = disks.iter().flatten().map(|(device, _)| *device).collect();
     for _ in 0..RESERVE_TRIES {
@@ -2397,7 +2433,7 @@ async fn remove_temp(path: &Path, timeout: Duration) -> Result<(), NotAnswering>
         },
     )
     .await;
-    removed.ok_or_else(|| NotAnswering::at(path))
+    removed.map_err(|e| e.at(path))
 }
 
 /// Deletes the temp file when a job ends without placing it.

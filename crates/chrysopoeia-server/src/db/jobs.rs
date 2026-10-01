@@ -479,7 +479,9 @@ pub struct JobFinish {
     pub notes: Vec<String>,
 }
 
-/// Mark a job finished. Returns false when the job no longer exists.
+/// Mark a job finished. Returns false when the job no longer exists. A job
+/// recorded `done` has its new file in place, so it is no longer marked as
+/// one whose new file may still be moving in (see [`mark_placing`]).
 pub async fn finish(
     conn: &mut SqliteConnection,
     id: Uuid,
@@ -507,6 +509,10 @@ pub async fn finish(
          progress = CASE WHEN ? = 'done' THEN 100 ELSE progress END, \
          freed_bytes = CASE WHEN ? <> 'done' THEN NULL WHEN ? THEN 0 \
              ELSE MAX(input_size - ?, 0) END, \
+         placing = CASE WHEN ? = 'done' THEN 0 ELSE placing END, \
+         placing_size = CASE WHEN ? = 'done' THEN NULL ELSE placing_size END, \
+         placing_original_size = \
+             CASE WHEN ? = 'done' THEN NULL ELSE placing_original_size END, \
          finished_at = ? WHERE id = ?",
     )
     .bind(enum_str(&state))
@@ -529,6 +535,9 @@ pub async fn finish(
     .bind(enum_str(&state))
     .bind(shared_original)
     .bind(f.output_size.map(i64_of))
+    .bind(enum_str(&state))
+    .bind(enum_str(&state))
+    .bind(enum_str(&state))
     .bind(now_ts())
     .bind(id.to_string())
     .execute(conn)
@@ -694,7 +703,7 @@ pub async fn trim_history(db: &Db) -> sqlx::Result<u64> {
         let mut tx = db.write_tx().await?;
         let n = sqlx::query(&format!(
             "DELETE FROM jobs WHERE rowid IN (SELECT rowid FROM jobs \
-             WHERE state IN {FINISHED_STATES} AND finished_at < ? \
+             WHERE state IN {FINISHED_STATES} AND finished_at < ? AND placing = 0 \
              AND id NOT IN (SELECT job_id FROM files WHERE job_id IS NOT NULL) \
              AND id NOT IN (SELECT kept FROM (SELECT (SELECT d.id FROM jobs d \
                  WHERE d.file_id = f.id AND d.state = 'done' \
@@ -717,17 +726,19 @@ pub async fn trim_history(db: &Db) -> sqlx::Result<u64> {
     }
 }
 
-/// Delete finished jobs. Files keep their status. Returns the count.
+/// Delete finished jobs. Files keep their status. Returns the count. A job
+/// whose new file may still be moving in is kept until that is known (see
+/// [`mark_placing`]).
 pub async fn clear_history(db: &Db) -> sqlx::Result<u64> {
     let mut tx = db.write_tx().await?;
     sqlx::query(&format!(
         "UPDATE files SET job_id = NULL WHERE job_id IN \
-         (SELECT id FROM jobs WHERE state IN {FINISHED_STATES})"
+         (SELECT id FROM jobs WHERE state IN {FINISHED_STATES} AND placing = 0)"
     ))
     .execute(&mut *tx)
     .await?;
     let done = sqlx::query(&format!(
-        "DELETE FROM jobs WHERE state IN {FINISHED_STATES}"
+        "DELETE FROM jobs WHERE state IN {FINISHED_STATES} AND placing = 0"
     ))
     .execute(&mut *tx)
     .await?;
@@ -776,6 +787,8 @@ async fn owner_of(
     file_id: Uuid,
     running_only: bool,
 ) -> sqlx::Result<Option<DestinationOwner>> {
+    // A job whose new file may still be moving in (see `mark_placing`)
+    // counts as running: its file may take the name any moment.
     let states = if running_only {
         "('running')"
     } else {
@@ -783,10 +796,11 @@ async fn owner_of(
     };
     let row = sqlx::query(&format!(
         "SELECT j.library_id, l.name AS library_name, f.relative_path, \
-         j.state = 'running' AS running FROM jobs j \
+         (j.state = 'running' OR j.placing > 0) AS running FROM jobs j \
          JOIN files f ON f.id = j.file_id JOIN libraries l ON l.id = j.library_id \
-         WHERE j.final_path = ? AND j.file_id != ? AND j.state IN {states} \
-         ORDER BY j.state = 'running' DESC, j.finished_at DESC, j.rowid DESC LIMIT 1"
+         WHERE j.final_path = ? AND j.file_id != ? AND (j.state IN {states} OR j.placing > 0) \
+         ORDER BY (j.state = 'running' OR j.placing > 0) DESC, j.finished_at DESC, \
+         j.rowid DESC LIMIT 1"
     ))
     .bind(final_path)
     .bind(file_id.to_string())
@@ -852,6 +866,136 @@ pub async fn destination_owner(
 pub struct InterruptedJob {
     pub job: Job,
     pub final_path: Option<String>,
+}
+
+/// A job whose new file may have been put in place by a step that was
+/// under way when the job ended or the server stopped (see
+/// [`mark_placing`]).
+#[derive(Debug, Clone)]
+pub struct PlacingJob {
+    pub job: Job,
+    /// Where the new file goes.
+    pub final_path: Option<String>,
+    /// Its new file was found in place (see [`mark_placed`]): only the
+    /// backup of the original is left to remove before it is recorded.
+    pub placed: bool,
+    /// The new file's size, when known.
+    pub size: Option<u64>,
+    /// The original's size, when known.
+    pub original_size: Option<u64>,
+}
+
+/// Mark job `id` as one whose new file may be put in place by a step that
+/// goes on after the job ended (on a share that stopped answering, a
+/// rename can't be called back), or that a stop interrupted: until the
+/// mark is cleared, what the job left (its backup of the original) is
+/// looked at only to find out whether the new file got there (see
+/// `services::dispatcher::settle`). `size` is the new file's size, when
+/// known.
+pub async fn mark_placing(pool: &SqlitePool, id: Uuid, size: Option<u64>) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE jobs SET placing = 1, placing_size = ?, placing_original_size = NULL \
+         WHERE id = ?",
+    )
+    .bind(size.map(i64_of))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Job `id`'s new file (`size` bytes, the original `original_size`) was
+/// found in place: what is left is removing the backup of the original and
+/// recording the job `done` (which clears the mark). Noted before the
+/// backup is removed, so that a removal that finishes after its caller gave
+/// up (a share that stopped answering) can't leave the job looking as if
+/// its new file never got there.
+pub async fn mark_placed(
+    pool: &SqlitePool,
+    id: Uuid,
+    size: u64,
+    original_size: u64,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE jobs SET placing = 2, placing_size = ?, placing_original_size = ? WHERE id = ?",
+    )
+    .bind(i64_of(size))
+    .bind(i64_of(original_size))
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The step that was putting job `id`'s new file in place is over and
+/// nothing more is to be recorded about it (see [`mark_placing`]).
+pub async fn clear_placing(pool: &SqlitePool, id: Uuid) -> sqlx::Result<()> {
+    sqlx::query(
+        "UPDATE jobs SET placing = 0, placing_size = NULL, placing_original_size = NULL \
+         WHERE id = ?",
+    )
+    .bind(id.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn placing_from_row(row: &SqliteRow) -> sqlx::Result<PlacingJob> {
+    let placing: i64 = row.try_get("placing")?;
+    Ok(PlacingJob {
+        job: from_row(row)?,
+        final_path: row.try_get("final_path")?,
+        placed: placing == 2,
+        size: opt_u64_col(row, "placing_size")?,
+        original_size: opt_u64_col(row, "placing_original_size")?,
+    })
+}
+
+/// The extra columns of a [`PlacingJob`].
+const PLACING_COLUMNS: &str = "placing, placing_size, placing_original_size";
+
+/// The jobs marked with [`mark_placing`]: all of them, or those of one file.
+pub async fn placing(pool: &SqlitePool, file_id: Option<Uuid>) -> sqlx::Result<Vec<PlacingJob>> {
+    let rows =
+        match file_id {
+            Some(file_id) => sqlx::query(&format!(
+                "SELECT {COLUMNS}, {PLACING_COLUMNS} FROM jobs WHERE placing > 0 AND file_id = ?"
+            ))
+            .bind(file_id.to_string())
+            .fetch_all(pool)
+            .await?,
+            None => {
+                sqlx::query(&format!(
+                    "SELECT {COLUMNS}, {PLACING_COLUMNS} FROM jobs WHERE placing > 0"
+                ))
+                .fetch_all(pool)
+                .await?
+            }
+        };
+    rows.iter().map(placing_from_row).collect()
+}
+
+/// Job `id`, if it is still marked with [`mark_placing`].
+pub async fn placing_job(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Option<PlacingJob>> {
+    let row = sqlx::query(&format!(
+        "SELECT {COLUMNS}, {PLACING_COLUMNS} FROM jobs WHERE placing > 0 AND id = ?"
+    ))
+    .bind(id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    row.as_ref().map(placing_from_row).transpose()
+}
+
+/// Whether another job than `id`, marked with [`mark_placing`], puts its
+/// new file at `path` too (the two can't be told apart on the disk).
+pub async fn other_placing_at(pool: &SqlitePool, id: Uuid, path: &str) -> sqlx::Result<bool> {
+    let row =
+        sqlx::query("SELECT 1 FROM jobs WHERE placing > 0 AND final_path = ? AND id != ? LIMIT 1")
+            .bind(path)
+            .bind(id.to_string())
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
 }
 
 /// Jobs left `running` by the previous run (before [`recover_interrupted`]).

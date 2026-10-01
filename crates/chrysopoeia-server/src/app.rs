@@ -340,10 +340,18 @@ pub async fn recover_artifacts(state: &AppState, include_libraries: bool) -> Vec
     let mut artifacts: Vec<PathBuf> = Vec::new();
     for (root, keep_for_later) in roots {
         let root_str = root.to_string_lossy().into_owned();
-        let problem = if libraries_with_files.contains(&root) {
+        let looked = if libraries_with_files.contains(&root) {
             library::root_unavailable(&root_str).await
         } else {
             library::path_problem(&root_str).await
+        };
+        let problem = match looked {
+            library::Folder::Fine => None,
+            library::Folder::Problem(problem) => Some(problem),
+            library::Folder::Unknown => Some(format!(
+                "{root_str} couldn't be checked right now, because checks of other folders that \
+                 stopped answering are still waiting"
+            )),
         };
         if let Some(problem) = problem {
             if keep_for_later {
@@ -467,9 +475,12 @@ pub async fn begin_shutdown(state: &AppState) {
 
 /// Finish shutting down: record whether it was clean and close the database.
 /// It isn't while crash leftovers are still to be looked for (the start-up
-/// search didn't finish, or a library folder was out of reach).
+/// search didn't finish, or a library folder was out of reach), or while a
+/// new file is still being put in place on a share that stopped answering.
 pub async fn finish_shutdown(state: &AppState) {
-    let clean = state.dispatcher.running_count() == 0 && !lock(&state.leftovers).due();
+    let clean = state.dispatcher.running_count() == 0
+        && state.dispatcher.placing_ids().is_empty()
+        && !lock(&state.leftovers).due();
     if let Err(e) =
         db::settings::set_flag(state.db.pool(), db::settings::CLEAN_SHUTDOWN_KEY, clean).await
     {

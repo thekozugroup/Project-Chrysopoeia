@@ -105,10 +105,10 @@ pub trait MediaToolkit: Send + Sync + 'static {
     /// Clean up a temp or backup file left behind by a crash.
     fn recover_artifact(&self, path: PathBuf) -> BoxFuture<'static, anyhow::Result<Recovery>>;
 
-    /// After a crash, finish a replacement whose new file was already in
-    /// place (see `chrysopoeia_worker::finalize::resume_replace`). Only
-    /// touches the files a job of this id left, so fakes use it as is.
-    /// Gives up after `timeout` when the folder doesn't answer.
+    /// After a crash, whether a replacement's new file was already in place
+    /// (see `chrysopoeia_worker::finalize::resume_replace`). Only looks at
+    /// the files a job of this id left, so fakes use it as is. Gives up
+    /// after `timeout` when the folder doesn't answer.
     fn resume_replace(
         &self,
         input: PathBuf,
@@ -118,6 +118,20 @@ pub trait MediaToolkit: Send + Sync + 'static {
     ) -> BoxFuture<'static, anyhow::Result<Interrupted>> {
         Box::pin(async move {
             chrysopoeia_worker::finalize::resume_replace(&input, &final_path, job_id, timeout).await
+        })
+    }
+
+    /// Remove a job's backup of its original once its new file was found in
+    /// place (see `chrysopoeia_worker::finalize::remove_backup`). Only
+    /// touches the backup a job of this id left, so fakes use it as is.
+    fn remove_backup(
+        &self,
+        input: PathBuf,
+        job_id: Uuid,
+        timeout: Duration,
+    ) -> BoxFuture<'static, anyhow::Result<()>> {
+        Box::pin(async move {
+            chrysopoeia_worker::finalize::remove_backup(&input, job_id, timeout).await
         })
     }
 
@@ -405,6 +419,20 @@ impl Toolkit {
         let inner = Arc::clone(&self.inner);
         self.async_call("crash recovery", move || {
             inner.resume_replace(input, final_path, job_id, timeout)
+        })
+        .await?
+    }
+
+    /// See [`MediaToolkit::remove_backup`].
+    pub async fn remove_backup(
+        &self,
+        input: PathBuf,
+        job_id: Uuid,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let inner = Arc::clone(&self.inner);
+        self.async_call("crash recovery", move || {
+            inner.remove_backup(input, job_id, timeout)
         })
         .await?
     }

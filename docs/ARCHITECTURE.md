@@ -42,7 +42,7 @@ shapes here are normative. The Rust source of truth for every shared type is
 | `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, tying child processes to the server's life | Everything in `src/*.rs` |
 | `chrysopoeia-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
 | `chrysopoeia-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
-| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `recover_artifact`) |
+| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
 | `chrysopoeia-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `chrysopoeia` |
 
 Existing public signatures are fixed; new public items may be added. The
@@ -139,9 +139,10 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      encoder, hw_api, attempt INT, input_size INT, output_size INT, error, problem TEXT NULL,
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
-     freed_bytes INT NULL, profile TEXT JSON NULL)
+     freed_bytes INT NULL, profile TEXT JSON NULL, placing INT DEFAULT 0,
+     placing_size INT NULL, placing_original_size INT NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
-     partial INDEX(finished_at) of finished jobs
+     partial INDEX(finished_at) of finished jobs, partial INDEX(placing) of marked jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
          problem TEXT NULL)
 savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, saved_bytes INT,
@@ -184,6 +185,12 @@ verdict was decided with, see "Verdicts and goal changes") and
 taken to be the library's current goal's, except a file a job skipped by
 the size rule in a library whose goal has no size rule now (an earlier
 goal's verdict): it is left unknown, so the next scan decides it again.
+11 = `jobs.placing`, `jobs.placing_size` and `jobs.placing_original_size`:
+a job whose new file may have been put in place after it ended (1), or
+was found in place with only the backup of its original left to remove
+(2), with the sizes of the new file and of the original when known; see
+"Putting the new file in place on a share that stops answering". Such
+jobs are kept by history trimming and clearing until that is settled.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -260,9 +267,17 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   offline.)
 - Leftovers in library folders: every scan hands the temp and backup files
   its walk finds (`WalkResult.artifacts`) to `recover_artifact`, except
-  those of running jobs: a temp file left in a folder renamed during a
-  conversion is deleted, and an original a crash left moved aside is put
-  back (and stays listed). A job that fails after its conversion started
+  those of running jobs and of jobs whose new file is still being put in
+  place: a temp file left in a folder renamed during a conversion is
+  deleted, and an original a crash left moved aside is put back (and stays
+  listed). The files of a job marked as one whose new file may have been
+  put in place after it ended (`jobs.placing`) are never handed over
+  blindly: such a job that can't run again by itself (cancelled, say) is
+  settled first (`dispatcher::settle`: the disk tells whether its new file
+  got there, see "Putting the new file in place on a share that stops
+  answering"), and one in the queue is left alone until it settles itself
+  when it runs. Either way its original is not taken for removed, and nor
+  is the file of any marked job (its job records what became of it). A job that fails after its conversion started
   and whose file is gone from its folder (a folder renamed meanwhile; the
   converter then finds no new file at the old path) has the library
   searched for its own temp files at once.
@@ -286,26 +301,37 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Files `queued`/`processing` are not touched by scans or watch events. Files
   `done` whose size/mtime still match are left alone. A file in `failed` is
   not re-queued automatically; the user retries.
-- Startup recovery: first, jobs left `running` whose new file was already in
-  place are finished and recorded as `done` (note: "Chrysopoeia stopped just
-  as the new file was being put in place. The new file was already complete,
-  so it was kept"): in replace mode when `worker::finalize::resume_replace`
-  finds the job's backup of the original next to a file under
-  `jobs.final_path`; in folder mode when the job was `finalizing`, its output
-  file exists and no other finished job claims that path. Then jobs `running`
-  → `queued` (attempt reset), files `processing` → `queued`, and each such
-  job's own temp and backup files (named with its id) in its file's folder
-  and its destination folder are recovered right away, whatever the last
-  stop recorded: an original moved aside is put back before the job runs
-  again. (A job that starts and finds its file gone looks for its own backup
-  once more, for a folder that was out of reach at the start.) Then every
-  temp/backup artifact is passed to `worker::finalize::recover_artifact`: in
-  the temp folders always, and in the library folders and the output folder
-  after an unclean shutdown. A stop is recorded as clean only when no job
-  was running and this search was done everywhere: a stop during it, or a
-  library or output folder that was out of reach (missing, not responding,
-  or a library with files that is empty now), keeps it due, and a scan that
-  reaches such a library does the search there.
+- Startup recovery (`dispatcher::complete_interrupted`), before anything
+  else looks at the disk: jobs left `running` that may have been putting
+  their new file in place are marked (`jobs.placing` = 1: replacements with
+  a `final_path`, and in folder mode those at the `finalizing` stage), and
+  every marked job (these, and those a stop left putting their new file in
+  place after the job ended, whatever the stop recorded them as: back in
+  the queue, cancelled) is settled from what is on the disk (see "Putting
+  the new file in place on a share that stops answering"): its new file in
+  place → recorded `done` (note: "Chrysopoeia stopped just as the new file
+  was being put in place. The new file was already complete, so it was
+  kept") and the backup removed; not in place → the original put back and
+  the job's temp files gone. A folder that doesn't answer within 10 s
+  leaves its job marked: the job settles itself when it runs again (before
+  it does anything with its file), a job that can't run again is settled
+  every 15 s in the background, and a search for leftovers that finds its
+  files settles it first. Two marked jobs aiming at one name can't be told
+  apart: both originals go back. Then jobs `running` → `queued` (attempt
+  reset), files `processing` → `queued`, and the other such jobs' own temp
+  and backup files (named with its id) in its file's folder and its
+  destination folder are recovered right away: an original moved aside is
+  put back before the job runs again. (A job that starts and finds its file
+  gone looks for its own backup once more, for a folder that was out of
+  reach at the start.) Then every temp/backup artifact is passed to
+  `worker::finalize::recover_artifact` (those of marked jobs as in the
+  leftovers rule above): in the temp folders always, and in the library
+  folders and the output folder after an unclean shutdown. A stop is
+  recorded as clean only when no job was running, no new file was still
+  being put in place, and this search was done everywhere: a stop during
+  it, or a library or output folder that was out of reach (missing, not
+  responding, or a library with files that is empty now), keeps it due, and
+  a scan that reaches such a library does the search there.
 
 ## Verdicts and goal changes
 
@@ -414,6 +440,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   then stopped well before its own 10 min stall timeout). When what stopped
   answering is not the library folder itself (one file in it, the work
   folder, the output folder), the library waits until that answers too.
+  A look that couldn't be made because too many checks of other shares are
+  stuck (`NoAnswer::Busy`, below) says nothing about the job's files: the
+  job goes back to the queue and is tried again 15 s later, its library
+  not taken for offline (`Requeue::ChecksBusy`, `JobOutcome::ChecksBusy`).
   Every await before the encode starts (the look at the file, ffprobe,
   leftover searches, the library folder check) gives way to Cancel and
   Stop, so they end such a job within seconds (the encode and the checks
@@ -430,11 +460,29 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   `services::fs_guard`): library checks, every check of a job (server and
   worker share them), leftover searches and the folder picker run on a
   blocking thread, one at a time per path and kind of check (a caller that
-  comes while one is running waits for its answer, up to its own timeout),
-  and at most 64 at once; a check that can't start counts as not
-  responding (the watch over a long step ignores those, so other stuck
-  shares can't stop a healthy encode). A hung share therefore costs one
-  thread per thing looked at, not one per page load or per retry.
+  comes while one is running waits for its answer, up to its own timeout).
+  Checks are counted by the mount they are on: the longest mount point
+  above the path in `/proc/self/mountinfo` (read without touching the
+  share, again every 30 s in the background; without it, the path's first
+  two folders). At most 8 run at once on one mount
+  (`MAX_STUCK_PER_MOUNT`): a check of a mount whose 8 are all stuck (each
+  past its caller's timeout) answers "not responding" at once, without a
+  thread (so does one that would wait for a stuck check of the same
+  thing), and while they are not all stuck yet it waits for room up to its
+  timeout. At most 128 run at once in all (`MAX_STUCK_CHECKS`, room for 16
+  hung shares, well below the runtime's 512 blocking threads); a check
+  that finds no room (after waiting up to its timeout) is
+  `NoAnswer::Busy`: unknown, never "not responding". A library whose
+  check is busy shows no problem, an offline library stays as it was and
+  is checked again 15 s later, a job waits (above), a failed job whose
+  file can't be looked at is tried again rather than failed or taken for
+  deleted, the folder picker answers 503 `busy` ("Chrysopoeia is still
+  waiting for other folders that stopped answering, so it couldn't open
+  this one right now. Try again in a moment."), and the watch over a long
+  step ignores such checks. A hung share therefore costs at most 8
+  threads, however many of its folders are looked at and however often,
+  and never the checks of other mounts (a share reached through a link
+  from another mount is counted with that mount).
   Reserving disk space looks at the disks without holding the reservations'
   lock, so a disk that hangs holds up no other job's reservation.
 - A job that runs out of disk space (`disk_full`) while other jobs are
@@ -750,18 +798,49 @@ while the new file was being put in place; that was finished when the
 folder answered again", or, when it had been stopped, "It was stopped while
 the new file was being put in place, but that had gone too far to undo, so
 it was finished"); undone or failed (the original kept) → nothing more is
-recorded, and a job back in the queue converts the file again. If the
-server stops first, the job's backup next to the new file finishes the
-record on the next start: start-up recovery (`complete_interrupted`, which
-gives a folder 10 s and otherwise leaves it) and, for replacements, the
-job itself before it converts anything when it runs again (its earlier
-`final_path` and its backup next to the new file mean `done`, with the
-note "Chrysopoeia stopped just as the new file was being put in place. The
-new file was already complete, so it was kept"; a backup without the new
-file is put back as before). Folder mode leaves no backup to go by: a file
-already in the output folder then fails the retry with the usual
-"already in the output folder" message (the original is never touched in
-folder mode).
+recorded, and a job back in the queue converts the file again.
+
+Before the job is recorded as anything (back in the queue, cancelled), it
+is marked in the database (`jobs.placing` = 1, with the new file's size):
+the share may finish the rename after the server has stopped (a rename a
+FUSE or NFS server already received is applied when it answers again),
+and what the stop recorded then says nothing about the files. The mark is
+cleared when the step ends here (recording `done` clears it), and the
+search for leftovers never hands such a job's backup to `recover_artifact`
+while it is marked. After a restart the disk settles it
+(`dispatcher::settle`), once per job at a time, before anything else is
+done with the file or the backup: at start-up for every marked job whose
+folder answers within 10 s; otherwise by the job itself when it runs again
+(it settles every marked job of its file first: a folder that doesn't
+answer puts its library offline as usual), every 15 s in the background
+for a job that can't run again (cancelled), and by a search for leftovers
+that finds its files. Replacements go by the backup
+(`finalize::resume_replace`, which only looks): the backup next to a file
+under the final name (the original's own name, or the new name while the
+original's name is free) → in place; this is noted first (`placing` = 2,
+with both sizes), then the backup is removed (`finalize::remove_backup`)
+and the job recorded `done` with the note "Chrysopoeia stopped just as the
+new file was being put in place. The new file was already complete, so it
+was kept", its savings counted. (Noting it first means a removal that
+finishes after a share answered late can't make the job look as if its
+new file never got there.) A step that finished and removed the
+backup just as the server stopped (its result no longer recorded) leaves
+the new file itself to tell, when the mark has its size: no backup left
+and a file of exactly that size where the new file goes (under the
+original's name only when that isn't the original's size; under a new
+name only while the original's name is free) → in place. Otherwise no
+backup, or a backup without the new file → not in place: the original is
+put back, the job's temp files go, and a job in the queue converts the
+file again. Folder mode, where the original is
+never touched, goes by the new file in the output folder with the size it
+had and no other finished job claiming it. Two marked jobs aiming at one
+name can't be told apart: neither is taken as done, and both originals go
+back. A job in the queue whose earlier run wasn't marked (an older
+version) is looked at the same way when it runs, by the backup its
+earlier run would have left. While a job is marked, its destination counts
+as taken (another file's job aiming at it fails before encoding, as for a
+running one), a scan never removes its file from the list, and history
+trimming keeps it.
 
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to
@@ -791,10 +870,11 @@ gets a job note when the file is converted anyway or into an output folder:
 1 styled subtitle to plain text because MP4 can't keep its styling", the
 attachment notes above, and "Left out 1 cover image because WebM can't hold
 it" ("Left out 2 cover images because WebM can't hold them"). After a crash,
-`resume_replace(input, final_path, job_id)` reports `Placed` (and deletes the
-backup) when the job's backup exists and the new file is in place — the
-original's name taken again (same path) or free with the new name present
-(new extension) — else `NotPlaced`. `recover_artifact`: temp and staged files
+`resume_replace(input, final_path, job_id)` reports `Placed` when the job's
+backup exists and the new file is in place — the original's name taken
+again (same path) or free with the new name present (new extension) — else
+`NotPlaced`; it only looks (it may be asked again), and
+`remove_backup(input, job_id)` then removes the backup. `recover_artifact`: temp and staged files
 are deleted; a backup is renamed back when the original is missing, deleted
 otherwise. A failure to put the new file in place is a
 `finalize::PlaceError` (inside the `anyhow::Error`) with its message and
@@ -887,7 +967,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
-| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
+| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots`, 503 `not_responding` (the folder didn't answer within 10 s, or its share already has as many stuck checks as it may) / `busy` (too many checks of other shares are stuck: try again) |
 | `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first (`problem` on entries about a failed file) |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 

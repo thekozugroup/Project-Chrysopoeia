@@ -70,6 +70,13 @@ pub enum Behavior {
     /// answering: `NotResponding`, with the placing left to the test (see
     /// [`FakeToolkit::finish_placing`]).
     StuckPlacing,
+    /// Write the new file next to its destination and put it in place with
+    /// the worker's own `finalize`, on its own thread like the worker does:
+    /// a step held with `finalize::hold` stands in for a rename that waits
+    /// for a share. Cancel and Stop ask it to undo itself; when it doesn't
+    /// end within a moment, the job ends `Cancelled` and leaves it to go
+    /// on (see `chrysopoeia_worker::run::take_unfinished`).
+    RealPlacing,
 }
 
 /// Holds library walks after they have listed the files, so a test can
@@ -445,21 +452,120 @@ fn final_path(cfg: &RunConfig, spec: &JobSpec) -> PathBuf {
     }
 }
 
-async fn fake_done(cfg: &RunConfig, spec: &JobSpec, ratio: f64) -> JobOutcome {
-    let original = tokio::fs::read(&spec.input).await.unwrap_or_default();
-    let original_size = original.len() as u64;
-    let out_len = ((original_size as f64) * ratio).round().max(1.0) as usize;
-    let out = final_path(cfg, spec);
-    if let Some(parent) = out.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    // Keep it probe-able: same text with the new codec, resized.
-    let body = String::from_utf8_lossy(&original).replace(
+/// A fake conversion of `original`: the same text with the new codec,
+/// resized to `ratio` times its size (so it can be probed).
+fn converted(spec: &JobSpec, original: &[u8], ratio: f64) -> Vec<u8> {
+    let out_len = ((original.len() as f64) * ratio).round().max(1.0) as usize;
+    let body = String::from_utf8_lossy(original).replace(
         &format!("video={}", spec.probe.video_codec().unwrap_or("")),
         &format!("video={}", spec.profile.video_codec.ffprobe_name()),
     );
     let mut bytes = body.into_bytes();
     bytes.resize(out_len, b'#');
+    bytes
+}
+
+/// [`Behavior::RealPlacing`].
+async fn real_placing(
+    me: &Arc<FakeToolkit>,
+    cfg: &RunConfig,
+    spec: &JobSpec,
+    cancel: &CancellationToken,
+) -> JobOutcome {
+    use chrysopoeia_worker::finalize::{
+        FileIdentity, FinalizeRequest, Finalized, Undone, joined, start_finalize, temp_output_path,
+    };
+    let original = tokio::fs::read(&spec.input).await.unwrap_or_default();
+    let original_size = original.len() as u64;
+    let target = final_path(cfg, spec);
+    let dir = target.parent().map(Path::to_path_buf).unwrap_or_default();
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let temp = temp_output_path(&target, spec.profile.container, spec.job_id, Some(&dir));
+    let bytes = converted(spec, &original, 0.5);
+    if let Err(e) = tokio::fs::write(&temp, &bytes).await {
+        return JobOutcome::Failed {
+            error: format!("write failed: {e}"),
+            problem: ProblemKind::Other,
+            log_tail: None,
+            command: None,
+            encoder: None,
+            attempt: 1,
+            validation: None,
+        };
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut thread = start_finalize(
+        &FinalizeRequest {
+            input: &spec.input,
+            temp: &temp,
+            final_path: &target,
+            mode: cfg.output_mode,
+            job_id: spec.job_id,
+            keep_dates: false,
+            original: FileIdentity::read(&spec.input).await.ok(),
+            force_copy: false,
+        },
+        Arc::clone(&stop),
+    );
+    let encoder = spec
+        .candidates
+        .first()
+        .map_or_else(|| "libx265".to_string(), |c| c.name.clone());
+    let ended = move |placed: anyhow::Result<Finalized>| match placed {
+        Ok(placed) => JobOutcome::Done {
+            output_path: target.clone(),
+            output_size: placed.size,
+            original_size,
+            encoder: encoder.clone(),
+            hw_api: HwApi::Software,
+            attempt: 1,
+            validation: Some(passed_report()),
+            command: "ffmpeg -i in out".into(),
+            notes: placed.notes,
+        },
+        Err(e) if e.is::<Undone>() => JobOutcome::Cancelled,
+        Err(e) => JobOutcome::Failed {
+            error: format!("{e:#}"),
+            problem: ProblemKind::Destination,
+            log_tail: None,
+            command: None,
+            encoder: None,
+            attempt: 1,
+            validation: None,
+        },
+    };
+    tokio::select! {
+        placed = &mut thread => ended(joined(placed)),
+        () = cancel.cancelled() => {
+            stop.store(true, Ordering::SeqCst);
+            match tokio::time::timeout(Duration::from_millis(300), &mut thread).await {
+                Ok(placed) => ended(joined(placed)),
+                Err(_) => {
+                    // Left to go on, as the worker does.
+                    let (unfinished, end) = Unfinished::new(stop);
+                    me.unfinished
+                        .lock()
+                        .unwrap()
+                        .insert(spec.job_id, unfinished.with_size(bytes.len() as u64));
+                    tokio::spawn(async move {
+                        let _ = end.send(ended(joined(thread.await)));
+                    });
+                    JobOutcome::Cancelled
+                }
+            }
+        }
+    }
+}
+
+async fn fake_done(cfg: &RunConfig, spec: &JobSpec, ratio: f64) -> JobOutcome {
+    let original = tokio::fs::read(&spec.input).await.unwrap_or_default();
+    let original_size = original.len() as u64;
+    let out = final_path(cfg, spec);
+    if let Some(parent) = out.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    // Keep it probe-able: same text with the new codec, resized.
+    let bytes = converted(spec, &original, ratio);
     if let Err(e) = tokio::fs::write(&out, &bytes).await {
         return JobOutcome::Failed {
             error: format!("write failed: {e}"),
@@ -797,6 +903,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     }
                     JobOutcome::NotResponding { path: spec.input }
                 }
+                Behavior::RealPlacing => real_placing(&me, &cfg, &spec, &cancel).await,
                 Behavior::StuckPlacing => {
                     let stop = Arc::new(AtomicBool::new(cancel.is_cancelled()));
                     let (unfinished, end) = Unfinished::new(Arc::clone(&stop));
