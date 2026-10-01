@@ -440,3 +440,40 @@ async fn a_moved_files_temp_file_is_removed_when_its_job_ends() {
     let j = app.get(&format!("/api/jobs/{job_id}")).await;
     assert_eq!(j.json["problem"], "source_changed", "{}", j.json);
 }
+
+/// The share starts answering with errors between a scan's walk and its
+/// probe of a new file (here a file stands where the file's folder was):
+/// that says nothing about the file, so it is left for the next scan
+/// instead of being recorded as a file that can't be read. Once the share
+/// works again, the next scan lists it as usual.
+#[tokio::test]
+async fn a_file_its_share_answers_errors_about_is_left_for_the_next_scan() {
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.write("Movies/old.mkv", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    let id = lib["id"].as_str().unwrap().to_string();
+    app.write("Movies/Film/film.mkv", h264());
+    let folder = app.media.join("Movies/Film");
+    let away = app.media.join("Movies/Film.away");
+
+    app.fake.walk_gate.close();
+    let r = app.post_empty(&format!("/api/libraries/{id}/scan")).await;
+    assert_eq!(r.status, axum::http::StatusCode::ACCEPTED, "{}", r.text);
+    app.fake.walk_gate.wait_reached().await;
+    std::fs::rename(&folder, &away).unwrap();
+    std::fs::write(&folder, "not a folder").unwrap();
+    app.fake.walk_gate.release();
+    app.wait_scan(&id).await;
+    let failed = app.get("/api/files?status=failed").await.json;
+    assert_eq!(failed["total"], 0, "{failed}");
+    let files = app.files_by_name(&id).await;
+    assert!(!files.contains_key("film.mkv"), "{files:#?}");
+
+    std::fs::remove_file(&folder).unwrap();
+    std::fs::rename(&away, &folder).unwrap();
+    app.rescan(&id).await;
+    let files = app.files_by_name(&id).await;
+    let film = &files["film.mkv"];
+    assert_ne!(film["status"], "failed", "{film:#}");
+}

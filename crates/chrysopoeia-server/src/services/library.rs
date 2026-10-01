@@ -562,11 +562,15 @@ async fn probe_limited(state: &AppState, path: PathBuf) -> Result<ProbeInfo, Pro
 /// (moved, renamed, or replaced by a conversion), or because it stopped
 /// answering (a share whose server went away). Such files are not reported
 /// as broken; the next scan sees them as they are.
+///
+/// A file its disk answers about with an error other than "not found" (a
+/// share that answers with errors) is left to the next scan too: that says
+/// nothing about the file itself.
 async fn vanished(probe: &Result<ProbeInfo, ProbeError>, path: &Path) -> bool {
     probe.is_err()
-        && matches!(
+        && !matches!(
             fs_guard::symlink_metadata(path, FILE_CHECK_TIMEOUT).await,
-            Err(_) | Ok(Err(std::io::ErrorKind::NotFound))
+            Ok(Ok(_))
         )
 }
 
@@ -1582,6 +1586,9 @@ pub struct Recovered {
     /// new file in place, or it isn't known yet whether it did. They are
     /// not gone.
     pub kept: Vec<PathBuf>,
+    /// Leftovers that couldn't be handled (the disk answered with an error,
+    /// or the database couldn't say whose they are): left as they are.
+    pub failed: Vec<PathBuf>,
 }
 
 impl Recovered {
@@ -1623,9 +1630,23 @@ pub async fn recover_leftovers(
             .collect(),
         Err(e) => {
             // Without knowing which backups may still be needed, none is
-            // touched; the next search tries again.
+            // touched (and their originals aren't gone); the next search
+            // tries again.
             tracing::warn!("could not look for interrupted conversions: {e}");
-            return Recovered::default();
+            let kept = artifacts
+                .iter()
+                .filter_map(|path| {
+                    let name = path.file_name()?.to_str()?;
+                    let original = chrysopoeia_core::paths::is_backup(name)
+                        .then(|| chrysopoeia_core::paths::original_name_from_backup(name))??;
+                    Some(path.with_file_name(original))
+                })
+                .collect();
+            return Recovered {
+                restored: Vec::new(),
+                kept,
+                failed: artifacts,
+            };
         }
     };
     // Per marked job met: whether its files are settled (and so handled).
@@ -1687,7 +1708,10 @@ pub async fn recover_leftovers(
             }
             Ok(r) => tracing::debug!(path = %path.display(), "leftover: {r:?}"),
             Err(e) => {
-                tracing::warn!(path = %path.display(), "could not clean up a leftover file: {e:#}")
+                tracing::warn!(path = %path.display(), "could not clean up a leftover file: {e:#}");
+                // An original that couldn't be put back isn't gone either.
+                out.kept.extend(original);
+                out.failed.push(path);
             }
         }
     }

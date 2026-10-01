@@ -205,3 +205,90 @@ async fn checks_that_cannot_start_never_take_a_library_offline() {
     )
     .await;
 }
+
+/// A share mounted after the list of mounts was read, that stops answering
+/// moments later: its stuck checks are first counted with the mount above
+/// it, where a healthy library is too. That library still opens in the
+/// folder picker, isn't shown as unreachable, and its queue moves while
+/// the share hangs; once the share is known as a mount, its stuck checks
+/// are counted by it. Before, they stayed counted against the mount above
+/// for as long as the share hung: the healthy folder answered 503 "isn't
+/// responding" at once, and its library's queue stopped.
+#[tokio::test]
+async fn a_share_mounted_later_doesnt_stop_the_mount_it_is_on() {
+    let (app, share, healthy) = two_libraries().await;
+    // Both libraries are on one mount (tests make their mounts up); the
+    // share isn't known as a mount of its own yet.
+    let _parent = hang::mount(&app.media);
+    let share_dir = app.media.join("Share");
+    let healthy_dir = app.media.join("Healthy");
+    for i in 0..12 {
+        std::fs::create_dir(share_dir.join(format!("folder {i}"))).unwrap();
+    }
+    let hung = hang::hang(&share_dir);
+    let looks: Vec<_> = (0..12)
+        .map(|i| {
+            let router = app.router.clone();
+            let path = share_dir.join(format!("folder {i}"));
+            tokio::spawn(async move {
+                use tower::ServiceExt;
+                let req = axum::http::Request::builder()
+                    .uri(format!(
+                        "/api/fs/browse?path={}",
+                        urlencoding(path.to_str().unwrap())
+                    ))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                router.oneshot(req).await.unwrap().status()
+            })
+        })
+        .collect();
+    for look in looks {
+        assert_eq!(look.await.unwrap(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    // The healthy folder opens, and its library isn't unreachable.
+    let r = browse(&app, &healthy_dir).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let lib = app
+        .get(&format!(
+            "/api/libraries/{}",
+            healthy["id"].as_str().unwrap()
+        ))
+        .await
+        .json;
+    assert!(lib["path_error"].is_null(), "{lib}");
+    // The share says it isn't responding.
+    let r = browse(&app, &share_dir.join("folder 0")).await;
+    assert_eq!(r.json["code"], "not_responding", "{}", r.text);
+
+    // Its queue moves while the share hangs.
+    app.resume().await;
+    wait("the healthy library's file to be converted", async || {
+        app.fake.started().iter().any(|n| n == "fine.mkv")
+            && app.get("/api/files?status=done").await.json["total"] == 1
+    })
+    .await;
+    assert!(
+        app.state
+            .dispatcher
+            .offline_reason(uuid(&healthy["id"]))
+            .is_none()
+    );
+
+    // The share turns out to be a mount of its own: its stuck checks are
+    // counted by it, and none by the mount above.
+    let _mounted = hang::mount(&share_dir);
+    assert!(hang::running_checks_on(&share_dir).await <= MAX_STUCK_PER_MOUNT);
+    wait("the mount above to count no stuck checks", async || {
+        hang::running_checks_on(&app.media).await == 0
+    })
+    .await;
+    let r = browse(&app, &healthy_dir).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    drop(hung);
+    let lib = app
+        .get(&format!("/api/libraries/{}", share["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(lib.status, StatusCode::OK, "{}", lib.text);
+}

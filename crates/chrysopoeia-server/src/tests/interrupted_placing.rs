@@ -416,3 +416,157 @@ async fn a_new_file_put_in_place_as_the_server_stopped_is_recorded_without_its_b
         }
     }
 }
+
+/// How a share answers at a restart when it isn't there as it should be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Broken {
+    /// Every look in it fails with an error (here a file stands where the
+    /// folder was, so looks inside fail with "not a folder", as a
+    /// soft-mounted share answers "read or write error" and a FUSE share
+    /// whose server stopped answers "not connected").
+    Errors,
+    /// It isn't mounted: its folder is there, empty.
+    Unmounted,
+}
+
+/// Make `folder` answer as `how` says; it comes back with [`mend`].
+fn break_share(folder: &Path, how: Broken) -> PathBuf {
+    let away = folder.with_extension("away");
+    std::fs::rename(folder, &away).unwrap();
+    match how {
+        Broken::Errors => std::fs::write(folder, "not a folder").unwrap(),
+        Broken::Unmounted => std::fs::create_dir(folder).unwrap(),
+    }
+    away
+}
+
+fn mend(folder: &Path, away: &Path) {
+    if folder.is_dir() {
+        std::fs::remove_dir(folder).unwrap();
+    } else {
+        std::fs::remove_file(folder).unwrap();
+    }
+    std::fs::rename(away, folder).unwrap();
+}
+
+async fn placing(app: &TestApp, job: &str) -> i64 {
+    sqlx::query_scalar("SELECT placing FROM jobs WHERE id = ?")
+        .bind(job)
+        .fetch_one(app.state.db.pool())
+        .await
+        .unwrap()
+}
+
+/// Where the share is: the library folder for a replacement, the output
+/// folder in folder mode.
+fn share_of(s: &Stopped, kind: Kind) -> PathBuf {
+    match kind {
+        Kind::NewName | Kind::SameName => s.original.parent().unwrap().to_path_buf(),
+        Kind::Folder => s.target.parent().unwrap().to_path_buf(),
+    }
+}
+
+/// The share put the new file in place after the stop, but at the restart
+/// it answers every look with an error (or isn't mounted): that tells
+/// nothing, so nothing is settled and the job keeps its mark. Once the
+/// share works again, a scan leaves the job's backup alone, and the job,
+/// when it runs, is recorded as done with its savings. Before, start-up
+/// took the errors for "not in place" and cleared the mark; the scan then
+/// put the original back next to the new file, and the job failed on the
+/// name ("Skipped: Already …" for the same name; in folder mode it failed
+/// at once on its own new file).
+#[tokio::test]
+async fn a_share_answering_with_errors_at_the_restart_settles_nothing() {
+    let cases = [
+        (Kind::NewName, Broken::Errors),
+        (Kind::SameName, Broken::Errors),
+        (Kind::Folder, Broken::Errors),
+        (Kind::NewName, Broken::Unmounted),
+        (Kind::SameName, Broken::Unmounted),
+    ];
+    for (kind, how) in cases {
+        let (dir, s) = stopped_while_placing(kind, true, true).await;
+        let share = share_of(&s, kind);
+        let before = names(&share);
+        let away = break_share(&share, how);
+        let (app, fake) = restart(dir).await;
+        assert_eq!(
+            placing(&app, &s.job).await,
+            1,
+            "{kind:?} {how:?}: still marked"
+        );
+        assert_eq!(
+            job(&app, &s.job).await["state"],
+            "queued",
+            "{kind:?} {how:?}"
+        );
+        assert_eq!(names(&away), before, "{kind:?} {how:?}: nothing touched");
+
+        mend(&share, &away);
+        let libs = app.get("/api/libraries").await.json;
+        let lib_id = libs[0]["id"].as_str().unwrap().to_string();
+        app.rescan(&lib_id).await;
+        assert_eq!(
+            names(&share),
+            before,
+            "{kind:?} {how:?}: the scan left the job's files alone"
+        );
+        assert_eq!(placing(&app, &s.job).await, 1, "{kind:?} {how:?}");
+
+        app.resume().await;
+        wait("the job to be recorded as done", async || {
+            job(&app, &s.job).await["state"] == "done"
+        })
+        .await;
+        app.wait_queue_idle().await;
+        assert_finished(&app, &fake, &s, kind).await;
+        drop(s.held);
+    }
+}
+
+/// The share still answers with errors when the job runs again: the job
+/// waits with its library shown as unreachable (not failed, nothing
+/// touched), and finishes as done once the share works.
+#[tokio::test]
+async fn a_job_waits_while_its_share_answers_with_errors() {
+    for kind in [Kind::NewName, Kind::Folder] {
+        let (dir, s) = stopped_while_placing(kind, true, false).await;
+        let share = share_of(&s, kind);
+        let before = names(&share);
+        let away = break_share(&share, Broken::Errors);
+        let (app, fake) = restart(dir).await;
+        let libs = app.get("/api/libraries").await.json;
+        let lib_id = libs[0]["id"].as_str().unwrap().to_string();
+        wait("the library to wait for its share", async || {
+            app.get(&format!("/api/libraries/{lib_id}")).await.json["path_error"]
+                .as_str()
+                .is_some()
+        })
+        .await;
+        let lib = app.get(&format!("/api/libraries/{lib_id}")).await.json;
+        let reason = lib["path_error"].as_str().unwrap_or_default().to_string();
+        // The library folder itself is the share for a replacement (its
+        // own problem is shown); in folder mode the output folder is.
+        if kind == Kind::Folder {
+            assert!(
+                reason.contains("can't read the folder") && reason.contains("check that it's"),
+                "{kind:?}: {reason}"
+            );
+        }
+        let j = job(&app, &s.job).await;
+        assert_eq!(j["state"], "queued", "{kind:?}: {j}");
+        assert!(fake.started().is_empty(), "{kind:?}: not converted again");
+        assert_eq!(placing(&app, &s.job).await, 1, "{kind:?}");
+        assert_eq!(names(&away), before, "{kind:?}: nothing touched");
+
+        mend(&share, &away);
+        app.state.dispatcher.recheck_now(uuid(&lib_id));
+        wait("the job to be recorded as done", async || {
+            job(&app, &s.job).await["state"] == "done"
+        })
+        .await;
+        app.wait_queue_idle().await;
+        assert_finished(&app, &fake, &s, kind).await;
+        drop(s.held);
+    }
+}

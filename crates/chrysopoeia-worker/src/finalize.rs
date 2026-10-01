@@ -1263,7 +1263,8 @@ pub enum Interrupted {
 /// next to the new file.
 ///
 /// Gives up after `timeout` when the folder doesn't answer: the error is
-/// then a [`NotAnswering`].
+/// then a [`NotAnswering`]. A look the disk answers with an error other
+/// than "not found" is an [`Unreadable`] error, never `NotPlaced`.
 pub async fn resume_replace(
     input: &Path,
     final_path: &Path,
@@ -1274,37 +1275,107 @@ pub async fn resume_replace(
     let input = input.to_path_buf();
     let final_path = final_path.to_path_buf();
     let checked = crate::slow_fs::guarded("resume_replace", &key, timeout, move || {
-        resume_blocking(&input, &final_path, job_id).map_err(|e| format!("{e:#}"))
+        resume_blocking(&input, &final_path, job_id)
     })
     .await
     .map_err(|e| e.at(parent_dir(&key).as_path()))?;
-    checked.map_err(|e| anyhow::anyhow!(e))
+    Ok(checked?)
 }
 
-fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Result<Interrupted> {
+/// A file or folder the disk answered about with an error other than "not
+/// found" (a soft-mounted share that timed out, a FUSE server that
+/// stopped: "the disk reported a read or write error", "the network share
+/// can't be reached"). Nothing can be told from such an answer, so it is
+/// never taken for "not there".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    /// What was looked at.
+    pub path: PathBuf,
+    /// Why it couldn't be read, in plain words.
+    pub reason: String,
+}
+
+impl Unreadable {
+    /// `e`, from a look at `path`.
+    pub fn new(path: &Path, e: &io::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            reason: io_reason(e),
+        }
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Chrysopoeia couldn't check {} because {}",
+            self.path.display(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// What is at `path` (not following a link), or `None` when nothing is.
+/// Only "not found" is nothing: any other error is [`Unreadable`].
+pub fn look(path: &Path) -> Result<Option<fs::Metadata>, Unreadable> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Unreadable::new(path, &e)),
+    }
+}
+
+fn resume_blocking(
+    input: &Path,
+    final_path: &Path,
+    job_id: Uuid,
+) -> Result<Interrupted, Unreadable> {
     let backup = parent_dir(input).join(backup_file_name(&file_name_lossy(input), job_id));
-    let Ok(backup_meta) = fs::symlink_metadata(&backup) else {
+    // Only "it isn't there" says there is no backup: a share that answers
+    // with an error says nothing about it, and taking that for "not
+    // placed" would put the original back next to a new file in place.
+    let Some(backup_meta) = look(&backup)? else {
         return Ok(Interrupted::NotPlaced);
     };
     if !backup_meta.is_file() {
         return Ok(Interrupted::NotPlaced);
     }
-    let same_name = input == final_path || is_same_file(input, final_path);
+    let same_name = input == final_path || same_file_strict(input, final_path)?;
     let placed = if same_name {
-        exists(input)?
+        look(input)?.is_some()
     } else {
-        !exists(input)? && exists(final_path)?
+        look(input)?.is_none() && look(final_path)?.is_some()
     };
     if !placed {
         return Ok(Interrupted::NotPlaced);
     }
     let size = fs::metadata(final_path)
-        .with_context(|| format!("Could not read {}", final_path.display()))?
+        .map_err(|e| Unreadable::new(final_path, &e))?
         .len();
     Ok(Interrupted::Placed {
         size,
         original_size: backup_meta.len(),
     })
+}
+
+/// [`is_same_file`] for a look that must not guess: two paths that don't
+/// both exist are not the same file, but one that can't be looked at (an
+/// error other than "not found") is [`Unreadable`].
+fn same_file_strict(a: &Path, b: &Path) -> Result<bool, Unreadable> {
+    if a == b {
+        return Ok(true);
+    }
+    for p in [a, b] {
+        match fs::metadata(p) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(Unreadable::new(p, &e)),
+        }
+    }
+    Ok(is_same_file(a, b))
 }
 
 /// Delete job `job_id`'s backup of `input` (see [`backup_file_name`]),
@@ -2077,5 +2148,48 @@ mod tests {
             Interrupted::NotPlaced
         );
         assert!(backup.exists());
+    }
+
+    /// A folder the disk answers about with an error (here a file stands
+    /// where the folder was, so every look inside it fails with "not a
+    /// folder", as a soft-mounted share answers "read or write error")
+    /// tells nothing: never "not placed", which would put the original back
+    /// next to a new file that is in place.
+    #[tokio::test]
+    async fn resume_never_takes_an_unreadable_folder_for_not_placed() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("Movies");
+        let away = dir.path().join("Movies.away");
+        let input = lib.join("Movie.mp4");
+        let new_name = lib.join("Movie.mkv");
+        fs::create_dir(&lib).unwrap();
+        fs::write(lib.join(backup_file_name("Movie.mp4", id())), OLD).unwrap();
+        fs::write(&new_name, NEW).unwrap();
+        fs::rename(&lib, &away).unwrap();
+        fs::write(&lib, "not a folder").unwrap();
+        for target in [&new_name, &input] {
+            let e = resume_replace(&input, target, id(), Duration::from_secs(30))
+                .await
+                .unwrap_err();
+            let unreadable = e
+                .downcast_ref::<Unreadable>()
+                .expect("unreadable, not an answer");
+            assert!(unreadable.path.starts_with(&lib), "{unreadable:?}");
+            assert!(!unreadable.reason.is_empty());
+        }
+        // The folder answers again: the new file is found in place.
+        fs::remove_file(&lib).unwrap();
+        fs::rename(&away, &lib).unwrap();
+        assert_eq!(
+            resume_replace(&input, &new_name, id(), Duration::from_secs(30))
+                .await
+                .unwrap(),
+            Interrupted::Placed {
+                size: NEW.len() as u64,
+                original_size: OLD.len() as u64
+            }
+        );
+        // Nothing was touched meanwhile.
+        assert_eq!(names(&lib).len(), 2, "{:?}", names(&lib));
     }
 }
