@@ -23,13 +23,14 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Timelike, Utc};
 use chrysopoeia_core::encoder::VIDEO_ENCODERS;
+use chrysopoeia_core::plain::io_reason;
 use chrysopoeia_core::{
     ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
     JobState, MaxJobsSource, MediaFile, OutputMode, ProblemKind, QueueState, Settings,
     TranscodeProfile,
 };
 use chrysopoeia_scanner::WatchEvent;
-use chrysopoeia_worker::finalize::{Interrupted, final_output_path, output_name_taken};
+use chrysopoeia_worker::finalize::{Interrupted, Unreadable, final_output_path, output_name_taken};
 use chrysopoeia_worker::run::Unfinished;
 use chrysopoeia_worker::slow_fs::{self, NotAnswering, WATCH_INTERVAL};
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
@@ -661,12 +662,20 @@ async fn recheck_offline(state: &AppState) {
         let looked = match library::root_unavailable(&lib.path).await {
             Folder::Problem(reason) => Recheck::Offline(reason),
             Folder::Unknown => Recheck::Unknown,
-            // What stopped answering inside it (or elsewhere) answers too.
+            // What stopped answering inside it (or elsewhere) answers too:
+            // "not found" is an answer, an error is not (a share that
+            // answers with errors is still out of reach).
             Folder::Fine => match &check {
-                Some(path) => match fs_guard::metadata(path, RECHECK_TIMEOUT).await {
-                    Err(NoAnswer::NotAnswering) => Recheck::Offline(stuck_reason(&lib.path, path)),
-                    Err(NoAnswer::Busy) => Recheck::Unknown,
+                Some(path) => match look(path, true, RECHECK_TIMEOUT).await {
                     Ok(_) => Recheck::Back,
+                    Err(Unsure::Disk { busy: true, .. } | Unsure::Database) => Recheck::Unknown,
+                    Err(Unsure::Disk {
+                        reason: Some(reason),
+                        ..
+                    }) => Recheck::Offline(reason),
+                    Err(Unsure::Disk { reason: None, .. }) => {
+                        Recheck::Offline(stuck_reason(&lib.path, path))
+                    }
                 },
                 None => Recheck::Back,
             },
@@ -1293,10 +1302,15 @@ async fn execute(
                     let recovered = or_cancelled!(recover_job_leftovers(state, job.id, &dirs));
                     let recovered = match recovered {
                         Ok(recovered) => recovered,
-                        Err(NoAnswer::Busy) => return busy(ctx),
-                        Err(NoAnswer::NotAnswering) => {
-                            let reason = or_cancelled!(offline_reason(&lib.path, &dirs[0]));
-                            return offline(reason, Some(dirs[0].clone()), ctx);
+                        Err(Unsure::Disk { busy: true, .. } | Unsure::Database) => {
+                            return busy(ctx);
+                        }
+                        Err(Unsure::Disk { path, reason, .. }) => {
+                            let reason = match reason {
+                                Some(reason) => reason,
+                                None => or_cancelled!(offline_reason(&lib.path, &path)),
+                            };
+                            return offline(reason, Some(path), ctx);
                         }
                     };
                     if recovered.contains(&input) {
@@ -2706,12 +2720,138 @@ pub enum Settled {
     /// It wasn't (or there was nothing to find out): what the job left was
     /// put back. The originals put back.
     NotPlaced(Vec<PathBuf>),
-    /// A folder didn't answer, or couldn't be looked at (`busy`): the job
-    /// stays marked and is looked at again later.
-    Unreachable { path: PathBuf, busy: bool },
+    /// The disk gave nothing to go by: `path` didn't answer, couldn't be
+    /// looked at (`busy`), answered with an error, or isn't there as it
+    /// should be (a library folder that is missing or empty, a share
+    /// mounted in it that isn't connected); `reason` says which when it
+    /// isn't that `path` didn't answer. Nothing was touched: the job stays
+    /// marked and is looked at again later.
+    Unreachable {
+        path: PathBuf,
+        busy: bool,
+        reason: Option<String>,
+    },
     /// Not now: it may still finish in this process, or it is in the queue
-    /// and settles itself when it runs.
+    /// and settles itself when it runs (or the database couldn't be read).
     Left,
+}
+
+/// A look on the way to settling a job that told nothing for sure (see
+/// [`Settled::Unreachable`]). Only an answer settles a job: "not found"
+/// from a folder that is there is one; an error (a soft-mounted share that
+/// timed out, a FUSE server that stopped), no answer, or a folder that
+/// isn't there as it should be (an unmounted share leaves an empty folder
+/// behind) is not.
+#[derive(Debug, Clone)]
+enum Unsure {
+    /// On the disk (see [`Settled::Unreachable`]).
+    Disk {
+        path: PathBuf,
+        busy: bool,
+        reason: Option<String>,
+    },
+    /// The database couldn't be read.
+    Database,
+}
+
+impl Unsure {
+    /// `path` gave no answer.
+    fn no_answer(e: NoAnswer, path: &Path) -> Self {
+        Self::Disk {
+            path: path.to_path_buf(),
+            busy: e == NoAnswer::Busy,
+            reason: None,
+        }
+    }
+
+    /// `path` can't be used now, because of `reason` (a sentence).
+    fn problem(path: &Path, reason: String) -> Self {
+        Self::Disk {
+            path: path.to_path_buf(),
+            busy: false,
+            reason: Some(reason),
+        }
+    }
+
+    fn settled(self) -> Settled {
+        match self {
+            Self::Disk { path, busy, reason } => Settled::Unreachable { path, busy, reason },
+            Self::Database => Settled::Left,
+        }
+    }
+}
+
+impl From<NotAnswering> for Unsure {
+    fn from(e: NotAnswering) -> Self {
+        Self::Disk {
+            path: e.path,
+            busy: e.busy,
+            reason: None,
+        }
+    }
+}
+
+/// Why a library's jobs wait when `path` (a file, shown by its folder, or a
+/// folder) answered with an error: `reason`, in plain words ("the disk
+/// reported a read or write error").
+fn unreadable_reason(path: &Path, reason: &str) -> String {
+    let folder = match path.parent() {
+        Some(parent) if path.extension().is_some() => parent,
+        _ => path,
+    };
+    format!(
+        "Chrysopoeia can't read the folder {} because {reason}. If it's on a drive or network \
+         share, check that it's connected.",
+        folder.display()
+    )
+}
+
+/// What is at `path` (following a link when `follow`), within `timeout`;
+/// `None` when nothing is there ("not found"). Any other error, and no
+/// answer, is [`Unsure`]: a share that answers with errors says nothing
+/// about what is on it.
+async fn look(
+    path: &Path,
+    follow: bool,
+    timeout: Duration,
+) -> Result<Option<std::fs::Metadata>, Unsure> {
+    let p = path.to_path_buf();
+    let kind = if follow {
+        "settle_metadata"
+    } else {
+        "settle_symlink_metadata"
+    };
+    let looked = fs_guard::guarded(kind, path, timeout, move || {
+        let found = if follow {
+            std::fs::metadata(&p)
+        } else {
+            std::fs::symlink_metadata(&p)
+        };
+        match found {
+            Ok(meta) => Ok(Some(meta)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io_reason(&e)),
+        }
+    })
+    .await
+    .map_err(|e| Unsure::no_answer(e, path))?;
+    looked.map_err(|reason| Unsure::problem(path, unreadable_reason(path, &reason)))
+}
+
+/// What an error from [`chrysopoeia_worker::finalize::resume_replace`]
+/// means: never that the new file isn't in place.
+fn unsure_of(state: &AppState, job: Uuid, e: &anyhow::Error, input: &Path) -> Unsure {
+    if let Some(e) = e.downcast_ref::<NotAnswering>() {
+        return e.clone().into();
+    }
+    if lock(&state.dispatcher.settle_warned).insert(job) {
+        tracing::warn!(job = %job, "could not check an interrupted conversion: {e:#}");
+    }
+    match e.downcast_ref::<Unreadable>() {
+        Some(u) => Unsure::problem(&u.path, unreadable_reason(&u.path, &u.reason)),
+        // Can't tell: looked at again later.
+        None => Unsure::no_answer(NoAnswer::NotAnswering, input),
+    }
 }
 
 /// Find out from the disk whether the new file of job `id`, marked as one
@@ -2727,7 +2867,10 @@ pub enum Settled {
 ///   job is recorded `done` (with [`RESUMED_NOTE`]) whatever it was
 ///   recorded as before; its temp files go too;
 /// - it didn't: the original is put back from its backup and the job's temp
-///   files go; a job in the queue converts the file again.
+///   files go; a job in the queue converts the file again;
+/// - the disk can't tell (a folder that doesn't answer or answers with
+///   errors, a library folder that is missing or empty): nothing is
+///   touched and the job stays marked ([`Settled::Unreachable`]).
 ///
 /// Replacements go by the backup of the original next to the new file (see
 /// [`chrysopoeia_worker::finalize::resume_replace`]); in folder mode, where
@@ -2743,13 +2886,33 @@ pub async fn settle(state: &AppState, id: Uuid, by: SettleBy, timeout: Duration)
     let held = d.settle_lock(id);
     let settled = {
         let _settling = held.lock().await;
-        settle_locked(state, id, by, timeout).await
+        settle_locked(state, id, by, timeout, false).await
     };
     d.drop_settle_lock(id, held);
     settled
 }
 
-async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Duration) -> Settled {
+/// [`settle`] at start-up of a job whose new file can't be told apart from
+/// another's (two marked jobs aimed at one name): taken as not in place,
+/// its original put back, once its folders are there to tell.
+async fn settle_unplaced(state: &AppState, id: Uuid, timeout: Duration) -> Settled {
+    let d = &state.dispatcher;
+    let held = d.settle_lock(id);
+    let settled = {
+        let _settling = held.lock().await;
+        settle_locked(state, id, SettleBy::Startup, timeout, true).await
+    };
+    d.drop_settle_lock(id, held);
+    settled
+}
+
+async fn settle_locked(
+    state: &AppState,
+    id: Uuid,
+    by: SettleBy,
+    timeout: Duration,
+    unplaced: bool,
+) -> Settled {
     let pool = state.db.pool();
     let marked = match db::jobs::placing_job(pool, id).await {
         Ok(Some(marked)) => marked,
@@ -2770,7 +2933,15 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
         size,
         original_size,
     } = marked;
-    let file = db::files::get(pool, job.file_id, true).await.ok().flatten();
+    // Where the file is now (a scan follows a renamed file): without it,
+    // the wrong place would be looked at.
+    let file = match db::files::get(pool, job.file_id, true).await {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::debug!(job = %id, "could not look up the file of an interrupted conversion: {e}");
+            return Settled::Left;
+        }
+    };
     let input = PathBuf::from(
         file.as_ref()
             .map_or(job.file_path.as_str(), |f| f.path.as_str()),
@@ -2781,6 +2952,7 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
         .is_none_or(|t| t.parent() == input.parent());
     let dirs = job_dirs(&input, final_path.as_deref());
     let found = match &target {
+        _ if unplaced => Ok(None),
         // Found in place before: only the backup is left to remove.
         Some(target) if placed => Ok(Some((
             target.clone(),
@@ -2793,24 +2965,20 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
     let found = match found {
         Ok(found) => found,
         Err(e) => {
-            tracing::debug!(job = %id, "{e}; looked at again later");
-            return Settled::Unreachable {
-                path: e.path,
-                busy: e.busy,
-            };
+            tracing::debug!(job = %id, "{e:?}; looked at again later");
+            return e.settled();
         }
     };
     let Some((target, new_size, original_size)) = found else {
         // Not in place: the original goes back (and the job's temp files),
-        // then the mark.
-        let restored = match recover_job_leftovers(state, id, &dirs).await {
+        // then the mark; only once its folders showed they are there, and
+        // everything the job left was handled.
+        let restored = match put_back(state, &job, &input, target.as_deref(), replace, &dirs).await
+        {
             Ok(restored) => restored,
             Err(e) => {
-                let path = dirs.first().cloned().unwrap_or_else(|| input.clone());
-                return Settled::Unreachable {
-                    path,
-                    busy: e == NoAnswer::Busy,
-                };
+                tracing::debug!(job = %id, "{e:?}; what the job left is looked at again later");
+                return e.settled();
             }
         };
         clear_placing(state, id).await;
@@ -2833,6 +3001,7 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
                 Some(e) => Settled::Unreachable {
                     path: e.path.clone(),
                     busy: e.busy,
+                    reason: None,
                 },
                 // Left as it is (the new file is in place), and tried again
                 // later.
@@ -2843,6 +3012,7 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
                     Settled::Unreachable {
                         path: input,
                         busy: false,
+                        reason: None,
                     }
                 }
             };
@@ -2890,7 +3060,8 @@ async fn settle_locked(state: &AppState, id: Uuid, by: SettleBy, timeout: Durati
 }
 
 /// Whether job `job`'s new file is in place at `target` (see [`settle`]):
-/// where, its size and the original's, or `None`.
+/// where, its size and the original's, or `None` when the disk says it
+/// isn't. A look that tells nothing for sure is [`Unsure`].
 async fn placed_on_disk(
     state: &AppState,
     job: &Job,
@@ -2899,15 +3070,18 @@ async fn placed_on_disk(
     replace: bool,
     size: Option<u64>,
     timeout: Duration,
-) -> Result<Option<(PathBuf, u64, u64)>, NotAnswering> {
+) -> Result<Option<(PathBuf, u64, u64)>, Unsure> {
     let pool = state.db.pool();
     let final_path = target.to_string_lossy();
     // Two jobs putting their file at one place can't be told apart: neither
     // is taken for done, and both originals go back.
-    if db::jobs::other_placing_at(pool, job.id, &final_path)
+    let shared = db::jobs::other_placing_at(pool, job.id, &final_path)
         .await
-        .unwrap_or(true)
-    {
+        .map_err(|e| {
+            tracing::debug!(job = %job.id, "could not look for other conversions aimed at the same name: {e}");
+            Unsure::Database
+        })?;
+    if shared {
         tracing::warn!(job = %job.id, "two interrupted conversions aimed at {final_path}; both originals are kept");
         return Ok(None);
     }
@@ -2928,31 +3102,23 @@ async fn placed_on_disk(
                 Some(size) => placed_without_backup(job, input, target, size, timeout).await,
                 None => Ok(None),
             },
-            Err(e) => match e.downcast_ref::<NotAnswering>() {
-                Some(e) => Err(e.clone()),
-                // Can't tell (a disk error reading the folder): left as it
-                // is, and looked at again later.
-                None => {
-                    if lock(&state.dispatcher.settle_warned).insert(job.id) {
-                        tracing::warn!(job = %job.id, "could not check an interrupted conversion: {e:#}");
-                    }
-                    Err(NotAnswering::at(input))
-                }
-            },
+            Err(e) => Err(unsure_of(state, job.id, &e, input)),
         };
     }
     // Folder mode never touches the original, so there is no backup to go
     // by: the job had reached its last step (it was marked then), and the
     // new file is in the output folder with the size it had (the name was
     // free when the job started), claimed by no other finished job.
-    let there = match fs_guard::metadata(target, timeout).await {
-        Ok(Ok(meta)) if meta.is_file() => meta,
-        Ok(_) => return Ok(None),
-        Err(e) => return Err(e.at(target)),
+    let there = match look(target, true, timeout).await? {
+        Some(meta) if meta.is_file() => meta,
+        _ => return Ok(None),
     };
     let claimed = db::jobs::other_done_at(pool, job.id, &final_path)
         .await
-        .unwrap_or(true);
+        .map_err(|e| {
+            tracing::debug!(job = %job.id, "could not look for other conversions to the same name: {e}");
+            Unsure::Database
+        })?;
     let same_size = size.is_none_or(|s| s == there.len());
     Ok((!claimed && same_size).then(|| (target.to_path_buf(), there.len(), job.input_size)))
 }
@@ -2962,14 +3128,14 @@ async fn placed_on_disk(
 /// backup of the original is left, and the new file is where it goes with
 /// that size, under the original's name (and not the original's size) or
 /// under a new name while the original's name is free. Its size and the
-/// original's, or `None`.
+/// original's, or `None`. Every look must answer: an error is [`Unsure`].
 async fn placed_without_backup(
     job: &Job,
     input: &Path,
     target: &Path,
     size: u64,
     timeout: Duration,
-) -> Result<Option<(PathBuf, u64, u64)>, NotAnswering> {
+) -> Result<Option<(PathBuf, u64, u64)>, Unsure> {
     let (Some(dir), Some(name)) = (input.parent(), input.file_name()) else {
         return Ok(None);
     };
@@ -2977,31 +3143,110 @@ async fn placed_without_backup(
         &name.to_string_lossy(),
         job.id,
     ));
-    match fs_guard::symlink_metadata(&backup, timeout).await {
-        Ok(Err(std::io::ErrorKind::NotFound)) => {}
-        Ok(_) => return Ok(None),
-        Err(e) => return Err(e.at(&backup)),
+    if look(&backup, false, timeout).await?.is_some() {
+        return Ok(None);
     }
     let is_new = |meta: &std::fs::Metadata| meta.is_file() && meta.len() == size;
     let placed = if target == input {
-        match fs_guard::metadata(input, timeout).await {
-            Ok(Ok(meta)) => is_new(&meta) && meta.len() != job.input_size,
-            Ok(Err(_)) => false,
-            Err(e) => return Err(e.at(input)),
-        }
+        look(input, true, timeout)
+            .await?
+            .is_some_and(|meta| is_new(&meta) && meta.len() != job.input_size)
     } else {
-        let original_gone = match fs_guard::symlink_metadata(input, timeout).await {
-            Ok(looked) => matches!(looked, Err(std::io::ErrorKind::NotFound)),
-            Err(e) => return Err(e.at(input)),
-        };
-        original_gone
-            && match fs_guard::metadata(target, timeout).await {
-                Ok(Ok(meta)) => is_new(&meta),
-                Ok(Err(_)) => false,
-                Err(e) => return Err(e.at(target)),
-            }
+        look(input, false, timeout).await?.is_none()
+            && look(target, true, timeout)
+                .await?
+                .is_some_and(|meta| is_new(&meta))
     };
     Ok(placed.then(|| (target.to_path_buf(), size, job.input_size)))
+}
+
+/// The new file of `job` isn't in place: put back what it left in `dirs`
+/// (its backup of the original, its temp files), returning the originals
+/// put back. Only once its folders are there to tell (see
+/// [`folders_are_there`]), and only when everything it left was handled:
+/// otherwise nothing more is done and the job stays marked, since a backup
+/// that loses its mark is put back by the next search for leftovers, even
+/// next to a new file that is in place.
+async fn put_back(
+    state: &AppState,
+    job: &Job,
+    input: &Path,
+    target: Option<&Path>,
+    replace: bool,
+    dirs: &[PathBuf],
+) -> Result<Vec<PathBuf>, Unsure> {
+    folders_are_there(state, job, input, target, replace).await?;
+    recover_job_leftovers(state, job.id, dirs).await
+}
+
+/// Whether the folders of `job` are there as they should be, so that not
+/// finding its new file in them means it isn't there: its library folder
+/// answers, can be read and isn't empty (an unmounted share leaves an
+/// empty folder behind, or none), no drive or share known to be mounted in
+/// the library above its file is disconnected, and in folder mode the
+/// output folder answers and can be read.
+async fn folders_are_there(
+    state: &AppState,
+    job: &Job,
+    input: &Path,
+    target: Option<&Path>,
+    replace: bool,
+) -> Result<(), Unsure> {
+    let pool = state.db.pool();
+    let lib = db::libraries::get(pool, job.library_id)
+        .await
+        .map_err(|_| Unsure::Database)?;
+    if let Some(lib) = lib {
+        let root = PathBuf::from(&lib.path);
+        match library::root_unavailable(&lib.path).await {
+            Folder::Fine => {}
+            Folder::Problem(reason) => return Err(Unsure::problem(&root, reason)),
+            Folder::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &root)),
+        }
+        let known = db::libraries::mounts(pool, lib.id)
+            .await
+            .map_err(|_| Unsure::Database)?;
+        let above: Vec<PathBuf> = known
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|m| *m != root && m.starts_with(&root) && input.starts_with(m))
+            .collect();
+        if !above.is_empty() {
+            let under = root.clone();
+            let mounted =
+                fs_guard::guarded("settle_mounts", &root, LEFTOVER_CHECK_TIMEOUT, move || {
+                    library::mounts::mount_points_under(&under)
+                })
+                .await
+                .map_err(|e| Unsure::no_answer(e, &root))?;
+            if let Some(gone) = above.iter().find(|m| !mounted.contains(m)) {
+                return Err(Unsure::problem(
+                    gone,
+                    format!(
+                        "The drive or share mounted at {} isn't connected. Reconnect it, and \
+                         its conversions continue.",
+                        gone.display()
+                    ),
+                ));
+            }
+        }
+    }
+    if !replace && let Some(target) = target {
+        let output = state
+            .settings()
+            .output_folder
+            .as_deref()
+            .map(PathBuf::from)
+            .filter(|o| target.starts_with(o));
+        if let Some(output) = output {
+            match library::path_problem(&output.to_string_lossy()).await {
+                Folder::Fine => {}
+                Folder::Problem(reason) => return Err(Unsure::problem(&output, reason)),
+                Folder::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &output)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What settling the earlier runs of a job's file found (see
@@ -3016,7 +3261,7 @@ enum FileSettled {
     /// Another job's new file had taken its place: the file is as that job
     /// left it.
     Changed,
-    /// A folder didn't answer.
+    /// A folder didn't answer, or can't tell yet.
     Unreachable {
         reason: String,
         check: Option<PathBuf>,
@@ -3071,9 +3316,17 @@ async fn settle_file(state: &AppState, job: &Job, input: &Path, lib_path: &str) 
             Settled::Placed(None) => changed = true,
             Settled::NotPlaced(_) => {}
             Settled::Unreachable { busy: true, .. } | Settled::Left => return FileSettled::Busy,
-            Settled::Unreachable { path, busy: false } => {
+            Settled::Unreachable {
+                path,
+                busy: false,
+                reason,
+            } => {
+                let reason = match reason {
+                    Some(reason) => reason,
+                    None => offline_reason(lib_path, &path).await,
+                };
                 return FileSettled::Unreachable {
-                    reason: offline_reason(lib_path, &path).await,
+                    reason,
                     check: Some(path),
                 };
             }
@@ -3133,10 +3386,11 @@ fn settle_waiting(state: &AppState) {
 /// left putting their new file in place (marked when that happened), and
 /// the jobs left `running` that may have been doing so: replacements, and
 /// in folder mode those at their last step (marked now). A folder that
-/// doesn't answer within a few seconds leaves its job marked: it is settled
-/// by the job itself when it runs again, or when its files are found (see
-/// [`settle`]). Runs before interrupted jobs are re-queued and before the
-/// search for leftovers. Returns how many were finished.
+/// doesn't answer within a few seconds, or can't tell (it answers with
+/// errors, or isn't there as it should be), leaves its job marked: it is
+/// settled by the job itself when it runs again, or when its files are
+/// found (see [`settle`]). Runs before interrupted jobs are re-queued and
+/// before the search for leftovers. Returns how many were finished.
 pub async fn complete_interrupted(state: &AppState) -> u64 {
     let pool = state.db.pool();
     let running = match db::jobs::interrupted(pool).await {
@@ -3188,20 +3442,18 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         .collect();
     let mut completed = 0;
     for m in &marked {
-        if shared.contains(&m.job.id) {
+        let settled = if shared.contains(&m.job.id) {
             tracing::warn!(job = %m.job.id, "two interrupted conversions aimed at one name; the original is kept");
-            let dirs = leftover_dirs(state, &m.job, m.final_path.as_deref()).await;
-            if recover_job_leftovers(state, m.job.id, &dirs).await.is_ok() {
-                clear_placing(state, m.job.id).await;
-            }
-            continue;
-        }
-        match settle(state, m.job.id, SettleBy::Startup, STARTUP_CHECK_TIMEOUT).await {
+            settle_unplaced(state, m.job.id, STARTUP_CHECK_TIMEOUT).await
+        } else {
+            settle(state, m.job.id, SettleBy::Startup, STARTUP_CHECK_TIMEOUT).await
+        };
+        match settled {
             Settled::Placed(_) => completed += 1,
             Settled::NotPlaced(_) => {}
             Settled::Unreachable { .. } | Settled::Left => tracing::info!(
                 job = %m.job.id,
-                "a folder didn't answer; the interrupted conversion is looked at again later"
+                "a folder didn't answer, or couldn't tell; the interrupted conversion is looked at again later"
             ),
         }
     }
@@ -3258,47 +3510,71 @@ fn recover_leftovers_boxed(
 
 /// Hand what a job left in `dirs` (its temp files, its backup of the
 /// original) to crash recovery: the backup is put back when the original's
-/// name is free. Returns the originals put back; an error when a folder
-/// didn't answer, or putting them back didn't end in time (the share
-/// stopped answering: a rename that started goes on by itself and only puts
-/// an original back).
+/// name is free. Returns the originals put back. A folder that isn't there
+/// holds nothing of the job's. [`Unsure`] when a folder didn't answer or
+/// answered with an error (nothing can be told from its contents), when
+/// putting them back didn't end in time (the share stopped answering: a
+/// rename that started goes on by itself and only puts an original back),
+/// or when something the job left couldn't be handled.
 async fn recover_job_leftovers(
     state: &AppState,
     job_id: Uuid,
     dirs: &[PathBuf],
-) -> Result<Vec<PathBuf>, NoAnswer> {
+) -> Result<Vec<PathBuf>, Unsure> {
     let mut found = Vec::new();
     for dir in dirs {
         let d = dir.clone();
         // One check per job and folder (see `fs_guard`).
         let key = dir.join(job_id.to_string());
         let listed = fs_guard::guarded("job_leftovers", &key, LEFTOVER_CHECK_TIMEOUT, move || {
-            std::fs::read_dir(&d)
-                .map(|rd| {
-                    rd.flatten()
-                        .filter(|e| {
-                            e.file_name()
-                                .to_str()
-                                .is_some_and(|n| chrysopoeia_core::paths::is_artifact_of(n, job_id))
-                        })
-                        .map(|e| e.path())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default()
+            let entries = match std::fs::read_dir(&d) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(e) => return Err(io_reason(&e)),
+            };
+            let mut mine = Vec::new();
+            for entry in entries {
+                // A folder whose listing breaks off can't tell what else is
+                // in it.
+                let entry = entry.map_err(|e| io_reason(&e))?;
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| chrysopoeia_core::paths::is_artifact_of(n, job_id))
+                {
+                    mine.push(entry.path());
+                }
+            }
+            Ok(mine)
         })
-        .await?;
-        found.extend(listed);
+        .await
+        .map_err(|e| Unsure::no_answer(e, dir))?;
+        found.extend(
+            listed.map_err(|reason| Unsure::problem(dir, unreadable_reason(dir, &reason)))?,
+        );
     }
     if found.is_empty() {
         return Ok(Vec::new());
     }
-    tokio::time::timeout(
+    let first = dirs.first().cloned().unwrap_or_default();
+    let recovered = tokio::time::timeout(
         LEFTOVER_CHECK_TIMEOUT,
         recover_leftovers_boxed(state, found, job_id),
     )
     .await
-    .map(|r| r.restored)
-    .map_err(|_| NoAnswer::NotAnswering)
+    .map_err(|_| Unsure::no_answer(NoAnswer::NotAnswering, &first))?;
+    if let Some(failed) = recovered.failed.first() {
+        let folder = failed.parent().unwrap_or(first.as_path());
+        return Err(Unsure::problem(
+            folder,
+            format!(
+                "Chrysopoeia couldn't put back what an interrupted conversion left in the folder \
+                 {}. If it's on a drive or network share, check that it's connected.",
+                folder.display()
+            ),
+        ));
+    }
+    Ok(recovered.restored)
 }
 
 /// Stop starting jobs, cancel the running ones (they go back to the queue)

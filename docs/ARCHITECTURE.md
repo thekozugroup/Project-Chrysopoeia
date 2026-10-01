@@ -255,7 +255,11 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   the server stopped is scanned again at start. Removed files are deleted
   from the DB (their jobs cascade), except below folders the walk couldn't
   read or left alone, and never when a library that had files walks empty
-  (an unmounted share). A file that is still on disk is never removed.
+  (an unmounted share). A file that is still on disk is never removed. A
+  folder whose listing fails part way counts as not read (its files
+  stay), and a file whose probe failed is recorded as unreadable only when
+  a look at it then answers: one that is gone, doesn't answer, or answers
+  with an error (a share answering with errors) is left to the next scan.
 - Drives and shares mounted inside a library folder: each scan reads the
   mount points under the library from `/proc/self/mountinfo` and remembers
   them (`library_mounts`). One that is no longer mounted and whose folder is
@@ -312,8 +316,12 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   place → recorded `done` (note: "Chrysopoeia stopped just as the new file
   was being put in place. The new file was already complete, so it was
   kept") and the backup removed; not in place → the original put back and
-  the job's temp files gone. A folder that doesn't answer within 10 s
-  leaves its job marked: the job settles itself when it runs again (before
+  the job's temp files gone. Only an answer settles a job: a folder that
+  doesn't answer within 10 s, answers with an error (a soft-mounted share
+  that timed out, a FUSE share whose server stopped), or isn't there as it
+  should be (its library folder missing or empty, a share mounted in the
+  library disconnected) leaves its job marked and touches nothing: the job
+  settles itself when it runs again (before
   it does anything with its file), a job that can't run again is settled
   every 15 s in the background, and a search for leftovers that finds its
   files settles it first. Two marked jobs aiming at one name can't be told
@@ -421,8 +429,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Claim: the `queued` job with the highest priority, then oldest, of an
   enabled library; marked running in the same transaction.
 - Jobs of a library whose folder is offline (missing, unreadable or empty)
-  wait, and the folder is checked again every 15 s; a job whose file changed
-  moments ago waits for it to settle.
+  wait, and the folder is checked again every 15 s (with what stopped
+  answering in it, if that was something else: "not found" is an answer,
+  an error is not, so a share that answers with errors stays offline); a
+  job whose file changed moments ago waits for it to settle.
 - **A share that stops answering** (an NFS hard mount whose server went
   away, a stuck FUSE mount) never holds a slot for good, whenever it stops:
   every look at a library, work or output path on a job's way is bounded,
@@ -463,13 +473,23 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   comes while one is running waits for its answer, up to its own timeout).
   Checks are counted by the mount they are on: the longest mount point
   above the path in `/proc/self/mountinfo` (read without touching the
-  share, again every 30 s in the background; without it, the path's first
-  two folders). At most 8 run at once on one mount
-  (`MAX_STUCK_PER_MOUNT`): a check of a mount whose 8 are all stuck (each
-  past its caller's timeout) answers "not responding" at once, without a
-  thread (so does one that would wait for a stuck check of the same
-  thing), and while they are not all stuck yet it waits for room up to its
-  timeout. At most 128 run at once in all (`MAX_STUCK_CHECKS`, room for 16
+  share; read again in the background every 30 s, and at most once a
+  second whenever a check gets no answer in time or finds no room on its
+  mount; without it, the path's first two folders). When the list changes,
+  the checks running are counted by it from then on: a share mounted since
+  the list was read, whose checks got stuck while they were counted with
+  the mount above it, gives that mount its room back. At most 8 run at once
+  on one mount (`MAX_STUCK_PER_MOUNT`): once 8 there are stuck (each past
+  its caller's timeout), a check of anything in the folder they have in
+  common answers "not responding" at once, without a thread (so does one
+  that would wait for a stuck check of the same thing); a check of a full
+  mount waits for room up to its timeout, except one away from the folder
+  its slow checks (stuck, or running for 2 s) have in common, which may
+  take room beyond the 8, up to 16: what is slow there is then most likely
+  another share counted with this mount (one mounted since the list was
+  read, or reached through a link), and must not stop the rest of the
+  mount, a healthy library on it say, for as long as that share hangs.
+  At most 128 run at once in all (`MAX_STUCK_CHECKS`, room for 16
   hung shares, well below the runtime's 512 blocking threads); a check
   that finds no room (after waiting up to its timeout) is
   `NoAnswer::Busy`: unknown, never "not responding". A library whose
@@ -480,9 +500,11 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   waiting for other folders that stopped answering, so it couldn't open
   this one right now. Try again in a moment."), and the watch over a long
   step ignores such checks. A hung share therefore costs at most 8
-  threads, however many of its folders are looked at and however often,
-  and never the checks of other mounts (a share reached through a link
-  from another mount is counted with that mount).
+  threads (16 when the checks stuck on it are all in one of its folders
+  and others are looked at too), however many of its folders are looked
+  at and however often, and never the checks of other mounts; a share
+  counted with another mount (reached through a link, or mounted since the
+  list was read) holds up only its own folders there.
   Reserving disk space looks at the disks without holding the reservations'
   lock, so a disk that hangs holds up no other job's reservation.
 - A job that runs out of disk space (`disk_full`) while other jobs are
@@ -837,7 +859,29 @@ had and no other finished job claiming it. Two marked jobs aiming at one
 name can't be told apart: neither is taken as done, and both originals go
 back. A job in the queue whose earlier run wasn't marked (an older
 version) is looked at the same way when it runs, by the backup its
-earlier run would have left. While a job is marked, its destination counts
+earlier run would have left.
+
+Only an answer settles a job, since a mark cleared without its backup
+put back lets the next search for leftovers put that backup back next to a
+new file that is in place (the job then fails on the name, or, for the
+same name, is skipped as already converted and its record lost). "Not
+found" is an answer; every other look gives none and leaves the job
+marked with nothing touched (`Settled::Unreachable`, looked at again as
+for a folder that doesn't answer): an error other than "not found" (a
+soft-mounted share that timed out answers "read or write error", a FUSE
+share whose server stopped "not connected"; `finalize::Unreadable`), a
+folder whose listing fails, a leftover that couldn't be put back or
+removed, and a database that couldn't be read. "Not in place" also needs
+the job's folders to be there as they should be, since an unmounted share
+leaves an empty folder, or none, where nothing is found: the library
+folder answers, can be read and isn't empty, no drive or share known to
+be mounted in the library above the file is disconnected, and in folder
+mode the output folder answers and can be read. A job that settles itself
+then waits with its library offline, its reason the library's own
+problem or "Chrysopoeia can't read the folder … because the disk reported
+a read or write error. If it's on a drive or network share, check that
+it's connected."; the check every 15 s keeps it so while the share
+answers with errors. While a job is marked, its destination counts
 as taken (another file's job aiming at it fails before encoding, as for a
 running one), a scan never removes its file from the list, and history
 trimming keeps it.
@@ -873,7 +917,9 @@ it" ("Left out 2 cover images because WebM can't hold them"). After a crash,
 `resume_replace(input, final_path, job_id)` reports `Placed` when the job's
 backup exists and the new file is in place — the original's name taken
 again (same path) or free with the new name present (new extension) — else
-`NotPlaced`; it only looks (it may be asked again), and
+`NotPlaced` (only when every look answered: an error other than "not
+found" is a `finalize::Unreadable`, never `NotPlaced`); it only looks (it
+may be asked again), and
 `remove_backup(input, job_id)` then removes the backup. `recover_artifact`: temp and staged files
 are deleted; a backup is renamed back when the original is missing, deleted
 otherwise. A failure to put the new file in place is a
