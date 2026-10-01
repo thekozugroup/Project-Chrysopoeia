@@ -253,3 +253,181 @@ async fn large_library_is_scanned_in_batches() {
     app.rescan(lib["id"].as_str().unwrap()).await;
     assert_eq!(app.fake.probes.load(Ordering::SeqCst), probes);
 }
+
+/// Leftovers of interrupted conversions in a library: a temp file left in a
+/// folder renamed while its file was converted is removed by the next scan,
+/// and an original a crash left moved aside is put back and stays listed.
+/// The files of a job that is running are left alone.
+#[tokio::test]
+async fn scans_clean_up_leftovers_of_interrupted_conversions() {
+    use chrysopoeia_core::paths::{backup_file_name, temp_file_name};
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.write("Movies/Show (2020)/a.mkv", h264());
+    app.write("Movies/b.mkv", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    let id = lib["id"].as_str().unwrap().to_string();
+    let movies = std::fs::canonicalize(app.media.join("Movies")).unwrap();
+    let stray = movies
+        .join("Show (2020)")
+        .join(temp_file_name("a", uuid::Uuid::new_v4(), "mkv"));
+    std::fs::write(&stray, "most of an encode").unwrap();
+    let b = movies.join("b.mkv");
+    let backup = movies.join(backup_file_name("b.mkv", uuid::Uuid::new_v4()));
+    std::fs::rename(&b, &backup).unwrap();
+
+    app.rescan(&id).await;
+    assert!(!stray.exists(), "the stray temp file was removed");
+    assert!(b.exists(), "the original was put back");
+    assert!(!backup.exists());
+    let files = app.files_by_name(&id).await;
+    assert!(files.contains_key("b.mkv"), "{files:#?}");
+    let act = app.get("/api/activity").await;
+    assert!(act.text.contains("Restored"), "{}", act.text);
+    assert!(!crate::state::lock(&app.state.leftovers).due());
+
+    // A running job's temp file is its own.
+    app.fake.set_behavior("b.mkv", Behavior::Hold);
+    app.post(
+        "/api/files/bulk",
+        json!({ "action": "queue", "library": id }),
+    )
+    .await;
+    app.resume().await;
+    let state = app.state.clone();
+    wait_until("the job runs", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_count() == 1 }
+    })
+    .await;
+    let job_id = app.state.dispatcher.running_ids()[0];
+    let own = movies.join(temp_file_name("b", job_id, "mkv"));
+    std::fs::write(&own, "being written").unwrap();
+    app.rescan(&id).await;
+    assert!(own.exists(), "a running job's temp file was left alone");
+    app.fake.release.add_permits(1);
+    app.wait_queue_idle().await;
+}
+
+/// A drive mounted inside a library that is unmounted leaves an empty
+/// folder behind. Its files used to be removed from the list, "Skipped by
+/// you" included, and converted as new ones once the drive was back (even
+/// after a restart). They stay listed, with their state, now.
+#[tokio::test]
+async fn files_of_an_unmounted_drive_inside_a_library_are_kept() {
+    use crate::services::library::mounts::fake;
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.write("Movies/a.mkv", h264());
+    app.write("Movies/USB/keep_me.mkv", h264());
+    let usb = std::fs::canonicalize(app.media.join("Movies/USB")).unwrap();
+    fake::mount(&usb);
+    let lib = app.add_library("Movies", json!({})).await;
+    let id = lib["id"].as_str().unwrap().to_string();
+    let files = app.files_by_name(&id).await;
+    let keep = files["keep_me.mkv"]["id"].as_str().unwrap().to_string();
+    let r = app.post_empty(&format!("/api/files/{keep}/skip")).await;
+    assert_eq!(r.status, axum::http::StatusCode::OK, "{}", r.text);
+
+    // Unmounted: the folder is left empty.
+    fake::unmount(&usb);
+    let away = app.dir.path().join("usb-away.mkv");
+    std::fs::rename(usb.join("keep_me.mkv"), &away).unwrap();
+    app.rescan(&id).await;
+    let files = app.files_by_name(&id).await;
+    assert_eq!(files["keep_me.mkv"]["status"], "skipped", "{files:#?}");
+    let act = app.get("/api/activity").await;
+    assert!(act.text.contains("isn't connected"), "{}", act.text);
+
+    // Still known after a restart; the drive comes back.
+    let dir = app.stop().await;
+    let app = TestApp::start(TestOptions {
+        dir: Some(dir),
+        ..TestOptions::default()
+    })
+    .await;
+    app.pause().await;
+    // The start-up scan.
+    let fake_c = app.fake.clone();
+    wait_until("the catch-up scan", move || {
+        let fake = fake_c.clone();
+        async move { !fake.walks.lock().unwrap().is_empty() }
+    })
+    .await;
+    app.wait_scan(&id).await;
+    app.rescan(&id).await;
+    assert_eq!(
+        app.files_by_name(&id).await["keep_me.mkv"]["status"],
+        "skipped"
+    );
+    std::fs::rename(&away, usb.join("keep_me.mkv")).unwrap();
+    fake::mount(&usb);
+    app.rescan(&id).await;
+    let files = app.files_by_name(&id).await;
+    assert_eq!(files["keep_me.mkv"]["status"], "skipped", "{files:#?}");
+    let queued = app.get("/api/jobs?state=queued").await;
+    assert!(!queued.text.contains("keep_me.mkv"), "{}", queued.text);
+
+    // A folder that was never a mount loses its files as before.
+    fake::unmount(&usb);
+    std::fs::remove_file(app.media.join("Movies/a.mkv")).unwrap();
+    app.rescan(&id).await;
+    assert!(!app.files_by_name(&id).await.contains_key("a.mkv"));
+}
+
+/// A folder renamed while one of its files was being converted: the
+/// converter goes on writing into the folder's new place and then finds no
+/// new file at the old path. The temp file left there is removed once the
+/// job ends, even with folder watching off; other jobs' files stay.
+#[tokio::test]
+async fn a_moved_files_temp_file_is_removed_when_its_job_ends() {
+    use chrysopoeia_core::paths::temp_file_name;
+    let app = TestApp::new().await;
+    app.pause().await;
+    let r = app
+        .patch("/api/settings", json!({ "watch_folders": false }))
+        .await;
+    assert_eq!(r.status, axum::http::StatusCode::OK, "{}", r.text);
+    app.write("Movies/Show/ep.mkv", h264());
+    app.write("Movies/other.mkv", h264());
+    app.add_library("Movies", json!({})).await;
+    let job = app.get("/api/jobs?state=queued").await.json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["file_name"] == "ep.mkv")
+        .unwrap()
+        .clone();
+    let job_id: uuid::Uuid = job["id"].as_str().unwrap().parse().unwrap();
+    let movies = std::fs::canonicalize(app.media.join("Movies")).unwrap();
+    app.fake.set_behavior(
+        "ep.mkv",
+        Behavior::HoldFail("finished without writing a new file".into()),
+    );
+    app.resume().await;
+    let state = app.state.clone();
+    wait_until("the job runs", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_ids().contains(&job_id) }
+    })
+    .await;
+    // Renamed during the encode: the temp file is in the folder's new place.
+    std::fs::rename(movies.join("Show"), movies.join("Show (2020)")).unwrap();
+    let stray = movies
+        .join("Show (2020)")
+        .join(temp_file_name("ep", job_id, "mkv"));
+    std::fs::write(&stray, "most of an encode").unwrap();
+    let other = movies
+        .join("Show (2020)")
+        .join(temp_file_name("ep", uuid::Uuid::new_v4(), "mkv"));
+    std::fs::write(&other, "another job's").unwrap();
+    app.fake.release.add_permits(1);
+    app.wait_queue_idle().await;
+    wait_until("the stray temp file is removed", || async {
+        !stray.exists()
+    })
+    .await;
+    assert!(other.exists(), "only that job's files");
+    let j = app.get(&format!("/api/jobs/{job_id}")).await;
+    assert_eq!(j.json["problem"], "source_changed", "{}", j.json);
+}

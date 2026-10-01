@@ -35,6 +35,21 @@ async fn health_and_json_errors() {
     let r = app.get("/api/libraries/not-a-uuid").await;
     assert_eq!(r.status, StatusCode::BAD_REQUEST);
     assert_eq!(r.json["code"], "invalid_path_param");
+    // In plain words, without the parser's own text.
+    let error = r.json["error"].as_str().unwrap();
+    assert!(
+        error.starts_with("\"not-a-uuid\" isn't a valid id."),
+        "{error}"
+    );
+    let r = app.get("/api/files/not-a-uuid").await;
+    assert!(!r.text.contains("UUID parsing failed"), "{}", r.text);
+    let r = app.get("/api/files?offset=-1").await;
+    assert_eq!(r.json["code"], "invalid_query");
+    assert_eq!(r.json["field"], "offset");
+    assert_eq!(
+        r.json["error"],
+        "The value of \"offset\" isn't valid. It must be a whole number, 0 or more."
+    );
 }
 
 #[tokio::test]

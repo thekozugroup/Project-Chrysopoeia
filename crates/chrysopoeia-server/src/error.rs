@@ -197,6 +197,13 @@ pub fn describe_value_error(field: Option<&str>, serde_message: &str) -> String 
     } else if msg.starts_with("missing field ") {
         let name = quoted(msg).into_iter().next().unwrap_or_default();
         format!("\"{name}\" is missing.")
+    } else if msg.starts_with("invalid digit") || msg.starts_with("cannot parse integer") {
+        // A number in the address (`?offset=-1`) that isn't a count.
+        "It must be a whole number, 0 or more.".to_string()
+    } else if msg.starts_with("number too large") {
+        "It's too large.".to_string()
+    } else if msg.starts_with("invalid float literal") {
+        "It must be a number.".to_string()
     } else if msg.starts_with("invalid type") || msg.starts_with("invalid value") {
         let expected = msg.rsplit_once("expected ").map_or("", |(_, e)| e);
         match expected {
@@ -275,25 +282,78 @@ impl From<JsonRejection> for ApiError {
 
 impl From<QueryRejection> for ApiError {
     fn from(rej: QueryRejection) -> Self {
-        Self::bad_request(
-            "invalid_query",
-            format!(
-                "The query string isn't valid ({}).",
-                rejection_detail(&rej.body_text())
+        // Plain words, naming the parameter; never the parser's own text.
+        let detail = rejection_detail(&rej.body_text());
+        match field_of(&detail) {
+            Some(field) => {
+                let serde_message = detail.split_once(": ").map_or(detail.as_str(), |(_, m)| m);
+                let message = describe_value_error(Some(&field), serde_message).replacen(
+                    "The value for",
+                    "The value of",
+                    1,
+                );
+                Self::bad_request("invalid_query", message).with_field(field)
+            }
+            None => Self::bad_request(
+                "invalid_query",
+                "Something after the ? in the address isn't valid. Check the names and values \
+                 there.",
             ),
-        )
+        }
     }
 }
 
 impl From<PathRejection> for ApiError {
     fn from(rej: PathRejection) -> Self {
-        Self::bad_request(
-            "invalid_path_param",
-            format!(
-                "The address isn't valid ({}).",
-                rejection_detail(&rej.body_text())
-            ),
+        use axum::extract::path::ErrorKind;
+        let message = match &rej {
+            PathRejection::FailedToDeserializePathParams(e) => match e.kind() {
+                ErrorKind::ParseErrorAtKey {
+                    key,
+                    value,
+                    expected_type,
+                } => path_value_problem(value, key == "id" || expected_type.contains("Uuid")),
+                ErrorKind::ParseErrorAtIndex {
+                    value,
+                    expected_type,
+                    ..
+                }
+                | ErrorKind::ParseError {
+                    value,
+                    expected_type,
+                } => path_value_problem(value, expected_type.contains("Uuid")),
+                ErrorKind::DeserializeError {
+                    key,
+                    value,
+                    message,
+                } => path_value_problem(value, key == "id" || message.contains("UUID")),
+                ErrorKind::InvalidUtf8InPathParam { .. } => {
+                    "This address has characters in it that aren't valid text.".to_string()
+                }
+                _ => "This address isn't valid.".to_string(),
+            },
+            _ => "This address isn't valid.".to_string(),
+        };
+        Self::bad_request("invalid_path_param", message)
+    }
+}
+
+/// Why a value in the address isn't valid, in plain words. `id`: the value
+/// should have been an id (every id in the API is a UUID).
+fn path_value_problem(value: &str, id: bool) -> String {
+    const SHOWN: usize = 60;
+    let shown: String = if value.chars().count() > SHOWN {
+        format!("{}…", value.chars().take(SHOWN).collect::<String>())
+    } else {
+        value.to_string()
+    };
+    if id {
+        format!(
+            "\"{shown}\" isn't a valid id. Ids look like 0b2f6c1e-5d0a-4c4e-9a53-2f1d7c0e8b41; use \
+             one from another answer of this API."
         )
+    } else {
+        format!("\"{shown}\" isn't valid in this address.")
     }
 }
 
@@ -388,6 +448,58 @@ mod tests {
         assert_eq!(
             describe_value_error(None, "something odd"),
             "A value isn't valid."
+        );
+    }
+
+    /// Rejections of the address or its query string say what is wrong in
+    /// plain words, never with the parser's own text.
+    #[tokio::test]
+    async fn address_errors_are_plain() {
+        use axum::extract::{FromRequestParts as _, Query};
+
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Page {
+            offset: Option<u32>,
+            limit: Option<u32>,
+        }
+        let query = |q: &str| {
+            let req = axum::http::Request::builder()
+                .uri(format!("/x?{q}"))
+                .body(())
+                .unwrap();
+            let (mut parts, ()) = req.into_parts();
+            async move {
+                ApiError::from(
+                    Query::<Page>::from_request_parts(&mut parts, &())
+                        .await
+                        .unwrap_err(),
+                )
+            }
+        };
+        let e = query("offset=-1").await;
+        assert_eq!(e.code, "invalid_query");
+        assert_eq!(
+            e.message,
+            "The value of \"offset\" isn't valid. It must be a whole number, 0 or more."
+        );
+        assert_eq!(e.field.as_deref(), Some("offset"));
+        let e = query("limit=abc").await;
+        assert_eq!(
+            e.message,
+            "The value of \"limit\" isn't valid. It must be a whole number, 0 or more."
+        );
+        let e = query("limit=99999999999").await;
+        assert!(e.message.ends_with("It's too large."), "{}", e.message);
+
+        assert_eq!(
+            path_value_problem("not-a-uuid", true),
+            "\"not-a-uuid\" isn't a valid id. Ids look like \
+             0b2f6c1e-5d0a-4c4e-9a53-2f1d7c0e8b41; use one from another answer of this API."
+        );
+        assert_eq!(
+            path_value_problem(&"x".repeat(100), false),
+            format!("\"{}…\" isn't valid in this address.", "x".repeat(60))
         );
     }
 

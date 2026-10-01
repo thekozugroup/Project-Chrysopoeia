@@ -148,10 +148,6 @@ impl AudioCodec {
         }
     }
 
-    pub fn is_lossless(self) -> bool {
-        matches!(self, Self::Flac)
-    }
-
     /// Maximum channels the encoder accepts; sources with more are downmixed.
     /// ffmpeg's E-AC-3 encoder stops at 5.1 even though the format allows 7.1.
     pub fn max_channels(self) -> u32 {
@@ -396,15 +392,6 @@ impl Container {
     /// Only Matroska carries attachments (fonts for styled subtitles).
     pub fn supports_attachments(self) -> bool {
         matches!(self, Self::Mkv)
-    }
-
-    pub fn from_extension(ext: &str) -> Option<Self> {
-        match ext.to_ascii_lowercase().as_str() {
-            "mkv" => Some(Self::Mkv),
-            "mp4" | "m4v" => Some(Self::Mp4),
-            "webm" => Some(Self::Webm),
-            _ => None,
-        }
     }
 }
 

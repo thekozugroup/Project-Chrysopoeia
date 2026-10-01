@@ -443,3 +443,69 @@ fn forced_decisions_skip_only_what_cannot_be_converted() {
         Decision::Skip { .. }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// What replacing the original would lose
+
+#[test]
+fn replacing_would_lose_picture_subtitles_and_fonts_only_outside_mkv() {
+    use chrysopoeia_core::{Goal, TranscodeProfile};
+    use chrysopoeia_worker::replace_loss;
+    let anime = probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            audio(1, "aac", 2, 48_000, Some("jpn")),
+            subtitle(2, "ass", Some("eng")),
+            subtitle(3, "hdmv_pgs_subtitle", Some("eng")),
+            subtitle(4, "hdmv_pgs_subtitle", Some("ger")),
+            subtitle(5, "dvb_teletext", Some("eng")),
+            attachment(6),
+        ],
+    );
+    let compatible = TranscodeProfile::from_goal(Goal::Compatible);
+    assert_eq!(
+        replace_loss(&anime, &compatible).as_deref(),
+        Some(
+            "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font, so it \
+             was left unchanged. To convert it, choose an MKV goal or save converted files to a \
+             separate folder; Convert anyway converts it without them"
+        )
+    );
+    // MKV keeps everything it can hold (teletext was never kept).
+    assert_eq!(
+        replace_loss(&anime, &TranscodeProfile::from_goal(Goal::Balanced)),
+        None
+    );
+    // Tracks the profile leaves out anyway are not a loss.
+    let mut english = compatible.clone();
+    english.subtitle_languages = vec!["eng".into()];
+    assert!(
+        replace_loss(&anime, &english)
+            .unwrap()
+            .contains("1 picture-based subtitle and 1 subtitle font,")
+    );
+    let mut no_subs = compatible.clone();
+    no_subs.subtitles = chrysopoeia_core::SubtitlePolicy::Drop;
+    assert_eq!(replace_loss(&anime, &no_subs), None);
+
+    // Text subtitles become MP4 text; an attached cover picture is still lost.
+    let plain = probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            subtitle(1, "subrip", Some("eng")),
+            subtitle(2, "ass", None),
+        ],
+    );
+    assert_eq!(replace_loss(&plain, &compatible), None);
+    let mut cover = attachment(3);
+    cover.codec = "mjpeg".into();
+    let mut with_cover = plain.clone();
+    with_cover.streams.push(cover);
+    assert!(
+        replace_loss(&with_cover, &no_subs)
+            .unwrap()
+            .starts_with("MP4 can't hold this file's 1 attached file,")
+    );
+}

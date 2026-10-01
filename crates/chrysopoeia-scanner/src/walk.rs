@@ -249,7 +249,7 @@ impl IgnoreRules {
             tracing::debug!("the ignore patterns could not be combined: {error}");
             invalid.push(
                 "The ignore patterns couldn't be used together, so none were used. Check them in \
-                 Settings > Advanced"
+                 Settings › Advanced"
                     .to_string(),
             );
             GlobSet::empty()

@@ -530,10 +530,6 @@ impl MediaToolkit for Arc<FakeToolkit> {
         hardware.chain(software).collect()
     }
 
-    fn is_media_path(&self, path: &Path) -> bool {
-        is_media(path)
-    }
-
     fn walk_library(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
         self.walks.lock().unwrap().push(root.to_path_buf());
         let result = walk(root, opts);
@@ -823,7 +819,7 @@ impl TestApp {
         let state = self.state.clone();
         wait_until("startup", move || {
             let state = state.clone();
-            async move { state.hardware.is_ready() }
+            async move { state.hardware.is_ready() && state.dispatcher.is_ready() }
         })
         .await;
     }

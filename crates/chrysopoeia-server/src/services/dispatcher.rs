@@ -38,6 +38,7 @@ use crate::db::files::{MISSING_INPUT_ERROR, ReplacedFile, missing_input_error};
 use crate::db::jobs::{InterruptedJob, JobFinish};
 use crate::db::{self};
 use crate::format;
+use crate::services::fs_guard;
 use crate::services::library::{
     self, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, probe_problem, still_settling,
 };
@@ -59,6 +60,16 @@ const OUTCOME_HARD_ATTEMPTS: u32 = 5;
 const OUTCOME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Minimum time between progress writes to the database, per job.
 const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
+/// How long the file a job starts on may take to answer before its library
+/// counts as offline. Generous: an array disk that has to spin up first
+/// takes several seconds.
+const INPUT_CHECK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
+/// How long a folder may take to list a job's leftovers.
+const LEFTOVER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard upper bound on concurrent jobs.
 pub const MAX_JOBS_LIMIT: u32 = 32;
 
@@ -112,6 +123,9 @@ pub struct DispatcherHandle {
     hardware_wait: std::sync::Mutex<HashSet<Uuid>>,
     /// Whether the feed already says that conversions wait for a busy GPU.
     hardware_wait_announced: AtomicBool,
+    /// Jobs put back once after the disk filled up while other jobs were
+    /// writing to it too (see [`space_was_shared`]).
+    disk_retried: std::sync::Mutex<HashSet<Uuid>>,
 }
 
 impl DispatcherHandle {
@@ -127,6 +141,7 @@ impl DispatcherHandle {
             deferred: std::sync::Mutex::new(HashMap::new()),
             hardware_wait: std::sync::Mutex::new(HashSet::new()),
             hardware_wait_announced: AtomicBool::new(false),
+            disk_retried: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -231,9 +246,9 @@ impl DispatcherHandle {
         lock(&self.running).values().filter(|j| j.software).count()
     }
 
-    /// Whether a job is running.
-    pub fn is_running(&self, job_id: Uuid) -> bool {
-        lock(&self.running).contains_key(&job_id)
+    /// The jobs running right now.
+    pub fn running_ids(&self) -> Vec<Uuid> {
+        lock(&self.running).keys().copied().collect()
     }
 
     /// Cancel a running job. Returns false when it isn't running.
@@ -551,11 +566,28 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         tracing::debug!(job = %job.id, file = %job.file_path, "job started");
 
         let (disposition, ctx) = execute(&state, &job, cancel).await;
+        let disposition = space_was_shared(&state, &job, disposition);
         let intent = guard.intent();
+        // A file moved during its conversion (a folder renamed by Sonarr or
+        // Radarr, say) leaves the temp file written next to it in the
+        // folder's new place, where this job can't find it (the converter
+        // then reports the new file missing): once the job has ended, the
+        // library is searched for this job's leftovers.
+        let may_have_left_files = matches!(
+            &disposition,
+            Disposition::Finished(JobOutcome::Failed { .. })
+        ) && ctx.worker_ran
+            && run_config(&state, &state.settings()).temp_dir.is_none();
         // The slot stays taken until the result is recorded.
         record(&state, &job, disposition, intent, &ctx).await;
         // Free the slot before announcing, so the queue state is current.
         drop(guard);
+        if may_have_left_files && !state.shutdown.is_cancelled() && input_vanished(&ctx).await {
+            let (state, library_id, job_id) = (state.clone(), job.library_id, job.id);
+            tokio::spawn(async move {
+                library::sweep_job_leftovers(&state, library_id, job_id).await;
+            });
+        }
         state.broadcast_job(job.id).await;
         state.broadcast_file(job.file_id).await;
         state.broadcast_library(job.library_id).await;
@@ -575,6 +607,36 @@ fn start_job(state: &AppState, job: Job, software: bool) {
     });
 }
 
+/// How long a job put back after running out of disk space waits before
+/// it may start again.
+const DISK_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(60)
+};
+
+/// A job that ran out of disk space while other jobs were writing to the
+/// same disks may well fit alone: put it back once (the space reservation
+/// then makes it wait its turn) instead of failing it for good.
+fn space_was_shared(state: &AppState, job: &Job, disposition: Disposition) -> Disposition {
+    let full = matches!(
+        &disposition,
+        Disposition::Finished(JobOutcome::Failed {
+            problem: ProblemKind::DiskFull,
+            ..
+        })
+    );
+    // This job still counts as running.
+    if full
+        && state.dispatcher.running_count() > 1
+        && !state.shutdown.is_cancelled()
+        && lock(&state.dispatcher.disk_retried).insert(job.id)
+    {
+        return Disposition::Requeue(Requeue::DiskShared);
+    }
+    disposition
+}
+
 /// What `apply_outcome` needs to know about how the job ran.
 #[derive(Debug, Clone)]
 struct ExecContext {
@@ -582,6 +644,11 @@ struct ExecContext {
     library_root: Option<PathBuf>,
     library_name: Option<String>,
     output_mode: OutputMode,
+    /// The worker ran (so it may have written a temp file).
+    worker_ran: bool,
+    /// The original has other hard links and is being replaced: its data
+    /// stays on disk through them, so the conversion saves no space.
+    shared_original: bool,
 }
 
 impl ExecContext {
@@ -599,6 +666,8 @@ impl ExecContext {
 enum Requeue {
     /// The library folder can't be reached (the reason says why).
     LibraryOffline(String),
+    /// The disk filled up while other jobs were writing to it too.
+    DiskShared,
     /// The file changed moments ago and may still be being copied.
     Settling,
     /// The file needs the GPU chosen in Settings, CPU fallback is off, and
@@ -671,6 +740,8 @@ async fn execute(
         library_root: None,
         library_name: None,
         output_mode: settings.output_mode,
+        worker_ran: false,
+        shared_original: false,
     };
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
@@ -708,20 +779,53 @@ async fn execute(
     ctx.library_name = Some(lib.name.clone());
 
     let input = PathBuf::from(&file.path);
-    let meta = match tokio::fs::metadata(&input).await {
-        Ok(m) if m.is_file() => m,
-        _ => {
-            // A whole library missing is a disconnected drive or share, not
-            // a deleted file: wait for it instead of failing every job.
-            if let Some(reason) = library::root_unavailable(&lib.path).await {
+    let mut restored = false;
+    let meta = loop {
+        // A share that stopped answering would keep this job (and its slot)
+        // "preparing" forever, and deaf to Cancel and Stop.
+        let looked = tokio::select! {
+            m = fs_guard::metadata(&input, INPUT_CHECK_TIMEOUT) => m,
+            () = cancel.cancelled() => return done(JobOutcome::Cancelled, ctx),
+        };
+        match looked {
+            None => {
+                let reason = library::root_unavailable(&lib.path)
+                    .await
+                    .unwrap_or_else(|| library::not_responding(&lib.path));
                 return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
             }
-            return done(
-                failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
-                ctx,
-            );
+            Some(Ok(m)) if m.is_file() => break m,
+            Some(_) => {
+                // A whole library missing is a disconnected drive or share,
+                // not a deleted file: wait for it instead of failing every
+                // job.
+                if let Some(reason) = library::root_unavailable(&lib.path).await {
+                    return (Disposition::Requeue(Requeue::LibraryOffline(reason)), ctx);
+                }
+                // This job's own earlier run may have left the original
+                // moved aside when the server stopped (its folder was out of
+                // reach at the start): put it back and go on.
+                if !restored
+                    && let Some(dir) = input.parent()
+                    && recover_job_leftovers(state, job.id, &[dir.to_path_buf()])
+                        .await
+                        .contains(&input)
+                {
+                    restored = true;
+                    continue;
+                }
+                return done(
+                    failed(ProblemKind::SourceChanged, missing_input_error(&file.path)),
+                    ctx,
+                );
+            }
         }
     };
+    #[cfg(unix)]
+    {
+        ctx.shared_original = ctx.output_mode == OutputMode::Replace
+            && std::os::unix::fs::MetadataExt::nlink(&meta) > 1;
+    }
     let modified: DateTime<Utc> = meta
         .modified()
         .map(DateTime::<Utc>::from)
@@ -779,7 +883,7 @@ async fn execute(
     // fail for their own reason) as usual.
     let preference_problem = hw
         .as_deref()
-        .filter(|_| would_convert(state, &probe, &lib.profile, job.force))
+        .filter(|_| would_convert(state, &probe, &lib.profile, job.force, settings.output_mode))
         .and_then(|hw| {
             let codec = Some(lib.profile.video_codec);
             chrysopoeia_hwdetect::preference_problem(hw, settings.hardware, codec).map(|problem| {
@@ -836,6 +940,7 @@ async fn execute(
 
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
     let forwarder = tokio::spawn(forward_progress(state.clone(), rx));
+    ctx.worker_ran = true;
     let outcome = match state.toolkit.run_job(cfg, spec, tx, cancel).await {
         Ok(outcome) => outcome,
         Err(_) => failed(
@@ -890,13 +995,15 @@ async fn execute(
 
 /// Whether the worker would convert this file (so it needs an encoder): the
 /// decision the worker makes before its first attempt, including "Convert
-/// anyway". A decision that can't be made counts as converting; the worker
-/// reports the problem.
+/// anyway" and leaving alone a file whose replacement couldn't hold all its
+/// subtitles or attachments. A decision that can't be made counts as
+/// converting; the worker reports the problem.
 fn would_convert(
     state: &AppState,
     probe: &chrysopoeia_core::ProbeInfo,
     profile: &chrysopoeia_core::TranscodeProfile,
     force: bool,
+    output_mode: OutputMode,
 ) -> bool {
     match state.toolkit.decide(probe, profile) {
         Ok(Decision::Skip { .. }) if force => matches!(
@@ -904,7 +1011,12 @@ fn would_convert(
             Decision::Transcode
         ),
         Ok(Decision::Skip { .. }) => false,
-        Ok(Decision::Transcode) | Err(_) => true,
+        Ok(Decision::Transcode) => {
+            force
+                || output_mode != OutputMode::Replace
+                || chrysopoeia_worker::replace_loss(probe, profile).is_none()
+        }
+        Err(_) => true,
     }
 }
 
@@ -1075,6 +1187,12 @@ async fn apply_requeue(
                 .defer(job.id, Instant::now() + state.config.settle);
             false
         }
+        Requeue::DiskShared => {
+            state
+                .dispatcher
+                .defer(job.id, Instant::now() + DISK_RETRY_DELAY);
+            false
+        }
         Requeue::HardwareBusy(_) => {
             state.dispatcher.wait_for_hardware(job.library_id);
             // Check again in a few minutes for as long as jobs wait.
@@ -1104,6 +1222,14 @@ async fn apply_requeue(
         Requeue::LibraryOffline(_) => {}
         Requeue::Settling => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
+        }
+        Requeue::DiskShared => {
+            tracing::info!(
+                job = %job.id,
+                "{} ran out of disk space while other conversions were running; it will be \
+                 tried again on its own",
+                crate::log_text(&job.file_name)
+            );
         }
         Requeue::HardwareBusy(problem) => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the chosen GPU");
@@ -1237,7 +1363,13 @@ async fn apply_outcome(
                 }
                 None => output_size,
             };
-            let saved_total = db::i64_of(first_original) - db::i64_of(current_size);
+            // A hard-linked original keeps its data on disk through its
+            // other name (a seeding torrent): nothing was freed.
+            let saved_total = if ctx.shared_original {
+                ctx.file.as_ref().and_then(|f| f.saved_bytes).unwrap_or(0)
+            } else {
+                db::i64_of(first_original) - db::i64_of(current_size)
+            };
             sqlx::query(
                 "UPDATE files SET status = 'done', original_size_bytes = ?, saved_bytes = ?, \
                  skip_reason = NULL, error = NULL, problem = NULL, job_id = ?, updated_at = ? \
@@ -1250,12 +1382,19 @@ async fn apply_outcome(
             .bind(job.file_id.to_string())
             .execute(&mut *tx)
             .await?;
-            let saved_now = db::i64_of(original_size) - db::i64_of(output_size);
+            let saved_now = if ctx.shared_original {
+                0
+            } else {
+                db::i64_of(original_size) - db::i64_of(output_size)
+            };
             db::stats::add_savings(&mut tx, job.library_id, saved_now).await?;
             tx.commit().await?;
 
             let pct = format::percent(saved_now, original_size);
-            let mut message = if saved_now >= 0 {
+            let mut message = if ctx.shared_original {
+                // Its note says why nothing was saved.
+                format!("Converted {name}")
+            } else if saved_now >= 0 {
                 format!(
                     "Converted {name} — saved {} ({pct}%)",
                     format::bytes(saved_now.unsigned_abs())
@@ -1313,9 +1452,9 @@ async fn apply_outcome(
             tx.commit().await?;
             if exists {
                 let message = if kept_done {
-                    format!("Kept {name} as it is — {reason}")
+                    format!("Kept {name} as it is: {reason}")
                 } else {
-                    format!("Skipped {name} — {reason}")
+                    format!("Skipped {name}: {reason}")
                 };
                 state.activity(ActivityLevel::Info, message, refs).await;
             }
@@ -1551,14 +1690,10 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         }
     }
     let mut completed = 0;
+    // Where each job may have left files of its own: its file's folder and
+    // the folder its result was going to.
+    let mut leftover_dirs: Vec<(Uuid, Vec<PathBuf>)> = Vec::new();
     for InterruptedJob { job, final_path } in jobs {
-        let Some(final_path) = final_path else {
-            continue;
-        };
-        // Two interrupted jobs aiming at one name can't be told apart.
-        if targets.get(&final_path).copied().unwrap_or(0) > 1 {
-            continue;
-        }
         let file = db::files::get(state.db.pool(), job.file_id, true)
             .await
             .ok()
@@ -1567,6 +1702,20 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             file.as_ref()
                 .map_or(job.file_path.as_str(), |f| f.path.as_str()),
         );
+        let mut dirs: Vec<PathBuf> = input.parent().map(Path::to_path_buf).into_iter().collect();
+        if let Some(dir) = final_path.as_deref().and_then(|p| Path::new(p).parent())
+            && !dirs.iter().any(|d| d == dir)
+        {
+            dirs.push(dir.to_path_buf());
+        }
+        leftover_dirs.push((job.id, dirs));
+        let Some(final_path) = final_path else {
+            continue;
+        };
+        // Two interrupted jobs aiming at one name can't be told apart.
+        if targets.get(&final_path).copied().unwrap_or(0) > 1 {
+            continue;
+        }
         let target = PathBuf::from(&final_path);
         let replace = target.parent() == input.parent();
         let placed = if replace {
@@ -1619,6 +1768,8 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
             } else {
                 OutputMode::Folder
             },
+            worker_ran: true,
+            shared_original: false,
         };
         let outcome = JobOutcome::Done {
             output_path: target,
@@ -1635,7 +1786,45 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
         record(state, &job, Disposition::Finished(outcome), None, &ctx).await;
         completed += 1;
     }
+    // Whatever the last stop recorded and wherever the library search gets
+    // to, an original the crash left moved aside is put back now (and its
+    // job's temp files go), so the job finds its file when it runs again.
+    for (job_id, dirs) in leftover_dirs {
+        recover_job_leftovers(state, job_id, &dirs).await;
+    }
     completed
+}
+
+/// Hand what a job left in `dirs` (its temp files, its backup of the
+/// original) to crash recovery: the backup is put back when the original's
+/// name is free. Folders that don't answer are left for the library search.
+async fn recover_job_leftovers(state: &AppState, job_id: Uuid, dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in dirs {
+        let d = dir.clone();
+        // One check per job and folder (see `fs_guard`).
+        let key = dir.join(job_id.to_string());
+        let listed = fs_guard::guarded("job_leftovers", &key, LEFTOVER_CHECK_TIMEOUT, move || {
+            std::fs::read_dir(&d)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name()
+                                .to_str()
+                                .is_some_and(|n| chrysopoeia_core::paths::is_artifact_of(n, job_id))
+                        })
+                        .map(|e| e.path())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .await;
+        found.extend(listed.unwrap_or_default());
+    }
+    if found.is_empty() {
+        return Vec::new();
+    }
+    library::recover_leftovers(state, found, Some(job_id)).await
 }
 
 /// Stop starting jobs, cancel the running ones (they go back to the queue)

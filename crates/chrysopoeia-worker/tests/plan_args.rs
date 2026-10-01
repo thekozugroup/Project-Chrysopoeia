@@ -1299,6 +1299,13 @@ fn mp4_converts_text_and_drops_picture_subtitles() {
         "{:?}",
         plan.notes
     );
+    assert!(
+        plan.notes
+            .iter()
+            .any(|n| n == "Left out 2 subtitle fonts because MP4 can't hold attachments"),
+        "{:?}",
+        plan.notes
+    );
     assert!(has_pair(a, "-movflags", "+faststart"));
     assert!(has_pair(a, "-tag:v", "hvc1"));
     assert_eq!(value(a, "-f").as_deref(), Some("mp4"));

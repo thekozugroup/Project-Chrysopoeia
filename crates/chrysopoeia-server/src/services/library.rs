@@ -19,6 +19,7 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_scanner::{DiscoveredFile, IgnoreRules, ProbeError, ScanOptions, WatchEvent};
 use chrysopoeia_worker::Decision;
+use chrysopoeia_worker::finalize::Recovery;
 use futures::StreamExt;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use tokio::sync::Semaphore;
@@ -31,6 +32,7 @@ use crate::db::jobs::NewJob;
 use crate::db::libraries::LibraryRow;
 use crate::db::{self, ts};
 use crate::format::{count, plural};
+use crate::services::fs_guard;
 use crate::services::watcher::ActiveWatcher;
 use crate::state::{AppState, lock};
 
@@ -943,6 +945,24 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     ));
     report_walk_problems(state, &lib, &walk.errors, &walk.notes).await;
 
+    // Leftovers of interrupted conversions (a temp file left behind when a
+    // folder was renamed during a conversion, an original moved aside by a
+    // crash): cleaned up, and an original put back is not taken for removed.
+    let restored: HashSet<String> = if walk.artifacts.is_empty() {
+        HashSet::new()
+    } else {
+        recover_leftovers(state, walk.artifacts.clone(), None)
+            .await
+            .into_iter()
+            .filter_map(|p| p.to_str().map(str::to_string))
+            .collect()
+    };
+    if !walk.files.is_empty() || !walk.artifacts.is_empty() || index.is_empty() {
+        lock(&state.leftovers)
+            .unreached
+            .remove(Path::new(&lib.path));
+    }
+
     let mut seen: HashSet<&str> = HashSet::with_capacity(walk.files.len());
     let mut to_analyze: Vec<(Option<IndexEntry>, DiscoveredFile)> = Vec::new();
     let mut settling: Vec<PathBuf> = Vec::new();
@@ -981,21 +1001,34 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
         );
     }
 
+    // Drives and shares mounted inside the library: one that is no longer
+    // mounted left an empty folder behind, and its files are kept.
+    let offline_mounts = mounts::check(state, &lib).await;
+    if !offline_mounts.is_empty() {
+        let problems: Vec<(PathBuf, String)> = offline_mounts
+            .iter()
+            .map(|p| (p.clone(), mounts::OFFLINE_REASON.to_string()))
+            .collect();
+        report_walk_problems(state, &lib, &problems, &[]).await;
+    }
+
     // Files that disappeared. An empty walk of a library that had files is
     // almost always an unmounted drive, so nothing is removed then. Nothing
     // below a folder that couldn't be read (or was left alone) was listed,
-    // so its files are kept too. Notes about the library folder itself (an
-    // ignore pattern that can't be used) don't hide anything.
+    // so its files are kept too, as are those of a drive mounted inside the
+    // library that isn't mounted now. Notes about the library folder itself
+    // (an ignore pattern that can't be used) don't hide anything.
     let root = Path::new(&lib.path);
     let unreadable: Vec<PathBuf> = walk
         .errors
         .iter()
         .chain(walk.notes.iter().filter(|(p, _)| p != root))
         .map(|(p, _)| p.clone())
+        .chain(offline_mounts)
         .collect();
     let removed: Vec<IndexEntry> = index
         .values()
-        .filter(|e| !seen.contains(e.path.as_str()))
+        .filter(|e| !seen.contains(e.path.as_str()) && !restored.contains(&e.path))
         .filter(|e| e.status != FileStatus::Processing)
         .filter(|e| !under_unreadable(&e.path, &unreadable))
         .cloned()
@@ -1429,15 +1462,108 @@ pub async fn redecide(
     Ok(changed)
 }
 
-/// Why a library's folder can't be used right now, if it can't.
-pub async fn path_problem(path: &str) -> Option<String> {
-    match tokio::time::timeout(PATH_CHECK_TIMEOUT, check_path(path)).await {
-        Ok(problem) => problem,
-        Err(_) => Some(format!(
-            "The folder {path} isn't responding. If it's on a network share or an external \
-             drive, check the connection."
-        )),
+/// Hand leftover temp and backup files (a walk's `artifacts`) to the
+/// worker's crash recovery: temp files are deleted, and an original moved
+/// aside as a backup is put back when its name is free (the backup is
+/// deleted otherwise). Files of jobs running right now are theirs and left
+/// alone, except those of `own_job` (a job looking for what its interrupted
+/// run left, before it starts working). Returns the originals put back.
+pub async fn recover_leftovers(
+    state: &AppState,
+    mut artifacts: Vec<PathBuf>,
+    own_job: Option<Uuid>,
+) -> Vec<PathBuf> {
+    artifacts.sort();
+    artifacts.dedup();
+    let mut running = state.dispatcher.running_ids();
+    running.retain(|id| Some(*id) != own_job);
+    let mut restored = Vec::new();
+    for path in artifacts {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if running
+            .iter()
+            .any(|id| chrysopoeia_core::paths::is_artifact_of(&name, *id))
+        {
+            continue;
+        }
+        match state.toolkit.recover_artifact(path.clone()).await {
+            Ok(Recovery::RestoredBackup(original)) => {
+                state
+                    .activity(
+                        ActivityLevel::Warning,
+                        format!(
+                            "Restored {} from its backup after an interrupted conversion.",
+                            original.display()
+                        ),
+                        ActivityRefs::default(),
+                    )
+                    .await;
+                restored.push(original);
+            }
+            Ok(r) => tracing::debug!(path = %path.display(), "leftover: {r:?}"),
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "could not clean up a leftover file: {e:#}")
+            }
+        }
     }
+    restored
+}
+
+/// Remove what a finished job left anywhere in its library: the temp file
+/// it wrote next to its file, when that file's folder was renamed while it
+/// was being converted (it ends up in the folder's new place, where the job
+/// can't find it). Only that job's files are touched.
+pub async fn sweep_job_leftovers(state: &AppState, library_id: Uuid, job_id: Uuid) {
+    let Ok(Some(lib)) = db::libraries::get(state.db.pool(), library_id).await else {
+        return;
+    };
+    let walked = state
+        .toolkit
+        .walk_library(PathBuf::from(&lib.path), scan_options(state))
+        .await;
+    let Ok(Ok(walk)) = walked else {
+        return;
+    };
+    let mine: Vec<PathBuf> = walk
+        .artifacts
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| chrysopoeia_core::paths::is_artifact_of(n, job_id))
+        })
+        .collect();
+    if !mine.is_empty() {
+        tracing::debug!(job = %job_id, "removing {} leftover file(s) of a moved file", mine.len());
+        recover_leftovers(state, mine, None).await;
+    }
+}
+
+/// The reason given for a folder that doesn't answer in time.
+pub fn not_responding(path: &str) -> String {
+    format!(
+        "The folder {path} isn't responding. If it's on a network share or an external drive, \
+         check the connection."
+    )
+}
+
+/// Why a library's folder can't be used right now, if it can't. A folder
+/// that doesn't answer within a few seconds is reported as not responding;
+/// the check itself runs on one thread per folder at a time (see
+/// [`fs_guard`]), so a hung share can't use up the server's threads.
+pub async fn path_problem(path: &str) -> Option<String> {
+    let p = path.to_string();
+    fs_guard::guarded(
+        "path_problem",
+        Path::new(path),
+        PATH_CHECK_TIMEOUT,
+        move || check_path(&p),
+    )
+    .await
+    .unwrap_or_else(|| Some(not_responding(path)))
 }
 
 /// Why a library folder can't hold the files the queue expects right now:
@@ -1445,30 +1571,30 @@ pub async fn path_problem(path: &str) -> Option<String> {
 /// library with files almost always means an unmounted drive or share (the
 /// mount point is left behind empty).
 pub async fn root_unavailable(path: &str) -> Option<String> {
-    if let Some(problem) = path_problem(path).await {
-        return Some(problem);
-    }
-    let empty = async {
-        match tokio::fs::read_dir(path).await {
-            Ok(mut rd) => matches!(rd.next_entry().await, Ok(None)),
-            Err(_) => false,
-        }
-    };
-    match tokio::time::timeout(PATH_CHECK_TIMEOUT, empty).await {
-        Ok(false) => None,
-        Ok(true) => Some(format!(
-            "The folder {path} is empty. If it's on a drive or network share, check that it's \
-             connected."
-        )),
-        Err(_) => Some(format!(
-            "The folder {path} isn't responding. If it's on a network share or an external \
-             drive, check the connection."
-        )),
-    }
+    let p = path.to_string();
+    fs_guard::guarded(
+        "root_unavailable",
+        Path::new(path),
+        PATH_CHECK_TIMEOUT,
+        move || {
+            check_path(&p).or_else(|| {
+                let empty = std::fs::read_dir(&p).is_ok_and(|mut rd| rd.next().is_none());
+                empty.then(|| {
+                    format!(
+                        "The folder {p} is empty. If it's on a drive or network share, check \
+                         that it's connected."
+                    )
+                })
+            })
+        },
+    )
+    .await
+    .unwrap_or_else(|| Some(not_responding(path)))
 }
 
-async fn check_path(path: &str) -> Option<String> {
-    match tokio::fs::metadata(path).await {
+/// [`path_problem`]'s check, with blocking calls.
+fn check_path(path: &str) -> Option<String> {
+    match std::fs::metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
             "The folder {path} is missing. If it's on a drive or network share, check that it's connected."
         )),
@@ -1482,7 +1608,7 @@ async fn check_path(path: &str) -> Option<String> {
             chrysopoeia_core::plain::io_reason(&e)
         )),
         Ok(m) if !m.is_dir() => Some(format!("{path} is not a folder.")),
-        Ok(_) => match tokio::fs::read_dir(path).await {
+        Ok(_) => match std::fs::read_dir(path) {
             Ok(_) => None,
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
                 "Chrysopoeia doesn't have permission to read {path}. Check the folder's \
@@ -1602,5 +1728,221 @@ mod tests {
         let set = compile_ignore(&["**/Extras/**".to_string(), "[".to_string()]);
         assert!(set.is_match("Movie/Extras/clip.mkv"));
         assert!(!set.is_match("Movie/movie.mkv"));
+    }
+}
+
+/// Drives and shares mounted inside a library folder.
+///
+/// When one is unmounted (a USB drive pulled, a share gone), its mount
+/// point is left behind as an empty folder, and a scan would take every
+/// file on it for deleted: their rows, and decisions such as "Skipped by
+/// you", would be lost, and the files converted as new ones when the drive
+/// is back. So scans remember the mount points inside each library (from
+/// `/proc/self/mountinfo`), and one that is no longer mounted and is empty
+/// or missing counts as offline: its files stay listed. It is forgotten
+/// once the folder has files of its own without being a mount.
+pub mod mounts {
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    use crate::db;
+    use crate::db::libraries::LibraryRow;
+    use crate::services::fs_guard;
+    use crate::state::AppState;
+
+    /// How the scan describes an offline mount.
+    pub const OFFLINE_REASON: &str = "the drive or share mounted there isn't connected, so its \
+        files stay in the list until it's back";
+
+    /// Mount points inside a library that are offline now (see the module
+    /// docs), after updating the library's known mounts.
+    pub async fn check(state: &AppState, lib: &LibraryRow) -> Vec<PathBuf> {
+        let known = match db::libraries::mounts(state.db.pool(), lib.id).await {
+            Ok(known) => known,
+            Err(e) => {
+                tracing::warn!(library = %lib.name, "could not read the known mounts: {e}");
+                Vec::new()
+            }
+        };
+        let root = PathBuf::from(&lib.path);
+        let known: Vec<PathBuf> = known
+            .into_iter()
+            .map(PathBuf::from)
+            .filter(|p| p.starts_with(&root) && *p != root)
+            .collect();
+        let (look_root, look_known) = (root.clone(), known.clone());
+        let looked = fs_guard::guarded("mounts", &root, super::PATH_CHECK_TIMEOUT, move || {
+            let current = mount_points_under(&look_root);
+            classify(&look_known, &current, empty_or_missing)
+        })
+        .await;
+        // A folder that doesn't answer: keep every known mount's files.
+        let (keep, offline) = looked.unwrap_or_else(|| (known.clone(), known.clone()));
+        let keep: Vec<String> = keep
+            .iter()
+            .filter_map(|p| p.to_str().map(str::to_string))
+            .collect();
+        let changed = {
+            let before: BTreeSet<&Path> = known.iter().map(PathBuf::as_path).collect();
+            let after: BTreeSet<&Path> = keep.iter().map(Path::new).collect();
+            before != after
+        };
+        if changed {
+            let saved = async {
+                let mut tx = state.db.write_tx().await?;
+                db::libraries::set_mounts(&mut tx, lib.id, &keep).await?;
+                tx.commit().await
+            }
+            .await;
+            if let Err(e) = saved {
+                tracing::warn!(library = %lib.name, "could not record the mounts: {e}");
+            }
+        }
+        offline
+    }
+
+    /// The mounts to remember (mounted now, or offline) and the offline
+    /// ones: known mounts not mounted now whose folder is empty or missing.
+    pub fn classify(
+        known: &[PathBuf],
+        current: &[PathBuf],
+        empty_or_missing: impl Fn(&Path) -> bool,
+    ) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let offline: Vec<PathBuf> = known
+            .iter()
+            .filter(|k| !current.contains(k) && empty_or_missing(k))
+            .cloned()
+            .collect();
+        let mut keep: Vec<PathBuf> = current.iter().chain(&offline).cloned().collect();
+        keep.sort();
+        keep.dedup();
+        (keep, offline)
+    }
+
+    fn empty_or_missing(path: &Path) -> bool {
+        match std::fs::read_dir(path) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Mount points strictly inside `root`.
+    pub fn mount_points_under(root: &Path) -> Vec<PathBuf> {
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut found: Vec<PathBuf> = std::fs::read_to_string("/proc/self/mountinfo")
+            .map(|text| parse_mountinfo(&text))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.starts_with(root) && p != root)
+            .collect();
+        #[cfg(test)]
+        found.extend(fake::mounted_under(root));
+        found.sort();
+        found.dedup();
+        found
+    }
+
+    /// The mount points listed in `/proc/self/mountinfo` (the fifth field,
+    /// with `\040`-style escapes for spaces and the like).
+    pub fn parse_mountinfo(text: &str) -> Vec<PathBuf> {
+        text.lines()
+            .filter_map(|line| line.split(' ').nth(4))
+            .map(|field| PathBuf::from(unescape(field)))
+            .collect()
+    }
+
+    fn unescape(field: &str) -> String {
+        let bytes = field.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\'
+                && let Some(octal) = bytes.get(i + 1..i + 4)
+                && octal.iter().all(|b| (b'0'..=b'7').contains(b))
+            {
+                let value = octal
+                    .iter()
+                    .fold(0u32, |acc, b| acc * 8 + u32::from(b - b'0'));
+                if let Ok(byte) = u8::try_from(value) {
+                    out.push(byte);
+                    i += 4;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Tests stand in for mounting a drive inside a library.
+    #[cfg(test)]
+    pub mod fake {
+        use std::collections::HashSet;
+        use std::path::{Path, PathBuf};
+        use std::sync::{LazyLock, Mutex};
+
+        use crate::state::lock;
+
+        static MOUNTED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+        /// Count `path` as a mount point.
+        pub fn mount(path: &Path) {
+            lock(&MOUNTED).insert(path.to_path_buf());
+        }
+
+        /// No longer.
+        pub fn unmount(path: &Path) {
+            lock(&MOUNTED).remove(path);
+        }
+
+        pub(super) fn mounted_under(root: &Path) -> Vec<PathBuf> {
+            lock(&MOUNTED)
+                .iter()
+                .filter(|p| p.starts_with(root) && *p != root)
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn mountinfo_lists_mount_points() {
+            let text = "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+                36 22 0:32 / /media/Movies/USB\\040Drive rw - vfat /dev/sdb1 rw\n\
+                37 22 0:33 / /media/Movies/Share rw - nfs server:/x rw\n";
+            assert_eq!(
+                parse_mountinfo(text),
+                [
+                    PathBuf::from("/"),
+                    PathBuf::from("/media/Movies/USB Drive"),
+                    PathBuf::from("/media/Movies/Share"),
+                ]
+            );
+            assert_eq!(unescape("a\\134b\\011c\\x"), "a\\b\tc\\x");
+        }
+
+        #[test]
+        fn unmounted_empty_mount_points_are_offline() {
+            let usb = PathBuf::from("/m/USB");
+            let nas = PathBuf::from("/m/NAS");
+            let old = PathBuf::from("/m/Old");
+            let empty = |p: &Path| p != Path::new("/m/Old");
+            // USB unmounted and empty: offline. NAS mounted. Old unmounted
+            // but has files of its own now: forgotten.
+            let (keep, offline) = classify(
+                &[usb.clone(), nas.clone(), old.clone()],
+                &[nas.clone(), PathBuf::from("/m/New")],
+                empty,
+            );
+            assert_eq!(offline, std::slice::from_ref(&usb));
+            assert_eq!(
+                keep,
+                [PathBuf::from("/m/NAS"), PathBuf::from("/m/New"), usb]
+            );
+        }
     }
 }

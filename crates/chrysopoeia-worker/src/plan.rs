@@ -453,6 +453,18 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
             .map(|s| s.index)
             .collect()
     } else {
+        let lost: Vec<&StreamInfo> = lost_attachments(req.probe, profile).collect();
+        if !lost.is_empty() {
+            let what = if lost.iter().all(|a| is_font_attachment(a)) {
+                plural(lost.len(), "subtitle font", "subtitle fonts")
+            } else {
+                plural(lost.len(), "attached file", "attached files")
+            };
+            notes.push(format!(
+                "Left out {what} because {} can't hold attachments",
+                container.label()
+            ));
+        }
         Vec::new()
     };
 
@@ -1668,6 +1680,85 @@ struct SubtitleTrack {
 /// SubRip) and picture formats it can't store (DivX XSUB) are dropped.
 fn subtitle_action(container: Container, codec: &str) -> SubtitleAction {
     container.subtitle_action(codec)
+}
+
+/// Picture-based subtitle tracks the profile wants kept (its language list,
+/// plus forced tracks) that the target container can't hold. (Other formats
+/// it can't hold, such as teletext in TV recordings, are dropped with a
+/// note as before: they are rarely the subtitles people watch.)
+fn lost_picture_subtitles<'a>(
+    probe: &'a ProbeInfo,
+    profile: &TranscodeProfile,
+) -> impl Iterator<Item = &'a StreamInfo> {
+    let keep = profile.subtitles != SubtitlePolicy::Drop;
+    let wanted = wanted_languages(&profile.subtitle_languages);
+    let container = profile.container;
+    probe.subtitle_streams().filter(move |s| {
+        let codec = s.codec.to_ascii_lowercase();
+        keep && (s.is_forced || language_allowed(s.language.as_deref(), &wanted))
+            && is_image_subtitle(&codec)
+            && subtitle_action(container, &codec) == SubtitleAction::Drop
+    })
+}
+
+/// Whether an attachment is a font (for styled subtitles).
+fn is_font_attachment(stream: &StreamInfo) -> bool {
+    matches!(
+        stream.codec.to_ascii_lowercase().as_str(),
+        "ttf" | "otf" | "woff" | "woff2"
+    )
+}
+
+/// Attachments the target container would leave out: every one when it
+/// can't hold attachments (only MKV can), except fonts when no subtitles
+/// are kept anyway.
+fn lost_attachments<'a>(
+    probe: &'a ProbeInfo,
+    profile: &TranscodeProfile,
+) -> impl Iterator<Item = &'a StreamInfo> {
+    let lost = !profile.container.supports_attachments();
+    let subtitles_kept = profile.subtitles != SubtitlePolicy::Drop;
+    probe.streams.iter().filter(move |s| {
+        lost && s.kind == Some(StreamKind::Attachment) && (subtitles_kept || !is_font_attachment(s))
+    })
+}
+
+/// When converting `probe` under `profile` would leave out tracks the
+/// original has, a plain sentence saying so: picture-based subtitles the
+/// new container can't hold (MP4 and WebM hold only text), or attachments
+/// such as the fonts of styled subtitles, which only MKV keeps. Replacing
+/// the original would lose them for good, so such a file is left unchanged
+/// when originals are replaced, unless the user converts it anyway (see
+/// [`crate::run::run_job`]). `None` when nothing would be lost.
+pub fn replace_loss(probe: &ProbeInfo, profile: &TranscodeProfile) -> Option<String> {
+    let pictures = lost_picture_subtitles(probe, profile).count();
+    let attachments: Vec<&StreamInfo> = lost_attachments(probe, profile).collect();
+    let fonts = attachments.iter().filter(|a| is_font_attachment(a)).count();
+    let mut lost: Vec<String> = Vec::new();
+    if pictures > 0 {
+        lost.push(plural(
+            pictures,
+            "picture-based subtitle",
+            "picture-based subtitles",
+        ));
+    }
+    if !attachments.is_empty() {
+        lost.push(if fonts == attachments.len() {
+            plural(fonts, "subtitle font", "subtitle fonts")
+        } else {
+            plural(attachments.len(), "attached file", "attached files")
+        });
+    }
+    if lost.is_empty() {
+        return None;
+    }
+    let label = profile.container.label();
+    Some(format!(
+        "{label} can't hold this file's {}, so it was left unchanged. To convert it, choose an \
+         MKV goal or save converted files to a separate folder; Convert anyway converts it \
+         without them",
+        lost.join(" and ")
+    ))
 }
 
 fn plan_subtitles(

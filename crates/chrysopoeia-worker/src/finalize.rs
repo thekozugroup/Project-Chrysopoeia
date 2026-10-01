@@ -209,8 +209,8 @@ fn placing_failed(e: &io::Error, dir: &Path, mode: OutputMode) -> anyhow::Error 
     use io::ErrorKind as K;
     let folder = destination_name(dir, mode);
     let other_place = match mode {
-        OutputMode::Folder => "choose another output folder in Settings > Output",
-        OutputMode::Replace => "save converted files to a separate folder in Settings > Output",
+        OutputMode::Folder => "choose another output folder in Settings › Output",
+        OutputMode::Replace => "save converted files to a separate folder in Settings › Output",
     };
     match e.kind() {
         K::StorageFull | K::QuotaExceeded => {
@@ -221,7 +221,7 @@ fn placing_failed(e: &io::Error, dir: &Path, mode: OutputMode) -> anyhow::Error 
                 .unwrap_or_default();
             let fix = match mode {
                 OutputMode::Folder => {
-                    "Free up some space there, or choose another output folder in Settings > \
+                    "Free up some space there, or choose another output folder in Settings › \
                      Output."
                 }
                 OutputMode::Replace => "Free up some space on that disk, then try again.",
@@ -452,10 +452,43 @@ fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
     }
 
     // The file is in place at this point; never report a failure from here.
-    let size = fs::metadata(&req.final_path)
-        .map(|m| m.len())
-        .unwrap_or(temp_meta.len());
+    let placed = fs::metadata(&req.final_path);
+    let size = placed.as_ref().map_or(temp_meta.len(), fs::Metadata::len);
+    #[cfg(unix)]
+    if let Ok(placed) = &placed {
+        use std::os::unix::fs::MetadataExt as _;
+        notes.extend(ownership_note(
+            (original.uid(), original.gid()),
+            (placed.uid(), placed.gid()),
+        ));
+    }
     Ok(Finalized { size, notes })
+}
+
+/// A job note when the new file couldn't keep the original's owner or group
+/// (`(user, group)` ids): with group-based access, the media server may not
+/// be able to read it.
+fn ownership_note(original: (u32, u32), new: (u32, u32)) -> Option<String> {
+    let ((user, group), (new_user, new_group)) = (original, new);
+    let what = match (user == new_user, group == new_group) {
+        (true, true) => return None,
+        (false, true) => format!(
+            "The new file couldn't keep the original's owner (user {user}), so it belongs to \
+             user {new_user}"
+        ),
+        (true, false) => format!(
+            "The new file couldn't keep the original's group (group {group}), so it is in group \
+             {new_group}"
+        ),
+        (false, false) => format!(
+            "The new file couldn't keep the original's owner and group (user {user}, group \
+             {group}), so it belongs to user {new_user} and group {new_group}"
+        ),
+    };
+    Some(format!(
+        "{what}. If your media server can't open it, run Chrysopoeia as the owner of your media \
+         (PUID and PGID)"
+    ))
 }
 
 /// Same path: stage beside the original, then original → backup,
@@ -844,10 +877,16 @@ fn apply_metadata(path: &Path, original: &fs::Metadata, keep_dates: bool) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        // Only root (or the owner, for the group) may do this; a container
-        // running as the media owner already creates files with that owner.
+        // Only root may give a file away; a container running as the media
+        // owner already creates files with that owner. The group alone is
+        // often allowed (any group the process belongs to), and it is what
+        // group-based access (0640 in group `media`) depends on. A result
+        // that still differs gets a job note (see `ownership_note`).
         if let Err(e) = std::os::unix::fs::chown(path, Some(original.uid()), Some(original.gid())) {
             tracing::debug!(path = %path.display(), "could not copy the original's owner: {e}");
+            if let Err(e) = std::os::unix::fs::chown(path, None, Some(original.gid())) {
+                tracing::debug!(path = %path.display(), "could not copy the original's group: {e}");
+            }
         }
     }
     if keep_dates {
@@ -893,6 +932,9 @@ fn file_name_lossy(path: &Path) -> String {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
+
+/// Longest file name most filesystems (ext4, XFS, Btrfs, ZFS) allow.
+const NAME_MAX_BYTES: usize = 255;
 
 /// Whether anything (file, folder or dangling link) exists at `path`.
 fn exists(path: &Path) -> anyhow::Result<bool> {
@@ -945,7 +987,26 @@ pub async fn destination_conflict(
     let input = input.to_path_buf();
     let final_path = final_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let taken = exists(&final_path).unwrap_or(false);
+        // A longer extension (.ts to .mkv) can push a long name past what
+        // the disk allows; find out now, not after the whole encode.
+        let name_bytes = final_path.file_name().map_or(0, |n| n.len());
+        if name_bytes > NAME_MAX_BYTES {
+            return Some(format!(
+                "The converted file's name would be too long for the disk ({name_bytes} bytes, \
+                 more than the {NAME_MAX_BYTES} a name can have), so this file wasn't \
+                 converted. Give it a shorter name, then try again."
+            ));
+        }
+        // A name that can't be checked is not a free name.
+        let taken = match exists(&final_path) {
+            Ok(taken) => taken,
+            Err(e) => {
+                return Some(
+                    e.downcast_ref::<PlaceError>()
+                        .map_or_else(|| e.to_string(), |p| p.message.clone()),
+                );
+            }
+        };
         match mode {
             OutputMode::Replace if taken && !is_same_file(&input, &final_path) => Some(format!(
                 "A file named \"{}\" is already next to the original, so the new file can't \
@@ -1106,6 +1167,64 @@ fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A replaced file that couldn't keep its owner or group says so.
+    #[test]
+    fn ownership_changes_get_a_note() {
+        assert_eq!(ownership_note((99, 100), (99, 100)), None);
+        assert_eq!(
+            ownership_note((0, 100), (65534, 100)).as_deref(),
+            Some(
+                "The new file couldn't keep the original's owner (user 0), so it belongs to user \
+                 65534. If your media server can't open it, run Chrysopoeia as the owner of your \
+                 media (PUID and PGID)"
+            )
+        );
+        assert!(ownership_note((99, 1001), (99, 100)).unwrap().starts_with(
+            "The new file couldn't keep the original's group (group 1001), so it \
+                     is in group 100."
+        ));
+        assert!(ownership_note((0, 0), (65534, 65534)).unwrap().contains(
+            "owner and group (user 0, group 0), so it belongs to user 65534 and \
+                     group 65534."
+        ));
+    }
+
+    /// A name that grows past 255 bytes (a long `.ts` name becoming `.mkv`)
+    /// and a name that can't be checked are refused before any encoding,
+    /// not after it.
+    #[tokio::test]
+    async fn destinations_that_cant_be_used_are_found_up_front() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join(format!("{}.ts", "b".repeat(252)));
+        fs::write(&input, "x").unwrap();
+        let long = input.with_extension("mkv");
+        let conflict = destination_conflict(&input, &long, OutputMode::Replace)
+            .await
+            .unwrap();
+        assert!(
+            conflict.starts_with(
+                "The converted file's name would be too long for the disk \
+                 (256 bytes"
+            ),
+            "{conflict}"
+        );
+        let fits = dir.path().join(format!("{}.mkv", "b".repeat(251)));
+        assert_eq!(
+            destination_conflict(&input, &fits, OutputMode::Replace).await,
+            None
+        );
+
+        // "Inside" a file: the check fails, which is not a free name.
+        let under_a_file = input.join("x.mkv");
+        let conflict = destination_conflict(&input, &under_a_file, OutputMode::Folder)
+            .await
+            .unwrap();
+        assert!(
+            conflict.starts_with("Chrysopoeia couldn't check"),
+            "{conflict}"
+        );
+    }
 
     fn id() -> Uuid {
         Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap()

@@ -55,17 +55,6 @@ impl Drop for ActiveWatcher {
     }
 }
 
-/// Paths currently watched (for tests and diagnostics).
-pub fn watched_roots(state: &AppState) -> Vec<PathBuf> {
-    let guard = lock(&state.library.watcher);
-    let mut roots: Vec<PathBuf> = guard
-        .as_ref()
-        .map(|w| w.roots.keys().cloned().collect())
-        .unwrap_or_default();
-    roots.sort();
-    roots
-}
-
 /// The watcher's own explanation (a sentence with its fix), without error
 /// numbers, and saying that rescans still find new files.
 fn with_rescan_note(reason: &str) -> String {

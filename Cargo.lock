@@ -330,6 +330,8 @@ dependencies = [
  "clap",
  "futures",
  "globset",
+ "hyper",
+ "hyper-util",
  "rustix",
  "serde",
  "serde_json",

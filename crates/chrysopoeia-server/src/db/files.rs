@@ -57,7 +57,6 @@ fn from_row(row: &SqliteRow, with_probe: bool) -> sqlx::Result<MediaFile> {
         saved_bytes: row.try_get("saved_bytes")?,
         skip_reason: row.try_get("skip_reason")?,
         job_id: opt_uuid_col(row, "job_id")?,
-        #[allow(clippy::cast_possible_truncation)]
         progress: progress.map(|p| p as f32),
         probe,
         scanned_at: ts_col(row, "scanned_at")?,
@@ -246,6 +245,15 @@ pub async fn index(pool: &SqlitePool, library_id: Uuid) -> sqlx::Result<Vec<Inde
     .fetch_all(pool)
     .await?;
     rows.iter().map(index_from_row).collect()
+}
+
+/// Whether a library lists any file.
+pub async fn any_in_library(pool: &SqlitePool, library_id: Uuid) -> sqlx::Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM files WHERE library_id = ? LIMIT 1")
+        .bind(library_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
 }
 
 /// Index entry for one path.

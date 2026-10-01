@@ -113,3 +113,32 @@ pub async fn delete(pool: &SqlitePool, id: Uuid) -> sqlx::Result<bool> {
         .await?;
     Ok(done.rows_affected() > 0)
 }
+
+/// Drives and shares mounted inside a library folder that scans have seen
+/// (see `services::library::mounts`).
+pub async fn mounts(pool: &SqlitePool, id: Uuid) -> sqlx::Result<Vec<String>> {
+    sqlx::query_scalar("SELECT path FROM library_mounts WHERE library_id = ? ORDER BY path")
+        .bind(id.to_string())
+        .fetch_all(pool)
+        .await
+}
+
+/// Replace a library's known mounts.
+pub async fn set_mounts(
+    conn: &mut sqlx::SqliteConnection,
+    id: Uuid,
+    paths: &[String],
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM library_mounts WHERE library_id = ?")
+        .bind(id.to_string())
+        .execute(&mut *conn)
+        .await?;
+    for path in paths {
+        sqlx::query("INSERT OR IGNORE INTO library_mounts (library_id, path) VALUES (?, ?)")
+            .bind(id.to_string())
+            .bind(path)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}

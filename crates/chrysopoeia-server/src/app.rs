@@ -16,14 +16,13 @@ use anyhow::Context;
 use chrysopoeia_core::paths::is_artifact;
 use chrysopoeia_core::{ActivityLevel, HwApi, HwPreference, Settings};
 use chrysopoeia_scanner::ScanOptions;
-use chrysopoeia_worker::finalize::Recovery;
 use tokio::net::TcpListener;
 
 use crate::config::Config;
 use crate::db::activity::ActivityRefs;
 use crate::db::{self, DB_FILE_NAME, Db};
 use crate::services::{dispatcher, hardware, library, library_admin, rescan, watcher};
-use crate::state::AppState;
+use crate::state::{AppState, lock};
 use crate::toolkit::Toolkit;
 
 /// Time allowed for running jobs to stop at shutdown.
@@ -102,7 +101,32 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
                 config.data_dir.display()
             )
         })?;
-    let db = Db::open_with(&config.data_dir.join(DB_FILE_NAME), config.db_busy_timeout).await?;
+    let db_path = config.data_dir.join(DB_FILE_NAME);
+    let (db, damaged_note) = match Db::open_with(&db_path, config.db_busy_timeout).await {
+        Ok(db) => (db, None),
+        Err(e) => {
+            // A damaged database would stop every start (and a container
+            // set to restart would loop): keep it aside and start afresh.
+            // It only holds settings, the file list and the history; the
+            // media files are never touched.
+            let Some(damaged) = e.downcast_ref::<db::DamagedDatabase>() else {
+                return Err(e);
+            };
+            tracing::error!("{damaged}");
+            let to_move = db_path.clone();
+            let aside = tokio::task::spawn_blocking(move || db::move_damaged_aside(&to_move))
+                .await
+                .context("moving the damaged database aside was interrupted")??;
+            let note = format!(
+                "The database was damaged, so Chrysopoeia moved it aside to {} and started \
+                 with a new one. Your media files were not touched. Add your libraries and \
+                 settings again.",
+                aside.display()
+            );
+            let db = Db::open_with(&db_path, config.db_busy_timeout).await?;
+            (db, Some(note))
+        }
+    };
     let pool = db.pool();
     let (mut settings, first_run) = match db::settings::load(pool).await? {
         Some(s) => (s, false),
@@ -122,10 +146,12 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
     db::settings::set_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY, false).await?;
 
     let state = AppState::new(config, db, toolkit, settings, paused);
+    lock(&state.leftovers).searching = !clean_shutdown;
     // Each note is one feed entry and one log line (the feed logs it).
-    let notes = hw_note
-        .map(|n| (ActivityLevel::Info, n))
+    let notes = damaged_note
+        .map(|n| (ActivityLevel::Warning, n))
         .into_iter()
+        .chain(hw_note.map(|n| (ActivityLevel::Info, n)))
         .chain(max_jobs_note(&state).map(|n| (ActivityLevel::Warning, n)));
     for (level, note) in notes {
         state.activity(level, note, ActivityRefs::default()).await;
@@ -238,22 +264,49 @@ fn temp_dirs(state: &AppState) -> Vec<PathBuf> {
 /// temp folders are always checked; library folders and the output folder
 /// (where folder mode writes when no temp folder is set) only after an
 /// unclean shutdown (a clean one lets every job remove its own files).
-pub async fn recover_artifacts(state: &AppState, include_libraries: bool) {
-    let mut roots = temp_dirs(state);
+/// Returns the library and output folders that couldn't be searched (missing,
+/// unreadable or not responding, or a library with files that is empty now:
+/// an unmounted share); a scan that reaches one searches it later.
+pub async fn recover_artifacts(state: &AppState, include_libraries: bool) -> Vec<PathBuf> {
+    // (folder, whether it must be searched later when it can't be now)
+    let mut roots: Vec<(PathBuf, bool)> =
+        temp_dirs(state).into_iter().map(|d| (d, false)).collect();
+    let mut libraries_with_files: Vec<PathBuf> = Vec::new();
     if include_libraries {
         match db::libraries::list(state.db.pool()).await {
-            Ok(libs) => roots.extend(libs.into_iter().map(|l| PathBuf::from(l.path))),
+            Ok(libs) => {
+                for lib in libs {
+                    if db::files::any_in_library(state.db.pool(), lib.id)
+                        .await
+                        .unwrap_or(true)
+                    {
+                        libraries_with_files.push(PathBuf::from(&lib.path));
+                    }
+                    roots.push((PathBuf::from(lib.path), true));
+                }
+            }
             Err(e) => tracing::error!("could not list libraries for recovery: {e}"),
         }
         if let Some(out) = state.settings().output_folder.map(PathBuf::from)
-            && !roots.contains(&out)
+            && !roots.iter().any(|(r, _)| *r == out)
         {
-            roots.push(out);
+            roots.push((out, true));
         }
     }
+    let mut unreached = Vec::new();
     let mut artifacts: Vec<PathBuf> = Vec::new();
-    for root in roots {
-        if !tokio::fs::metadata(&root).await.is_ok_and(|m| m.is_dir()) {
+    for (root, keep_for_later) in roots {
+        let root_str = root.to_string_lossy().into_owned();
+        let problem = if libraries_with_files.contains(&root) {
+            library::root_unavailable(&root_str).await
+        } else {
+            library::path_problem(&root_str).await
+        };
+        if let Some(problem) = problem {
+            if keep_for_later {
+                tracing::info!("will look for leftovers later: {problem}");
+                unreached.push(root);
+            }
             continue;
         }
         match state
@@ -263,7 +316,10 @@ pub async fn recover_artifacts(state: &AppState, include_libraries: bool) {
         {
             Ok(Ok(walk)) => artifacts.extend(walk.artifacts),
             Ok(Err(e)) => {
-                tracing::warn!(root = %root.display(), "could not look for leftovers: {e:#}")
+                tracing::warn!(root = %root.display(), "could not look for leftovers: {e:#}");
+                if keep_for_later {
+                    unreached.push(root);
+                }
             }
             Err(_) => {
                 // Fall back to the top level of the folder.
@@ -277,28 +333,8 @@ pub async fn recover_artifacts(state: &AppState, include_libraries: bool) {
             }
         }
     }
-    artifacts.sort();
-    artifacts.dedup();
-    for path in artifacts {
-        match state.toolkit.recover_artifact(path.clone()).await {
-            Ok(Recovery::RestoredBackup(original)) => {
-                state
-                    .activity(
-                        ActivityLevel::Warning,
-                        format!(
-                            "Restored {} from its backup after an interrupted conversion.",
-                            original.display()
-                        ),
-                        ActivityRefs::default(),
-                    )
-                    .await;
-            }
-            Ok(r) => tracing::debug!(path = %path.display(), "recovery: {r:?}"),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "could not clean up a leftover file: {e:#}")
-            }
-        }
-    }
+    library::recover_leftovers(state, artifacts, None).await;
+    unreached
 }
 
 /// Start every background task.
@@ -313,7 +349,12 @@ pub fn start_background(state: &AppState, startup: Startup) {
     // changes meanwhile falls between them.
     let s = state.clone();
     tokio::spawn(async move {
-        recover_artifacts(&s, !startup.clean_shutdown).await;
+        let unreached = recover_artifacts(&s, !startup.clean_shutdown).await;
+        {
+            let mut leftovers = lock(&s.leftovers);
+            leftovers.searching = false;
+            leftovers.unreached.extend(unreached);
+        }
         s.dispatcher.set_ready();
         watcher::sync(&s).await;
         startup_scans(&s).await;
@@ -368,11 +409,8 @@ pub async fn bind(config: &Config) -> anyhow::Result<TcpListener> {
 /// Serve HTTP until shutdown begins.
 pub async fn serve(state: AppState, listener: TcpListener) -> anyhow::Result<()> {
     let router = crate::web::app(state.clone()).await;
-    let shutdown = state.shutdown.clone();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .context("the HTTP server stopped")
+    crate::http::serve(listener, router, state.shutdown.clone()).await;
+    Ok(())
 }
 
 /// Begin shutting down: no new jobs, running jobs back to the queue, scans
@@ -385,8 +423,10 @@ pub async fn begin_shutdown(state: &AppState) {
 }
 
 /// Finish shutting down: record whether it was clean and close the database.
+/// It isn't while crash leftovers are still to be looked for (the start-up
+/// search didn't finish, or a library folder was out of reach).
 pub async fn finish_shutdown(state: &AppState) {
-    let clean = state.dispatcher.running_count() == 0;
+    let clean = state.dispatcher.running_count() == 0 && !lock(&state.leftovers).due();
     if let Err(e) =
         db::settings::set_flag(state.db.pool(), db::settings::CLEAN_SHUTDOWN_KEY, clean).await
     {

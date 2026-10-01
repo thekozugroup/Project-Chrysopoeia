@@ -34,6 +34,36 @@ pub fn end_with_parent(command: &mut std::process::Command) {
     let _ = command;
 }
 
+/// Waits between attempts to start a program while too many files are
+/// open (see [`out_of_file_handles`]): about half a minute in all.
+pub const SPAWN_RETRY_DELAYS: [std::time::Duration; 5] = [
+    std::time::Duration::from_secs(1),
+    std::time::Duration::from_secs(2),
+    std::time::Duration::from_secs(4),
+    std::time::Duration::from_secs(8),
+    std::time::Duration::from_secs(15),
+];
+
+/// Whether starting a program failed because this process (`EMFILE`) or the
+/// whole system (`ENFILE`) has too many files open. That passes once other
+/// work finishes, so it is worth waiting for rather than failing the file.
+pub fn out_of_file_handles(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(23 | 24))
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn running_out_of_files_is_recognised() {
+        assert!(out_of_file_handles(&std::io::Error::from_raw_os_error(24)));
+        assert!(out_of_file_handles(&std::io::Error::from_raw_os_error(23)));
+        assert!(!out_of_file_handles(&std::io::Error::from_raw_os_error(2)));
+        assert!(!out_of_file_handles(&std::io::Error::other("x")));
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

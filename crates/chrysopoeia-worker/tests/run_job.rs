@@ -591,6 +591,72 @@ async fn cancelled_before_start_does_nothing() {
     assert_eq!(support::walk(dir.path()), [input]);
 }
 
+/// Replacing an MKV with an MP4 that can't hold its picture-based subtitles
+/// or its subtitle fonts would lose them for good: the file is left as it
+/// is. Converting anyway, or into a separate folder (the original stays),
+/// goes ahead.
+#[tokio::test]
+async fn replacing_never_silently_loses_picture_subtitles_or_fonts() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MKV_1080P_SUBS, dir.path());
+    let original = std::fs::read(&input).unwrap();
+    let mp4 = TranscodeProfile {
+        container: Container::Mp4,
+        ..profile()
+    };
+    let mut s = spec(&input, dir.path(), mp4);
+    let next = u32::try_from(s.probe.streams.len()).unwrap();
+    s.probe.streams.push(chrysopoeia_core::StreamInfo {
+        index: next,
+        kind: Some(chrysopoeia_core::StreamKind::Subtitle),
+        codec: "hdmv_pgs_subtitle".into(),
+        ..Default::default()
+    });
+    s.probe.streams.push(chrysopoeia_core::StreamInfo {
+        index: next + 1,
+        kind: Some(chrysopoeia_core::StreamKind::Attachment),
+        codec: "ttf".into(),
+        ..Default::default()
+    });
+    let cfg = config(ValidationLevel::Quick);
+    let (outcome, _) = run(&cfg, &s, &fake_plan).await;
+    match outcome {
+        JobOutcome::Skipped {
+            reason,
+            encoder: None,
+            output_size: None,
+        } => assert!(
+            reason.starts_with(
+                "MP4 can't hold this file's 1 picture-based subtitle and 1 subtitle font, so it \
+                 was left unchanged."
+            ),
+            "{reason}"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(support::artifacts_in(dir.path()).is_empty());
+
+    // Past that check, planning fails here on purpose (nothing is encoded).
+    let unplannable =
+        |_: &PlanRequest<'_>| -> anyhow::Result<FfmpegPlan> { anyhow::bail!("not planned") };
+    s.force = true;
+    let (outcome, _) = run(&cfg, &s, &unplannable).await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    s.force = false;
+    let out = dir.path().join("converted");
+    std::fs::create_dir_all(&out).unwrap();
+    let folder = RunConfig {
+        output_mode: OutputMode::Folder,
+        output_folder: Some(out),
+        ..cfg.clone()
+    };
+    let (outcome, _) = run(&folder, &s, &unplannable).await;
+    assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+}
+
 #[tokio::test]
 async fn preparing_checks_fail_fast() {
     require_ffmpeg!();
@@ -776,6 +842,129 @@ async fn an_original_replaced_during_the_encode_is_left_alone() {
     assert_eq!(support::walk(dir.path()), [input]);
 }
 
+/// An original replaced while the new file is being checked (after the
+/// last look before the checks) makes the checks compare the new file with
+/// the replacement. That is "the original changed", not a failed check.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_original_replaced_during_the_checks_is_left_alone() {
+    use std::os::unix::fs::PermissionsExt as _;
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, dir.path());
+    let spec = spec(&input, dir.path(), profile());
+    // A newer release, much shorter, waiting to be renamed over the
+    // original the moment the checks first read it.
+    let newer = dir.path().join("import.partial");
+    support::ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=duration=1:size=320x240:rate=24",
+        "-c:v",
+        "libx264",
+        "-f",
+        "mp4",
+        newer.to_str().unwrap(),
+    ]);
+    let newer_bytes = std::fs::read(&newer).unwrap();
+    let ffprobe = dir.path().join("ffprobe-swapping");
+    std::fs::write(
+        &ffprobe,
+        format!(
+            "#!/bin/sh\nfor last; do :; done\nif [ \"$last\" = '{input}' ] && [ -f '{newer}' ]; then \
+             mv '{newer}' '{input}'; fi\nexec ffprobe \"$@\"\n",
+            input = input.display(),
+            newer = newer.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ffprobe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cfg = RunConfig {
+        ffprobe: ffprobe.clone(),
+        ..config(ValidationLevel::Standard)
+    };
+
+    let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
+    match outcome {
+        JobOutcome::Skipped { reason, .. } => assert_eq!(
+            reason,
+            "The original changed while it was being converted, so it was left alone"
+        ),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert!(!newer.exists(), "the swap happened during the checks");
+    assert_eq!(std::fs::read(&input).unwrap(), newer_bytes);
+    assert!(support::artifacts_in(dir.path()).is_empty());
+}
+
+/// The TRaSH-guides layout: the library file is a hard link of a seeding
+/// torrent. Replacing it would keep the old data (through the torrent) and
+/// add the new file, so it is left alone unless converted anyway; then the
+/// job says no space was freed. Folder mode keeps the original anyway.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_hard_linked_original_is_not_replaced_unless_converted_anyway() {
+    use chrysopoeia_worker::run::{SHARED_ORIGINAL, SHARED_ORIGINAL_NOTE};
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &library);
+    let torrent = dir.path().join("torrent.mp4");
+    std::fs::hard_link(&input, &torrent).unwrap();
+    let original = std::fs::read(&input).unwrap();
+    let mut s = spec(&input, &library, profile());
+    let cfg = config(ValidationLevel::Quick);
+
+    let (outcome, _) = run(&cfg, &s, &fake_plan).await;
+    match outcome {
+        JobOutcome::Skipped {
+            reason,
+            encoder: None,
+            ..
+        } => assert_eq!(reason, SHARED_ORIGINAL),
+        other => panic!("expected Skipped, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&input).unwrap(), original);
+    assert!(support::artifacts_in(&library).is_empty());
+
+    // Into a separate folder: the original stays, nothing to protect.
+    let folder = RunConfig {
+        output_mode: OutputMode::Folder,
+        output_folder: Some(dir.path().join("converted")),
+        ..cfg.clone()
+    };
+    let (outcome, _) = run(&folder, &s, &fake_plan).await;
+    match outcome {
+        JobOutcome::Done { notes, .. } => {
+            assert!(
+                !notes.iter().any(|n| n == SHARED_ORIGINAL_NOTE),
+                "{notes:?}"
+            );
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+
+    // Converted anyway: replaced, and the note says nothing was freed.
+    s.force = true;
+    let (outcome, _) = run(&cfg, &s, &fake_plan).await;
+    match outcome {
+        JobOutcome::Done {
+            notes, output_path, ..
+        } => {
+            assert!(notes.iter().any(|n| n == SHARED_ORIGINAL_NOTE), "{notes:?}");
+            assert_eq!(output_path, input.with_extension("mkv"));
+        }
+        other => panic!("expected Done, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(&torrent).unwrap(),
+        original,
+        "the torrent is intact"
+    );
+}
+
 #[tokio::test]
 async fn folder_mode_without_a_temp_folder_encodes_into_the_output_folder() {
     require_ffmpeg!();
@@ -959,7 +1148,7 @@ async fn a_blocked_work_folder_is_a_work_folder_problem() {
                 error,
                 format!(
                     "The work folder {} can't be used because a file with that name is in the \
-                     way. Fix it, or choose another work folder, in Settings > Output.",
+                     way. Fix it, or choose another work folder, in Settings › Output.",
                     blocker.display()
                 )
             );

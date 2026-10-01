@@ -19,7 +19,6 @@ const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, sta
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
 
-#[allow(clippy::cast_possible_truncation)]
 fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let state: String = row.try_get("state")?;
     let stage: String = row.try_get("stage")?;

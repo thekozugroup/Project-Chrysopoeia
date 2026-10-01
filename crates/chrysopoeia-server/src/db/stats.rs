@@ -249,7 +249,6 @@ pub async fn projected_savings(pool: &SqlitePool) -> sqlx::Result<Option<i64>> {
     )
     .fetch_one(pool)
     .await?;
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     let projected = (remaining as f64 * (saved as f64 / original as f64)).round() as i64;
     Ok(Some(projected.max(0)))
 }

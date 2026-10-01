@@ -28,6 +28,19 @@ pub fn is_artifact(file_name: &str) -> bool {
     file_name.contains(ARTIFACT_MARKER)
 }
 
+/// Whether a temporary or backup file name was made by the job `job_id`
+/// (its name carries the job's short id).
+pub fn is_artifact_of(file_name: &str, job_id: Uuid) -> bool {
+    artifact_job(file_name) == Some(short_id(job_id).as_str())
+}
+
+/// The short job id (8 hex digits) a temporary or backup file name carries.
+pub fn artifact_job(file_name: &str) -> Option<&str> {
+    let at = file_name.rfind(ARTIFACT_MARKER)?;
+    let id = file_name.get(at + ARTIFACT_MARKER.len()..)?.get(..8)?;
+    id.chars().all(|c| c.is_ascii_hexdigit()).then_some(id)
+}
+
 /// Whether a file name is one of our backups.
 pub fn is_backup(file_name: &str) -> bool {
     is_artifact(file_name) && file_name.ends_with(".bak")
@@ -61,5 +74,21 @@ mod tests {
             Some("Movie (2020).mkv")
         );
         assert!(!is_artifact("Movie (2020).mkv"));
+    }
+
+    #[test]
+    fn artifacts_name_their_job() {
+        let id = Uuid::parse_str("0123456789abcdef0123456789abcdef").unwrap();
+        let other = Uuid::parse_str("fedcba9876543210fedcba9876543210").unwrap();
+        for name in [
+            temp_file_name("Show.chrysopoeia-edition", id, "mkv"),
+            backup_file_name("Movie.mkv", id),
+        ] {
+            assert_eq!(artifact_job(&name), Some("01234567"), "{name}");
+            assert!(is_artifact_of(&name, id));
+            assert!(!is_artifact_of(&name, other));
+        }
+        assert_eq!(artifact_job("Movie.mkv"), None);
+        assert_eq!(artifact_job(".x.chrysopoeia-zz.tmp.mkv"), None);
     }
 }

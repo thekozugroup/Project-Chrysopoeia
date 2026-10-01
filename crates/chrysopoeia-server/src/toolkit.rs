@@ -54,7 +54,7 @@ pub trait FolderWatcher: Send + Sync {
 
 /// The operations the server needs from the media crates.
 ///
-/// Blocking methods (`walk_library`, `is_media_path`) are only called from
+/// Blocking methods (`walk_library`, `is_video_path`) are only called from
 /// blocking threads. Async methods return `'static` futures that own their
 /// inputs.
 pub trait MediaToolkit: Send + Sync + 'static {
@@ -72,9 +72,6 @@ pub trait MediaToolkit: Send + Sync + 'static {
         preference: HwPreference,
         cpu_fallback: bool,
     ) -> Vec<EncoderCandidate>;
-
-    /// Whether a path has a media extension. Blocking-safe, pure.
-    fn is_media_path(&self, path: &Path) -> bool;
 
     /// Whether a path is a video file (media, but not audio only).
     /// Blocking-safe, pure.
@@ -179,10 +176,6 @@ impl MediaToolkit for RealToolkit {
         cpu_fallback: bool,
     ) -> Vec<EncoderCandidate> {
         chrysopoeia_hwdetect::encoder_candidates(hw, codec, preference, cpu_fallback)
-    }
-
-    fn is_media_path(&self, path: &Path) -> bool {
-        chrysopoeia_scanner::is_media_path(path)
     }
 
     fn walk_library(&self, root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResult> {
@@ -320,11 +313,6 @@ impl Toolkit {
         })
     }
 
-    /// See [`MediaToolkit::is_media_path`]. Call from a blocking thread.
-    pub fn is_media_path_blocking(&self, path: &Path) -> Result<bool, ToolPanic> {
-        self.sync_call("media file check", || self.inner.is_media_path(path))
-    }
-
     /// See [`MediaToolkit::is_video_path`]. Call from a blocking thread.
     pub fn is_video_path_blocking(&self, path: &Path) -> Result<bool, ToolPanic> {
         self.sync_call("video file check", || self.inner.is_video_path(path))
@@ -431,17 +419,92 @@ impl Toolkit {
 mod tests {
     use super::*;
 
+    /// A toolkit whose every call panics.
+    struct Panicking;
+
+    impl MediaToolkit for Panicking {
+        fn detect_hardware(&self, _: DetectOptions) -> BoxFuture<'static, HardwareInfo> {
+            Box::pin(async { panic!("detection broke") })
+        }
+        fn recommend_jobs(&self, _: &HardwareInfo, _: HwPreference) -> JobRecommendation {
+            panic!("recommendation broke")
+        }
+        fn encoder_candidates(
+            &self,
+            _: &HardwareInfo,
+            _: VideoCodec,
+            _: HwPreference,
+            _: bool,
+        ) -> Vec<EncoderCandidate> {
+            panic!("selection broke")
+        }
+        fn walk_library(&self, _: &Path, _: &ScanOptions) -> anyhow::Result<WalkResult> {
+            panic!("walk broke")
+        }
+        fn probe_file(
+            &self,
+            _: PathBuf,
+            _: Duration,
+        ) -> BoxFuture<'static, Result<ProbeInfo, ProbeError>> {
+            panic!("probe broke before it started")
+        }
+        fn decide(&self, _: &ProbeInfo, _: &TranscodeProfile) -> Decision {
+            panic!("{}", String::from("decision broke"))
+        }
+        fn run_job(
+            &self,
+            _: RunConfig,
+            _: JobSpec,
+            _: mpsc::Sender<JobProgress>,
+            _: CancellationToken,
+        ) -> BoxFuture<'static, JobOutcome> {
+            Box::pin(async { panic!("job broke") })
+        }
+        fn recover_artifact(&self, _: PathBuf) -> BoxFuture<'static, anyhow::Result<Recovery>> {
+            Box::pin(async { panic!("recovery broke") })
+        }
+        #[allow(clippy::type_complexity)]
+        fn start_watcher(
+            &self,
+            _: Duration,
+        ) -> anyhow::Result<(Box<dyn FolderWatcher>, mpsc::Receiver<WatchEvent>)> {
+            panic!("watcher broke")
+        }
+    }
+
+    /// A panic inside a media tool, in a plain call, while making a future
+    /// or while it runs, comes back as `ToolPanic` naming the operation.
     #[tokio::test]
-    async fn panics_in_the_real_stubs_become_errors() {
-        // In a checkout where a media crate is unfinished its functions
-        // panic; either way the wrapper must not unwind into the caller.
-        let tk = Toolkit::new(Arc::new(RealToolkit::new(PathBuf::from("ffprobe-missing"))));
-        let _ = tk
-            .walk_library(
-                PathBuf::from("/nonexistent-chrysopoeia"),
-                ScanOptions::default(),
-            )
+    async fn panics_in_media_tools_become_errors() {
+        let tk = Toolkit::new(Arc::new(Panicking));
+        let decided = tk.decide(&ProbeInfo::default(), &TranscodeProfile::default());
+        assert_eq!(
+            decided.unwrap_err(),
+            ToolPanic {
+                tool: "skip decision",
+                message: "decision broke".into()
+            }
+        );
+        let walked = tk
+            .walk_library(PathBuf::from("/nowhere"), ScanOptions::default())
             .await;
-        let _ = tk.decide(&ProbeInfo::default(), &TranscodeProfile::default());
+        assert_eq!(walked.unwrap_err().message, "walk broke");
+        let probed = tk
+            .probe_file(PathBuf::from("/nowhere.mkv"), Duration::from_secs(1))
+            .await;
+        assert!(
+            matches!(&probed, Err(ProbeError::Spawn(m)) if m.contains("probe broke")),
+            "{probed:?}"
+        );
+        let hw = tk.detect_hardware(DetectOptions::default()).await;
+        assert_eq!(hw.unwrap_err().message, "detection broke");
+        assert_eq!(
+            tk.recover_artifact(PathBuf::from("/x"))
+                .await
+                .unwrap_err()
+                .to_string(),
+            "crash recovery stopped unexpectedly: recovery broke"
+        );
+        assert!(tk.start_watcher(Duration::from_secs(1)).is_err());
     }
 }

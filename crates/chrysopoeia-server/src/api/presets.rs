@@ -64,7 +64,8 @@ pub fn goal_text(goal: Goal) -> (&'static str, &'static str) {
         ),
         Goal::Compatible => (
             "Plays everywhere",
-            "Files that play on every device and in every browser.",
+            "Files that play on every device and in every browser, though picture-based \
+             subtitles and subtitle styling can't come along.",
         ),
         Goal::Archive => ("Archive", "Near-original picture quality, in less space."),
         Goal::Custom => ("Custom", "Your own combination of settings."),
