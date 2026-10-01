@@ -61,6 +61,7 @@ fn spec(input: &Path, library_root: &Path) -> JobSpec {
             hw_decode: false,
         }],
         force: false,
+        mounts: Vec::new(),
     }
 }
 
@@ -333,5 +334,76 @@ async fn cancel_while_the_new_file_moves_in() {
             assert_ne!(std::fs::read(&input).unwrap(), original);
             assert!(support::artifacts_in(&lib).is_empty(), "no backup left");
         }
+    }
+}
+
+/// The names in a folder, sorted.
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The output folder is a share that isn't mounted when the job starts,
+/// or is unmounted while it encodes: its mount point is an ordinary folder
+/// then, and the job writes nothing there. It ends with `NotResponding`
+/// for the share, and the original is left alone.
+#[tokio::test]
+async fn nothing_is_written_where_a_share_was_unmounted() {
+    require_ffmpeg!();
+    for mid_encode in [false, true] {
+        let (dir, lib, input, original) = library();
+        let (out, work) = (dir.path().join("out"), dir.path().join("work"));
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let cfg = RunConfig {
+            output_mode: OutputMode::Folder,
+            output_folder: Some(out.clone()),
+            temp_dir: Some(work.clone()),
+            ..config()
+        };
+        let mut spec = spec(&input, &lib);
+        spec.mounts = vec![out.clone()];
+        let mut mounted = mid_encode.then(|| hang::mount(&out));
+        let (tx, mut rx) = mpsc::channel(1024);
+        let job = tokio::spawn({
+            let (cfg, spec) = (cfg.clone(), spec.clone());
+            async move {
+                run_job_with(
+                    &cfg,
+                    &spec,
+                    &realtime_plan,
+                    &transcode,
+                    tx,
+                    CancellationToken::new(),
+                )
+                .await
+            }
+        });
+        if mid_encode {
+            while let Some(p) = rx.recv().await {
+                if p.stage == chrysopoeia_core::JobStage::Transcoding && p.progress > 0.0 {
+                    mounted = None;
+                    break;
+                }
+            }
+            assert!(mounted.is_none(), "the encode started");
+        }
+        let outcome = tokio::time::timeout(PATIENCE, job)
+            .await
+            .expect("the job ends")
+            .unwrap();
+        assert_eq!(
+            outcome,
+            JobOutcome::NotResponding { path: out.clone() },
+            "mid encode: {mid_encode}"
+        );
+        assert!(names(&out).is_empty(), "nothing written: {:?}", names(&out));
+        assert_eq!(std::fs::read(&input).unwrap(), original);
+        wait_for("the temp file to go", || names(&work).is_empty()).await;
     }
 }

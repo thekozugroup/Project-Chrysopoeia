@@ -19,20 +19,31 @@
 //!   are stuck there (each has run past its caller's timeout), a further
 //!   check of anything in the folder they have in common counts as not
 //!   answering straight away, without a thread, so one share that stopped
-//!   answering costs at most that many threads, however many different
-//!   folders on it are looked at. A check elsewhere on a full mount, away
-//!   from where its checks are slow, may take room beyond that (up to twice
-//!   as many): what is slow there is then another share counted with this
-//!   mount (one mounted since the list of mounts was read, or reached
-//!   through a link), and it must not stop the rest of the mount;
-//! - the list of mounts is read again whenever a check gets no answer in
-//!   time or finds no room on its mount (at most once a second), and the
-//!   checks running are counted by the new list, so a share mounted since
-//!   it was read soon has its stuck checks counted by its own mount;
+//!   answering costs a few threads at most, however many different folders
+//!   on it are looked at. A check elsewhere on a full mount, away from the
+//!   folder its slow checks have in common, may take room beyond that while
+//!   fewer than that many checks there are not slow: what is slow there is
+//!   then another share counted with this mount (one mounted since the list
+//!   of mounts was read, or reached through a link), and checks stuck on it
+//!   never take the room of the rest of the mount;
+//! - a check is counted by the mount it started on for as long as it runs.
+//!   Mounts are told apart by their id, so a share mounted again at the
+//!   same place is another mount. When the list of mounts is read again
+//!   (whenever a check gets no answer in time or finds no room on its
+//!   mount, at most once a second), only a mount that appeared since,
+//!   between the one a check is counted by and its path, takes it over: a
+//!   share mounted after the list was read soon has its stuck checks
+//!   counted by its own mount. A check whose mount is gone from the list (a
+//!   hung share unmounted lazily, `umount -l`) stays counted by that mount:
+//!   its stuck checks are charged to no other;
 //! - at most [`MAX_STUCK_CHECKS`] run at once in all, which leaves room for
 //!   healthy folders while many shares hang. A check that can't start for
 //!   that reason is [`NoAnswer::Busy`]: nothing is known about its folder,
 //!   and it is never taken for one that stopped answering.
+//!
+//! [`first_unmounted`] tells whether the mount points a job's folders sit
+//! on are all still mounted (an unmounted share leaves its mount point
+//! behind as an ordinary folder on the disk below).
 //!
 //! The server and the worker share these checks.
 
@@ -175,10 +186,22 @@ const LIMITS: Limits = Limits {
 struct Slots {
     running: Vec<Slot>,
     next_id: u64,
-    /// The mount points checks are counted by (see [`group_in`]).
-    mounts: Arc<Vec<PathBuf>>,
+    /// The mounts checks are counted by (see [`group_in`]).
+    mounts: Arc<Vec<Mount>>,
     /// When they were read (`None`: not yet).
     mounts_read: Option<Instant>,
+}
+
+/// A mount checks are counted by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Mount {
+    /// Its id in `/proc/self/mountinfo`, which tells it from another mount
+    /// at the same place (a share unmounted, and another one mounted there
+    /// since); `None` for a path no listed mount is above (see
+    /// [`group_in`]).
+    id: Option<u64>,
+    /// Where it is mounted (or the path's first folders).
+    point: PathBuf,
 }
 
 /// One running check.
@@ -187,12 +210,20 @@ struct Slot {
     id: u64,
     /// What it looks at.
     path: PathBuf,
-    /// The mount it is counted by, by the mount points as last read.
-    group: PathBuf,
+    /// The mount it is counted by: the one it started on, or one mounted
+    /// between that and its path since (see [`taken_over`]).
+    group: Mount,
     started: Instant,
     /// When the caller that started it gave up waiting for it: from then
     /// on it counts as stuck.
     overdue_at: Instant,
+}
+
+impl Slot {
+    /// Whether it has run for [`SLOW_CHECK`] or is stuck at `now`.
+    fn is_slow(&self, now: Instant) -> bool {
+        self.started + SLOW_CHECK <= now || self.overdue_at <= now
+    }
 }
 
 /// Why a check couldn't start now.
@@ -210,13 +241,13 @@ enum Refused {
 
 impl Slots {
     /// The mount checks of `path` are counted by.
-    fn group(&self, path: &Path) -> PathBuf {
+    fn group(&self, path: &Path) -> Mount {
         group_in(&self.mounts, path, FALLBACK_COMPONENTS)
     }
 
     /// The checks running on `group`.
-    fn on(&self, group: &Path) -> Vec<&Slot> {
-        self.running.iter().filter(|s| s.group == group).collect()
+    fn on(&self, group: &Mount) -> Vec<&Slot> {
+        self.running.iter().filter(|s| s.group == *group).collect()
     }
 
     /// Room for a check of `path`, started now and given up on at
@@ -226,11 +257,16 @@ impl Slots {
     /// there, a check of anything in the folder they have in common is
     /// refused at once (`GroupStuck`). A check elsewhere on a full mount,
     /// away from the folder its slow checks (stuck, or running for
-    /// [`SLOW_CHECK`]) have in common, may take room beyond that, up to
-    /// twice as many: what is slow there is then most likely another share
-    /// counted with this mount (one mounted since the list of mounts was
-    /// read, or reached through a link), and must not stop the rest of
-    /// the mount for as long as it hangs.
+    /// [`SLOW_CHECK`]) have in common, may take room beyond that, as long
+    /// as fewer than [`Limits::per_group`] checks there are not slow: what
+    /// is slow there is then most likely another share counted with this
+    /// mount (one mounted since the list of mounts was read, or reached
+    /// through a link), and must not stop the rest of the mount for as long
+    /// as it hangs, however many of its checks are stuck. Each such share
+    /// costs a few threads at most: a check of it beyond its room is in
+    /// the folder its slow checks have in common, or once those are slow
+    /// too, in the folder all of them have in common, which takes in more
+    /// with each new folder they are in.
     fn take(
         &mut self,
         path: &Path,
@@ -244,14 +280,12 @@ impl Slots {
             return Err(Refused::GroupStuck);
         }
         if on_mount.len() >= limits.per_group {
-            let slow: Vec<&Path> = on_mount
-                .iter()
-                .filter(|s| s.started + SLOW_CHECK <= now || s.overdue_at <= now)
-                .map(|s| s.path.as_path())
-                .collect();
+            let (slow, fresh): (Vec<&Slot>, Vec<&Slot>) =
+                on_mount.iter().partition(|s| s.is_slow(now));
+            let slow: Vec<&Path> = slow.iter().map(|s| s.path.as_path()).collect();
             let elsewhere =
                 slow.len() >= limits.per_group && !path.starts_with(common_folder(&slow));
-            if !elsewhere || on_mount.len() >= 2 * limits.per_group {
+            if !elsewhere || fresh.len() >= limits.per_group {
                 return Err(Refused::GroupFull);
             }
         }
@@ -281,20 +315,47 @@ impl Slots {
         self.running.retain(|s| s.id != id);
     }
 
-    /// Count checks by `mounts` from now on, those running included (a
-    /// share mounted since the list was last read had its checks counted
-    /// with the mount above it). `read_at`: when the list was read.
-    fn set_mounts(&mut self, mounts: Vec<PathBuf>, read_at: Instant) {
+    /// Count new checks by `mounts` from now on, and the running ones that
+    /// a mount which appeared since takes over (see [`taken_over`]).
+    /// `read_at`: when the list was read.
+    fn set_mounts(&mut self, mounts: Vec<Mount>, read_at: Instant) {
         self.mounts_read = Some(read_at);
         if *self.mounts == mounts {
             return;
         }
-        self.mounts = Arc::new(mounts);
-        let mounts = Arc::clone(&self.mounts);
+        let before = std::mem::replace(&mut self.mounts, Arc::new(mounts));
+        let now = Arc::clone(&self.mounts);
         for slot in &mut self.running {
-            slot.group = group_in(&mounts, &slot.path, FALLBACK_COMPONENTS);
+            if let Some(group) = taken_over(&before, &now, slot) {
+                slot.group = group;
+            }
         }
     }
+}
+
+/// The mount that takes `slot` over now that the list of mounts went from
+/// `before` to `now`, if any: one that wasn't listed before, between the
+/// mount the slot is counted by (still listed) and its path. That is the
+/// share the check looks at, mounted after the list was read, and counting
+/// its stuck checks by it gives the mount above its room back. Nothing
+/// else moves a check: one whose mount is gone from the list (a share
+/// unmounted lazily while its checks hang) stays counted by it, never by
+/// the mount above, where it would take the room of healthy folders for as
+/// long as the share hangs; and a share mounted again at the same place is
+/// another mount, which the checks stuck on the old one aren't counted by.
+fn taken_over(before: &[Mount], now: &[Mount], slot: &Slot) -> Option<Mount> {
+    let candidate = group_in(now, &slot.path, FALLBACK_COMPONENTS);
+    let appeared = candidate.id.is_some() && !before.contains(&candidate);
+    let below = match slot.group.id {
+        Some(_) => {
+            now.contains(&slot.group)
+                && candidate.point != slot.group.point
+                && candidate.point.starts_with(&slot.group.point)
+        }
+        // Counted by its first folders (no mount was listed above it).
+        None => candidate.point.starts_with(&slot.group.point),
+    };
+    (appeared && below).then_some(candidate)
 }
 
 /// Whether, among the checks of one mount (`on_mount`), as many are stuck
@@ -527,7 +588,7 @@ pub async fn first_unanswered(paths: &[PathBuf], every: Duration, timeout: Durat
 /// the share), else (no list of mounts) its first two folders.
 pub async fn group_of(path: &Path) -> PathBuf {
     current_mounts().await;
-    lock(&SLOTS).group(path)
+    lock(&SLOTS).group(path).point
 }
 
 /// How much of a path stands for its mount when no mount point is above it
@@ -539,18 +600,85 @@ const FALLBACK_COMPONENTS: usize = if cfg!(any(test, feature = "test-hooks")) {
     3
 };
 
-/// [`group_of`] with the mount points given, and the first `fallback`
-/// components of the path when none is above it.
-fn group_in(mounts: &[PathBuf], path: &Path, fallback: usize) -> PathBuf {
+/// [`group_of`] with the mounts given (the later of two at one place, the
+/// one on top), and the first `fallback` components of the path when none
+/// is above it.
+fn group_in(mounts: &[Mount], path: &Path, fallback: usize) -> Mount {
     mounts
         .iter()
-        .filter(|m| path.starts_with(m))
-        .max_by_key(|m| m.components().count())
+        .filter(|m| path.starts_with(&m.point))
+        .max_by_key(|m| m.point.components().count())
         .cloned()
-        .unwrap_or_else(|| path.components().take(fallback).collect())
+        .unwrap_or_else(|| Mount {
+            id: None,
+            point: path.components().take(fallback).collect(),
+        })
 }
 
-/// Read the list of mount points when it hasn't been yet, and again in the
+/// A mount point listed in `/proc/self/mountinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountPoint {
+    /// Where it is mounted.
+    pub path: PathBuf,
+    /// Mounted on demand by an automounter (on an `autofs` mount): it comes
+    /// and goes by itself, and a look at its folder mounts it again.
+    pub on_demand: bool,
+}
+
+/// The mount points listed now, read afresh (without touching any share),
+/// or `None` when the list can't be read.
+pub async fn mount_points() -> Option<Vec<MountPoint>> {
+    Some(points_of(fresh_mounts().await?))
+}
+
+/// The mount points of the mounts `listed`.
+fn points_of(listed: Vec<Listed>) -> Vec<MountPoint> {
+    let autofs: Vec<u64> = listed
+        .iter()
+        .filter(|l| l.fstype == "autofs")
+        .filter_map(|l| l.mount.id)
+        .collect();
+    listed
+        .into_iter()
+        .map(|l| MountPoint {
+            on_demand: l.parent.is_some_and(|p| autofs.contains(&p)),
+            path: l.mount.point,
+        })
+        .collect()
+}
+
+/// The first of `points` (mount points a job's folders sit on) that isn't
+/// mounted now: its folder is then an ordinary folder on the disk below
+/// (an unmounted share leaves its mount point behind), where nothing may
+/// be written. `None` when they all are, or the list can't be read.
+pub async fn first_unmounted(points: &[PathBuf]) -> Option<PathBuf> {
+    if points.is_empty() {
+        return None;
+    }
+    let now = mount_points().await?;
+    points
+        .iter()
+        .find(|p| !now.iter().any(|m| m.path == **p))
+        .cloned()
+}
+
+/// One line of `/proc/self/mountinfo`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Listed {
+    mount: Mount,
+    /// The id of the mount it is on.
+    parent: Option<u64>,
+    /// Its filesystem type.
+    fstype: String,
+}
+
+/// The mounts checks are counted by, from the list.
+#[cfg(any(test, not(feature = "test-hooks")))]
+fn mounts_of(listed: &[Listed]) -> Vec<Mount> {
+    listed.iter().map(|l| l.mount.clone()).collect()
+}
+
+/// Read the list of mounts when it hasn't been yet, and again in the
 /// background once it is older than [`MOUNTS_MAX_AGE`] (this check goes by
 /// the list it has).
 #[cfg(not(any(test, feature = "test-hooks")))]
@@ -559,19 +687,45 @@ async fn current_mounts() {
     match read {
         None => {
             let asked = Instant::now();
-            let points = tokio::task::spawn_blocking(read_mount_points)
+            let listed = tokio::task::spawn_blocking(read_mounts)
                 .await
-                .unwrap_or_default();
-            lock(&SLOTS).set_mounts(points, asked);
+                .ok()
+                .flatten();
+            note_mounts(listed.as_deref(), asked);
         }
         Some(at) if at.elapsed() > MOUNTS_MAX_AGE => reread_mounts(),
         Some(_) => {}
     }
 }
 
-/// Read the list of mount points again in the background, unless it was
-/// read moments ago: a check that got no answer, or no room on its mount,
-/// may be counted with the wrong mount (a share mounted since the list was
+/// Count checks by the mounts `listed`, read at `asked` (`None`: the list
+/// couldn't be read; the one there is stays, and isn't read again at
+/// once).
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn note_mounts(listed: Option<&[Listed]>, asked: Instant) {
+    let mut slots = lock(&SLOTS);
+    match listed {
+        Some(listed) => slots.set_mounts(mounts_of(listed), asked),
+        None => slots.mounts_read = Some(asked),
+    }
+}
+
+/// The list of mounts, read now on a blocking thread (checks are counted
+/// by it from then on too).
+#[cfg(not(any(test, feature = "test-hooks")))]
+async fn fresh_mounts() -> Option<Vec<Listed>> {
+    let asked = Instant::now();
+    let listed = tokio::task::spawn_blocking(read_mounts)
+        .await
+        .ok()
+        .flatten()?;
+    note_mounts(Some(&listed), asked);
+    Some(listed)
+}
+
+/// Read the list of mounts again in the background, unless it was read
+/// moments ago: a check that got no answer, or no room on its mount, may
+/// be counted with the wrong mount (a share mounted since the list was
 /// read), and its slot moves to the right one once the list is read.
 #[cfg(not(any(test, feature = "test-hooks")))]
 fn refresh_mounts() {
@@ -583,8 +737,8 @@ fn refresh_mounts() {
     }
 }
 
-/// Read the list of mount points on a blocking thread (one read at a time),
-/// and count checks by it.
+/// Read the list of mounts on a blocking thread (one read at a time), and
+/// count checks by it.
 #[cfg(not(any(test, feature = "test-hooks")))]
 fn reread_mounts() {
     static READING: AtomicBool = AtomicBool::new(false);
@@ -605,8 +759,7 @@ fn reread_mounts() {
     runtime.spawn_blocking(move || {
         let _reading = reading;
         let asked = Instant::now();
-        let points = read_mount_points();
-        lock(&SLOTS).set_mounts(points, asked);
+        note_mounts(read_mounts().as_deref(), asked);
     });
 }
 
@@ -624,14 +777,30 @@ fn refresh_mounts() {
     lock(&SLOTS).set_mounts(mounts, Instant::now());
 }
 
-/// The mount points in `/proc/self/mountinfo` (none when it can't be read).
+#[cfg(any(test, feature = "test-hooks"))]
+async fn fresh_mounts() -> Option<Vec<Listed>> {
+    let mounts = hang::mounts();
+    lock(&SLOTS).set_mounts(mounts.clone(), Instant::now());
+    Some(
+        mounts
+            .into_iter()
+            .map(|mount| Listed {
+                mount,
+                parent: None,
+                fstype: "test".to_string(),
+            })
+            .collect(),
+    )
+}
+
+/// The mounts in `/proc/self/mountinfo` (`None` when it can't be read).
 #[cfg(not(any(test, feature = "test-hooks")))]
-fn read_mount_points() -> Vec<PathBuf> {
+fn read_mounts() -> Option<Vec<Listed>> {
     match std::fs::read("/proc/self/mountinfo") {
-        Ok(text) => parse_mountinfo(&text),
+        Ok(text) => Some(parse_listed(&text)),
         Err(e) => {
             tracing::debug!("could not read the list of mounts: {e}");
-            Vec::new()
+            None
         }
     }
 }
@@ -639,10 +808,37 @@ fn read_mount_points() -> Vec<PathBuf> {
 /// The mount points listed in `/proc/self/mountinfo`: the fifth field of
 /// each line, with `\040`-style escapes for spaces and the like.
 pub fn parse_mountinfo(text: &[u8]) -> Vec<PathBuf> {
+    parse_listed(text)
+        .into_iter()
+        .map(|l| l.mount.point)
+        .collect()
+}
+
+/// The lines of `/proc/self/mountinfo`: the mount's id is the first field,
+/// the id of the mount it is on the second, the mount point the fifth, and
+/// the filesystem type the field after the lone `-`.
+fn parse_listed(text: &[u8]) -> Vec<Listed> {
+    let number = |field: &[u8]| std::str::from_utf8(field).ok().and_then(|i| i.parse().ok());
     text.split(|b| *b == b'\n')
-        .filter_map(|line| line.split(|b| *b == b' ').nth(4))
-        .filter(|field| !field.is_empty())
-        .map(|field| path_from_bytes(unescape(field)))
+        .filter_map(|line| {
+            let fields: Vec<&[u8]> = line.split(|b| *b == b' ').collect();
+            let point = fields.get(4).filter(|f| !f.is_empty())?;
+            let fstype = fields
+                .iter()
+                .skip(6)
+                .skip_while(|f| **f != b"-".as_slice())
+                .nth(1)
+                .map(|f| String::from_utf8_lossy(f).into_owned())
+                .unwrap_or_default();
+            Some(Listed {
+                mount: Mount {
+                    id: fields.first().and_then(|f| number(f)),
+                    point: path_from_bytes(unescape(point)),
+                },
+                parent: fields.get(1).and_then(|f| number(f)),
+                fstype,
+            })
+        })
         .collect()
 }
 
@@ -687,14 +883,19 @@ fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
 #[cfg(any(test, feature = "test-hooks"))]
 pub mod hang {
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
-    use super::lock;
+    use super::{Mount, lock};
 
-    static HUNG: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Mutex::default);
-    static BUSY: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Mutex::default);
-    static MOUNTS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(Mutex::default);
+    /// Marked paths, each with the id of its mark.
+    type Marks = Mutex<Vec<(PathBuf, u64)>>;
+
+    static HUNG: LazyLock<Marks> = LazyLock::new(Mutex::default);
+    static BUSY: LazyLock<Marks> = LazyLock::new(Mutex::default);
+    static MOUNTS: LazyLock<Marks> = LazyLock::new(Mutex::default);
+    static NEXT_MARK: AtomicU64 = AtomicU64::new(1);
 
     /// Make every check of `path`, and of anything under it, hang until
     /// the returned guard is dropped (even by a failing test, whose runtime
@@ -709,26 +910,26 @@ pub mod hang {
         mark(&BUSY, path)
     }
 
-    /// Count checks of anything under `path` as checks of one mount (tests
-    /// otherwise count by a path's first two folders) until the guard is
-    /// dropped.
+    /// Mount something at `path`: checks of anything under it are counted
+    /// as checks of one mount (tests otherwise count by a path's first
+    /// folders), and it is listed as mounted ([`super::mount_points`]),
+    /// until the guard is dropped (unmounted). Each mount is another one,
+    /// also at a place where one was mounted before.
     pub fn mount(path: &Path) -> Marked {
         mark(&MOUNTS, path)
     }
 
-    fn mark(list: &'static Mutex<Vec<PathBuf>>, path: &Path) -> Marked {
-        lock(list).push(path.to_path_buf());
-        Marked {
-            list,
-            path: path.to_path_buf(),
-        }
+    fn mark(list: &'static Marks, path: &Path) -> Marked {
+        let id = NEXT_MARK.fetch_add(1, Ordering::SeqCst);
+        lock(list).push((path.to_path_buf(), id));
+        Marked { list, id }
     }
 
     /// Lifts its mark when dropped.
     #[derive(Debug)]
     pub struct Marked {
-        list: &'static Mutex<Vec<PathBuf>>,
-        path: PathBuf,
+        list: &'static Marks,
+        id: u64,
     }
 
     /// The guard of [`hang`].
@@ -736,26 +937,29 @@ pub mod hang {
 
     impl Drop for Marked {
         fn drop(&mut self) {
-            let mut list = lock(self.list);
-            if let Some(i) = list.iter().position(|p| *p == self.path) {
-                list.remove(i);
-            }
+            lock(self.list).retain(|(_, id)| *id != self.id);
         }
     }
 
     /// Whether `path` is (under) a path marked hung.
     pub fn is_hung(path: &Path) -> bool {
-        lock(&HUNG).iter().any(|p| path.starts_with(p))
+        lock(&HUNG).iter().any(|(p, _)| path.starts_with(p))
     }
 
     /// Whether `path` is (under) a path marked busy.
     pub fn is_busy(path: &Path) -> bool {
-        lock(&BUSY).iter().any(|p| path.starts_with(p))
+        lock(&BUSY).iter().any(|(p, _)| path.starts_with(p))
     }
 
-    /// The mounts tests made up.
-    pub(super) fn mounts() -> Vec<PathBuf> {
-        lock(&MOUNTS).clone()
+    /// The mounts tests made up, in the order they were mounted.
+    pub(super) fn mounts() -> Vec<Mount> {
+        lock(&MOUNTS)
+            .iter()
+            .map(|(point, id)| Mount {
+                id: Some(*id),
+                point: point.clone(),
+            })
+            .collect()
     }
 
     /// Block while `path` is marked hung.
@@ -770,10 +974,11 @@ pub mod hang {
         lock(&super::SLOTS).running.len()
     }
 
-    /// Checks running now on the mount `path` is counted by.
+    /// Checks running now that are counted by the mount `path` is on.
     pub async fn running_checks_on(path: &Path) -> usize {
-        let group = super::group_of(path).await;
-        lock(&super::SLOTS).on(&group).len()
+        super::current_mounts().await;
+        let slots = lock(&super::SLOTS);
+        slots.on(&slots.group(path)).len()
     }
 }
 
@@ -902,10 +1107,28 @@ mod tests {
         base + Duration::from_millis(ms)
     }
 
-    fn slots_with_mounts(mounts: &[&str], now: Instant) -> Slots {
+    /// Mounts at `points`, with ids.
+    fn mounts(points: &[(&str, u64)]) -> Vec<Mount> {
+        points
+            .iter()
+            .map(|(point, id)| Mount {
+                id: Some(*id),
+                point: PathBuf::from(point),
+            })
+            .collect()
+    }
+
+    /// Slots counted by mounts at `points` (numbered in order).
+    fn slots_with_mounts(points: &[&str], now: Instant) -> Slots {
         let mut slots = Slots::default();
-        slots.set_mounts(mounts.iter().map(PathBuf::from).collect(), now);
+        let numbered: Vec<(&str, u64)> = points.iter().copied().zip(1..).collect();
+        slots.set_mounts(mounts(&numbered), now);
         slots
+    }
+
+    /// Checks running that are counted by the mount `path` is on now.
+    fn on_mount_of(slots: &Slots, path: &str) -> usize {
+        slots.on(&slots.group(Path::new(path))).len()
     }
 
     /// One mount can hold only so many checks; once they are all stuck a
@@ -1002,9 +1225,9 @@ mod tests {
         slots.give_back(h);
 
         // The list is read again: the share is a mount of its own.
-        slots.set_mounts(vec![PathBuf::from("/"), PathBuf::from("/mnt/new")], later);
-        assert_eq!(slots.on(Path::new("/")).len(), 0);
-        assert_eq!(slots.on(Path::new("/mnt/new")).len(), 3);
+        slots.set_mounts(mounts(&[("/", 1), ("/mnt/new", 2)]), later);
+        assert_eq!(on_mount_of(&slots, "/data"), 0);
+        assert_eq!(on_mount_of(&slots, "/mnt/new"), 3);
         for i in 0..limits.per_group {
             let path = Path::new("/data").join(format!("folder {i}"));
             assert!(slots.take(&path, later, at(now, 300), limits).is_ok());
@@ -1197,28 +1420,32 @@ mod tests {
 
     #[test]
     fn checks_are_counted_by_the_longest_mount_above_them() {
-        let mounts: Vec<PathBuf> = ["/", "/mnt/user", "/mnt/remotes/nas", "/mnt"]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
+        let mounts = mounts(&[
+            ("/", 1),
+            ("/mnt/user", 2),
+            ("/mnt/remotes/nas", 3),
+            ("/mnt", 4),
+            ("/mnt/remotes/nas", 5),
+        ]);
+        let group = |path: &str| group_in(&mounts, Path::new(path), 3);
+        // The later of two at one place: the one on top.
         assert_eq!(
-            group_in(&mounts, Path::new("/mnt/remotes/nas/Movies/a.mkv"), 3),
-            Path::new("/mnt/remotes/nas")
+            group("/mnt/remotes/nas/Movies/a.mkv"),
+            mounts[4],
+            "{:?}",
+            group("/mnt/remotes/nas/Movies/a.mkv")
         );
-        assert_eq!(
-            group_in(&mounts, Path::new("/mnt/user/TV"), 3),
-            Path::new("/mnt/user")
-        );
+        assert_eq!(group("/mnt/user/TV").point, Path::new("/mnt/user"));
         // Component-wise: /mnt/username is not under /mnt/user.
-        assert_eq!(
-            group_in(&mounts, Path::new("/mnt/username/x"), 3),
-            Path::new("/mnt")
-        );
-        assert_eq!(group_in(&mounts, Path::new("/config"), 3), Path::new("/"));
+        assert_eq!(group("/mnt/username/x").point, Path::new("/mnt"));
+        assert_eq!(group("/config").point, Path::new("/"));
         // Without a list of mounts: the first two folders.
         assert_eq!(
             group_in(&[], Path::new("/media/share/Movies/a.mkv"), 3),
-            Path::new("/media/share")
+            Mount {
+                id: None,
+                point: PathBuf::from("/media/share")
+            }
         );
     }
 
@@ -1235,5 +1462,279 @@ mod tests {
                 PathBuf::from("/media/café"),
             ]
         );
+        assert_eq!(
+            mounts_of(&parse_listed(text)),
+            mounts(&[
+                ("/", 22),
+                ("/mnt/remotes/My Share", 40),
+                ("/media/café", 41)
+            ])
+        );
+        let types: Vec<(Option<u64>, String)> = parse_listed(text)
+            .into_iter()
+            .map(|l| (l.parent, l.fstype))
+            .collect();
+        assert_eq!(
+            types,
+            [
+                (Some(1), "ext4".to_string()),
+                (Some(22), "cifs".to_string()),
+                (Some(22), "fuse".to_string()),
+            ]
+        );
+    }
+
+    /// A share an automounter mounted on demand (on an `autofs` mount) is
+    /// told apart: it comes and goes by itself.
+    #[test]
+    fn shares_mounted_on_demand_are_told_apart() {
+        let text = b"22 1 8:1 / / rw - ext4 /dev/sda1 rw\n\
+            30 22 0:40 / /mnt/auto rw - autofs auto.nas rw\n\
+            31 30 0:41 / /mnt/auto/nas rw - nfs4 nas:/export rw\n\
+            32 22 0:42 / /mnt/nas rw - nfs4 nas:/other rw\n";
+        let on_demand: Vec<(String, bool)> = points_of(parse_listed(text))
+            .into_iter()
+            .map(|m| (m.path.display().to_string(), m.on_demand))
+            .collect();
+        assert_eq!(
+            on_demand,
+            [
+                ("/".to_string(), false),
+                ("/mnt/auto".to_string(), false),
+                ("/mnt/auto/nas".to_string(), true),
+                ("/mnt/nas".to_string(), false),
+            ]
+        );
+    }
+
+    /// Checks stuck on two shares, one of them with checks in two of its
+    /// folders (twice its room), stay counted by those shares once they
+    /// are unmounted while they hang (`umount -l`): the mount above them
+    /// keeps all its room. Before, they were counted by it from the next
+    /// read of the list on, and with that many stuck there a healthy
+    /// folder on it got no room for as long as the shares hung.
+    #[test]
+    fn checks_stuck_on_an_unmounted_share_are_charged_to_no_other_mount() {
+        let limits = Limits {
+            per_group: 2,
+            total: 50,
+        };
+        let now = Instant::now();
+        let mut slots = slots_with_mounts(&["/", "/mnt/a", "/mnt/b"], now);
+        let overdue = at(now, 100);
+        for path in ["/mnt/a/x/1", "/mnt/a/x/2", "/mnt/b/1", "/mnt/b/2"] {
+            slots.take(Path::new(path), now, overdue, limits).unwrap();
+        }
+        // Slow and stuck in a/x; a/y is elsewhere on that share.
+        let later = at(now, 1_000);
+        for path in ["/mnt/a/y/1", "/mnt/a/y/2"] {
+            slots
+                .take(Path::new(path), later, at(now, 1_100), limits)
+                .unwrap();
+        }
+        let stuck = at(now, 5_000);
+        assert_eq!(on_mount_of(&slots, "/mnt/a"), 4);
+        assert_eq!(
+            slots.take(Path::new("/mnt/a/z"), stuck, at(now, 6_000), limits),
+            Err(Refused::GroupStuck)
+        );
+
+        // Both shares are unmounted lazily: their checks hang on.
+        slots.set_mounts(mounts(&[("/", 1)]), stuck);
+        assert_eq!(on_mount_of(&slots, "/data"), 0);
+        assert_eq!(slots.running.len(), 6);
+        for i in 0..limits.per_group {
+            let path = Path::new("/data/Movies").join(format!("{i}"));
+            assert!(
+                slots.take(&path, stuck, at(now, 6_000), limits).is_ok(),
+                "{i}"
+            );
+        }
+        // Their mount points are ordinary folders on "/" now, with room.
+        slots.running.retain(|s| !s.path.starts_with("/data"));
+        assert!(
+            slots
+                .take(Path::new("/mnt/a"), stuck, at(now, 6_000), limits)
+                .is_ok()
+        );
+    }
+
+    /// A share mounted again where one hangs is another mount: the checks
+    /// stuck on the old one aren't counted by it, whether the list was
+    /// read in between or not.
+    #[test]
+    fn a_share_mounted_again_at_the_same_place_is_another_mount() {
+        let limits = Limits {
+            per_group: 2,
+            total: 50,
+        };
+        let now = Instant::now();
+        for read_in_between in [false, true] {
+            let mut slots = slots_with_mounts(&["/", "/mnt/nas"], now);
+            for path in ["/mnt/nas/1", "/mnt/nas/2"] {
+                slots
+                    .take(Path::new(path), now, at(now, 100), limits)
+                    .unwrap();
+            }
+            let later = at(now, 1_000);
+            assert_eq!(
+                slots.take(Path::new("/mnt/nas/3"), later, at(now, 2_000), limits),
+                Err(Refused::GroupStuck)
+            );
+            if read_in_between {
+                slots.set_mounts(mounts(&[("/", 1)]), later);
+            }
+            slots.set_mounts(mounts(&[("/", 1), ("/mnt/nas", 7)]), later);
+            assert_eq!(on_mount_of(&slots, "/mnt/nas"), 0);
+            assert!(
+                slots
+                    .take(Path::new("/mnt/nas/3"), later, at(now, 2_000), limits)
+                    .is_ok()
+            );
+        }
+    }
+
+    /// However many checks are stuck on a share counted with a healthy
+    /// mount (reached through a link, say), in however many of its
+    /// folders, they never take the room of checks away from them; a
+    /// check of the share itself is refused once its checks are stuck.
+    #[test]
+    fn stuck_checks_never_take_the_room_of_folders_away_from_them() {
+        let limits = Limits {
+            per_group: 2,
+            total: 50,
+        };
+        let now = Instant::now();
+        let mut slots = slots_with_mounts(&["/"], now);
+        let mut t = 0;
+        // Two folders of the share, then a second share: each fills the
+        // room left beside the slow ones.
+        for folder in ["/data/link/a", "/data/link/b", "/data/link2"] {
+            for i in 0..limits.per_group {
+                let path = Path::new(folder).join(format!("{i}"));
+                slots
+                    .take(&path, at(now, t), at(now, t + 100), limits)
+                    .unwrap();
+            }
+            t += 1_000;
+        }
+        assert_eq!(on_mount_of(&slots, "/"), 6);
+        let later = at(now, t);
+        assert_eq!(
+            slots.take(Path::new("/data/link/c"), later, at(now, t + 100), limits),
+            Err(Refused::GroupStuck)
+        );
+        for i in 0..limits.per_group {
+            let path = Path::new("/media/Movies").join(format!("{i}"));
+            assert!(
+                slots.take(&path, later, at(now, t + 100), limits).is_ok(),
+                "{i}"
+            );
+        }
+        // Its room is for checks that are not slow: full, until one ends.
+        assert_eq!(
+            slots.take(Path::new("/media/TV"), later, at(now, t + 100), limits),
+            Err(Refused::GroupFull)
+        );
+    }
+
+    /// The list of mounts is only taken from a fresh read, and only a
+    /// mount that appeared since, between the one a check is counted by
+    /// and its path, takes the check over.
+    #[test]
+    fn only_a_mount_that_appeared_below_takes_a_check_over() {
+        let limits = Limits {
+            per_group: 4,
+            total: 50,
+        };
+        let now = Instant::now();
+        let mut slots = slots_with_mounts(&["/", "/mnt/a"], now);
+        slots
+            .take(Path::new("/mnt/a/x/1"), now, at(now, 100), limits)
+            .unwrap();
+        slots
+            .take(Path::new("/srv/y/1"), now, at(now, 100), limits)
+            .unwrap();
+        // /mnt/a/x mounted since: the check under it moves there. /srv
+        // mounted since: so does the one under it (it was on "/").
+        slots.set_mounts(
+            mounts(&[("/", 1), ("/mnt/a", 2), ("/mnt/a/x", 3), ("/srv", 4)]),
+            now,
+        );
+        assert_eq!(on_mount_of(&slots, "/mnt/a/x"), 1);
+        assert_eq!(on_mount_of(&slots, "/srv"), 1);
+        assert_eq!(on_mount_of(&slots, "/mnt/a"), 0);
+        // /mnt/a unmounted, and the share at /mnt/a/x with it: the check
+        // stays counted by /mnt/a/x, never by "/".
+        slots.set_mounts(mounts(&[("/", 1), ("/srv", 4)]), now);
+        assert_eq!(on_mount_of(&slots, "/data"), 0);
+        // Mounted again (another mount, at one place or below): it stays.
+        slots.set_mounts(
+            mounts(&[("/", 1), ("/srv", 4), ("/mnt/a", 8), ("/mnt/a/x", 9)]),
+            now,
+        );
+        assert_eq!(on_mount_of(&slots, "/mnt/a/x"), 0);
+        assert_eq!(on_mount_of(&slots, "/mnt/a"), 0);
+        assert_eq!(slots.running.len(), 2);
+    }
+
+    /// The same through real checks: two shares that hang, each with
+    /// twice its room of stuck checks (in two of its folders), unmounted
+    /// lazily while they hang. A healthy folder on the mount above still
+    /// answers, quickly, and none of their checks are counted by it.
+    #[tokio::test]
+    async fn checks_stuck_on_unmounted_shares_leave_the_mount_above_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        let healthy = parent.join("healthy");
+        std::fs::create_dir_all(&healthy).unwrap();
+        let _parent = hang::mount(&parent);
+        let shares = [parent.join("a"), parent.join("b")];
+        let mut mounted = Vec::new();
+        let mut hung = Vec::new();
+        for share in &shares {
+            mounted.push(hang::mount(share));
+            hung.push(hang::hang(share));
+        }
+        let timeout = Duration::from_millis(300);
+        for share in &shares {
+            for folder in ["one", "two"] {
+                let mut asks = Vec::new();
+                for i in 0..12 {
+                    let path = share.join(folder).join(format!("{i}"));
+                    asks.push(tokio::spawn(async move {
+                        guarded("browse", &path, timeout, || ()).await
+                    }));
+                }
+                for ask in asks {
+                    assert_eq!(ask.await.unwrap(), Err(NoAnswer::NotAnswering));
+                }
+            }
+            let stuck = hang::running_checks_on(share).await;
+            assert!(
+                (MAX_STUCK_PER_MOUNT..=2 * MAX_STUCK_PER_MOUNT).contains(&stuck),
+                "{stuck}"
+            );
+        }
+        assert_eq!(hang::running_checks_on(&parent).await, 0);
+
+        // Unmounted while they hang.
+        mounted.clear();
+        assert_eq!(hang::running_checks_on(&parent).await, 0);
+        for i in 0..3 {
+            let h = healthy.clone();
+            let asked = Instant::now();
+            let listed = guarded("browse", &healthy, Duration::from_secs(30), move || {
+                std::fs::read_dir(&h).is_ok()
+            })
+            .await;
+            assert_eq!(listed, Ok(true), "look {i}");
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "{:?}",
+                asked.elapsed()
+            );
+        }
+        drop(hung);
     }
 }

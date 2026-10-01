@@ -80,6 +80,8 @@ pub struct AppInner {
     pub shutdown: CancellationToken,
     /// Crash leftovers still to be looked for in library folders.
     pub leftovers: std::sync::Mutex<Leftovers>,
+    /// The drives and shares the folders in use are mounted from.
+    pub mounts: crate::services::share_mounts::ShareMounts,
 }
 
 /// The search for crash leftovers (temp files and, above all, originals
@@ -126,6 +128,7 @@ impl AppState {
             library: LibraryHandle::default(),
             shutdown: CancellationToken::new(),
             leftovers: std::sync::Mutex::new(Leftovers::default()),
+            mounts: crate::services::share_mounts::ShareMounts::default(),
         }))
     }
 

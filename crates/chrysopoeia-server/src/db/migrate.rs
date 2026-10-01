@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 11;
+pub const SCHEMA_VERSION: i64 = 12;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -303,6 +303,19 @@ const MIGRATION_V11: &[&str] = &[
     "CREATE INDEX idx_jobs_placing ON jobs(placing) WHERE placing > 0",
 ];
 
+/// Version 12: `folder_mounts`, the mount points each folder Chrysopoeia
+/// uses (a library folder, the output folder, the work folder) was seen on
+/// or under. An unmounted share leaves its mount point behind as an
+/// ordinary folder; while one of these isn't mounted, its folder counts as
+/// not connected, so nothing takes that folder for the share (see
+/// `services::share_mounts`). Nothing is known for the folders in use
+/// before: they are learned from the next look at them.
+const MIGRATION_V12: &[&str] = &["CREATE TABLE folder_mounts (
+        folder TEXT NOT NULL,
+        mount  TEXT NOT NULL,
+        PRIMARY KEY (folder, mount)
+    )"];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -315,6 +328,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (9, MIGRATION_V9),
     (10, MIGRATION_V10),
     (11, MIGRATION_V11),
+    (12, MIGRATION_V12),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -434,6 +448,7 @@ mod tests {
             [
                 "activity",
                 "files",
+                "folder_mounts",
                 "jobs",
                 "libraries",
                 "library_mounts",
@@ -1195,6 +1210,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(goals, [None, None]);
+    }
+
+    /// Version 12 adds the mount points of the folders in use, none known
+    /// yet; what was there is kept.
+    #[tokio::test]
+    async fn version_12_adds_the_mount_points_of_folders() {
+        const LIB: &str = "00000000-0000-0000-0000-0000000000a1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v11.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 11).await.unwrap();
+            sqlx::query(
+                "INSERT INTO libraries (id, name, path, profile, created_at) \
+                 VALUES (?, 'Movies', '/mnt/nas/Movies', '{}', '2026-01-01T00:00:00.000Z')",
+            )
+            .bind(LIB)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO library_mounts (library_id, path) VALUES (?, ?)")
+                .bind(LIB)
+                .bind("/mnt/nas/Movies/USB")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let known: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM folder_mounts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(known, 0);
+        let inner = crate::db::libraries::mounts(db.pool(), uuid::Uuid::parse_str(LIB).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(inner, ["/mnt/nas/Movies/USB"]);
+        let mut tx = db.write_tx().await.unwrap();
+        crate::db::folder_mounts::add(&mut tx, "/mnt/nas/Movies", &["/mnt/nas".to_string()])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            crate::db::folder_mounts::get(db.pool(), "/mnt/nas/Movies")
+                .await
+                .unwrap(),
+            ["/mnt/nas"]
+        );
     }
 
     #[tokio::test]

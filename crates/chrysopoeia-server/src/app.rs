@@ -308,8 +308,9 @@ fn temp_dirs(state: &AppState) -> Vec<PathBuf> {
 /// (where folder mode writes when no temp folder is set) only after an
 /// unclean shutdown (a clean one lets every job remove its own files).
 /// Returns the library and output folders that couldn't be searched (missing,
-/// unreadable or not responding, or a library with files that is empty now:
-/// an unmounted share); a scan that reaches one searches it later.
+/// unreadable or not responding, on a share seen mounted there that isn't
+/// now, or a library with files that is empty now: an unmounted share); a
+/// scan that reaches one searches it later.
 pub async fn recover_artifacts(state: &AppState, include_libraries: bool) -> Vec<PathBuf> {
     // (folder, whether it must be searched later when it can't be now)
     let mut roots: Vec<(PathBuf, bool)> =
@@ -341,9 +342,9 @@ pub async fn recover_artifacts(state: &AppState, include_libraries: bool) -> Vec
     for (root, keep_for_later) in roots {
         let root_str = root.to_string_lossy().into_owned();
         let looked = if libraries_with_files.contains(&root) {
-            library::root_unavailable(&root_str).await
+            library::root_unavailable(state, &root_str).await
         } else {
-            library::path_problem(&root_str).await
+            library::folder_unavailable(state, &root_str).await
         };
         let problem = match looked {
             library::Folder::Fine => None,

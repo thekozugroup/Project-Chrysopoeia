@@ -21,4 +21,5 @@ mod settings;
 mod startup;
 mod stuck_checks;
 mod support;
+mod unmounted_shares;
 mod web;

@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod files;
+pub mod folder_mounts;
 pub mod jobs;
 pub mod libraries;
 pub mod migrate;

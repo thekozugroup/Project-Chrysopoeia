@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::db;
 use crate::error::{ApiError, ApiResult, describe_value_error};
 use crate::services::dispatcher::MAX_JOBS_LIMIT;
-use crate::services::{hardware, watcher};
+use crate::services::{hardware, share_mounts, watcher};
 use crate::state::AppState;
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -240,6 +240,24 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
         || old.min_file_size_mb != new.min_file_size_mb
     {
         watcher::sync(state).await;
+    }
+    // A work or output folder chosen anew (moved off a share, say) has its
+    // drives and shares learned afresh, from now (it was just found
+    // usable); the one it replaces is forgotten.
+    for (before, after) in [
+        (&old.output_folder, &new.output_folder),
+        (&old.temp_dir, &new.temp_dir),
+    ] {
+        if before == after {
+            continue;
+        }
+        if let Some(before) = before {
+            share_mounts::forget_unless_used(state, Path::new(before)).await;
+        }
+        if let Some(after) = after {
+            share_mounts::forget(state, Path::new(after)).await;
+            share_mounts::check(state, Path::new(after)).await;
+        }
     }
     state.dispatcher.wake();
     state.broadcast_queue_state().await;

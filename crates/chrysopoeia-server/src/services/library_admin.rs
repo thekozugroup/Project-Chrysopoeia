@@ -12,7 +12,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::services::dispatcher::CancelIntent;
 use crate::services::library::{self, view_by_id};
 use crate::services::queue::CANCEL_WAIT;
-use crate::services::watcher;
+use crate::services::{share_mounts, watcher};
 use crate::state::AppState;
 
 /// Longest accepted library name.
@@ -331,6 +331,9 @@ pub async fn create(state: &AppState, new: NewLibrary) -> ApiResult<Library> {
         }
         return Err(e.into());
     }
+    // The drives and shares it is on are learned afresh (a library added
+    // again after its share was removed for good).
+    share_mounts::forget(state, &path).await;
     state
         .library_activity(
             ActivityLevel::Info,
@@ -418,6 +421,7 @@ pub async fn delete(state: &AppState, id: Uuid) -> ApiResult<()> {
     if !running.is_empty() {
         state.dispatcher.wait_finished(&running, CANCEL_WAIT).await;
     }
+    share_mounts::forget_unless_used(state, Path::new(&row.path)).await;
     watcher::sync(state).await;
     state
         .library_activity(

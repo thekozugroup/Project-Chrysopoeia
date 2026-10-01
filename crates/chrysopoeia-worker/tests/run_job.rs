@@ -68,6 +68,7 @@ fn spec(input: &Path, library_root: &Path, profile: TranscodeProfile) -> JobSpec
         profile,
         candidates: vec![software()],
         force: false,
+        mounts: Vec::new(),
     }
 }
 

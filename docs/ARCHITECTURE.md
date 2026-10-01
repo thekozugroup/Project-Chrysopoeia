@@ -148,6 +148,7 @@ activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, libra
 savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, saved_bytes INT,
         files INT, PK(date, library_id))
 library_mounts(library_id FK→libraries ON DELETE CASCADE, path, PK(library_id, path))
+folder_mounts(folder, mount, PK(folder, mount))
 ```
 
 Versions: 1 = base schema; 2 = job-list indexes and `finished_at` on every
@@ -191,6 +192,10 @@ was found in place with only the backup of its original left to remove
 (2), with the sizes of the new file and of the original when known; see
 "Putting the new file in place on a share that stops answering". Such
 jobs are kept by history trimming and clearing until that is settled.
+12 = `folder_mounts`: the mount points each library folder, the output
+folder and the work folder were seen on or under (see "Drives and shares
+the folders sit on" under File and job lifecycle). Nothing is known for
+the folders in use before: they are learned from the next look at them.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -269,6 +274,33 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   it's back". It is forgotten once its folder has files without being a
   mount. (When the folder doesn't answer, every known mount counts as
   offline.)
+- Drives and shares the folders sit on (`services::share_mounts`). An
+  unmounted share leaves its mount point behind as an ordinary folder on
+  the disk below: empty, or holding whatever was there before the share
+  was mounted over it. So the mount points each library folder, the
+  output folder and the work folder sit on or under (from
+  `/proc/self/mountinfo`, read without touching any share; not `/`, and
+  not a share an automounter mounts on demand on an `autofs` mount, which
+  comes back by itself when looked at) are remembered (`folder_mounts`),
+  adding any found mounted whenever the folder is looked at: when a
+  library is added, when the output or work folder is chosen in Settings,
+  at start-up, and by every library view, scan and job. While one of them
+  isn't mounted, the folder is not connected ("The drive or share mounted
+  at /mnt/remotes/nas isn't connected. Reconnect it, and its conversions
+  continue."), whatever the folder below holds: the library shows that
+  as its `path_error`, a scan of it stops there (an error entry, nothing
+  taken for removed or added), its jobs and every job that uses the
+  output or work folder wait with their library offline (checked again
+  every 15 s; nothing is read from or written into the bare mount point),
+  the start-up search for leftovers leaves it for later, and a job whose
+  new file may have been put in place is never settled on it. Once the
+  share is mounted again (any mount at that place), it is connected.
+  Mounts are only forgotten when a folder stops being used for that, so
+  a share removed for good is moved off like this: a library is removed
+  and added again (its mounts are learned afresh from that moment), the
+  output or work folder is changed in Settings (the folder it replaces is
+  forgotten; choosing the old one again later learns it afresh, as an
+  ordinary folder when nothing is mounted there).
 - Leftovers in library folders: every scan hands the temp and backup files
   its walk finds (`WalkResult.artifacts`) to `recover_artifact`, except
   those of running jobs and of jobs whose new file is still being put in
@@ -320,7 +352,8 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   doesn't answer within 10 s, answers with an error (a soft-mounted share
   that timed out, a FUSE share whose server stopped), or isn't there as it
   should be (its library folder missing or empty, a share mounted in the
-  library disconnected) leaves its job marked and touches nothing: the job
+  library disconnected, the library or output folder on a share seen
+  mounted there that isn't now) leaves its job marked and touches nothing: the job
   settles itself when it runs again (before
   it does anything with its file), a job that can't run again is settled
   every 15 s in the background, and a search for leftovers that finds its
@@ -338,7 +371,8 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   recorded as clean only when no job was running, no new file was still
   being put in place, and this search was done everywhere: a stop during
   it, or a library or output folder that was out of reach (missing, not
-  responding, or a library with files that is empty now), keeps it due, and
+  responding, on a share that isn't mounted, or a library with files that
+  is empty now), keeps it due, and
   a scan that reaches such a library does the search there.
 
 ## Verdicts and goal changes
@@ -428,8 +462,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   when paused, or outside `active_hours`.
 - Claim: the `queued` job with the highest priority, then oldest, of an
   enabled library; marked running in the same transaction.
-- Jobs of a library whose folder is offline (missing, unreadable or empty)
-  wait, and the folder is checked again every 15 s (with what stopped
+- Jobs of a library whose folder is offline (missing, unreadable, empty,
+  or on a share that isn't mounted), and jobs whose work or output folder
+  is on a share that isn't mounted (see "Drives and shares the folders sit
+  on"), wait, and the folder is checked again every 15 s (with what stopped
   answering in it, if that was something else: "not found" is an answer,
   an error is not, so a share that answers with errors stays offline); a
   job whose file changed moments ago waits for it to settle.
@@ -475,20 +511,29 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   above the path in `/proc/self/mountinfo` (read without touching the
   share; read again in the background every 30 s, and at most once a
   second whenever a check gets no answer in time or finds no room on its
-  mount; without it, the path's first two folders). When the list changes,
-  the checks running are counted by it from then on: a share mounted since
-  the list was read, whose checks got stuck while they were counted with
-  the mount above it, gives that mount its room back. At most 8 run at once
-  on one mount (`MAX_STUCK_PER_MOUNT`): once 8 there are stuck (each past
-  its caller's timeout), a check of anything in the folder they have in
-  common answers "not responding" at once, without a thread (so does one
-  that would wait for a stuck check of the same thing); a check of a full
-  mount waits for room up to its timeout, except one away from the folder
-  its slow checks (stuck, or running for 2 s) have in common, which may
-  take room beyond the 8, up to 16: what is slow there is then most likely
-  another share counted with this mount (one mounted since the list was
-  read, or reached through a link), and must not stop the rest of the
-  mount, a healthy library on it say, for as long as that share hangs.
+  mount; without it, the path's first two folders). Mounts are told apart
+  by their id there, so a share mounted again at one place is another
+  mount. A check is counted by the mount it started on for as long as it
+  runs; when the list changes, only a mount that appeared since, between
+  that mount (still listed) and the check's path, takes it over: a share
+  mounted since the list was read, whose checks got stuck while they were
+  counted with the mount above it, gives that mount its room back. A check
+  whose mount is gone from the list (a hung share unmounted lazily with
+  `umount -l`, the usual way out of a hung NFS or SMB mount) stays counted
+  by that mount, never by the mount above, so its stuck checks take no
+  room of the healthy folders there for as long as they hang, and a share
+  mounted again at that place starts with all its room. At most 8 run at
+  once on one mount (`MAX_STUCK_PER_MOUNT`): once 8 there are stuck (each
+  past its caller's timeout), a check of anything in the folder they have
+  in common answers "not responding" at once, without a thread (so does
+  one that would wait for a stuck check of the same thing); a check of a
+  full mount waits for room up to its timeout, except one away from the
+  folder its slow checks (stuck, or running for 2 s) have in common, which
+  may take room beyond the 8 while fewer than 8 checks there are not slow:
+  what is slow there is then most likely another share counted with this
+  mount (one mounted since the list was read, or reached through a link),
+  and must not stop the rest of the mount, a healthy library on it say,
+  for as long as that share hangs, however many of its checks are stuck.
   At most 128 run at once in all (`MAX_STUCK_CHECKS`, room for 16
   hung shares, well below the runtime's 512 blocking threads); a check
   that finds no room (after waiting up to its timeout) is
@@ -500,11 +545,12 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   waiting for other folders that stopped answering, so it couldn't open
   this one right now. Try again in a moment."), and the watch over a long
   step ignores such checks. A hung share therefore costs at most 8
-  threads (16 when the checks stuck on it are all in one of its folders
-  and others are looked at too), however many of its folders are looked
-  at and however often, and never the checks of other mounts; a share
-  counted with another mount (reached through a link, or mounted since the
-  list was read) holds up only its own folders there.
+  threads, 8 more each time checks away from the folder its stuck checks
+  have in common get stuck too (that folder then takes in more of the
+  share, until it is the whole share), however many of its folders are
+  looked at and however often, and never the checks of other mounts; a
+  share counted with another mount (reached through a link, or mounted
+  since the list was read) holds up only its own folders there.
   Reserving disk space looks at the disks without holding the reservations'
   lock, so a disk that hangs holds up no other job's reservation.
 - A job that runs out of disk space (`disk_full`) while other jobs are
@@ -671,7 +717,14 @@ with `JobSpec.force` uses it when `decide` says skip.
 - Compromises (dropped subtitles, 8-bit reduction, resizes, fallbacks) are
   returned as plain-language `notes`.
 
-**run_job**:
+**run_job**: `JobSpec.mounts` are the mount points the library folder,
+the work folder and the output folder were seen on (see "Drives and
+shares the folders sit on"). Before the job creates its temp file and
+before it starts putting the new file in place, it reads
+`/proc/self/mountinfo` again (`slow_fs::first_unmounted`): one that is
+no longer mounted (a share unmounted while the job ran) ends the job with
+`NotResponding { path: <mount point> }`, nothing written, its temp file
+removed, and the dispatcher's wait says the share isn't connected.
 1. Preparing: the input exists (answering within 30 s; otherwise the job
    ends with `JobOutcome::NotResponding { path }`, which the dispatcher
    turns into a requeue with the library offline), `decide` agrees
@@ -873,10 +926,15 @@ share whose server stopped "not connected"; `finalize::Unreadable`), a
 folder whose listing fails, a leftover that couldn't be put back or
 removed, and a database that couldn't be read. "Not in place" also needs
 the job's folders to be there as they should be, since an unmounted share
-leaves an empty folder, or none, where nothing is found: the library
-folder answers, can be read and isn't empty, no drive or share known to
-be mounted in the library above the file is disconnected, and in folder
-mode the output folder answers and can be read. A job that settles itself
+leaves an empty folder, or none, where nothing is found: the drives and
+shares the library folder (and in folder mode the output folder) were
+seen mounted from are mounted (see "Drives and shares the folders sit
+on"; a share cleanly unmounted while the server was down leaves an
+ordinary folder, which may even hold files of its own, and is "not
+connected"), the library folder answers, can be read and isn't empty, no
+drive or share known to be mounted in the library above the file is
+disconnected, and in folder mode the output folder answers and can be
+read. A job that settles itself
 then waits with its library offline, its reason the library's own
 problem or "Chrysopoeia can't read the folder … because the disk reported
 a read or write error. If it's on a drive or network share, check that
@@ -988,7 +1046,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /health` | | `{"ok":true,"version":"0.2.0"}` |
 | `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `CHRYSOPOEIA_VERSION` when it differs from `version`, else null) |
 | `GET /overview` | | `Overview` (`totals` and `savings_history` cover the same libraries; `resolutions` has a "No video" bucket for files without a video stream, "Unknown" for pictures whose size couldn't be read) |
-| `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline) |
+| `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline, or on a drive or share seen mounted there that isn't now: "The drive or share mounted at … isn't connected. …") |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`folder_not_allowed`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. `folder_not_allowed`: the folder (as the disk has it, links followed) is `/`, the data folder or inside it or above it, `/config`, `/app` or the web folder or inside them, or `/proc`, `/sys` or `/dev` or inside them; the `LIBRARIES` start-up list follows the same rule. Starts a scan. |
 | `GET /libraries/{id}` | | `Library` |
 | `PATCH /libraries/{id}` | `{"name"?, "enabled"?, "profile"?}` (profile is normalized; response includes it) | `Library`. Profile changes re-decide `pending`/`skipped` files (not done/failed; files skipped by the user stay skipped); a file being converted is decided again when its job ends (see "Verdicts and goal changes"). |
