@@ -80,6 +80,19 @@ function audioMeta(s: StreamInfo): string {
 }
 
 /** "English audio", or just "Audio" when the track has no language tag. */
+/**
+ * The saving shown for a converted file. The server's own figure wins: it
+ * records 0 when nothing was freed (a hard-linked file, whose other links
+ * still hold the old data), and then no saving is claimed.
+ */
+export function doneSavings(
+  file: Pick<MediaFile, "original_size_bytes" | "saved_bytes" | "size_bytes">,
+): ReturnType<typeof savingsText> {
+  if (file.original_size_bytes === null || file.saved_bytes === 0) return null;
+  const output = file.saved_bytes !== null ? file.original_size_bytes - file.saved_bytes : file.size_bytes;
+  return savingsText(file.original_size_bytes, output);
+}
+
 export function trackTitle(kind: "audio" | "subtitles", language: string | null, title: string | null): string {
   const known = language && language.toLowerCase() !== "und" ? languageLabel(language) : null;
   const noun = known ? `${known} ${kind}` : kind === "audio" ? "Audio" : "Subtitles";
@@ -230,7 +243,7 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
     );
   }
   if (file.status === "done") {
-    const saved = file.original_size_bytes !== null ? savingsText(file.original_size_bytes, file.size_bytes) : null;
+    const saved = doneSavings(file);
     // Jobs are newest first; the latest finished one says whether it was checked.
     const last = jobs.find((j) => j.state === "done");
     const verified = Boolean(last?.validation?.passed);

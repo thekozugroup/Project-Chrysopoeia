@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { trackTitle } from "./files";
+import { doneSavings, trackTitle } from "./files";
 import { rootOf } from "./folder-picker";
 import { skipFollowsSettings } from "@/lib/convertible";
 import type { MediaFile, ProbeInfo, StreamInfo } from "@/lib/types";
@@ -124,5 +124,22 @@ describe("rootOf", () => {
     expect(rootOf("/tmp/fe-media2", roots)).toBe("/tmp");
     expect(rootOf("/media2", roots)).toBeNull();
     expect(rootOf("/anything", ["/"])).toBe("/");
+  });
+});
+
+describe("doneSavings", () => {
+  it("uses the server's saved bytes", () => {
+    expect(doneSavings({ original_size_bytes: 1_000_000, saved_bytes: 400_000, size_bytes: 600_000 })?.text).toBe(
+      "Saved 400 KB (40%)",
+    );
+  });
+
+  it("claims no saving when the server recorded none (hard-linked file)", () => {
+    expect(doneSavings({ original_size_bytes: 1_000_000, saved_bytes: 0, size_bytes: 600_000 })).toBeNull();
+  });
+
+  it("falls back to the sizes when the server sent no figure", () => {
+    expect(doneSavings({ original_size_bytes: 1_000_000, saved_bytes: null, size_bytes: 750_000 })?.saved).toBe(true);
+    expect(doneSavings({ original_size_bytes: null, saved_bytes: null, size_bytes: 750_000 })).toBeNull();
   });
 });
