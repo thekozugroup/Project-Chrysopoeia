@@ -37,9 +37,10 @@ services:
       UMASK: ${UMASK:-002}
       # Time zone for the "When to convert" schedule (log lines are in UTC).
       TZ: ${TZ:-Etc/UTC}
-      # auto picks the best verified hardware encoder, else the CPU. Other
-      # values: cpu, nvenc (NVIDIA), qsv (Intel), vaapi (Intel or AMD), amf,
-      # rkmpp (Rockchip), v4l2m2m (Raspberry Pi 4); see .env.example.
+      # auto picks the best hardware encoder that passes a test, else the
+      # CPU. Other values: cpu, nvenc (NVIDIA), qsv (Intel), vaapi (Intel or
+      # AMD), amf, rkmpp (Rockchip), v4l2m2m (Raspberry Pi 4); see
+      # .env.example.
       # Applied on first start and whenever the value changes.
       HW_ACCEL: ${HW_ACCEL:-auto}
       # Files at once. Empty = automatic (based on CPU, memory and GPU); a

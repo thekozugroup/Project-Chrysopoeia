@@ -10,9 +10,9 @@
 #   group_add:
 #     - "105"   # the number shown by: stat -c %g /dev/dri/renderD128
 #
-# Check it worked: the Hardware page in the app lists QSV or VA-API encoders
-# as verified, and `docker exec chrysopoeia vainfo --display drm` prints
-# your GPU's profiles.
+# Check it worked: Settings > Hardware in the app shows QSV or VA-API encoders
+# as Works under Details, and `docker exec chrysopoeia vainfo --display drm`
+# prints your GPU's profiles.
 services:
   chrysopoeia:
     devices:

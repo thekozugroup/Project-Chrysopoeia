@@ -64,7 +64,7 @@ list.
 | Field | What to enter |
 |---|---|
 | Web UI port | `8080`, or any free port. |
-| Config | `/mnt/user/appdata/chrysopoeia` (the default). Holds the database; it stays small. |
+| Config | `/mnt/user/appdata/chrysopoeia` (the default). Holds the database; it stays small. Keep it a folder of its own: never choose `/mnt/user/appdata` itself, which other apps share. |
 | Media | **Required.** The share that holds your videos, e.g. `/mnt/user/media/` (click the field to browse). Choose only what you want converted, never all of `/mnt/user/`: Chrysopoeia replaces files in this folder, so other apps' folders (appdata, photo libraries, camera recordings) must stay out of it. Inside the app this folder is `/media`. |
 | Transcode cache | Optional. A folder on an SSD pool for in-progress files, e.g. `/mnt/cache/chrysopoeia-temp/`. See [Transcode cache](#transcode-cache-on-an-ssd). |
 
@@ -85,7 +85,7 @@ Under **Show more settings**:
 |---|---|---|
 | PUID / PGID | `99` / `100` | Unraid's `nobody` / `users`. Keep them unless your media is owned by someone else. |
 | UMASK | `002` | New files are readable by everyone and editable by the `users` group. |
-| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU. `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) uses only that kind of GPU; when it is missing or cannot encode the chosen format, files are still converted, on the CPU, so check Settings › Hardware that its encoders show as *verified*. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
+| HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU. `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) uses only that kind of GPU; when it is missing or cannot encode the chosen format, files are still converted, on the CPU, so check Settings › Hardware: under *Details: encoders and ffmpeg*, each format its test encode passed shows *Works*. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
 | MAX_JOBS | empty | Empty = automatic. A number here replaces the automatic count while *Files at once* is *Automatic* in the app (Settings › Processing); a number chosen in the app wins. |
 | ALLOWED_HOSTS | empty | Only behind a reverse proxy: the domain name you open Chrysopoeia at. See [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik). |
 | NVIDIA_VISIBLE_DEVICES | empty | NVIDIA: `all`, or one GPU UUID to use only that card. |
@@ -104,17 +104,20 @@ Click **Apply**. Unraid pulls the image and starts the container.
    page already says which GPU it found (or that your CPU will do the work).
 2. Click **Choose a folder**. The folder browser opens at `/media`, which is
    the Media share you picked. Open the folder you want converted (for
-   example `Movies`) and click **Use this folder**. You can add more libraries
-   later.
+   example `Movies`) and click the button at the bottom, which names the folder
+   you are in: **Use “Movies”**. You can add more libraries later.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
    suits old devices. The cards show how fast your hardware handles each one.
 4. Click **Start**. Chrysopoeia scans the folder, queues the files that need
-   work, and starts converting. The **Overview** shows progress and space
-   saved; the **Queue** shows each running file with its speed and time left.
+   work, and starts converting. The **Overview** shows the space saved so far
+   and what is happening now; the **Queue** has three tabs: **Running** (each
+   file with its step, progress and time left), **Up next** and **History**.
 
-Open **Settings > Hardware** to confirm your GPU was found: its encoders show as
-*verified*. If they do not, the page shows a hint with the fix; see
+Open **Settings > Hardware** (the page headed *This machine*) to confirm your
+GPU was found: it appears as a graphics card, and under **Details: encoders and
+ffmpeg** the formats it can encode show *Works*. If it is missing or a format
+shows *Failed test*, the page shows a setup tip with the fix; see
 [Troubleshooting](#troubleshooting).
 
 Files that are new or changed later are picked up on their own: folder
@@ -171,8 +174,9 @@ before making it reachable from the internet.
 
 Unraid shares are normally owned by `nobody:users` (99:100), which is why the
 template uses those ids. Chrysopoeia starts as root only long enough to adopt
-them, join the group that owns your GPU device, and fix the owner of its
-config folder; then it drops to that user. If the log says it *cannot write to
+them, join the group that owns your GPU device, and fix the owner of its own
+files in the config folder (the database and its lock file); then it drops to
+that user. It never changes the owner of anything else there. If the log says it *cannot write to
 /media*, your media is owned by a different user: either set PUID/PGID to that
 owner, or run **Tools > New Permissions** on the share (this resets it to
 `nobody:users`).
@@ -223,14 +227,17 @@ and set Repository to the `edge` image before clicking **Apply**.
 
 Start with the app itself:
 
-- **Settings > Hardware** lists the CPU and every GPU the container can see,
-  each hardware encoder with the result of its test encode (and the error when
-  it failed), and a hint with the exact fix when something is missing, for
-  example a GPU visible on the host but not passed to the container. After
+- **Settings > Hardware** lists the processor, the memory and every GPU the
+  container can see, with a setup tip giving the exact fix when something is
+  missing, for example a GPU visible on the host but not passed to the
+  container. Under **Details: encoders and ffmpeg**, each encoder shows
+  *Works* or *Failed test* (with the error), from a short test encode. After
   changing the template, click **Check again** on that page, or restart the
   container.
-- Each failed file in the **Queue** says why in a sentence; open it for the
-  verification report, the ffmpeg command and the end of ffmpeg's log.
+- Each failed file in the **Queue** (under **History**) says why in a
+  sentence; open it for the checks that ran and, under *Technical details*,
+  the ffmpeg command and the end of ffmpeg's log. The **Log** at the bottom of
+  that tab lists scans, warnings and problems.
 
 Then the container log (Docker tab > Chrysopoeia icon > **Logs**). The first
 lines list the version, the user it runs as, the transcode folder and every
@@ -241,10 +248,12 @@ GPU device it can see.
 | Container will not start: *error gathering device information while adding custom device "/dev/dri"* | The template has a `/dev/dri` device, but the server has no `/dev/dri`. Install Intel GPU TOP or Radeon TOP and reboot, or remove the device: **Edit** the container and click **Remove** next to it. |
 | Log warns that a device *belongs to the root group* | Chrysopoeia does not join the root group, for safety. In the Unraid terminal run `chgrp video /dev/dri/renderD128 && chmod g+rw /dev/dri/renderD128` (with the device named in the warning), then restart the container. To keep it after a reboot, add the same line to `/boot/config/go`. |
 | NVIDIA card not used; log says *NVIDIA_VISIBLE_DEVICES is set but no NVIDIA GPU is visible* | Add `--runtime=nvidia` to Extra Parameters (Advanced View). After installing the Nvidia-Driver plugin, restart Docker once. |
-| NVIDIA encoders fail on the Hardware page | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
-| Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). The Hardware page shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
+| NVIDIA encoders show *Failed test* in Settings > Hardware | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
+| Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). Settings > Hardware shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
 | Log says *cannot write to /media* | See [PUID, PGID and permissions](#puid-pgid-and-permissions). |
 | Log says */media is mounted read-only* | The Media path's **Access Mode** is *Read Only*. **Edit** the container, click **Edit** next to Media, set Access Mode to *Read/Write* and click **Apply**. Read-only is fine only when Settings > Output writes new files to a separate output folder. |
+| Log says */config already holds other files but no Chrysopoeia database* | The Config path points at a folder that other apps use, such as `/mnt/user/appdata`. Chrysopoeia only adds its own files there and leaves the rest alone, but give it a folder of its own: **Edit** the container, set Config to `/mnt/user/appdata/chrysopoeia` and click **Apply**. |
+| Log says *cannot write to /config* | The Config folder belongs to someone else and is not writable for PUID/PGID, and Chrysopoeia will not take over a folder that holds other data. Set PUID/PGID to the folder's owner, or set Config to a new folder such as `/mnt/user/appdata/chrysopoeia`, which Chrysopoeia then takes over. |
 | Log says *No host folder is mounted at /config* | The Config path is empty, so settings and history would be lost on the next update. Set it to `/mnt/user/appdata/chrysopoeia`. |
 | New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or click **Scan now** on the library. |
 | The server feels slow while converting | Lower *Files at once* in Settings > Processing, or turn on *When to convert* there so conversions run overnight. |

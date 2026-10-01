@@ -5,9 +5,11 @@ times faster, at the cost of somewhat larger files than the CPU encoders give
 at the same visual quality.
 
 You do not pick encoders by hand. At startup (and whenever you click **Check
-again** in Settings > Hardware) Chrysopoeia lists the encoders its ffmpeg
-build has, runs a one-second test encode on each hardware encoder, and marks
-only the ones that succeed as *verified*. Jobs use the best verified encoder
+again** in Settings > Hardware, the page headed *This machine*) Chrysopoeia
+lists the encoders its ffmpeg build has, runs a one-second test encode on each
+hardware encoder, and uses only the ones that succeed. Under **Details:
+encoders and ffmpeg** on that page, each format shows *Works* when its test
+passed, or *Failed test* with the reason. Jobs use the best encoder that works
 for the library's codec; if a hardware encode fails on a particular file, it is
 retried with CPU decoding and then on the CPU. So the practical question is only
 *can the container see the GPU?* The table in each section says what that takes.
@@ -21,7 +23,7 @@ driver libraries are injected by the NVIDIA runtime.
 For the curious: the VA-API drivers live in `/usr/lib/jellyfin-ffmpeg/lib/dri`
 (`iHD_drv_video.so`, `i965_drv_video.so`, `radeonsi_drv_video.so`) next to the
 oneVPL and Media SDK runtimes, and the bundled `libva` looks there first, so
-`LIBVA_DRIVERS_PATH` does not need to be set. The Hardware page names GPUs
+`LIBVA_DRIVERS_PATH` does not need to be set. Settings > Hardware names GPUs
 with `lspci`, which the image includes. `ffmpeg`, `ffprobe` and `vainfo` are
 on the `PATH` for checks with `docker exec`.
 
@@ -30,7 +32,7 @@ on the `PATH` for checks with `docker exec`.
 Encode support by codec. Decoding is broader (every listed GPU also decodes
 the codecs it encodes). "Gen" means Intel Core generation. Where a claim is
 uncertain it says so: hardware support varies by exact model, so the test
-encode on the Hardware page is the final word.
+encode under Details on Settings > Hardware is the final word.
 
 | Vendor | H.264 | HEVC (H.265) | AV1 | VP9 |
 |---|---|---|---|---|
@@ -130,8 +132,9 @@ with a 64-bit OS and on other ARM64 boards.
 `HW_ACCEL=auto` picks these encoders on its own once their test encode
 passes. To use only one, set `HW_ACCEL=v4l2m2m` (Pi 4) or `HW_ACCEL=rkmpp`
 (Rockchip); formats it cannot encode, or all files if its test encode fails,
-still go to the CPU, so check that Settings › Hardware shows it as
-*verified*. `HW_ACCEL=cpu` turns hardware encoding off.
+still go to the CPU, so check that Settings › Hardware shows *Works* for it
+under *Details: encoders and ffmpeg*. `HW_ACCEL=cpu` turns hardware encoding
+off.
 
 ## CPU only
 
@@ -142,8 +145,9 @@ rest of the server stays responsive.
 
 ## When a GPU is not detected
 
-Open Settings > Hardware. It lists the devices the container can see, each
-encoder's test result with the error if it failed, and a hint with the fix.
+Open Settings > Hardware. It lists the devices the container can see and a
+setup tip with the fix; under *Details: encoders and ffmpeg*, each encoder's
+test result shows *Works* or *Failed test* with the error.
 The container log also prints the GPU devices it found at startup
 (`docker logs chrysopoeia`). The common causes:
 
@@ -153,4 +157,4 @@ The container log also prints the GPU devices it found at startup
 | `/dev/dri` exists but encoders fail with "permission denied" | Start the container as root with `PUID`/`PGID` (the default) so it can join the render group, or add `--group-add <gid of /dev/dri/renderD128>` when using `--user`. |
 | NVIDIA GPU listed on the host, no NVENC in the container | Add `--gpus all`, or `--runtime=nvidia` with `NVIDIA_VISIBLE_DEVICES=all`; restart Docker after installing the NVIDIA driver or plugin. |
 | Log warns that a device *belongs to the root group* | The container never joins the root group. On the host, give the device a group of its own, e.g. `chgrp video /dev/dri/renderD128 && chmod g+rw /dev/dri/renderD128`, and make it permanent with a udev rule (Unraid: add the line to `/boot/config/go`). |
-| Encoders verified but files still use the CPU | Settings > Hardware > preference is set to *CPU only*, or the library's codec has no hardware encoder on this GPU (see the matrix above). |
+| Encoders show *Works* but files still use the CPU | Settings > Hardware > *Use for converting* is set to *CPU only*, or the library's codec has no hardware encoder on this GPU (see the matrix above). |
