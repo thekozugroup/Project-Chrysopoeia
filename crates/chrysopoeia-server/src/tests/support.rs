@@ -4,7 +4,7 @@
 //! prober reads, e.g. `video=h264\naudio=aac\nwidth=1920\nheight=1080`. A
 //! file containing `broken` fails to probe.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,6 +24,7 @@ use chrysopoeia_core::{
 use chrysopoeia_hwdetect::DetectOptions;
 use chrysopoeia_scanner::{DiscoveredFile, ProbeError, ScanOptions, WalkResult, WatchEvent};
 use chrysopoeia_worker::finalize::Recovery;
+use chrysopoeia_worker::run::Unfinished;
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -31,6 +32,7 @@ use tempfile::TempDir;
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use uuid::Uuid;
 
 use crate::app::{self, Startup};
 use crate::config::Config;
@@ -55,6 +57,16 @@ pub enum Behavior {
     HoldFail(String),
     /// Panic inside the transcoder.
     Panic,
+    /// The file stopped answering: `NotResponding` at once.
+    NotResponding,
+    /// Like a job stuck in a step that ignores Cancel until it is released
+    /// (a system call waiting for a share): wait for a release, cancelled
+    /// or not, then end with `NotResponding`.
+    StuckThenNotResponding,
+    /// The new file was being put in place when the share stopped
+    /// answering: `NotResponding`, with the placing left to the test (see
+    /// [`FakeToolkit::finish_placing`]).
+    StuckPlacing,
 }
 
 /// Holds library walks after they have listed the files, so a test can
@@ -141,6 +153,17 @@ pub struct FakeToolkit {
     pub done_notes: Mutex<Vec<String>>,
     /// Hardware detections run so far.
     pub detections: AtomicUsize,
+    /// File names whose probe waits until they are taken out (a share
+    /// that stopped answering while ffprobe reads).
+    pub probe_hold: Mutex<HashSet<String>>,
+    /// Placings left unfinished by `StuckPlacing` jobs, for the server.
+    pub unfinished: Mutex<HashMap<Uuid, Unfinished>>,
+    /// How each of them ends, by job id (see [`FakeToolkit::finish_placing`]).
+    pub placing_ends: Mutex<HashMap<Uuid, tokio::sync::oneshot::Sender<JobOutcome>>>,
+    /// Their stop flags, by job id.
+    pub placing_stops: Mutex<HashMap<Uuid, Arc<AtomicBool>>>,
+    /// What each `StuckPlacing` job would have put in place, by job id.
+    pub placing_specs: Mutex<HashMap<Uuid, (RunConfig, JobSpec)>>,
 }
 
 impl Default for FakeToolkit {
@@ -166,6 +189,11 @@ impl Default for FakeToolkit {
             hardware: Mutex::new(None),
             done_notes: Mutex::new(Vec::new()),
             detections: AtomicUsize::new(0),
+            probe_hold: Mutex::new(HashSet::new()),
+            unfinished: Mutex::new(HashMap::new()),
+            placing_ends: Mutex::new(HashMap::new()),
+            placing_stops: Mutex::new(HashMap::new()),
+            placing_specs: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -184,6 +212,32 @@ impl FakeToolkit {
 
     pub fn started(&self) -> Vec<String> {
         self.started.lock().unwrap().clone()
+    }
+
+    /// End the placing a `StuckPlacing` job left: `placed` puts the new
+    /// file in place (as a finished conversion does) and reports `Done`;
+    /// otherwise it reports `Cancelled` (undone, nothing changed).
+    pub async fn finish_placing(&self, job_id: Uuid, placed: bool) {
+        let end = self.placing_ends.lock().unwrap().remove(&job_id);
+        let spec = self.placing_specs.lock().unwrap().remove(&job_id);
+        let (Some(end), Some((cfg, spec))) = (end, spec) else {
+            panic!("no placing left for job {job_id}");
+        };
+        let outcome = if placed {
+            fake_done(&cfg, &spec, 0.5).await
+        } else {
+            JobOutcome::Cancelled
+        };
+        let _ = end.send(outcome);
+    }
+
+    /// Whether the server asked job `job_id`'s unfinished placing to stop.
+    pub fn placing_stopped(&self, job_id: Uuid) -> bool {
+        self.placing_stops
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .is_some_and(|s| s.load(Ordering::SeqCst))
     }
 
     pub fn watch_sender(&self) -> mpsc::Sender<WatchEvent> {
@@ -545,6 +599,13 @@ impl MediaToolkit for Arc<FakeToolkit> {
         let me = Arc::clone(self);
         Box::pin(async move {
             me.probes.fetch_add(1, Ordering::SeqCst);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            while me.probe_hold.lock().unwrap().contains(&name) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             let bytes = tokio::fs::read(&path)
                 .await
                 .map_err(|e| ProbeError::Unreadable(e.to_string()))?;
@@ -677,8 +738,40 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     }
                 }
                 Behavior::Panic => panic!("fake transcoder exploded"),
+                Behavior::NotResponding => JobOutcome::NotResponding { path: spec.input },
+                Behavior::StuckThenNotResponding => {
+                    if let Ok(p) = me.release.acquire().await {
+                        p.forget();
+                    }
+                    JobOutcome::NotResponding { path: spec.input }
+                }
+                Behavior::StuckPlacing => {
+                    let stop = Arc::new(AtomicBool::new(cancel.is_cancelled()));
+                    let (unfinished, end) = Unfinished::new(Arc::clone(&stop));
+                    me.unfinished
+                        .lock()
+                        .unwrap()
+                        .insert(spec.job_id, unfinished);
+                    me.placing_ends.lock().unwrap().insert(spec.job_id, end);
+                    me.placing_stops.lock().unwrap().insert(spec.job_id, stop);
+                    me.placing_specs
+                        .lock()
+                        .unwrap()
+                        .insert(spec.job_id, (cfg.clone(), spec.clone()));
+                    JobOutcome::NotResponding {
+                        path: spec
+                            .input
+                            .parent()
+                            .map(Path::to_path_buf)
+                            .unwrap_or_default(),
+                    }
+                }
             }
         })
+    }
+
+    fn take_unfinished(&self, job_id: Uuid) -> Option<Unfinished> {
+        self.unfinished.lock().unwrap().remove(&job_id)
     }
 
     fn recover_artifact(&self, path: PathBuf) -> BoxFuture<'static, anyhow::Result<Recovery>> {

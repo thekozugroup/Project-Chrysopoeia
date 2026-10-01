@@ -27,6 +27,9 @@
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use chrysopoeia_core::paths::{
@@ -35,6 +38,8 @@ use chrysopoeia_core::paths::{
 use chrysopoeia_core::plain::io_reason;
 use chrysopoeia_core::{Container, OutputMode, ProblemKind};
 use uuid::Uuid;
+
+use crate::slow_fs::NotAnswering;
 
 /// Longest file-name stem used for temp files, in bytes. Keeps temp names
 /// under the usual 255-byte file-name limit.
@@ -163,6 +168,21 @@ impl std::fmt::Display for OriginalChanged {
 }
 
 impl std::error::Error for OriginalChanged {}
+
+/// Putting the new file in place was stopped (see [`start_finalize`])
+/// before the new file took the original's place: everything it had done
+/// was undone, so the original is where it was. [`finalize`] returns this
+/// inside its `anyhow::Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Undone;
+
+impl std::fmt::Display for Undone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Stopped before the new file was put in place, so nothing was changed")
+    }
+}
+
+impl std::error::Error for Undone {}
 
 /// Why [`finalize`] couldn't put the new file in place: one or two plain
 /// sentences saying what happened and what to do, and what kind of problem
@@ -355,6 +375,23 @@ pub struct Finalized {
 /// delete. If the original no longer matches `req.original` the error is
 /// [`OriginalChanged`].
 pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<Finalized> {
+    joined(start_finalize(req, Arc::new(AtomicBool::new(false))).await)
+}
+
+/// [`finalize`] on its own blocking thread, which goes on even when the
+/// returned handle is dropped: a rename on a share that stopped answering
+/// can't be called back once it has started, and leaving it half done
+/// would leave the files out of step with what is recorded about them.
+///
+/// Setting `stop` asks it to stop at the next safe point: before the
+/// original is touched, or right after it was moved aside (it is put back
+/// then). Stopped there, it undoes what it did and fails with [`Undone`];
+/// once the new file has taken its final name, it finishes. Pass the
+/// handle's result to [`joined`].
+pub fn start_finalize(
+    req: &FinalizeRequest<'_>,
+    stop: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<anyhow::Result<Finalized>> {
     let owned = OwnedRequest {
         input: req.input.to_path_buf(),
         temp: req.temp.to_path_buf(),
@@ -364,17 +401,23 @@ pub async fn finalize(req: &FinalizeRequest<'_>) -> anyhow::Result<Finalized> {
         keep_dates: req.keep_dates,
         original: req.original,
         force_copy: req.force_copy,
+        stop,
     };
     tokio::task::spawn_blocking(move || finalize_blocking(&owned))
-        .await
-        .map_err(|e| {
-            tracing::warn!("putting a new file in place stopped unexpectedly: {e}");
-            PlaceError::error(
-                ProblemKind::Other,
-                "Putting the new file in place stopped unexpectedly. The details are in the \
-                 server log.",
-            )
-        })?
+}
+
+/// The result of a [`start_finalize`] thread.
+pub fn joined(
+    result: Result<anyhow::Result<Finalized>, tokio::task::JoinError>,
+) -> anyhow::Result<Finalized> {
+    result.map_err(|e| {
+        tracing::warn!("putting a new file in place stopped unexpectedly: {e}");
+        PlaceError::error(
+            ProblemKind::Other,
+            "Putting the new file in place stopped unexpectedly. The details are in the \
+             server log.",
+        )
+    })?
 }
 
 #[derive(Debug)]
@@ -387,9 +430,21 @@ struct OwnedRequest {
     keep_dates: bool,
     original: Option<FileIdentity>,
     force_copy: bool,
+    /// Asked to stop at the next safe point (see [`start_finalize`]).
+    stop: Arc<AtomicBool>,
 }
 
 impl OwnedRequest {
+    /// Fail with [`Undone`] when asked to stop (nothing has been changed
+    /// yet, or the caller undoes it first).
+    fn check_stop(&self) -> anyhow::Result<()> {
+        if self.stop.load(Ordering::SeqCst) {
+            tracing::debug!(job = %self.job_id, "stopped before the new file was put in place");
+            return Err(Undone.into());
+        }
+        Ok(())
+    }
+
     /// Fail with [`OriginalChanged`] when the input no longer matches the
     /// identity recorded at the start of the job.
     fn check_original(&self) -> anyhow::Result<()> {
@@ -405,6 +460,8 @@ impl OwnedRequest {
 }
 
 fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
+    hold::pause(req.job_id, hold::Step::Start);
+    req.check_stop()?;
     let original = fs::metadata(&req.input).map_err(|e| original_unavailable(&e))?;
     if req
         .original
@@ -432,6 +489,7 @@ fn finalize_blocking(req: &OwnedRequest) -> anyhow::Result<Finalized> {
     // finished file in one step.
     sync_file(&req.temp);
     apply_metadata(&req.temp, &original, req.keep_dates);
+    req.check_stop()?;
 
     let mover = Mover {
         job_id: req.job_id,
@@ -527,6 +585,7 @@ fn swap_in(
         }
     };
     // A cross-device copy can take minutes; look again right before the swap.
+    req.check_stop()?;
     req.check_original()?;
     taken()?;
     let file_name = file_name_lossy(&req.input);
@@ -537,7 +596,9 @@ fn swap_in(
     }
     let backup = dir.join(backup_name);
 
+    req.check_stop()?;
     fs::rename(&req.input, &backup).map_err(|e| placing_failed(&e, dir, req.mode))?;
+    hold::pause(req.job_id, hold::Step::MovedAside);
 
     // What was moved aside must be the file the job read. Checked on the
     // backup itself, so a replacement that raced the rename is caught too.
@@ -550,8 +611,10 @@ fn swap_in(
         }
     }
 
-    let committed = match taken() {
-        Err(conflict) => Err(conflict),
+    // Asked to stop (a rename that waited for a share that stopped
+    // answering has just finished): put the original back.
+    let committed = match req.check_stop().and_then(|()| taken()) {
+        Err(problem) => Err(problem),
         Ok(()) => mover
             .commit(staged, &req.final_path, &req.temp)
             .map_err(|e| placing_failed(&e, dir, req.mode)),
@@ -560,6 +623,8 @@ fn swap_in(
         restore_backup(&backup, &req.input).map_err(|e| restore_failed(&backup, &req.input, &e))?;
         return Err(problem);
     }
+    // The new file has its name: from here on, finish.
+    hold::pause(req.job_id, hold::Step::Committed);
     sync_dir(dir);
 
     // New name: a file that appeared under the original's name meanwhile
@@ -599,9 +664,11 @@ fn commit_without_backup(
     dir: &Path,
     notes: &mut Vec<String>,
 ) -> anyhow::Result<()> {
+    req.check_stop()?;
     mover
         .commit(staged, &req.final_path, &req.temp)
         .map_err(|e| placing_failed(&e, dir, req.mode))?;
+    hold::pause(req.job_id, hold::Step::Committed);
     sync_dir(dir);
     if req.input == req.final_path || is_same_file(&req.input, &req.final_path) {
         return Ok(());
@@ -689,6 +756,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
         .stage(&req.temp, &req.final_path)
         .map_err(|e| placing_failed(&e, &dir, req.mode))?;
     let placed = (|| {
+        req.check_stop()?;
         req.check_original()?;
         if exists(&req.final_path)? {
             return Err(conflict());
@@ -701,6 +769,7 @@ fn place_in_folder(req: &OwnedRequest, mover: &Mover<'_>) -> anyhow::Result<()> 
         mover.discard(&staged, &req.temp);
         return Err(e);
     }
+    hold::pause(req.job_id, hold::Step::Committed);
     sync_dir(&dir);
     Ok(())
 }
@@ -978,15 +1047,18 @@ fn is_same_file(a: &Path, b: &Path) -> bool {
 /// Why [`finalize`] would refuse to write `final_path`, checked before any
 /// encoding starts so a conflict fails in seconds rather than after hours.
 /// `None` when the destination is free (or is the input itself in replace
-/// mode). [`finalize`] checks again at the end.
+/// mode). [`finalize`] checks again at the end. Gives up after `timeout`
+/// when the folder doesn't answer (see [`crate::slow_fs`]).
 pub async fn destination_conflict(
     input: &Path,
     final_path: &Path,
     mode: OutputMode,
-) -> Option<String> {
+    timeout: Duration,
+) -> Result<Option<String>, NotAnswering> {
+    let key = final_path.to_path_buf();
     let input = input.to_path_buf();
     let final_path = final_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
+    crate::slow_fs::guarded("destination_conflict", &key, timeout, move || {
         // A longer extension (.ts to .mkv) can push a long name past what
         // the disk allows; find out now, not after the whole encode.
         let name_bytes = final_path.file_name().map_or(0, |n| n.len());
@@ -1022,8 +1094,7 @@ pub async fn destination_conflict(
         }
     })
     .await
-    .ok()
-    .flatten()
+    .ok_or_else(|| NotAnswering::at(&key))
 }
 
 /// What [`recover_artifact`] did with a leftover file.
@@ -1123,16 +1194,24 @@ pub enum Interrupted {
 ///
 /// Call it before [`recover_artifact`], which would put such a backup back
 /// next to the new file.
+///
+/// Gives up after `timeout` when the folder doesn't answer: the error is
+/// then a [`NotAnswering`] (and the check may still finish by itself).
 pub async fn resume_replace(
     input: &Path,
     final_path: &Path,
     job_id: Uuid,
+    timeout: Duration,
 ) -> anyhow::Result<Interrupted> {
+    let key = parent_dir(input).join(job_id.to_string());
     let input = input.to_path_buf();
     let final_path = final_path.to_path_buf();
-    tokio::task::spawn_blocking(move || resume_blocking(&input, &final_path, job_id))
-        .await
-        .context("Checking an interrupted replacement was interrupted")?
+    let checked = crate::slow_fs::guarded("resume_replace", &key, timeout, move || {
+        resume_blocking(&input, &final_path, job_id).map_err(|e| format!("{e:#}"))
+    })
+    .await
+    .ok_or_else(|| NotAnswering::at(parent_dir(&key).as_path()))?;
+    checked.map_err(|e| anyhow::anyhow!(e))
 }
 
 fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Result<Interrupted> {
@@ -1162,6 +1241,101 @@ fn resume_blocking(input: &Path, final_path: &Path, job_id: Uuid) -> anyhow::Res
         size,
         original_size: backup_meta.len(),
     })
+}
+
+/// Tests stand in for a share that stops answering while a new file is put
+/// in place: [`finalize`] of a job can be held at a chosen step (the
+/// system call before it then looks like one that waited for the share).
+#[cfg(any(test, feature = "test-hooks"))]
+pub mod hold {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+    use std::time::Duration;
+
+    use uuid::Uuid;
+
+    /// Where [`super::finalize`] can be held.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Step {
+        /// Before anything (its first look at the files).
+        Start,
+        /// Right after the original was moved aside as its backup.
+        MovedAside,
+        /// Right after the new file took its final name.
+        Committed,
+    }
+
+    type Holds = Vec<(Uuid, Step, Arc<AtomicBool>)>;
+    static HOLDS: LazyLock<Mutex<Holds>> = LazyLock::new(Mutex::default);
+
+    /// Hold job `job_id`'s finalize at `step` until the guard is dropped.
+    pub fn hold(job_id: Uuid, step: Step) -> Held {
+        let reached = Arc::new(AtomicBool::new(false));
+        HOLDS.lock().unwrap_or_else(PoisonError::into_inner).push((
+            job_id,
+            step,
+            Arc::clone(&reached),
+        ));
+        Held {
+            job_id,
+            step,
+            reached,
+        }
+    }
+
+    /// Releases the hold when dropped.
+    #[derive(Debug)]
+    pub struct Held {
+        job_id: Uuid,
+        step: Step,
+        reached: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        /// Whether the finalize got to the held step.
+        pub fn reached(&self) -> bool {
+            self.reached.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            HOLDS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|(id, step, _)| !(*id == self.job_id && *step == self.step));
+        }
+    }
+
+    pub(crate) fn pause(job_id: Uuid, step: Step) {
+        loop {
+            let held = HOLDS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(id, s, _)| *id == job_id && *s == step)
+                .map(|(_, _, reached)| Arc::clone(reached));
+            let Some(reached) = held else {
+                return;
+            };
+            reached.store(true, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+mod hold {
+    use uuid::Uuid;
+
+    pub(crate) enum Step {
+        Start,
+        MovedAside,
+        Committed,
+    }
+
+    #[inline]
+    pub(crate) fn pause(_: Uuid, _: Step) {}
 }
 
 #[cfg(test)]
@@ -1195,12 +1369,14 @@ mod tests {
     /// not after it.
     #[tokio::test]
     async fn destinations_that_cant_be_used_are_found_up_front() {
+        let wait = Duration::from_secs(30);
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join(format!("{}.ts", "b".repeat(252)));
         fs::write(&input, "x").unwrap();
         let long = input.with_extension("mkv");
-        let conflict = destination_conflict(&input, &long, OutputMode::Replace)
+        let conflict = destination_conflict(&input, &long, OutputMode::Replace, wait)
             .await
+            .unwrap()
             .unwrap();
         assert!(
             conflict.starts_with(
@@ -1211,18 +1387,32 @@ mod tests {
         );
         let fits = dir.path().join(format!("{}.mkv", "b".repeat(251)));
         assert_eq!(
-            destination_conflict(&input, &fits, OutputMode::Replace).await,
-            None
+            destination_conflict(&input, &fits, OutputMode::Replace, wait).await,
+            Ok(None)
         );
 
         // "Inside" a file: the check fails, which is not a free name.
         let under_a_file = input.join("x.mkv");
-        let conflict = destination_conflict(&input, &under_a_file, OutputMode::Folder)
+        let conflict = destination_conflict(&input, &under_a_file, OutputMode::Folder, wait)
             .await
+            .unwrap()
             .unwrap();
         assert!(
             conflict.starts_with("Chrysopoeia couldn't check"),
             "{conflict}"
+        );
+
+        // A folder that doesn't answer is not a free name either.
+        let _hung = crate::slow_fs::hang::hang(dir.path());
+        assert_eq!(
+            destination_conflict(
+                &input,
+                &fits,
+                OutputMode::Replace,
+                Duration::from_millis(200)
+            )
+            .await,
+            Err(NotAnswering::at(&fits))
         );
     }
 
@@ -1341,6 +1531,7 @@ mod tests {
             keep_dates: true,
             original: Some(FileIdentity::of(&meta)),
             force_copy: true,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         (req, meta)
     }
@@ -1393,6 +1584,45 @@ mod tests {
         assert_eq!(fs::read(&req.input).unwrap(), NEW);
         assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
         assert!(!req.temp.exists(), "the temp file is removed after copying");
+    }
+
+    /// Asked to stop (Cancel, or a share that stopped answering) before the
+    /// new file took its place: everything done is undone, the original is
+    /// where it was, and only the temp file (the caller's) is left.
+    #[test]
+    fn a_stopped_finalize_undoes_what_it_did() {
+        // Before anything.
+        let dir = tempfile::tempdir().unwrap();
+        let (req, _) = setup(dir.path(), "Movie.mkv");
+        req.stop.store(true, Ordering::SeqCst);
+        let err = finalize_blocking(&req).unwrap_err();
+        assert!(err.is::<Undone>(), "{err:#}");
+        assert_eq!(fs::read(&req.input).unwrap(), OLD);
+        assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+        assert!(req.temp.exists());
+
+        // After the (long) copy beside the original: the copy goes again.
+        for final_name in ["Movie.mkv", "Movie.mp4"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (req, meta) = setup(dir.path(), final_name);
+            let stop = |_: &Path| req.stop.store(true, Ordering::SeqCst);
+            let hooks = TestHooks {
+                after_stage: Some(&stop),
+                fail_commit: false,
+                before_commit: None,
+            };
+            let mut notes = Vec::new();
+            let err = if final_name == "Movie.mkv" {
+                replace_in_place(&req, &mover(&meta, hooks))
+            } else {
+                replace_with_new_name(&req, &mover(&meta, hooks), &mut notes)
+            }
+            .unwrap_err();
+            assert!(err.is::<Undone>(), "{final_name}: {err:#}");
+            assert_eq!(fs::read(&req.input).unwrap(), OLD);
+            assert_eq!(names(&dir.path().join("library")), ["Movie.mkv"]);
+            assert!(req.temp.exists());
+        }
     }
 
     #[test]

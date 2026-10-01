@@ -23,6 +23,7 @@ use chrysopoeia_core::{
 use chrysopoeia_hwdetect::DetectOptions;
 use chrysopoeia_scanner::{ProbeError, ScanOptions, WalkResult, WatchEvent};
 use chrysopoeia_worker::finalize::{Interrupted, Recovery};
+use chrysopoeia_worker::run::Unfinished;
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use futures::FutureExt;
 use futures::future::BoxFuture;
@@ -107,15 +108,23 @@ pub trait MediaToolkit: Send + Sync + 'static {
     /// After a crash, finish a replacement whose new file was already in
     /// place (see `chrysopoeia_worker::finalize::resume_replace`). Only
     /// touches the files a job of this id left, so fakes use it as is.
+    /// Gives up after `timeout` when the folder doesn't answer.
     fn resume_replace(
         &self,
         input: PathBuf,
         final_path: PathBuf,
         job_id: Uuid,
+        timeout: Duration,
     ) -> BoxFuture<'static, anyhow::Result<Interrupted>> {
         Box::pin(async move {
-            chrysopoeia_worker::finalize::resume_replace(&input, &final_path, job_id).await
+            chrysopoeia_worker::finalize::resume_replace(&input, &final_path, job_id, timeout).await
         })
+    }
+
+    /// The new file of a job that ended while it was still being put in
+    /// place (see `chrysopoeia_worker::run::take_unfinished`). Taken once.
+    fn take_unfinished(&self, job_id: Uuid) -> Option<Unfinished> {
+        chrysopoeia_worker::run::take_unfinished(job_id)
     }
 
     /// Start a debounced folder watcher.
@@ -391,12 +400,20 @@ impl Toolkit {
         input: PathBuf,
         final_path: PathBuf,
         job_id: Uuid,
+        timeout: Duration,
     ) -> anyhow::Result<Interrupted> {
         let inner = Arc::clone(&self.inner);
         self.async_call("crash recovery", move || {
-            inner.resume_replace(input, final_path, job_id)
+            inner.resume_replace(input, final_path, job_id, timeout)
         })
         .await?
+    }
+
+    /// See [`MediaToolkit::take_unfinished`].
+    pub fn take_unfinished(&self, job_id: Uuid) -> Option<Unfinished> {
+        self.sync_call("transcoder", || self.inner.take_unfinished(job_id))
+            .ok()
+            .flatten()
     }
 
     /// See [`MediaToolkit::start_watcher`].

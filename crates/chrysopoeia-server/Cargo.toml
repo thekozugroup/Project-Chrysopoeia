@@ -42,4 +42,6 @@ rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Folders that stop answering, in tests (`slow_fs::hang`).
+chrysopoeia-worker = { workspace = true, features = ["test-hooks"] }
 tokio-tungstenite = "0.28"

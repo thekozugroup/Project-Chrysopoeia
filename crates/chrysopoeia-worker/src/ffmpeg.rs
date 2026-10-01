@@ -859,14 +859,30 @@ async fn next_segment<R: AsyncBufRead + Unpin>(reader: &mut Option<Split<R>>) ->
 /// Kill the child at once and reap it. Its output is discarded, so a
 /// graceful stop would only keep the caller (and a user pressing Cancel)
 /// waiting while the encoder flushes frames nobody will use.
+///
+/// A process stuck in a read from a share that stopped answering may not
+/// die until the share answers (the kernel holds it), so the wait for it is
+/// bounded: past [`REAP_WAIT`] it is left to be reaped in the background.
 async fn kill_child(child: &mut Child) {
     if let Err(e) = child.start_kill() {
         tracing::debug!("could not kill ffmpeg: {e}");
     }
-    if let Err(e) = child.wait().await {
-        tracing::debug!("could not reap ffmpeg: {e}");
+    match tokio::time::timeout(REAP_WAIT, child.wait()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::debug!("could not reap ffmpeg: {e}"),
+        Err(_) => tracing::warn!(
+            "ffmpeg didn't end within {} seconds of being stopped (its files may be on a share \
+             that isn't responding); it is left to end by itself",
+            REAP_WAIT.as_secs()
+        ),
     }
 }
+
+/// How long a killed ffmpeg may take to end before it is left to end by
+/// itself. One that has its files on a share that stopped answering can't
+/// end until the share answers (closing a file there waits for it); Cancel
+/// and Stop don't wait for that.
+const REAP_WAIT: Duration = Duration::from_secs(2);
 
 static NICE_BINARY: OnceLock<Option<PathBuf>> = OnceLock::new();
 

@@ -11,6 +11,7 @@ pub mod finalize;
 pub mod plan;
 pub mod quality;
 pub mod run;
+pub mod slow_fs;
 pub mod validate;
 
 pub use plan::{

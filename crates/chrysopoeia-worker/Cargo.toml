@@ -22,6 +22,12 @@ filetime = "0.2"
 # Scratch directory for SSIM/PSNR statistics during verification.
 tempfile = { workspace = true }
 
+[features]
+# Test seams: folders that stop answering (`slow_fs::hang`) and steps of
+# `finalize` held at a chosen point (`finalize::hold`), with short timeouts.
+# For tests only (the server's tests turn it on); never in a release build.
+test-hooks = []
+
 [target.'cfg(unix)'.dependencies]
 # Free-space checks (statvfs) and graceful termination of ffmpeg (SIGTERM).
 rustix = { version = "1", features = ["fs", "process"] }
@@ -29,3 +35,5 @@ rustix = { version = "1", features = ["fs", "process"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 chrysopoeia-scanner = { workspace = true }
+# The integration tests use the test seams (`slow_fs::hang`, `finalize::hold`).
+chrysopoeia-worker = { path = ".", features = ["test-hooks"] }
