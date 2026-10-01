@@ -475,7 +475,13 @@ async fn a_file_on_a_share_that_stopped_answering_does_not_hold_the_queue() {
         }
     })
     .await;
-    assert_eq!(app.state.dispatcher.running_count(), 0);
+    // The offline mark can land a moment before the slot is released.
+    let state = app.state.clone();
+    wait_until("the requeued job lets go of its slot", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_count() == 0 }
+    })
+    .await;
     let queued = app.get("/api/jobs?state=queued").await;
     assert_eq!(queued.json["total"], 1, "{}", queued.json);
     assert_eq!(app.fake.started(), ["fine.mkv"]);
