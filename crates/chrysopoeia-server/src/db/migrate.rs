@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -245,6 +245,21 @@ const MIGRATION_V8: &[&str] = &["CREATE TABLE library_mounts (
         PRIMARY KEY (library_id, path)
     )"];
 
+/// Version 9:
+/// - `jobs.freed_bytes`: the disk space a finished conversion released (see
+///   `Job::freed_bytes`). Not guessed for conversions finished before: those
+///   jobs keep `NULL`.
+/// - `activity.problem`: the kind of problem an entry about a failed file
+///   is about (`ProblemKind` as snake_case text). The failures already in
+///   the feed take it from the failed job they refer to.
+const MIGRATION_V9: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN freed_bytes INTEGER",
+    "ALTER TABLE activity ADD COLUMN problem TEXT",
+    "UPDATE activity SET problem = (SELECT j.problem FROM jobs j \
+         WHERE j.id = activity.job_id AND j.state = 'failed' AND j.error IS NOT NULL) \
+     WHERE level = 'error' AND job_id IS NOT NULL",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -254,6 +269,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (6, MIGRATION_V6),
     (7, MIGRATION_V7),
     (8, MIGRATION_V8),
+    (9, MIGRATION_V9),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -930,6 +946,85 @@ mod tests {
                 .unwrap();
         let expected: Vec<Option<String>> = rows.into_iter().map(|(_, _, after)| after).collect();
         assert_eq!(got, expected);
+    }
+
+    /// Version 9 adds the space a conversion freed (not guessed for old
+    /// jobs) and the kind of problem on feed entries (taken from the failed
+    /// job an old error entry refers to).
+    #[tokio::test]
+    async fn version_9_adds_freed_bytes_and_the_feed_problem() {
+        const LIB: &str = "00000000-0000-0000-0000-00000000000a";
+        const FILE: &str = "00000000-0000-0000-0000-00000000000b";
+        const DONE: &str = "00000000-0000-0000-0000-0000000000d1";
+        const FAILED: &str = "00000000-0000-0000-0000-0000000000f1";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v8.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 8).await.unwrap();
+            for sql in [
+                format!(
+                    "INSERT INTO libraries (id, name, path, profile, created_at) \
+                     VALUES ('{LIB}', 'Movies', '/m', '{{}}', '2026-01-01T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, scanned_at, updated_at) VALUES \
+                     ('{FILE}', '{LIB}', '/m/a.mkv', 'a.mkv', 'a.mkv', 1, 'x', 'failed', 'x', 'x')"
+                ),
+                format!(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, input_size, output_size, created_at) VALUES ('{DONE}', '{FILE}', \
+                     '{LIB}', 'a.mkv', '/m/a.mkv', 'done', 'finalizing', 100, 60, \
+                     '2026-01-02T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, error, problem, created_at) VALUES ('{FAILED}', '{FILE}', '{LIB}', \
+                     'a.mkv', '/m/a.mkv', 'failed', 'waiting', 'Not enough free space', \
+                     'disk_full', '2026-01-03T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO activity (at, level, message, job_id) VALUES \
+                     ('2026-01-03T00:00:00.000Z', 'error', 'Failed a.mkv', '{FAILED}'), \
+                     ('2026-01-03T00:00:00.000Z', 'info', 'Something else', '{FAILED}'), \
+                     ('2026-01-03T00:00:00.000Z', 'error', 'Failed with no job', NULL), \
+                     ('2026-01-03T00:00:00.000Z', 'error', 'The job is done', '{DONE}')"
+                ),
+            ] {
+                sqlx::query(&sql).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        // Conversions finished before keep no number.
+        let (jobs, _) = crate::db::jobs::list(db.pool(), crate::db::jobs::JobFilter::All, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs.iter().all(|j| j.freed_bytes.is_none()), "{jobs:?}");
+        let feed = crate::db::activity::list(db.pool(), 10, None)
+            .await
+            .unwrap();
+        let problems: Vec<(&str, Option<chrysopoeia_core::ProblemKind>)> = feed
+            .iter()
+            .rev()
+            .map(|e| (e.message.as_str(), e.problem))
+            .collect();
+        assert_eq!(
+            problems,
+            [
+                (
+                    "Failed a.mkv",
+                    Some(chrysopoeia_core::ProblemKind::DiskFull)
+                ),
+                ("Something else", None),
+                ("Failed with no job", None),
+                ("The job is done", None),
+            ]
+        );
     }
 
     #[tokio::test]

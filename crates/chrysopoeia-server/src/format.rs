@@ -18,45 +18,10 @@ pub fn plural(n: u64, singular: &str, plural: &str) -> String {
     format!("{} {}", count(n), if n == 1 { singular } else { plural })
 }
 
-/// Byte size in decimal units, as Finder shows it: `1.2 GB`, `346 MB`,
-/// `12 KB`. The same rules as the web UI's `formatBytes`, so the log and the
-/// UI give one saving the same way: whole KB, then two decimals below 10,
-/// one below 100 and none above (trailing zeros dropped); rounded before
-/// moving up a unit, so 999,600 bytes is `1 MB`, not `1000 KB`.
-pub fn bytes(n: u64) -> String {
-    const UNITS: [&str; 5] = ["KB", "MB", "GB", "TB", "PB"];
-    if n < 1000 {
-        return if n == 1 {
-            "1 byte".to_string()
-        } else {
-            format!("{n} bytes")
-        };
-    }
-    let mut value = n as f64 / 1000.0;
-    let mut unit = 0;
-    loop {
-        let digits: usize = match value {
-            _ if unit == 0 => 0,
-            v if v < 10.0 => 2,
-            v if v < 100.0 => 1,
-            _ => 0,
-        };
-        let factor = 10f64.powi(i32::try_from(digits).unwrap_or(0));
-        let rounded = (value * factor).round() / factor;
-        if rounded >= 1000.0 && unit < UNITS.len() - 1 {
-            value /= 1000.0;
-            unit += 1;
-            continue;
-        }
-        let text = format!("{rounded:.digits$}");
-        let text = if text.contains('.') {
-            text.trim_end_matches('0').trim_end_matches('.')
-        } else {
-            text.as_str()
-        };
-        return format!("{text} {}", UNITS[unit]);
-    }
-}
+/// Byte size in decimal units (`1.2 GB`, `346 MB`): the one formatter the
+/// worker's check lines and the web UI follow too, so the log and the UI
+/// give one saving the same way.
+pub use chrysopoeia_core::format::bytes;
 
 /// Signed percentage of `part` in `whole`, rounded: `38`.
 pub fn percent(part: i64, whole: u64) -> i64 {
@@ -80,35 +45,10 @@ mod tests {
         assert_eq!(plural(2, "file", "files"), "2 files");
     }
 
-    /// The web UI's `formatBytes` expectations (web/src/lib/format.test.ts):
-    /// the log and the UI show a saving the same way.
     #[test]
-    fn byte_sizes_match_the_web_ui() {
-        for (n, text) in [
-            (0, "0 bytes"),
-            (1, "1 byte"),
-            (512, "512 bytes"),
-            (999, "999 bytes"),
-            (1_000, "1 KB"),
-            (12_345, "12 KB"),
-            (1_234_567, "1.23 MB"),
-            (345_600_000, "346 MB"),
-            (34_560_000, "34.6 MB"),
-            (340_000_000, "340 MB"),
-            (1_200_000_000, "1.2 GB"),
-            (3_250_000_000, "3.25 GB"),
-            (2_500_000_000, "2.5 GB"),
-            // Rounded before moving up a unit.
-            (999_600, "1 MB"),
-            (999_700_000, "1 GB"),
-            (999_960_000_000, "1 TB"),
-            (99_960_000, "100 MB"),
-            (9_996_000, "10 MB"),
-            (933_000, "933 KB"),
-            (4_500_000, "4.5 MB"),
-        ] {
-            assert_eq!(bytes(n), text, "{n}");
-        }
+    fn sizes_use_the_shared_formatter() {
+        assert_eq!(bytes(1_234_567), "1.23 MB");
+        assert_eq!(bytes(999_600), "1 MB");
     }
 
     #[test]

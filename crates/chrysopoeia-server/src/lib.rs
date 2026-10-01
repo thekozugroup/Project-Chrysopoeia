@@ -67,8 +67,33 @@ pub fn init_tracing(level: &str) {
         .with_env_filter(filter)
         .with_target(false)
         .with_ansi(color)
+        .fmt_fields(EscapedFields::default())
         .with_writer(|| OneLine(std::io::stdout()))
         .try_init();
+}
+
+/// Formats the fields of every log line (and the message, which is one of
+/// them) like the default, but shows control characters in them as escapes.
+/// A file name can hold any of them, an ESC byte included, and a field
+/// printed as it is (`file = %path`) would send commands to the terminal
+/// reading the log. Done here, once, for every field at every level, so no
+/// call site has to remember it.
+#[derive(Debug, Default)]
+struct EscapedFields(tracing_subscriber::fmt::format::DefaultFields);
+
+impl<'writer> tracing_subscriber::fmt::FormatFields<'writer> for EscapedFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        mut writer: tracing_subscriber::fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        let mut plain = String::new();
+        self.0.format_fields(
+            tracing_subscriber::fmt::format::Writer::new(&mut plain),
+            fields,
+        )?;
+        writer.write_str(&log_text(&plain))
+    }
 }
 
 /// Text made safe for one log line: line breaks, tabs and other control
@@ -156,5 +181,79 @@ mod log_tests {
             String::from_utf8(w.0).unwrap(),
             "INFO Converted a\\nERROR forged.mkv\nINFO plain\nno end"
         );
+    }
+
+    /// A writer the test can read back.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = OneLine<Capture>;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            OneLine(self.clone())
+        }
+    }
+
+    /// At debug level the job lines print the file name as a field
+    /// (`file = %path`); an ESC byte in it reached the terminal as it was.
+    /// Every field is escaped, whatever the level or how it is formatted.
+    #[test]
+    fn control_characters_in_log_fields_are_escaped() {
+        let capture = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .fmt_fields(EscapedFields::default())
+            .with_writer(capture.clone())
+            .finish();
+        let name = "Evil\u{1b}[2J\u{7}name\nERROR forged.mkv";
+        let path = std::path::Path::new("/media/Evil\u{1b}]0;title\u{7}.mkv");
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(job = %uuid::Uuid::nil(), file = %name, "job started");
+            tracing::debug!(%name, "done: 1 MB → 500 KB");
+            tracing::info!(path = %path.display(), "could not delete a leftover file");
+            tracing::warn!(?name, "Debug fields stay escaped too");
+            tracing::trace!(file = name, "plain strings as well");
+            tracing::info!("Converted {name}");
+        });
+        let out = String::from_utf8(
+            capture
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        assert!(
+            !out.chars().any(|c| c.is_control() && c != '\n'),
+            "a control character got through: {out:?}"
+        );
+        // One line per message: the line break in the name started no other.
+        assert_eq!(out.lines().count(), 6, "{out}");
+        assert!(
+            out.contains("file=Evil\\u{1b}[2J\\u{7}name\\nERROR forged.mkv"),
+            "{out}"
+        );
+        assert!(
+            out.contains("path=/media/Evil\\u{1b}]0;title\\u{7}.mkv"),
+            "{out}"
+        );
+        // The message is escaped by the formatter itself; its text is there.
+        assert!(out.contains("Converted Evil"), "{out:?}");
     }
 }

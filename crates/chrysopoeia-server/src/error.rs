@@ -165,6 +165,52 @@ fn field_of(detail: &str) -> Option<String> {
     valid.then(|| path.to_string())
 }
 
+/// What a body that should be an object (but is text, a number or a list)
+/// is told.
+const ROOT_NOT_AN_OBJECT: &str =
+    "The request body should be an object with named values, like {\"name\": \"value\"}.";
+
+/// What a body that isn't JSON at all is told.
+const NOT_JSON: &str = "The request body isn't valid JSON. It may be cut off, or have a missing \
+                        quote, bracket or comma.";
+
+/// What a body that couldn't be received is told.
+const UNREADABLE_BODY: &str = "The request body couldn't be read.";
+
+/// The error for a body that is valid JSON but doesn't fit what the request
+/// needs: it names the field when serde did, in plain words, and never
+/// repeats the parser's own text.
+fn body_data_error(field: Option<String>, serde_message: &str) -> ApiError {
+    // A list where an object belongs is read as the object's fields in
+    // order (`[0]` is its first field): the body as a whole is the problem.
+    if field.as_deref().is_some_and(|f| f.starts_with('[')) {
+        return ApiError::bad_request("invalid_request", ROOT_NOT_AN_OBJECT);
+    }
+    let message = describe_value_error(field.as_deref(), serde_message);
+    let error = ApiError::bad_request("invalid_request", message);
+    match field {
+        Some(f) => error.with_field(f),
+        None => error,
+    }
+}
+
+impl ApiError {
+    /// A JSON body that couldn't be used, from the error `serde_json` gave
+    /// and the path of the value it was reading (`.` for the whole body,
+    /// otherwise like `profile.quality`).
+    pub fn from_json_error(path: &str, error: &serde_json::Error) -> Self {
+        use serde_json::error::Category;
+        match error.classify() {
+            Category::Data => {
+                let field = (!path.is_empty() && path != ".").then(|| path.to_string());
+                body_data_error(field, &rejection_detail(&error.to_string()))
+            }
+            Category::Io => Self::bad_request("invalid_request", UNREADABLE_BODY),
+            Category::Syntax | Category::Eof => Self::bad_request("invalid_json", NOT_JSON),
+        }
+    }
+}
+
 /// Say what is wrong with one value in plain words, from serde's message
 /// about it (`unknown variant `x`, expected one of `a`, `b``, `invalid type:
 /// string "x", expected u32`, …). `field` is the value's path, when known.
@@ -196,6 +242,9 @@ pub fn describe_value_error(field: Option<&str>, serde_message: &str) -> String 
         format!("There's no setting called \"{name}\" here.")
     } else if msg.starts_with("missing field ") {
         let name = quoted(msg).into_iter().next().unwrap_or_default();
+        if field.is_none() {
+            return format!("The request is missing \"{name}\".");
+        }
         format!("\"{name}\" is missing.")
     } else if msg.starts_with("invalid digit") || msg.starts_with("cannot parse integer") {
         // A number in the address (`?offset=-1`) that isn't a count.
@@ -206,6 +255,10 @@ pub fn describe_value_error(field: Option<&str>, serde_message: &str) -> String 
         "It must be a number.".to_string()
     } else if msg.starts_with("invalid type") || msg.starts_with("invalid value") {
         let expected = msg.rsplit_once("expected ").map_or("", |(_, e)| e);
+        if field.is_none() && (expected.contains("map") || expected.starts_with("struct")) {
+            // The whole body is the wrong shape (text, a number, a list).
+            return ROOT_NOT_AN_OBJECT.to_string();
+        }
         match expected {
             e if e.starts_with('u') || e.starts_with('i') || e.contains("integer") => {
                 "It must be a whole number.".to_string()
@@ -237,29 +290,16 @@ impl From<JsonRejection> for ApiError {
                 "unsupported_media_type",
                 "Send the request body as JSON (Content-Type: application/json).",
             ),
-            JsonRejection::JsonSyntaxError(e) => Self::bad_request(
-                "invalid_json",
-                format!(
-                    "The request body isn't valid JSON ({}).",
-                    rejection_detail(&e.body_text())
-                ),
-            ),
+            JsonRejection::JsonSyntaxError(_) => Self::bad_request("invalid_json", NOT_JSON),
             JsonRejection::JsonDataError(e) => {
                 let detail = rejection_detail(&e.body_text());
                 match field_of(&detail) {
                     Some(field) => {
                         let serde_message =
                             detail.split_once(": ").map_or(detail.as_str(), |(_, m)| m);
-                        Self::bad_request(
-                            "invalid_request",
-                            describe_value_error(Some(&field), serde_message),
-                        )
-                        .with_field(field)
+                        body_data_error(Some(field), serde_message)
                     }
-                    None => Self::bad_request(
-                        "invalid_request",
-                        format!("The request has a wrong or missing field ({detail})."),
-                    ),
+                    None => body_data_error(None, &detail),
                 }
             }
             JsonRejection::BytesRejection(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
@@ -269,13 +309,7 @@ impl From<JsonRejection> for ApiError {
                     "The request body is too large (the limit is 1 MB).",
                 )
             }
-            other => Self::bad_request(
-                "invalid_request",
-                format!(
-                    "The request couldn't be read ({}).",
-                    rejection_detail(&other.body_text())
-                ),
-            ),
+            _ => Self::bad_request("invalid_request", UNREADABLE_BODY),
         }
     }
 }
@@ -419,6 +453,65 @@ mod tests {
         let e = ApiError::from(rej);
         assert_eq!(e.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
         assert_eq!(e.code, "unsupported_media_type");
+    }
+
+    /// A body that can't be used is explained without the parser's words
+    /// (`EOF while parsing a value`, `missing field `path``) or the name of
+    /// the type it was read into (`struct CreateBody`).
+    #[test]
+    fn body_errors_are_plain() {
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct CreateBody {
+            path: String,
+            nested: Option<Nested>,
+        }
+        #[derive(Debug, serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Nested {
+            quality: String,
+        }
+        let read = |body: &str| {
+            let mut de = serde_json::Deserializer::from_str(body);
+            let e = serde_path_to_error::deserialize::<_, CreateBody>(&mut de).unwrap_err();
+            ApiError::from_json_error(&e.path().to_string(), e.inner())
+        };
+        for body in ["", "{", "{\"path\": ", "nope", "{\"path\" 1}"] {
+            let e = read(body);
+            assert_eq!(e.code, "invalid_json", "{body:?}");
+            assert_eq!(
+                e.message,
+                "The request body isn't valid JSON. It may be cut off, or have a missing \
+                 quote, bracket or comma."
+            );
+        }
+        let e = read("{}");
+        assert_eq!(e.code, "invalid_request");
+        assert_eq!(e.message, "The request is missing \"path\".");
+        assert_eq!(e.field, None);
+        for body in ["\"x\"", "7", "[1, 2]", "null", "true"] {
+            let e = read(body);
+            assert_eq!(e.code, "invalid_request", "{body:?}");
+            assert_eq!(e.message, ROOT_NOT_AN_OBJECT, "{body:?}");
+            assert_eq!(e.field, None);
+        }
+        let e = read("{\"path\": 5}");
+        assert_eq!(
+            e.message,
+            "The value for \"path\" isn't valid. It must be text."
+        );
+        assert_eq!(e.field.as_deref(), Some("path"));
+        let e = read("{\"path\": \"/x\", \"nested\": {}}");
+        assert_eq!(
+            e.message,
+            "The value for \"nested\" isn't valid. \"quality\" is missing."
+        );
+        assert_eq!(e.field.as_deref(), Some("nested"));
+        for e in [read(""), read("{}"), read("\"x\""), read("{\"path\": 5}")] {
+            for jargon in ["EOF", "expected", "struct", "CreateBody", "`", "line "] {
+                assert!(!e.message.contains(jargon), "{}", e.message);
+            }
+        }
     }
 
     #[test]

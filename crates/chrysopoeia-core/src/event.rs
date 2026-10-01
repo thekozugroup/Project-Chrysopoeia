@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::hardware::HardwareInfo;
-use crate::job::{Job, JobProgress};
+use crate::job::{Job, JobProgress, ProblemKind};
 use crate::library::{Library, LibraryStats, MediaFile};
 use crate::settings::Settings;
 
@@ -32,6 +32,12 @@ pub struct ActivityEntry {
     pub file_id: Option<Uuid>,
     pub job_id: Option<Uuid>,
     pub library_id: Option<Uuid>,
+    /// What kind of problem the entry is about, for an entry written about
+    /// a failed or skipped file whose problem is known (the same values as
+    /// `Job::problem`), so the UI can group it without reading the
+    /// sentence. `None` for everything else.
+    #[serde(default)]
+    pub problem: Option<ProblemKind>,
 }
 
 /// State of the job queue.

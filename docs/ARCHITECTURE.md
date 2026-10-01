@@ -123,10 +123,12 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      state TEXT, stage TEXT, priority INT, progress REAL, fps REAL, speed REAL, eta_secs INT,
      encoder, hw_api, attempt INT, input_size INT, output_size INT, error, problem TEXT NULL,
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
-     created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0)
+     created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
+     freed_bytes INT NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs
-activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id)
+activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
+         problem TEXT NULL)
 savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, saved_bytes INT,
         files INT, PK(date, library_id))
 library_mounts(library_id FK→libraries ON DELETE CASCADE, path, PK(library_id, path))
@@ -156,7 +158,11 @@ wide is the class of the same picture turned sideways (1080×1920 is
 `1080p`, not `1440p`, as `core::media::resolution_label` now gives it and
 as the size limit judges it). 8 = `library_mounts`: drives and shares
 mounted inside a library folder that scans have seen (see File and job
-lifecycle).
+lifecycle). 9 = `jobs.freed_bytes` (the space a conversion released, not
+guessed for conversions finished before) and `activity.problem` (the kind of
+problem an entry about a failed file is about; the error entries already in
+the feed take it from the failed job they refer to); see Contract additions
+(round 5).
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -287,6 +293,17 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   settle time and its size/mtime held still that long; removals (files and
   folders) are reported at once, except renames to Chrysopoeia's backup names
   and the loss of a whole root.
+- Chrysopoeia's own results are not copies in progress. A converted file put
+  in place goes through the same settle wait as any new file, but it is
+  complete, so the count of files still being copied
+  (`LibraryStats.settling`, "Waiting for 1 file to finish copying") leaves
+  out the result of a running job and of a job finished within the settle
+  time plus 30 s (`jobs.final_path`, one query per look at a non-empty
+  waiting list; the scanner's `WaitingFiles::files()` names the waiting
+  files). A watch event for the result of a job that is still running is
+  left to the job: it is not probed, and under a new name it does not
+  become a second row. The event for a result already recorded finds its
+  size and modification time unchanged and does nothing.
 - Renames and moves (a watcher removal plus a new file, or a scan that finds
   a row's file gone and a new one): a new file with the same size and
   modification time as a row removed from the same library within the last
@@ -372,8 +389,11 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   each finished job logs one plain INFO line, its activity entry ("Converted
   …", "Skipped …", "Cancelled …"; failures at WARN). Job starts, attempts
   and fallbacks are logged at DEBUG. Every log message stays on one line:
-  line breaks (and, in activity lines, other control characters) in file
-  names are written as escapes, so a file name can't forge a log line.
+  line breaks in file names are written as escapes, so a file name can't
+  forge a log line, and so is every other control character (an ESC byte
+  can send commands to the terminal reading the log): the log formatter
+  escapes every field, whatever the level (`file=…`, `path=…`), and the
+  message.
 - A converted original with other hard links, converted anyway, saves
   nothing: `files.saved_bytes`, the savings history and the activity line
   ("Converted <name>", with the job's note) count no saving.
@@ -595,7 +615,11 @@ the folder is ("the work folder /temp", "the output folder /out/TV", "the
 original's folder /media/Films"); the fix fits the output mode (in folder
 mode: choose another output folder; replacing: make the drive writable or
 save to a separate folder). A copy refused for lack of room gives the new
-file's size, not the margin kept free.
+file's size, not the margin kept free. A size reads the same wherever it
+appears (the activity feed, a job's check lines, the web UI): decimal units,
+whole KB, then two decimals below 10, one below 100 and none above, rounded
+before moving up a unit ("3.13 MB", "572 KB", "1 GB"); one formatter,
+`chrysopoeia_core::format::bytes`, follows the web's `formatBytes`.
 An unfamiliar ffmpeg failure is described plainly and then quoted
 ("Converting on the CPU stopped with an error, so the original was left
 unchanged. ffmpeg said: "…""); the job's `log_tail` keeps the details.
@@ -625,13 +649,13 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `DELETE /libraries/{id}` | | 204. Removes DB rows only (files, jobs and its share of the savings history), never media. Cancels its running jobs. |
 | `POST /libraries/{id}/scan` | | 202 `{"started":true}` (409 `scan_running`, 409 `library_disabled`) |
 | `POST /scan` | | 202, scans all enabled libraries |
-| `GET /files` | `status`, `library`, `q` (substring of name/path), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`; `problem` with every `error`) |
+| `GET /files` | `status`, `library`, `q` (substring of the name or path, or of a name the file had before a conversion renamed it), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`; `problem` with every `error`) |
 | `GET /files/{id}` | | `{"file": MediaFile (with probe), "jobs": Job[] (newest first, ≤10)}` |
 | `POST /files/{id}/queue` | `{"priority"?: int, "force"?: bool}` | `Job` (`force` echoed). Works for pending/failed/skipped/done (re-encode). `force` = "Convert anyway" (see `decide_forced`, no size rule; verified as usual). A done file whose new job ends without a new result (skipped, cancelled, failed) stays done. 409 `already_queued`. |
 | `POST /files/{id}/skip` | | `MediaFile` status skipped, reason "Skipped by you"; cancels its job |
 | `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`), except files skipped by the size rule under that goal; the rest are counted in `left_out` (0 for other selections). |
 | `GET /jobs` | `state` (`active` = running+queued, `running`, `queued`, `history` = finished, `all`), `limit`, `offset` | `{"items": Job[], "total"}`; active sorted running-first then queue order; history newest first |
-| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`) |
+| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`, `freed_bytes`, `output_name`) |
 | `POST /jobs/{id}/cancel` | | `Job` (409 `job_finished`) |
 | `POST /jobs/{id}/priority` | `{"priority": int}` or `{"move":"top"}` | `Job` |
 | `POST /jobs/clear` | `{"state":"history"}` | `{"affected": n}` deletes finished job rows (files keep status) |
@@ -644,13 +668,18 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
 | `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots` |
-| `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first |
+| `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first (`problem` on entries about a failed file) |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 
 Other codes: 404 `not_found` (unknown path), `library_not_found`,
 `file_not_found`, `job_not_found`; 405 `method_not_allowed`; 400
-`invalid_json`, `invalid_request` (with `field` when serde names one),
-`invalid_query` (plain words naming the parameter, with `field`: "The value
+`invalid_json` ("The request body isn't valid JSON. It may be cut off, or
+have a missing quote, bracket or comma."), `invalid_request` (with `field`
+when serde names one: "The value for "path" isn't valid. It must be text.";
+without one: "The request is missing "path"." or "The request body should be
+an object with named values, like {"name": "value"}." — never the parser's
+text or an internal type name; bodies that may be left out, such as
+`POST /files/{id}/queue`, answer the same way), `invalid_query` (plain words naming the parameter, with `field`: "The value
 of "offset" isn't valid. It must be a whole number, 0 or more."),
 `invalid_path_param` (""not-a-uuid" isn't a valid id. …", never the
 parser's text), `invalid_status`, `invalid_sort`, `invalid_state` ("Filter
@@ -690,6 +719,35 @@ reverse proxy, make it pass the original Host header." Requests without
 `Origin`, `Referer` and `Sec-Fetch-Site` (curl, scripts) pass. No CORS
 headers are sent (except with `--dev-cors`, which also skips the
 `Sec-Fetch-Site` check).
+
+### Contract additions (round 5)
+
+- **`Job.freed_bytes`** (`integer | null`, `jobs.freed_bytes`): the disk
+  space the conversion actually released. For a done job it is the input's
+  size minus the output's in the usual case, and `0` when the original's
+  space was not released (the original had another hard link, so replacing
+  it freed nothing: the same rule as `MediaFile.saved_bytes`, taken from
+  the worker's "…so replacing it freed no space" note) or the output is
+  not smaller (never negative). `null` for a job that is not done and for
+  one that finished before the field existed. Written by `db::jobs::finish`
+  in the transaction that marks the job done.
+- **`ActivityEntry.problem`** (`ProblemKind | null`, `activity.problem`): set
+  for an entry written about a failed or skipped file whose problem kind is
+  known, with the same values as `Job.problem`: the problem of the failed
+  job the entry refers to, else (an entry about a file without a job) of
+  the file when it is failed. `null` for success entries, entries about a
+  library as a whole, and everything else. It is the kind the failure had
+  when the entry was written, and goes out in the `activity` event too.
+- **File search** (`q` of `GET /files`) also matches a name the file had
+  before a conversion renamed it (`q=land1080.mp4` finds the file now named
+  `land1080.mkv`), by the names recorded on the file's jobs
+  (`jobs.file_name`, the name the file had when the job was queued). Still a
+  case-insensitive substring, and a file is listed once however many jobs
+  match.
+- **`Job.output_name`** (`string | null`): the file name of the result when
+  it differs from the original's (the extension changed, say), for a done
+  job; `null` otherwise. Derived from `jobs.final_path` (where the job put
+  its result, stored when it started), so nothing more is stored.
 
 ## Hardware detection (normative)
 

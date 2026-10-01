@@ -112,14 +112,14 @@ pub async fn validate_library_path(state: &AppState, raw: &str) -> ApiResult<Pat
         if canonical == existing {
             return Err(ApiError::conflict(
                 "library_exists",
-                format!("That folder is already the library {}.", lib.name),
+                format!("That folder is already the library “{}”.", lib.name),
             ));
         }
         if canonical.starts_with(existing) {
             return Err(ApiError::conflict(
                 "library_overlaps",
                 format!(
-                    "That folder is inside {}, which is already a library.",
+                    "That folder is inside “{}”, which is already a library.",
                     lib.name
                 ),
             ));
@@ -128,7 +128,7 @@ pub async fn validate_library_path(state: &AppState, raw: &str) -> ApiResult<Pat
             return Err(ApiError::conflict(
                 "library_overlaps",
                 format!(
-                    "That folder contains the library {}. Pick a different folder, or remove {} first.",
+                    "That folder contains the library “{}”. Pick a different folder, or remove “{}” first.",
                     lib.name, lib.name
                 ),
             ));
@@ -161,7 +161,7 @@ async fn note_adjustments(state: &AppState, name: &str, notes: &[String], id: Uu
     state
         .library_activity(
             ActivityLevel::Info,
-            format!("Adjusted {name}'s settings: {}.", notes.join("; ")),
+            format!("Adjusted the settings of “{name}”: {}.", notes.join("; ")),
             id,
         )
         .await;
@@ -226,7 +226,7 @@ pub async fn create(state: &AppState, new: NewLibrary) -> ApiResult<Library> {
     state
         .library_activity(
             ActivityLevel::Info,
-            format!("Added the library {} ({path_str})", row.name),
+            format!("Added the library “{}” ({path_str})", row.name),
             row.id,
         )
         .await;
@@ -315,7 +315,7 @@ pub async fn delete(state: &AppState, id: Uuid) -> ApiResult<()> {
         .library_activity(
             ActivityLevel::Info,
             format!(
-                "Removed the library {}. Its files on disk were not touched.",
+                "Removed the library “{}”. Its files on disk were not touched.",
                 row.name
             ),
             id,

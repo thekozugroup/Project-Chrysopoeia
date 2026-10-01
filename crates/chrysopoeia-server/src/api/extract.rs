@@ -75,13 +75,21 @@ where
                 "Send the request body as JSON (Content-Type: application/json).",
             ));
         }
-        serde_json::from_slice(&bytes).map(Self).map_err(|e| {
-            ApiError::bad_request(
-                "invalid_json",
-                format!("The request body isn't valid ({e})."),
-            )
-        })
+        parse_json_body(&bytes).map(Self)
     }
+}
+
+/// Read a JSON body, naming the value at fault (`profile.quality`) when it
+/// doesn't fit. Errors are in plain words, the same as for [`ApiJson`].
+fn parse_json_body<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
+    let mut reader = serde_json::Deserializer::from_slice(bytes);
+    let value = serde_path_to_error::deserialize::<_, T>(&mut reader)
+        .map_err(|e| ApiError::from_json_error(&e.path().to_string(), e.inner()))?;
+    // Anything after the value is not JSON either.
+    reader
+        .end()
+        .map_err(|e| ApiError::from_json_error(".", &e))?;
+    Ok(value)
 }
 
 /// Query string.

@@ -111,7 +111,8 @@ pub struct FileQuery {
     /// Empty = any status.
     pub statuses: Vec<FileStatus>,
     pub library: Option<Uuid>,
-    /// Case-insensitive substring of the name or path.
+    /// Case-insensitive substring of the name or path, or of a name the
+    /// file had before a conversion renamed it (the names its jobs record).
     pub search: Option<String>,
     pub sort: SortKey,
     pub descending: bool,
@@ -137,8 +138,15 @@ fn push_filters(qb: &mut QueryBuilder<'_, Sqlite>, q: &FileQuery) {
         qb.push(" AND (f.file_name LIKE ")
             .push_bind(pattern.clone())
             .push(" ESCAPE '\\' OR f.relative_path LIKE ")
+            .push_bind(pattern.clone())
+            // A converted file is also found by the name it had before: its
+            // jobs record the name they were queued with.
+            .push(
+                " ESCAPE '\\' OR EXISTS (SELECT 1 FROM jobs j WHERE j.file_id = f.id \
+                 AND j.file_name LIKE ",
+            )
             .push_bind(pattern)
-            .push(" ESCAPE '\\')");
+            .push(" ESCAPE '\\'))");
     }
 }
 
