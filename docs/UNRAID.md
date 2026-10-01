@@ -84,7 +84,7 @@ Under **Show more settings**:
 | Field | Default | Notes |
 |---|---|---|
 | PUID / PGID | `99` / `100` | Unraid's `nobody` / `users`. Keep them unless your media is owned by someone else. |
-| UMASK | `002` | New files are readable by everyone and editable by the `users` group. |
+| UMASK | `002` | For what Chrysopoeia creates itself (work files, folders in an output folder): editable by the `users` group. A converted file keeps the permissions of the original it replaces. |
 | HW_ACCEL | `auto` | Uses the best encoder that passes a test encode. `cpu` never uses the GPU. `nvenc` (NVIDIA), `qsv` (Intel) or `vaapi` (Intel or AMD) uses only that kind of GPU; when it is missing or cannot encode the chosen format, files are still converted, on the CPU, so check Settings › Hardware: under *Details: encoders and ffmpeg*, each format its test encode passed shows *Works*. Applied on the first start and on the next start whenever you change it here; in between, the choice in the app (Settings › Hardware) is kept. `auto` never overrides a choice made in the app. |
 | MAX_JOBS | empty | Empty = automatic. A number here replaces the automatic count while *Files at once* is *Automatic* in the app (Settings › Processing); a number chosen in the app wins. |
 | ALLOWED_HOSTS | empty | Only behind a reverse proxy: the domain name you open Chrysopoeia at. See [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik). |
@@ -108,17 +108,24 @@ Click **Apply**. Unraid pulls the image and starts the container.
    you are in: **Use “Movies”**. You can add more libraries later.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
-   suits old devices. The cards show how fast your hardware handles each one.
+   suits old devices; *Archive* keeps near-original quality. Each card shows
+   how fast your hardware handles it, and the one that suits this machine is
+   marked *Best fit*. You can rename the library here.
 4. Click **Start**. Chrysopoeia scans the folder, queues the files that need
    work, and starts converting. The **Overview** shows the space saved so far
    and what is happening now; the **Queue** has three tabs: **Running** (each
    file with its step, progress and time left), **Up next** and **History**.
+   Open a finished file in **History** to see the checks it passed before it
+   replaced the original.
 
 Open **Settings > Hardware** (the page headed *This machine*) to confirm your
 GPU was found: it appears as a graphics card, and under **Details: encoders and
 ffmpeg** the formats it can encode show *Works*. If it is missing or a format
 shows *Failed test*, the page shows a setup tip with the fix; see
-[Troubleshooting](#troubleshooting).
+[Troubleshooting](#troubleshooting). Anything that stops files from converting
+(a GPU the container cannot see, a read-only Media path, a full disk) also
+appears on the **Overview** under **Needs your attention**, with the setting to
+change and a **Try again** button for the files that waited on it.
 
 Files that are new or changed later are picked up on their own: folder
 watching sees changes made through `/mnt/user` shares, and every library is
@@ -176,52 +183,81 @@ Unraid shares are normally owned by `nobody:users` (99:100), which is why the
 template uses those ids. Chrysopoeia starts as root only long enough to adopt
 them, join the group that owns your GPU device, and fix the owner of its own
 files in the config folder (the database and its lock file); then it drops to
-that user. It never changes the owner of anything else there. If the log says it *cannot write to
-/media*, your media is owned by a different user: either set PUID/PGID to that
-owner, or run **Tools > New Permissions** on the share (this resets it to
-`nobody:users`).
+that user. It never changes the owner of anything else there.
 
-## Backups
+A converted file takes the permissions of the original it replaces. Its owner
+and group stay the same too when Chrysopoeia runs as that owner, which is the
+case with 99/100 on a normal share. If it cannot (the original belonged to
+someone else), the file belongs to PUID/PGID and its details in the Queue say
+so. UMASK applies to what Chrysopoeia creates itself, such as work files and
+the folders of an output folder.
 
-Everything Chrysopoeia needs is in `/mnt/user/appdata/chrysopoeia`: the
-database with your libraries, settings and history. Include it in your appdata
-backup (for example the *Appdata Backup* plugin, which stops the container
-while it copies, keeping the database consistent).
+If the log says Chrysopoeia *cannot write to /media*, your media is owned by a
+different user: either set PUID/PGID to that owner, or run **Tools > New
+Permissions** on the share (this resets it to `nobody:users`). Until then the
+Overview lists the files under **Needs your attention** as *Finished files
+can't be saved*.
+
+## Backing up
+
+Everything Chrysopoeia keeps is in `/mnt/user/appdata/chrysopoeia`: the
+database with your libraries, settings and history (`chrysopoeia.db` and,
+while it runs, its `-wal` and `-shm` files). Include the folder in your appdata
+backup, for example the *Appdata Backup* plugin, which stops the container
+while it copies and so keeps the database consistent. Copying it by hand? Stop
+the container first.
 
 If the folder is ever lost, nothing in your media is affected: add the
 libraries again and files that were already converted are recognised as
-already efficient and skipped. Only history and statistics are lost.
+already efficient and skipped. Only history and statistics are lost. Your
+media is not part of this backup: keep a separate backup of anything you cannot
+replace, since conversion replaces files.
 
-## Updating
+## Upgrading
 
 **Docker** tab > **Check for Updates** > **apply update** next to Chrysopoeia.
-Your settings and libraries are kept. Jobs that were running are restarted
-from the beginning after the update; originals are never left half-replaced.
+Your settings and libraries are kept, and the database is brought up to date on
+the first start. Files that were converting are stopped, their work files
+removed, and they start again from the beginning; originals are never left
+half-replaced. Unraid waits for the container to stop before replacing it, and
+Chrysopoeia exits within a few seconds. To see which build is running, open
+the bottom of **Settings** in the app (*About*) or the first lines of the
+container log.
+
+To go back to an older version, set **Repository** to that version and restore
+a backup of the config folder taken before the upgrade: a database written by a
+newer version is refused by an older one with a plain message.
 
 The `latest` image follows the project's main branch, so every tested change
 arrives as an update. To stay on released versions only, **Edit** the
-container and set **Repository** to a version tag, for example
-`ghcr.io/thekozugroup/chrysopoeia:1` (the newest 1.x release) or `:1.2` (only
-fixes for 1.2).
+container and set **Repository** to a version tag once releases exist, for
+example `ghcr.io/thekozugroup/chrysopoeia:1.2.3` (exactly that release),
+`:1.2` (only fixes for 1.2) or `:1` (the newest 1.x).
 
 ## Trying a test build
 
-Builds that are not released yet (for example a branch before it is merged)
-are published as `ghcr.io/thekozugroup/chrysopoeia:edge` when someone runs the
-*Release* workflow on that branch. To use one, **Edit** the container, set
-**Repository** to `ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**.
-Set it back to `ghcr.io/thekozugroup/chrysopoeia:latest` to return to the
-regular image; your settings and libraries are kept either way.
+A branch that is not merged yet is published as
+`ghcr.io/thekozugroup/chrysopoeia:edge` when someone opens **Actions >
+Release > Run workflow** on GitHub and picks that branch. The workflow builds
+the image, runs its tests and pushes it for amd64 and arm64; `latest` is not
+touched. To use it, **Edit** the container, set **Repository** to
+`ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**. After the branch
+is merged to `main`, `latest` carries the same change: set **Repository** back
+to `ghcr.io/thekozugroup/chrysopoeia:latest`. Your settings and libraries are
+kept either way.
 
 If that run published the very first image, the package on GitHub is still
 private and Unraid's pull is refused (*denied* or *unauthorized* in the pull
 log). The repository owner makes it public once: on GitHub, **Packages** >
 **chrysopoeia** > **Package settings** > **Change visibility** > **Public**.
 
-Before the very first release there is no `latest` yet: install the template
+The template's `Icon` and `TemplateURL` point at the `main` branch. Until the
+template and `unraid/chrysopoeia.png` are on `main`, a template installed from
+a branch shows no icon and cannot refresh itself; the container works the same.
+Before the very first release there is also no `latest`: install the template
 from the branch instead (replace `main` in the `wget` address of step 2 with
 the branch name, e.g. `.../Project-Chrysopoeia/my-branch/unraid/chrysopoeia.xml`)
-and set Repository to the `edge` image before clicking **Apply**.
+and set **Repository** to the `edge` image before clicking **Apply**.
 
 ## Troubleshooting
 

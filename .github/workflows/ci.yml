@@ -20,11 +20,14 @@ env:
   COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
   # Default pnpm when web/package.json has no "packageManager" field.
   PNPM_VERSION: "10.33.0"
+  # Drives web/e2e/smoke.mjs (scripts/e2e-browser.sh) against the built image.
+  PLAYWRIGHT_VERSION: "1.56.1"
 
 jobs:
   lint-files:
-    name: Workflows and shell scripts (actionlint, shellcheck)
+    name: Workflows, scripts and templates (actionlint, shellcheck, xmllint, compose)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -35,9 +38,21 @@ jobs:
       - name: shellcheck
         run: shellcheck docker/*.sh scripts/*.sh
 
+      - name: Unraid template is well-formed XML
+        run: |
+          command -v xmllint >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils; }
+          xmllint --noout unraid/chrysopoeia.xml
+
+      - name: Compose files are valid
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.nvidia.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml config --quiet
+
   rust:
     name: Rust (fmt, clippy, tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -64,6 +79,7 @@ jobs:
   web:
     name: Web (lint, typecheck, tests, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: web
@@ -104,12 +120,17 @@ jobs:
           test -f out/index.html || { echo "::error::web/out/index.html is missing; next.config.ts must set output: \"export\"."; exit 1; }
 
   docker:
-    name: Docker image (build, end-to-end smoke test)
+    name: Docker image (build, entrypoint and end-to-end tests)
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Build linux/amd64
         uses: docker/build-push-action@v6
@@ -130,5 +151,23 @@ jobs:
       - name: Entrypoint tests (PUID/PGID, GPU groups, privilege drop)
         run: docker/test-entrypoint.sh chrysopoeia:ci
 
-      - name: End-to-end smoke test
+      - name: End-to-end smoke test (API)
         run: scripts/e2e-smoke.sh chrysopoeia:ci
+
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --global "playwright@${PLAYWRIGHT_VERSION}"
+          playwright install --with-deps chromium
+
+      - name: End-to-end smoke test (first run in a browser)
+        run: scripts/e2e-browser.sh chrysopoeia:ci
+        env:
+          E2E_SCREENSHOTS: ${{ runner.temp }}/e2e-screenshots
+
+      - name: Upload browser screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: ${{ runner.temp }}/e2e-screenshots
+          if-no-files-found: ignore

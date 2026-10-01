@@ -7,8 +7,9 @@
 #   2. adds the user to the groups that own the GPU device nodes it can see
 #      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes), except root,
 #   3. hands that user Chrysopoeia's own files in /config (the database and its
-#      lock) and the top of /config and /temp when those are new or empty,
-#      without ever re-owning other files or folders (the folder may be shared),
+#      lock), the top folder of /config when it is new, empty or already holds
+#      the database, and the top folder of /temp, without ever re-owning other
+#      files or folders (the folder may be shared),
 #   4. prints a short banner and drops privileges with setpriv.
 # Started as any other user (docker run --user ...), it only applies UMASK
 # and the path defaults, then runs the command directly.

@@ -47,7 +47,9 @@ services:
       # number chosen in Settings wins over this one.
       MAX_JOBS: ${MAX_JOBS:-}
       # Folders (inside the container) to add as libraries on first start,
-      # comma-separated, e.g. /media/Movies,/media/TV. You can also add them in the app.
+      # comma-separated, e.g. /media/Movies,/media/TV. They start with the
+      # "Save space" goal and begin converting at once; leave it empty to
+      # choose folder and goal in the app instead.
       LIBRARIES: ${LIBRARIES:-}
       # Behind a reverse proxy: the domain name(s) you open Chrysopoeia at,
       # e.g. transcode.example.com. IP addresses and local names always work.

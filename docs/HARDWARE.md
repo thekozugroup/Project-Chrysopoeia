@@ -11,8 +11,20 @@ hardware encoder, and uses only the ones that succeed. Under **Details:
 encoders and ffmpeg** on that page, each format shows *Works* when its test
 passed, or *Failed test* with the reason. Jobs use the best encoder that works
 for the library's codec; if a hardware encode fails on a particular file, it is
-retried with CPU decoding and then on the CPU. So the practical question is only
-*can the container see the GPU?* The table in each section says what that takes.
+retried with CPU decoding and then, while *If the GPU fails, try the CPU* is on
+(the default), on the CPU. So the practical question is only *can the container
+see the GPU?* The table in each section says what that takes.
+
+To change the choice, use **Use for converting** in Settings > Hardware
+(*Automatic*, *CPU only*, or one kind of GPU), or set `HW_ACCEL` on the
+container: `auto`, `cpu`, `nvenc`, `qsv`, `vaapi`, `rkmpp` or `v4l2m2m` (`amf`
+needs a driver the image does not have, `videotoolbox` is for native macOS).
+`HW_ACCEL` is applied on the first start and again whenever its value changes;
+in between, the choice made in the app is kept. A GPU choice uses only that kind
+of GPU: files it cannot encode go to the CPU (or fail, if *If the GPU fails,
+try the CPU* is off, and the Overview lists them under *Needs your attention*
+as *The hardware you chose isn't working*). A GPU the app can see on the host
+but not in the container is listed there too, with the fix.
 
 The Docker image ships [jellyfin-ffmpeg 7](https://github.com/jellyfin/jellyfin-ffmpeg),
 which includes NVENC, Intel Quick Sync (oneVPL and the older Media SDK), VA-API
@@ -48,8 +60,10 @@ Notes worth knowing:
 
 - **NVIDIA session limit.** GeForce cards limit how many encodes run at once
   (8 per system with Linux driver 550.54 or newer; 3 to 5 with older drivers).
-  Chrysopoeia runs at most 3 jobs per NVIDIA GPU by default. Professional (RTX
-  A-series, Quadro) cards have no such limit; raise *Files at once* if you like.
+  Chrysopoeia runs at most 3 files per NVIDIA GPU at once by default
+  (2 per Intel or AMD GPU). Professional (RTX A-series, Quadro) cards have no
+  such limit; choose a higher number under *Files at once* in Settings >
+  Processing if you like.
 - **No NVENC at all.** The GeForce GT 1030 and most GeForce MX laptop chips
   have no video encoder, so Chrysopoeia encodes on the CPU with them. NVIDIA's
   [Video Encode and Decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new)
