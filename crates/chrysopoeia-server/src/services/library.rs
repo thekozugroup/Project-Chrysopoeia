@@ -33,6 +33,7 @@ use crate::db::libraries::LibraryRow;
 use crate::db::{self, ts};
 use crate::format::{count, plural};
 use crate::services::fs_guard;
+use crate::services::share_mounts::{self, Mounted};
 use crate::services::watcher::ActiveWatcher;
 use crate::state::{AppState, lock};
 
@@ -925,6 +926,24 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     };
     let started = Instant::now();
     state.emit(scan_progress(&lib, ScanPhase::Discovering, 0, 0, 0));
+    // The share the library is on isn't mounted: its mount point is an
+    // ordinary folder, whose files (or lack of them) say nothing about the
+    // library's.
+    if let Mounted::No(mount) = share_mounts::check(state, Path::new(&lib.path)).await {
+        state
+            .library_activity(
+                ActivityLevel::Error,
+                format!(
+                    "Couldn't scan {}. {}",
+                    lib.name,
+                    share_mounts::not_connected(&mount)
+                ),
+                id,
+            )
+            .await;
+        state.emit(scan_progress(&lib, ScanPhase::Done, 0, 0, 0));
+        return Ok(());
+    }
 
     // Read the database before walking. A job that finishes during a long
     // walk then shows up as a row that changed since this snapshot (and is
@@ -1807,11 +1826,30 @@ pub async fn path_problem(path: &str) -> Folder {
     Folder::from_check(path, looked)
 }
 
+/// Whether a folder the app uses (the output folder, the work folder, a
+/// library folder as the folder picker shows it) can be used right now:
+/// the drive or share it was seen mounted from is still mounted (see
+/// [`share_mounts`]), and [`path_problem`].
+pub async fn folder_unavailable(state: &AppState, path: &str) -> Folder {
+    match share_mounts::check(state, Path::new(path)).await {
+        Mounted::Yes(_) => path_problem(path).await,
+        Mounted::No(mount) => Folder::Problem(share_mounts::not_connected(&mount)),
+        Mounted::Unknown => Folder::Unknown,
+    }
+}
+
 /// Whether a library folder can hold the files the queue expects right now:
-/// [`path_problem`], and a folder with nothing in it at all, which for a
-/// library with files almost always means an unmounted drive or share (the
-/// mount point is left behind empty), is a problem too.
-pub async fn root_unavailable(path: &str) -> Folder {
+/// the drive or share it was seen mounted from is still mounted (an
+/// unmounted share leaves its mount point behind as an ordinary folder, see
+/// [`share_mounts`]), [`path_problem`], and a folder with nothing in it at
+/// all, which for a library with files almost always means an unmounted
+/// drive or share too (one not seen mounted yet), is a problem as well.
+pub async fn root_unavailable(state: &AppState, path: &str) -> Folder {
+    match share_mounts::check(state, Path::new(path)).await {
+        Mounted::Yes(_) => {}
+        Mounted::No(mount) => return Folder::Problem(share_mounts::not_connected(&mount)),
+        Mounted::Unknown => return Folder::Unknown,
+    }
     let p = path.to_string();
     let looked = fs_guard::guarded(
         "root_unavailable",
@@ -1888,7 +1926,7 @@ fn assemble(
 /// Why a library's folder can't be used: a problem with the folder itself,
 /// or the reason the queue is waiting for it (e.g. a share mounted empty).
 async fn library_problem(state: &AppState, row: &LibraryRow) -> Option<String> {
-    match path_problem(&row.path).await {
+    match folder_unavailable(state, &row.path).await {
         Folder::Problem(p) => Some(p),
         // Not looked at (too many checks stuck elsewhere): no problem is
         // claimed for it.

@@ -28,7 +28,10 @@
 //! stops answering (a network share whose server went away), the job ends
 //! with [`JobOutcome::NotResponding`] instead of waiting for it. Putting
 //! the new file in place is never abandoned half way: it goes on by itself
-//! and reports how it ended through [`take_unfinished`].
+//! and reports how it ended through [`take_unfinished`]. Before it writes
+//! anything (the temp file, the new file), the job makes sure the shares
+//! its folders are on are still mounted ([`JobSpec::mounts`]): an unmounted
+//! share leaves an ordinary folder behind, where nothing may be written.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -101,6 +104,13 @@ pub struct JobSpec {
     /// keep the result whatever its size (`min_savings_pct` is not applied).
     /// Verification still applies.
     pub force: bool,
+    /// The mount points the library folder, the work folder and the output
+    /// folder were seen on. While one of them isn't mounted, its folder is
+    /// an ordinary folder on the disk below (an unmounted share leaves its
+    /// mount point behind): the job then writes nothing, and ends with
+    /// [`JobOutcome::NotResponding`] for it, before it creates its temp
+    /// file and before it puts the new file in place.
+    pub mounts: Vec<PathBuf>,
 }
 
 /// How a job ended.
@@ -620,6 +630,9 @@ impl Job<'_> {
 
     async fn prepare(&self) -> Result<Prepared, JobOutcome> {
         let (cfg, spec) = (self.cfg, self.spec);
+        if let Some(gone) = slow_fs::first_unmounted(&spec.mounts).await {
+            return Err(NotAnswering::at(&gone).into());
+        }
         // A share that stopped answering: the job goes back to the queue
         // (and Cancel or Stop still ends it at once, see `run`).
         let input_meta = match slow_fs::metadata(&spec.input, FOLDER_CHECK_TIMEOUT).await {
@@ -1249,6 +1262,16 @@ impl Job<'_> {
     /// job without waiting for it (see [`take_unfinished`]).
     async fn place(&self, prepared: &Prepared, placing: Placing) -> JobOutcome {
         let (cfg, spec) = (self.cfg, self.spec);
+        // A share unmounted during the encode: its mount point is an
+        // ordinary folder now, and the new file must not go there.
+        if let Some(gone) = slow_fs::first_unmounted(&spec.mounts).await {
+            tracing::info!(
+                job = %spec.job_id,
+                "{} is no longer mounted; the new file wasn't put in place",
+                gone.display()
+            );
+            return NotAnswering::at(&gone).into();
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let mut thread = start_finalize(
             &FinalizeRequest {
@@ -3436,6 +3459,7 @@ mod tests {
             profile: TranscodeProfile::default(),
             candidates: Vec::new(),
             force: false,
+            mounts: Vec::new(),
         };
         let (tx, _rx) = mpsc::channel(1);
         let job = run_job(&cfg, &spec, tx, CancellationToken::new());

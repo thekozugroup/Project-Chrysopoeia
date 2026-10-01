@@ -526,6 +526,20 @@ so Docker may go on showing the container as running, and `docker stop` may
 report *tried to kill container, but did not receive an exit event*, until the
 share answers.
 
+**What if a share is unmounted?**
+An unmounted share leaves its mount point behind as an ordinary folder, empty
+or holding whatever was there before the share was mounted over it.
+Chrysopoeia remembers which drives and shares each library folder, the output
+folder and the work folder were seen mounted from, so it never takes that
+folder for the share: the library shows *The drive or share mounted at
+/mnt/remotes/nas isn't connected. Reconnect it, and its conversions continue.*,
+its conversions (and every one that uses the output or work folder) wait,
+nothing is written into the bare folder, and the files stay listed. Mount the
+share again and they continue. If you removed the share for good, tell
+Chrysopoeia: remove the library and add it again, or choose the output or work
+folder again in Settings (pick another folder, save, and pick the old one again
+if it keeps its path).
+
 **What happens to files when I change a library's goal?**
 Files that were skipped or are waiting are decided again under the new goal; a
 scan does the same for any it missed. Files already converted stay as they are.

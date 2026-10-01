@@ -48,6 +48,7 @@ use crate::services::library::{
     self, Folder, PROBE_TIMEOUT, USER_SKIP_REASON, probe_error_message, probe_problem,
     still_settling,
 };
+use crate::services::share_mounts::{self, Mounted};
 use crate::state::{AppState, lock};
 
 /// Idle re-check interval.
@@ -659,25 +660,31 @@ async fn recheck_offline(state: &AppState) {
                 continue;
             }
         };
-        let looked = match library::root_unavailable(&lib.path).await {
+        let looked = match library::root_unavailable(state, &lib.path).await {
             Folder::Problem(reason) => Recheck::Offline(reason),
             Folder::Unknown => Recheck::Unknown,
-            // What stopped answering inside it (or elsewhere) answers too:
-            // "not found" is an answer, an error is not (a share that
-            // answers with errors is still out of reach).
-            Folder::Fine => match &check {
-                Some(path) => match look(path, true, RECHECK_TIMEOUT).await {
-                    Ok(_) => Recheck::Back,
-                    Err(Unsure::Disk { busy: true, .. } | Unsure::Database) => Recheck::Unknown,
-                    Err(Unsure::Disk {
-                        reason: Some(reason),
-                        ..
-                    }) => Recheck::Offline(reason),
-                    Err(Unsure::Disk { reason: None, .. }) => {
-                        Recheck::Offline(stuck_reason(&lib.path, path))
-                    }
+            // The work and output folders' shares are mounted (their mount
+            // points answer even when they aren't), and what stopped
+            // answering inside it (or elsewhere) answers too: "not found"
+            // is an answer, an error is not (a share that answers with
+            // errors is still out of reach).
+            Folder::Fine => match job_folders(state, &lib.path).await {
+                Connected::No { reason, .. } => Recheck::Offline(reason),
+                Connected::Unknown => Recheck::Unknown,
+                Connected::Yes(_) => match &check {
+                    Some(path) => match look(path, true, RECHECK_TIMEOUT).await {
+                        Ok(_) => Recheck::Back,
+                        Err(Unsure::Disk { busy: true, .. } | Unsure::Database) => Recheck::Unknown,
+                        Err(Unsure::Disk {
+                            reason: Some(reason),
+                            ..
+                        }) => Recheck::Offline(reason),
+                        Err(Unsure::Disk { reason: None, .. }) => {
+                            Recheck::Offline(stuck_reason(&lib.path, path))
+                        }
+                    },
+                    None => Recheck::Back,
                 },
-                None => Recheck::Back,
             },
         };
         match looked {
@@ -746,7 +753,7 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         let disposition = space_was_shared(&state, &job, disposition);
         // Every look at the disk from here on is bounded and gives way to
         // Cancel and Stop: the job holds its slot until it is recorded.
-        let disposition = after_failure(&disposition, &mut ctx, &cancel)
+        let disposition = after_failure(&state, &disposition, &mut ctx, &cancel)
             .await
             .unwrap_or(disposition);
         prepare_record(&state, &disposition, &mut ctx, &cancel).await;
@@ -806,6 +813,7 @@ fn start_job(state: &AppState, job: Job, software: bool) {
 /// one whose file is gone is noted in `ctx`. Cancel and Stop win over the
 /// check (the job then ends as they say). `None` keeps `disposition`.
 async fn after_failure(
+    state: &AppState,
     disposition: &Disposition,
     ctx: &mut ExecContext,
     cancel: &CancellationToken,
@@ -817,7 +825,7 @@ async fn after_failure(
         return None;
     }
     let now = tokio::select! {
-        now = input_now(ctx) => now,
+        now = input_now(state, ctx) => now,
         () = cancel.cancelled() => return Some(Disposition::Finished(JobOutcome::Cancelled)),
     };
     match now {
@@ -1233,6 +1241,15 @@ async fn execute(
         };
     }
 
+    // A share the job's folders are on that is no longer mounted leaves an
+    // ordinary folder where it was: nothing is read from it, settled on it
+    // or written into it. The job waits for it.
+    let mounts = match or_cancelled!(job_folders(state, &lib.path)) {
+        Connected::Yes(mounts) => mounts,
+        Connected::No { reason, check } => return offline(reason, check, ctx),
+        Connected::Unknown => return busy(ctx),
+    };
+
     // An earlier run of this job, or of another job of this file, may have
     // ended while its new file was being put in place (its share stopped
     // answering, or the server stopped, and the share finished it later):
@@ -1279,7 +1296,7 @@ async fn execute(
         let looked = or_cancelled!(fs_guard::metadata(&input, INPUT_CHECK_TIMEOUT));
         match looked {
             Err(NoAnswer::NotAnswering) => {
-                let reason = or_cancelled!(offline_reason(&lib.path, &input));
+                let reason = or_cancelled!(offline_reason(state, &lib.path, &input));
                 return offline(reason, Some(input.clone()), ctx);
             }
             Err(NoAnswer::Busy) => return busy(ctx),
@@ -1288,7 +1305,7 @@ async fn execute(
                 // A whole library missing is a disconnected drive or share,
                 // not a deleted file: wait for it instead of failing every
                 // job.
-                match or_cancelled!(library::root_unavailable(&lib.path)) {
+                match or_cancelled!(library::root_unavailable(state, &lib.path)) {
                     Folder::Fine => {}
                     Folder::Problem(reason) => return offline(reason, None, ctx),
                     Folder::Unknown => return busy(ctx),
@@ -1308,7 +1325,7 @@ async fn execute(
                         Err(Unsure::Disk { path, reason, .. }) => {
                             let reason = match reason {
                                 Some(reason) => reason,
-                                None => or_cancelled!(offline_reason(&lib.path, &path)),
+                                None => or_cancelled!(offline_reason(state, &lib.path, &path)),
                             };
                             return offline(reason, Some(path), ctx);
                         }
@@ -1369,7 +1386,7 @@ async fn execute(
                 }
                 Ok(Err(e)) => return done(failed(probe_problem(&e), probe_error_message(&e)), ctx),
                 Err(stuck) => {
-                    let reason = or_cancelled!(offline_reason(&lib.path, &stuck));
+                    let reason = or_cancelled!(offline_reason(state, &lib.path, &stuck));
                     return offline(reason, Some(stuck), ctx);
                 }
             }
@@ -1481,6 +1498,7 @@ async fn execute(
         profile: lib.profile.clone(),
         candidates,
         force: job.force,
+        mounts,
     };
 
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
@@ -1577,12 +1595,22 @@ async fn execute(
     }
     // A file or folder that stopped answering made the job stop: it waits
     // in the queue, with its library offline, until it answers again.
+    // (The worker also stops before it writes into the output or work
+    // folder, or the library, when the share it is on is no longer
+    // mounted.)
     if let JobOutcome::NotResponding { path } = &outcome {
-        let reason = tokio::select! {
-            reason = offline_reason(&lib.path, path) => reason,
-            () = cancel.cancelled() => stuck_reason(&lib.path, path),
+        let (reason, check) = tokio::select! {
+            looked = async {
+                match job_folders(state, &lib.path).await {
+                    Connected::No { reason, check } => (reason, check),
+                    Connected::Yes(_) | Connected::Unknown => {
+                        (offline_reason(state, &lib.path, path).await, Some(path.clone()))
+                    }
+                }
+            } => looked,
+            () = cancel.cancelled() => (stuck_reason(&lib.path, path), Some(path.clone())),
         };
-        return offline(reason, Some(path.clone()), ctx);
+        return offline(reason, check, ctx);
     }
     // A look it needed couldn't be made (too many checks of other shares
     // are stuck): tried again shortly, its library not taken for offline.
@@ -2573,23 +2601,30 @@ enum InputNow {
 
 /// Look at the file of a job that failed, with bounded checks (see
 /// [`fs_guard`]).
-async fn input_now(ctx: &ExecContext) -> InputNow {
+async fn input_now(state: &AppState, ctx: &ExecContext) -> InputNow {
     let (Some(file), Some(root)) = (&ctx.file, &ctx.library_root) else {
         return InputNow::There;
     };
     let root = root.to_string_lossy();
+    // A share the job writes to that is no longer mounted (its output or
+    // work folder) may well be why it failed.
+    match job_folders(state, &root).await {
+        Connected::Yes(_) => {}
+        Connected::No { reason, check } => return InputNow::Unreachable { reason, check },
+        Connected::Unknown => return InputNow::Unknown,
+    }
     let path = Path::new(&file.path);
     let looked = match fs_guard::symlink_metadata(path, INPUT_CHECK_TIMEOUT).await {
         Ok(looked) => looked,
         Err(NoAnswer::Busy) => return InputNow::Unknown,
         Err(NoAnswer::NotAnswering) => {
             return InputNow::Unreachable {
-                reason: offline_reason(&root, path).await,
+                reason: offline_reason(state, &root, path).await,
                 check: Some(path.to_path_buf()),
             };
         }
     };
-    match library::root_unavailable(&root).await {
+    match library::root_unavailable(state, &root).await {
         Folder::Fine => {}
         Folder::Problem(reason) => {
             return InputNow::Unreachable {
@@ -2605,11 +2640,58 @@ async fn input_now(ctx: &ExecContext) -> InputNow {
     }
 }
 
+/// Whether the drives and shares the folders of a job sit on are mounted
+/// (see [`job_folders`]).
+#[derive(Debug)]
+enum Connected {
+    /// They are: these mount points (the worker makes sure they still are
+    /// before it writes anything).
+    Yes(Vec<PathBuf>),
+    /// One isn't: why the job waits, and what to look at again (`None`:
+    /// the library folder).
+    No {
+        reason: String,
+        check: Option<PathBuf>,
+    },
+    /// Can't tell right now.
+    Unknown,
+}
+
+/// Whether the drives and shares the folders of a job in the library at
+/// `lib_path` were seen mounted from are all mounted (see
+/// [`share_mounts`]): the library folder's, the work folder's and, in
+/// folder mode, the output folder's. One that isn't leaves its mount point
+/// behind as an ordinary folder, which must not be taken for the share.
+async fn job_folders(state: &AppState, lib_path: &str) -> Connected {
+    let cfg = run_config(state, &state.settings());
+    let mut folders = vec![(PathBuf::from(lib_path), true)];
+    folders.extend(cfg.temp_dir.map(|dir| (dir, false)));
+    if cfg.output_mode == OutputMode::Folder {
+        folders.extend(cfg.output_folder.map(|dir| (dir, false)));
+    }
+    let mut mounts = Vec::new();
+    for (folder, library) in folders {
+        match share_mounts::check(state, &folder).await {
+            Mounted::Yes(points) => mounts.extend(points),
+            Mounted::No(mount) => {
+                return Connected::No {
+                    reason: share_mounts::not_connected(&mount),
+                    check: (!library).then_some(mount),
+                };
+            }
+            Mounted::Unknown => return Connected::Unknown,
+        }
+    }
+    mounts.sort();
+    mounts.dedup();
+    Connected::Yes(mounts)
+}
+
 /// Why a library's jobs wait when `stuck` (in it, or a folder the jobs use)
 /// didn't answer: the library folder's own problem, if it has one, else
 /// that `stuck`'s folder isn't responding.
-async fn offline_reason(lib_path: &str, stuck: &Path) -> String {
-    match library::root_unavailable(lib_path).await {
+async fn offline_reason(state: &AppState, lib_path: &str, stuck: &Path) -> String {
+    match library::root_unavailable(state, lib_path).await {
         Folder::Problem(reason) => reason,
         Folder::Fine | Folder::Unknown => stuck_reason(lib_path, stuck),
     }
@@ -3198,7 +3280,7 @@ async fn folders_are_there(
         .map_err(|_| Unsure::Database)?;
     if let Some(lib) = lib {
         let root = PathBuf::from(&lib.path);
-        match library::root_unavailable(&lib.path).await {
+        match library::root_unavailable(state, &lib.path).await {
             Folder::Fine => {}
             Folder::Problem(reason) => return Err(Unsure::problem(&root, reason)),
             Folder::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &root)),
@@ -3239,7 +3321,7 @@ async fn folders_are_there(
             .map(PathBuf::from)
             .filter(|o| target.starts_with(o));
         if let Some(output) = output {
-            match library::path_problem(&output.to_string_lossy()).await {
+            match library::folder_unavailable(state, &output.to_string_lossy()).await {
                 Folder::Fine => {}
                 Folder::Problem(reason) => return Err(Unsure::problem(&output, reason)),
                 Folder::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &output)),
@@ -3323,7 +3405,7 @@ async fn settle_file(state: &AppState, job: &Job, input: &Path, lib_path: &str) 
             } => {
                 let reason = match reason {
                     Some(reason) => reason,
-                    None => offline_reason(lib_path, &path).await,
+                    None => offline_reason(state, lib_path, &path).await,
                 };
                 return FileSettled::Unreachable {
                     reason,
