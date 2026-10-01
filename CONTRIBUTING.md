@@ -93,6 +93,15 @@ make docker                                   # chrysopoeia:dev for linux/amd64
 docker buildx build --platform linux/amd64,linux/arm64 -t chrysopoeia:multi .
 ```
 
+The first build takes 10 to 15 minutes on four cores and about 8 GB of disk
+space (`docker builder prune -af` gives back about 3 GB afterwards); the image
+is about 600 MB. Later builds reuse the cached steps: a change
+to the web pages alone takes about two minutes.
+`make docker` does not pass `VERSION`, so the image's build label is `dev`; for
+a build that others will install (README, [Build it
+yourself](README.md#build-it-yourself)) use
+`docker build -t chrysopoeia:local --build-arg VERSION=local .`.
+
 The build compiles the UI and the Rust binary on the build machine's own
 architecture and cross-compiles the binary for arm64, so an arm64 image needs
 emulation only for the final `apt-get` step. To build and try one on an amd64
@@ -191,19 +200,22 @@ twenty minutes on four cores. Shrink the results before committing them
   end-to-end tests against it, and only then pushes a multi-arch (amd64 +
   arm64) image to `ghcr.io/<owner>/chrysopoeia`: a push to `main` is tagged
   `latest` and `sha-<short>`; a tag `v1.2.3` is tagged `1.2.3`, `1.2`, `1` and
-  `sha-<short>`. A version tag never moves `latest`, which always follows
-  `main`. The arm64 image is cross-compiled (only the final `apt-get` step runs
+  `sha-<short>` (a `v0.*` tag gets no major-only tag: `v0.2.3` is tagged `0.2.3`,
+  `0.2` and `sha-<short>`). A version tag never moves `latest`, which always
+  follows `main`. The arm64 image is cross-compiled (only the final `apt-get` step runs
   under emulation) and is not run in CI.
 - There are two version numbers. The server reports the `version` in
   `Cargo.toml` (`[workspace.package]`) in `/api/health`, `/api/system` and its
   "is running" log line. The image version is `1.2.3` for a tag,
   `main-<short sha>` for a build from `main` and `<branch>-<short sha>` for a
-  manual run; it is in the OCI version label, the `CHRYSOPOEIA_VERSION`
-  variable, the first line of the container log and *About* at the bottom of
-  Settings, next to the server's (`Chrysopoeia 0.2.0 (image main-1a2b3c4)`),
-  so a bug report names the exact commit. To release, set `version` in
-  `Cargo.toml` to `1.2.3`, commit, then tag `v1.2.3`; the workflow refuses a
-  tag that does not match.
+  manual run (`dev` for a local build without `VERSION`); it is in the OCI
+  version label, the `CHRYSOPOEIA_VERSION` variable, the first line of the
+  container log and *About* at the bottom of Settings, where it is called the
+  *build*, next to the server's version: `Chrysopoeia 0.2.0 (build
+  main-1a2b3c4)` in the log, `Chrysopoeia 0.2.0 · build main-1a2b3c4` in
+  *About*. A bug report that quotes it names the exact commit. To release, set
+  `version` in `Cargo.toml` to `1.2.3`, commit, then tag `v1.2.3`; the workflow
+  refuses a tag that does not match.
 - To publish an image from a branch before merging it (for example to try it
   on an Unraid server), open **Actions > Release > Run workflow** and pick the
   branch. The same tests run, and the image is pushed as `edge` and
@@ -221,6 +233,36 @@ twenty minutes on four cores. Shrink the results before committing them
   GitHub > Packages > chrysopoeia > Package settings > Change visibility >
   Public. Until then Unraid and Docker are refused when pulling it. The
   workflow run's summary repeats this.
+
+### Before announcing a release
+
+Everything the README and `docs/UNRAID.md` tell a new user to download or pull
+exists only after these steps, in this order. Check them from a machine (or a
+shell) that is not logged in to GitHub or GHCR, because a private package
+and a logged-in session hide the problem:
+
+1. Merge to `main` (or push the version tag) and wait for the **Release** run
+   to finish green: it pushes `:latest` (or the version tags).
+2. The first time ever: set the package to **Public** (GitHub > Packages >
+   chrysopoeia > Package settings > Change visibility).
+3. Check the image and the raw files the docs point at:
+
+   ```sh
+   docker logout ghcr.io
+   docker pull ghcr.io/thekozugroup/chrysopoeia:latest      # not "denied"
+   raw=https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main
+   for f in unraid/chrysopoeia.xml unraid/chrysopoeia.png docker-compose.yml .env.example; do
+     curl -fsSL -o /dev/null -w "%{http_code}  $f\n" "$raw/$f" || echo "FAILED  $f"
+   done
+   ```
+
+   All four must answer `200`. For a fresh Compose install, also run the
+   README's Compose steps in an empty folder and confirm `docker compose up -d`
+   starts `ghcr.io/thekozugroup/chrysopoeia:latest` (`docker compose config`
+   shows the image), and open the web UI.
+4. Only then announce it. Until it is done, the README and UNRAID.md callouts
+   tell people to use the branch's raw URLs and the `:edge` image, or to build
+   the image themselves.
 
 Run the workflow checks locally before pushing a change to `.github/`:
 

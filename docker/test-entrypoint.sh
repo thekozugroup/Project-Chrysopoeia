@@ -181,8 +181,8 @@ docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
 STATUS=0
 expect "the startup banner lists GPU devices" 'GPU devices +/dev/dri/renderD128 \(group gpu993\)'
 expect "the startup banner names the user" 'Runs as +uid 99 \(chrysopoeia\), gid 100 \(users\)'
-# The server's own version (Cargo.toml), plus the image version when it differs.
-expect "the startup banner shows the server version" 'Chrysopoeia [0-9]+\.[0-9]+\.[0-9]+( \(image [^)]+\))?$'
+# The server's own version (Cargo.toml), plus the build label when it differs.
+expect "the startup banner shows the server version" 'Chrysopoeia [0-9]+\.[0-9]+\.[0-9]+( \(build [^)]+\))?$'
 
 # --- Mount warnings ---------------------------------------------------------------
 

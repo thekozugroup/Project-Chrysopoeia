@@ -59,6 +59,19 @@ wget -O /boot/config/plugins/dockerMan/templates-user/my-Chrysopoeia.xml \
 Then **Docker > Add Container**, and choose **Chrysopoeia** in the *Template*
 list.
 
+> **Before the first release, or from a branch.** The template, its icon and
+> the image `ghcr.io/thekozugroup/chrysopoeia:latest` (the template's
+> Repository) exist only once the project has been merged to `main`, its
+> Release workflow has published the image, and the package has been made
+> public. Until then the `wget` address above answers *404*, and Unraid's pull
+> of `:latest` is refused (*denied*). Install from the branch instead:
+> replace `main` in the `wget` address with the branch's name, and before
+> clicking **Apply** in step 3 set **Repository** to
+> `ghcr.io/thekozugroup/chrysopoeia:edge`. The details, including making the
+> package public, are under [Trying a test build](#trying-a-test-build). Or
+> [build the image yourself](../README.md#build-it-yourself) and set
+> **Repository** to `chrysopoeia:local`.
+
 ## 3. Fill in the template
 
 | Field | What to enter |
@@ -131,6 +144,13 @@ Files that are new or changed later are picked up on their own: folder
 watching sees changes made through `/mnt/user` shares, and every library is
 rescanned every 12 hours (Settings > Processing).
 
+The converted file gets the new container's extension, so `Movie.mp4` becomes
+`Movie.mkv` (and an `.mkv` becomes `.mp4` under *Plays everywhere*); a file
+that is already in that container keeps its name. Plex, Jellyfin and Emby pick
+this up at their next scan. Sonarr and Radarr see the old file as missing until
+their next disk scan, or until you run *Refresh & Scan* on the series or
+movie.
+
 ## Transcode cache on an SSD
 
 Without a cache folder, Chrysopoeia writes each new file next to the original,
@@ -148,6 +168,33 @@ copied into place once, after it passes verification.
 
 Never point it at `/tmp` or leave it inside the container: large files there
 end up in RAM or in `docker.img`, which can fill up and stop all containers.
+
+## Keeping your originals
+
+To leave your library untouched and write the converted files somewhere else,
+the container needs a second, writable folder, because the template has only
+Config, Media and Transcode cache:
+
+1. On the Docker tab, **Edit** Chrysopoeia and click **Add another Path, Port,
+   Variable, Label or Device** at the bottom. Set **Config Type** to *Path*,
+   **Name** to `Converted files`, **Container Path** to `/output`, **Host
+   Path** to a share for the results, e.g. `/mnt/user/converted/`, and **Access
+   Mode** to *Read/Write*. Click **Add**, then **Apply**.
+2. In the app, open **Settings > Output**, choose **Save to a separate
+   folder**, click the **Output folder** field, pick `/` at the top of the
+   folder browser, open `output` and click **Use “output”**.
+3. Optional, and only after step 2: set the Media path's **Access Mode** to
+   *Read Only*, so that nothing can change your originals at all. While
+   Chrysopoeia is set to replace originals, a read-only Media path stops every
+   conversion.
+
+The new files mirror each library's folder structure inside `/output`, with
+the goal's extension, but without the library's own folder name. Two libraries
+that hold the same relative path therefore want the same output file: the
+second is not written (it is never overwritten), and its page says *A file
+named "…" is already in the output folder*. When your libraries are folders
+of one share (`Movies`, `TV`), add that share as a single library instead:
+the output then keeps the `Movies` and `TV` folders.
 
 ## Reverse proxy (SWAG, Nginx Proxy Manager, Traefik)
 
@@ -208,10 +255,13 @@ while it copies and so keeps the database consistent. Copying it by hand? Stop
 the container first.
 
 If the folder is ever lost, nothing in your media is affected: add the
-libraries again and files that were already converted are recognised as
-already efficient and skipped. Only history and statistics are lost. Your
-media is not part of this backup: keep a separate backup of anything you cannot
-replace, since conversion replaces files.
+libraries again, with the same goal as before, and files that were already
+converted are recognised as already efficient and skipped. Only history and
+statistics are lost. Files that had been tried but kept as originals because
+the result was not enough smaller are tried again, and converting them again
+takes as long as the first time; a different goal converts everything again.
+Your media is not part of this backup: keep a separate backup of anything you
+cannot replace, since conversion replaces files.
 
 ## Upgrading
 
@@ -259,6 +309,10 @@ from the branch instead (replace `main` in the `wget` address of step 2 with
 the branch name, e.g. `.../Project-Chrysopoeia/my-branch/unraid/chrysopoeia.xml`)
 and set **Repository** to the `edge` image before clicking **Apply**.
 
+Without waiting for either, you can
+[build the image yourself](../README.md#build-it-yourself) (10 to 15 minutes)
+and set **Repository** to `chrysopoeia:local`.
+
 ## Troubleshooting
 
 Start with the app itself:
@@ -285,13 +339,15 @@ GPU device it can see.
 | Log warns that a device *belongs to the root group* | Chrysopoeia does not join the root group, for safety. In the Unraid terminal run `chgrp video /dev/dri/renderD128 && chmod g+rw /dev/dri/renderD128` (with the device named in the warning), then restart the container. To keep it after a reboot, add the same line to `/boot/config/go`. |
 | NVIDIA card not used; log says *NVIDIA_VISIBLE_DEVICES is set but no NVIDIA GPU is visible* | Add `--runtime=nvidia` to Extra Parameters (Advanced View). After installing the Nvidia-Driver plugin, restart Docker once. |
 | NVIDIA encoders show *Failed test* in Settings > Hardware | Check that the driver plugin shows your card, that `NVIDIA_VISIBLE_DEVICES` is `all` or the right UUID, and that another container is not holding all encode sessions. `docker exec Chrysopoeia nvidia-smi` should list the card. |
+| Docker error when applying: *unknown or invalid runtime name: nvidia* | `--runtime=nvidia` is in Extra Parameters, but Docker does not have the NVIDIA runtime yet, so the container is not even created. Install the **Nvidia-Driver** plugin, wait until it says it is done, then restart Docker (**Settings > Docker > Enable Docker: No > Apply**, then **Yes > Apply**) or reboot. To use the CPU instead, remove `--runtime=nvidia` from Extra Parameters. |
 | Intel/AMD: no hardware encoders, `/dev/dri` present | Check that `renderD128` exists (`ls -l /dev/dri`). Settings > Hardware shows the exact error; permission errors mean the container was started with a custom `--user`: remove it and use PUID/PGID. |
+| A file fails with *Chrysopoeia doesn't have permission to write in the work folder*, or the Overview says *The work folder can't be used* or *The disk is full* | The **Transcode cache** folder (without one, the folder of each original) is not writable for PUID/PGID, or has no room: it needs space for the largest file you convert, times *Files at once*. Restarting the container makes its top folder belong to PUID/PGID again; for what is inside it, run `chown -R 99:100 /mnt/cache/chrysopoeia-temp` in the Unraid terminal (with your own path), and free up space if the disk is full. Then click **Try again** on the Overview, which queues every file that waited. |
 | Log says *cannot write to /media* | See [PUID, PGID and permissions](#puid-pgid-and-permissions). |
-| Log says */media is mounted read-only* | The Media path's **Access Mode** is *Read Only*. **Edit** the container, click **Edit** next to Media, set Access Mode to *Read/Write* and click **Apply**. Read-only is fine only when Settings > Output writes new files to a separate output folder. |
+| Log says */media is mounted read-only* | The Media path's **Access Mode** is *Read Only*. **Edit** the container, click **Edit** next to Media, set Access Mode to *Read/Write* and click **Apply**. Read-only is fine only when Settings > Output writes new files to a separate output folder (see [Keeping your originals](#keeping-your-originals)). |
 | Log says */config already holds other files but no Chrysopoeia database* | The Config path points at a folder that other apps use, such as `/mnt/user/appdata`. Chrysopoeia only adds its own files there and leaves the rest alone, but give it a folder of its own: **Edit** the container, set Config to `/mnt/user/appdata/chrysopoeia` and click **Apply**. |
 | Log says *cannot write to /config* | The Config folder belongs to someone else and is not writable for PUID/PGID, and Chrysopoeia will not take over a folder that holds other data. Set PUID/PGID to the folder's owner, or set Config to a new folder such as `/mnt/user/appdata/chrysopoeia`, which Chrysopoeia then takes over. |
 | Log says *No host folder is mounted at /config* | The Config path is empty, so settings and history would be lost on the next update. Set it to `/mnt/user/appdata/chrysopoeia`. |
-| New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or click **Scan now** on the library. |
+| New files are not picked up | Folder watching sees changes made through `/mnt/user` shares. Files added directly to a disk (`/mnt/disk1/...`) are found by the periodic rescan (every 12 hours by default), or open the **⋯** menu at the top right of the library's page and choose **Scan now**. |
 | The server feels slow while converting | Lower *Files at once* in Settings > Processing, or turn on *When to convert* there so conversions run overnight. |
 | Nothing converts at night / during the day as expected | *When to convert* uses the server's time zone. Unraid passes it automatically; check **Settings > Date and Time**. |
 | The app says *Chrysopoeia doesn't answer to the address …* | You opened it through a domain name. Add that name to ALLOWED_HOSTS (see [Reverse proxy](#reverse-proxy-swag-nginx-proxy-manager-traefik)). |

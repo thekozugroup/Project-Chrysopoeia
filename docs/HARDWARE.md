@@ -37,7 +37,11 @@ For the curious: the VA-API drivers live in `/usr/lib/jellyfin-ffmpeg/lib/dri`
 oneVPL and Media SDK runtimes, and the bundled `libva` looks there first, so
 `LIBVA_DRIVERS_PATH` does not need to be set. Settings > Hardware names GPUs
 with `lspci`, which the image includes. `ffmpeg`, `ffprobe` and `vainfo` are
-on the `PATH` for checks with `docker exec`.
+on the `PATH` for checks with `docker exec`. The commands in this guide call
+the container `chrysopoeia`, which is what `docker run` and Compose name it;
+on Unraid the template names it `Chrysopoeia` with a capital C, and Docker
+container names are case-sensitive, so use that name there (or open the
+container's **Console** from the Docker tab and leave out `docker exec`).
 
 ## Support matrix
 
@@ -93,7 +97,7 @@ Notes worth knowing:
 
 The image already sets `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`;
 without `video` NVENC is not available. Check from the host with
-`docker exec chrysopoeia nvidia-smi`.
+`docker exec chrysopoeia nvidia-smi` (Unraid: `docker exec Chrysopoeia nvidia-smi`).
 
 ## Intel
 
@@ -106,7 +110,8 @@ without `video` NVENC is not available. Check from the host with
 
 The container adds itself to the group that owns the render node, so no
 `group_add` is needed unless you start it with `--user`. Check with
-`docker exec chrysopoeia vainfo --display drm --device /dev/dri/renderD128`.
+`docker exec chrysopoeia vainfo --display drm --device /dev/dri/renderD128`
+(Unraid: `Chrysopoeia`, with a capital C).
 
 ## AMD
 
@@ -163,12 +168,14 @@ Open Settings > Hardware. It lists the devices the container can see and a
 setup tip with the fix; under *Details: encoders and ffmpeg*, each encoder's
 test result shows *Works* or *Failed test* with the error.
 The container log also prints the GPU devices it found at startup
-(`docker logs chrysopoeia`). The common causes:
+(`docker logs chrysopoeia`; Unraid: the container's **Logs** on the Docker tab).
+The common causes:
 
 | Symptom | Fix |
 |---|---|
 | No `/dev/dri` in the container | Pass `--device /dev/dri:/dev/dri` (Unraid: add a Device `/dev/dri` to the template). If the host has no `/dev/dri` either, load the driver first (Unraid: Intel GPU TOP / Radeon TOP plugin); Docker will not start a container whose device is missing. |
 | `/dev/dri` exists but encoders fail with "permission denied" | Start the container as root with `PUID`/`PGID` (the default) so it can join the render group, or add `--group-add <gid of /dev/dri/renderD128>` when using `--user`. |
 | NVIDIA GPU listed on the host, no NVENC in the container | Add `--gpus all`, or `--runtime=nvidia` with `NVIDIA_VISIBLE_DEVICES=all`; restart Docker after installing the NVIDIA driver or plugin. |
+| Docker refuses to start the container: *unknown or invalid runtime name: nvidia* | `--runtime=nvidia` is set, but Docker does not have the NVIDIA runtime. Install the NVIDIA driver and Container Toolkit (Unraid: the **Nvidia-Driver** plugin) and restart Docker, or remove `--runtime=nvidia` to use the CPU. |
 | Log warns that a device *belongs to the root group* | The container never joins the root group. On the host, give the device a group of its own, e.g. `chgrp video /dev/dri/renderD128 && chmod g+rw /dev/dri/renderD128`, and make it permanent with a udev rule (Unraid: add the line to `/boot/config/go`). |
 | Encoders show *Works* but files still use the CPU | Settings > Hardware > *Use for converting* is set to *CPU only*, or the library's codec has no hardware encoder on this GPU (see the matrix above). |

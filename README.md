@@ -70,7 +70,11 @@ while asking far less of you:
 - Watches folders and picks up new files, with an optional schedule (*When to
   convert*), pause, priorities and retry.
 - Replaces originals in place, or writes to a separate output folder and leaves
-  originals alone.
+  originals alone. The converted file gets the new container's extension, so
+  `Movie.mp4` becomes `Movie.mkv`: Plex, Jellyfin and Emby pick that up at their
+  next scan, while Sonarr and Radarr see the old file as missing until their next
+  disk scan or a *Refresh & Scan* of the series or movie (see the
+  [FAQ](#faq)).
 
 ### Goals
 
@@ -85,6 +89,22 @@ The first-run screen suggests the goal that suits the machine (the *Best fit*
 badge) and shows how fast each goal converts on it.
 
 ## Quick start
+
+> **Installing before the first release, or from a branch?** The addresses and
+> the image in this section belong to the `main` branch and to the image
+> `ghcr.io/thekozugroup/chrysopoeia:latest` that its Release workflow publishes.
+> Until the project is merged to `main`, that workflow has run, and the package
+> has been made public, the template and icon addresses answer *404*, the compose
+> file address may still serve an older, incompatible file, and pulling
+> `:latest` is *denied*. Until then, do one of these:
+>
+> - **Use the branch.** In every `raw.githubusercontent.com` address, replace
+>   `main` with the branch's name (a pushed branch serves the same files), and
+>   use the image `ghcr.io/thekozugroup/chrysopoeia:edge` instead of `:latest`.
+>   Run **Actions › Release › Run workflow** on the branch to publish it, and
+>   make the package public once (see [Which image](#which-image)).
+> - **[Build the image yourself](#build-it-yourself)**, about 15 minutes, and
+>   use the local image (`chrysopoeia:local`) wherever `:latest` appears below.
 
 ### Unraid
 
@@ -149,6 +169,10 @@ curl -o .env https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/
 docker compose up -d
 ```
 
+To run another image than `:latest` (the `:edge` test build, or one you
+[built yourself](#build-it-yourself)), add a line to `.env`, for example
+`CHRYSOPOEIA_IMAGE=chrysopoeia:local`.
+
 With a GPU, download the matching overlay file too and name both files:
 
 ```sh
@@ -178,6 +202,9 @@ and `linux/arm64`:
 | `edge` | A test build of a branch that is not merged yet. It is published when someone runs **Actions › Release › Run workflow** on that branch, and never changes `latest`. |
 | `sha-<commit>` | One exact commit. |
 
+Versions before 1.0 are tagged `0.2.3` and `0.2` only; the `1` tag starts with
+version 1.0.
+
 To try a branch before it is merged, run the Release workflow on it, then pull
 `ghcr.io/thekozugroup/chrysopoeia:edge` (Unraid: set the container's
 *Repository* to that). After the merge to `main`, switch back to `:latest`. The
@@ -187,6 +214,55 @@ GitHub › Packages › chrysopoeia › Package settings.
 The Unraid template's `Icon` and `TemplateURL` point at the `main` branch, so
 the icon and the template's own updates appear only once the template is on
 `main`. The image itself does not depend on that.
+
+### Build it yourself
+
+When the published image is not available yet (see the note at the top of
+[Quick start](#quick-start)), or you want to run your own changes, build the
+image from the source. You need Docker 23 or newer (it includes BuildKit). The
+first build takes 10 to 15 minutes on a four-core machine and needs about 8 GB
+of free disk space while it runs (build tools and their cache; afterwards
+`docker builder prune -af` gives back about 3 GB of it). The finished image is
+about 600 MB (150 MB compressed). Later builds reuse the cached steps: a change
+to the web pages alone takes a couple of minutes.
+
+```sh
+git clone https://github.com/thekozugroup/Project-Chrysopoeia.git
+cd Project-Chrysopoeia          # for a branch that is not merged yet: git checkout <branch>
+docker build -t chrysopoeia:local --build-arg VERSION=local .
+```
+
+No `git`? Download the branch as an archive instead (replace `main` with the
+branch name):
+
+```sh
+curl -L https://github.com/thekozugroup/Project-Chrysopoeia/archive/refs/heads/main.tar.gz | tar xz
+cd Project-Chrysopoeia-*
+docker build -t chrysopoeia:local --build-arg VERSION=local .
+```
+
+Then use `chrysopoeia:local` in place of `ghcr.io/thekozugroup/chrysopoeia:latest`
+in the `docker run` command, or as `CHRYSOPOEIA_IMAGE` for Compose. An image
+built without `--build-arg VERSION=...` shows *dev* as its build in *About* and
+in the first log line. Building for a server with a different kind of
+processor than the build machine (an Apple Silicon Mac for an Intel or AMD
+server)? Add `--platform linux/amd64` (or `linux/arm64`).
+
+**On Unraid** the easiest way is to build on another machine that has Docker
+and send the image over:
+
+```sh
+docker save chrysopoeia:local | ssh root@tower docker load
+```
+
+You can also run the commands above in the Unraid terminal, but Docker keeps
+the build and its cache in `docker.img`, which also holds all your other
+containers and may be only 20 GB: do it only when `docker.img` has about 10 GB
+free, and run `docker builder prune -af` afterwards.
+
+Then **Edit** the container (or Add Container) and set **Repository** to
+`chrysopoeia:local`. There is no registry to check for a local image, so to
+update it, build again and then recreate the container with **Edit › Apply**.
 
 ## GPU setup
 
@@ -230,9 +306,9 @@ variables; empty values count as not set.
 | `BROWSE_ROOTS` | `/media,/` if `/media` is mounted | Folders the in-app folder picker starts from. |
 | `NVIDIA_VISIBLE_DEVICES` | unset | NVIDIA with `--runtime=nvidia` (Unraid): `all` or a GPU UUID. With `--gpus` or the compose overlay, Docker sets it from the GPUs chosen there. |
 | `NVIDIA_DRIVER_CAPABILITIES` | `compute,video,utility` | Already set in the image; `video` is what enables NVENC. |
-| `PORT` | `8080` | Port inside the container. |
+| `PORT` | `8080` | The port the server listens on inside the container; leave it alone unless you also change what you publish (`-p 9000:9000`). To use another port on the host, change the left number of `-p` (`-p 9000:8080`), the Unraid *Web UI port*, or, for the compose file, `PORT` in `.env`: that one is the host port, and the container stays on 8080. |
 | `LOG_LEVEL` | `info` | `error`, `warn`, `info`, `debug` or `trace`. |
-| `CHRYSOPOEIA_VERSION` | set by the image | The build label (a release such as `1.2.3`, or `<branch>-<commit>`). Shown in the first log line and under *About* at the bottom of Settings; do not set it. |
+| `CHRYSOPOEIA_VERSION` | set by the image | The build label (a release such as `1.2.3`, or `<branch>-<commit>`; *dev* for an image built without `--build-arg VERSION`). Shown in the first log line and under *About* at the bottom of Settings, both as the *build*; do not set it. |
 
 The image also sets `DATA_DIR`, `WEB_DIR`, `FFMPEG_PATH` and `FFPROBE_PATH`;
 leave them as they are.
@@ -304,10 +380,13 @@ settings and history (`chrysopoeia.db`, plus its `-wal` and `-shm` files while
 it runs). Copy the folder while the container is stopped, or use your usual
 appdata backup (Unraid: the *Appdata Backup* plugin stops containers while it
 copies). Your media is not stored there, and nothing in it changes if `/config`
-is lost: add the libraries again and files that were already converted are
-recognised as efficient and skipped. Only history and statistics are lost.
-Chrysopoeia is not a backup tool either: keep a backup of media you cannot
-replace.
+is lost: add the libraries again, with the same goal as before, and files that
+were already converted are recognised as efficient and skipped. Only history
+and statistics are lost. Files that had been tried but kept as originals
+because the result was not enough smaller are tried again, and converting them
+again takes as long as the first time; a different goal converts everything
+again. Chrysopoeia is not a backup tool either: keep a backup of media you
+cannot replace.
 
 ## FAQ
 
@@ -322,6 +401,18 @@ it was converting (for example by Sonarr or Radarr). If you would rather keep
 originals, choose *Save to a separate folder* in Settings › Output and
 Chrysopoeia will never modify your library. As with any tool that rewrites
 files, keep a backup of media you cannot replace.
+
+**Why did the file extension change?**
+The converted file is named for the container the goal writes: `.mkv` for *Save
+space*, *Balanced* and *Archive*, `.mp4` for *Plays everywhere*, or whatever you
+chose under *More format options*. `Movie.mp4` becomes `Movie.mkv`, and an
+`.mkv` becomes `.mp4` under *Plays everywhere*; a file that is already in that
+container keeps its name. Because the old path then no longer exists, Plex,
+Jellyfin and Emby pick up the new name at their next library scan, while Sonarr
+and Radarr show the file as missing until their next disk scan or until you
+run *Refresh & Scan* on the series or movie. To keep names as they are, choose
+a goal whose container matches your files (*Balanced* for a library of `.mkv`
+files), or *Save to a separate folder*.
 
 **What does "Verified" mean?**
 The new file was opened and checked before it replaced the original. With the

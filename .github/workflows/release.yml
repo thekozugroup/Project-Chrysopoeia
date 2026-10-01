@@ -50,7 +50,7 @@ jobs:
 
       - name: Version string
         # The image version: shown in the first line of the container log
-        # ("Chrysopoeia 0.2.0 (image main-1a2b3c4)") and in the OCI version
+        # ("Chrysopoeia 0.2.0 (build main-1a2b3c4)") and in the OCI version
         # label. Tags: v1.2.3 -> 1.2.3. Branches: <branch>-<short sha>, so a
         # bug report from a :latest image names the exact commit. The server
         # itself (API, "is running" log line) reports Cargo.toml's version.
