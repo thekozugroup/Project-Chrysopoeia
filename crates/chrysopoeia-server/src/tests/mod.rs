@@ -7,6 +7,7 @@ mod files;
 mod followups;
 mod fs_browse;
 mod libraries;
+mod library_folders;
 mod polish;
 mod problems;
 mod regressions;

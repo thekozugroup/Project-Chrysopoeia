@@ -310,3 +310,40 @@ async fn a_second_server_cannot_use_the_same_data_folder() {
     drop(first);
     app::lock_data_dir(dir.path()).unwrap();
 }
+
+/// In a container the data folder is set by the image and must be left
+/// alone, so the advice names the Config folder (the `/config` mount);
+/// outside one it names the option that moves the data folder.
+#[tokio::test]
+async fn the_data_folder_advice_depends_on_where_the_server_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let _first = app::lock_data_dir_in(dir.path(), true).unwrap();
+
+    let in_docker = app::lock_data_dir_in(dir.path(), true)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        in_docker.contains("Stop the other one first, or give this one its own Config folder"),
+        "{in_docker}"
+    );
+    assert!(
+        in_docker.contains("Unraid: the Config path; docker: -v /other/folder:/config"),
+        "{in_docker}"
+    );
+    assert!(!in_docker.contains("DATA_DIR"), "{in_docker}");
+    assert!(!in_docker.contains("--data-dir"), "{in_docker}");
+
+    let outside = app::lock_data_dir_in(dir.path(), false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        outside.contains("Stop the other one first, or give this one its own data folder"),
+        "{outside}"
+    );
+    assert!(outside.contains("--data-dir"), "{outside}");
+    assert!(outside.contains("DATA_DIR"), "{outside}");
+    assert!(!outside.contains("Config folder"), "{outside}");
+    for text in [&in_docker, &outside] {
+        assert!(text.contains(&dir.path().display().to_string()), "{text}");
+    }
+}

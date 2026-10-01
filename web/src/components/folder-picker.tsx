@@ -135,6 +135,27 @@ interface FolderPickerProps {
    * can't be used (see `libraryConflict`).
    */
   libraries?: readonly KnownLibrary[];
+  /**
+   * Picking the folder of a new library: a folder the server says can't be
+   * one (the whole server, the folder holding the database, a system folder;
+   * `library_blocked` in its answer) can't be used, and the reason is shown.
+   * Output and work folders leave this off, so any folder can be chosen.
+   */
+  forLibrary?: boolean;
+}
+
+/**
+ * Why the folder just opened can't be used, if it can't: for a library's
+ * folder, the server's reason (`library_blocked`), else a clash with a
+ * library that exists. `null` when it's free.
+ */
+export function folderRefusal(
+  data: Pick<FsBrowse, "path" | "library_blocked">,
+  libraries: readonly KnownLibrary[],
+  forLibrary: boolean,
+): string | null {
+  if (forLibrary && data.library_blocked) return data.library_blocked;
+  return libraryConflict(data.path, libraries);
 }
 
 export function FolderPicker({
@@ -146,6 +167,7 @@ export function FolderPicker({
   className,
   onNavigate,
   libraries = NO_LIBRARIES,
+  forLibrary = false,
 }: FolderPickerProps) {
   const [path, setPath] = useState<string | undefined>(initialPath || undefined);
   const [typed, setTyped] = useState("");
@@ -248,7 +270,7 @@ export function FolderPicker({
   };
 
   const forbidden = browse.error instanceof ApiError && browse.error.status === 403;
-  const conflict = data && !loadingNew ? libraryConflict(data.path, libraries) : null;
+  const conflict = data && !loadingNew ? folderRefusal(data, libraries, forLibrary) : null;
   const conflictId = useId();
 
   return (

@@ -35,6 +35,111 @@ pub struct LibraryPatch {
     pub profile: Option<TranscodeProfile>,
 }
 
+/// Folders that are never a place for videos, in any setup.
+const SYSTEM_FOLDERS: [&str; 3] = ["/proc", "/sys", "/dev"];
+/// Where the Docker image keeps the database (the `/config` mount).
+const IMAGE_CONFIG_FOLDER: &str = "/config";
+/// Where the Docker image keeps the app and the web UI (read-only).
+const IMAGE_APP_FOLDER: &str = "/app";
+
+/// Follow links where the folder exists; else make the path absolute.
+fn resolved(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// The folders Chrysopoeia keeps its own files in, as the disk really has
+/// them (links followed), so a library can't be made out of them.
+#[derive(Debug, Clone)]
+pub struct OwnFolders {
+    /// The database folder (`DATA_DIR`, `/config` in the image).
+    data: PathBuf,
+    /// The web UI folder (`WEB_DIR`, `/app/web` in the image).
+    web: PathBuf,
+    image_config: PathBuf,
+    image_app: PathBuf,
+    system: Vec<PathBuf>,
+}
+
+impl OwnFolders {
+    /// Resolve the server's own folders. Looks at the disk, so call it from
+    /// a blocking thread.
+    pub fn resolve(data_dir: &Path, web_dir: &Path) -> Self {
+        Self {
+            data: resolved(data_dir),
+            web: resolved(web_dir),
+            image_config: resolved(Path::new(IMAGE_CONFIG_FOLDER)),
+            image_app: resolved(Path::new(IMAGE_APP_FOLDER)),
+            system: SYSTEM_FOLDERS
+                .iter()
+                .map(|f| resolved(Path::new(f)))
+                .collect(),
+        }
+    }
+}
+
+/// Why a folder (already resolved to its real path) can't be a library, in
+/// a sentence for the user, or `None` when it can. A library is scanned and
+/// its files are replaced, so these are refused: the whole server (`/`),
+/// the folder holding the database and anything inside it or above it,
+/// the app's own folder (read-only) and the system folders `/proc`, `/sys`
+/// and `/dev`.
+pub fn library_folder_refusal(path: &Path, own: &OwnFolders) -> Option<String> {
+    const INSTEAD: &str = "Choose the folder that holds your videos.";
+    if path == Path::new("/") {
+        return Some(format!(
+            "The whole server can't be a library: it includes Chrysopoeia's own files and every \
+             share. {INSTEAD}"
+        ));
+    }
+    if let Some(system) = own.system.iter().find(|s| path.starts_with(s)) {
+        return Some(format!(
+            "{} is a system folder, not a place for videos. {INSTEAD}",
+            system.display()
+        ));
+    }
+    if let Some(kept) = [&own.data, &own.image_config]
+        .into_iter()
+        .find(|k| path.starts_with(k))
+    {
+        return Some(format!(
+            "{} is where Chrysopoeia keeps its database and settings. {INSTEAD}",
+            kept.display()
+        ));
+    }
+    if own.data.starts_with(path) {
+        return Some(format!(
+            "This folder contains Chrysopoeia's own settings folder ({}). Choose a folder that \
+             holds only your videos.",
+            own.data.display()
+        ));
+    }
+    if let Some(app) = [&own.web, &own.image_app]
+        .into_iter()
+        .find(|a| path.starts_with(a))
+    {
+        return Some(format!(
+            "{} holds the Chrysopoeia app itself, which is read-only. {INSTEAD}",
+            app.display()
+        ));
+    }
+    None
+}
+
+/// [`library_folder_refusal`] for this server's own folders. Looks at the
+/// disk, so it runs on a blocking thread.
+pub async fn folder_refusal(state: &AppState, path: &Path) -> ApiResult<Option<String>> {
+    let data_dir = state.config.data_dir.clone();
+    let web_dir = state.config.web_dir.clone();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        library_folder_refusal(&path, &OwnFolders::resolve(&data_dir, &web_dir))
+    })
+    .await
+    .map_err(ApiError::internal)
+}
+
 fn not_readable(path: &str) -> ApiError {
     ApiError::bad_request(
         "not_readable",
@@ -91,6 +196,9 @@ pub async fn validate_library_path(state: &AppState, raw: &str) -> ApiResult<Pat
             "path_not_supported",
             "Folder names must be valid UTF-8 text.",
         ));
+    }
+    if let Some(reason) = folder_refusal(state, &canonical).await? {
+        return Err(ApiError::bad_request("folder_not_allowed", reason));
     }
     let settings = state.settings();
     if settings.output_mode == OutputMode::Folder

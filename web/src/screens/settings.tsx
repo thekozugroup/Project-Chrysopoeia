@@ -290,7 +290,15 @@ function ProcessingSection({ draft, onChange, errors }: SectionProps) {
   );
 }
 
-/** What "Automatic" means for the work folder on this server; the general rule while it loads. */
+/** How to get a fast work folder under "Automatic" on Unraid: map /temp, nothing to choose. */
+const UNRAID_TEMP_TIP = "On Unraid, map /temp to your cache pool; Automatic then uses it.";
+
+/**
+ * What "Automatic" means for the work folder on this server; the general
+ * rule while it loads. In a container it also says how to give Automatic a
+ * fast drive (map /temp), which is all it takes: the folder doesn't have to
+ * be chosen again under "A specific folder".
+ */
 export function automaticWorkFolderText(system: SystemInfo | undefined): ReactNode {
   if (!system) {
     return "The server's work folder when it has one (the Docker image uses /temp when it's mapped), otherwise next to each file, which needs free space on the same drive as the video.";
@@ -300,12 +308,20 @@ export function automaticWorkFolderText(system: SystemInfo | undefined): ReactNo
       <>
         Uses <span className="font-mono text-[0.8125rem] text-fg">{system.default_temp_dir}</span>, the work folder this
         server was started with.
+        {system.in_container ? <> {UNRAID_TEMP_TIP}</> : null}
       </>
     );
   }
   return system.in_container
-    ? "Next to each file, which needs free space on the same drive as the video. Map a /temp folder into the container to use a faster drive instead."
+    ? `Next to each file, which needs free space on the same drive as the video. ${UNRAID_TEMP_TIP}`
     : "Next to each file, which needs free space on the same drive as the video.";
+}
+
+/** What "A specific folder" means for the work folder: another folder than the one Automatic uses. */
+export function specificWorkFolderText(system: SystemInfo | undefined): string {
+  return system?.in_container === false
+    ? "Pick another folder on this server."
+    : "Pick another folder inside the container, for example another mapped path.";
 }
 
 /**
@@ -432,7 +448,7 @@ function OutputSection({ draft, onChange, errors, focus }: SectionProps & { focu
             checked={draft.temp_dir !== null}
             onChange={() => onChange({ temp_dir: draft.temp_dir ?? "" })}
             title="A specific folder"
-            description="On Unraid, map /temp to a folder on your cache pool and choose it here."
+            description={specificWorkFolderText(system.data)}
           />
         </fieldset>
         {draft.temp_dir !== null ? (
