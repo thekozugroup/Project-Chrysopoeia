@@ -44,6 +44,15 @@ pub struct StreamInfo {
     pub is_forced: bool,
     /// Cover art stored as a video stream.
     pub is_attached_pic: bool,
+    /// File name of an attachment or of an MKV cover image (its `filename`
+    /// tag), e.g. `cover.jpg`. Kept so a cover image copied into a new MKV
+    /// keeps its name, which media servers look for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    /// MIME type of an attachment or of an MKV cover image (its `mimetype`
+    /// tag), e.g. `image/jpeg`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mimetype: Option<String>,
     pub bit_rate: Option<u64>,
 
     // Video

@@ -467,9 +467,9 @@ fn replacing_would_lose_picture_subtitles_and_fonts_only_outside_mkv() {
     assert_eq!(
         replace_loss(&anime, &compatible).as_deref(),
         Some(
-            "MP4 can't hold this file's 2 picture-based subtitles and 1 subtitle font, so it \
-             was left unchanged. To convert it, choose an MKV goal or save converted files to a \
-             separate folder; Convert anyway converts it without them"
+            "MP4 can't hold this file's 2 picture-based subtitles, 1 styled subtitle and 1 \
+             subtitle font, so it was left unchanged. To convert it, choose an MKV goal or save \
+             converted files to a separate folder; Convert anyway converts it without them"
         )
     );
     // MKV keeps everything it can hold (teletext was never kept).
@@ -478,34 +478,150 @@ fn replacing_would_lose_picture_subtitles_and_fonts_only_outside_mkv() {
         None
     );
     // Tracks the profile leaves out anyway are not a loss.
-    let mut english = compatible.clone();
-    english.subtitle_languages = vec!["eng".into()];
+    let mut german = compatible.clone();
+    german.subtitle_languages = vec!["ger".into()];
     assert!(
-        replace_loss(&anime, &english)
+        replace_loss(&anime, &german)
             .unwrap()
-            .contains("1 picture-based subtitle and 1 subtitle font,")
+            .contains("this file's 1 picture-based subtitle and 1 subtitle font,")
     );
     let mut no_subs = compatible.clone();
     no_subs.subtitles = chrysopoeia_core::SubtitlePolicy::Drop;
     assert_eq!(replace_loss(&anime, &no_subs), None);
 
-    // Text subtitles become MP4 text; an attached cover picture is still lost.
+    // Plain text subtitles become MP4 text without losing anything; an
+    // attachment that is not a font is still lost.
     let plain = probe_of(
         "matroska",
         vec![
             video(0, "h264", 1920, 1080),
             subtitle(1, "subrip", Some("eng")),
-            subtitle(2, "ass", None),
+            subtitle(2, "webvtt", None),
         ],
     );
     assert_eq!(replace_loss(&plain, &compatible), None);
-    let mut cover = attachment(3);
-    cover.codec = "mjpeg".into();
-    let mut with_cover = plain.clone();
-    with_cover.streams.push(cover);
+    let mut other = attachment(3);
+    other.codec = "text".into();
+    let mut with_other = plain.clone();
+    with_other.streams.push(other);
     assert!(
-        replace_loss(&with_cover, &no_subs)
+        replace_loss(&with_other, &no_subs)
             .unwrap()
             .starts_with("MP4 can't hold this file's 1 attached file,")
     );
+}
+
+/// ASS/SSA subtitles keep only their text in MP4 and WebM: positions,
+/// colours and overlapping lines are lost, so replacing the original would
+/// lose them for good.
+#[test]
+fn replacing_would_lose_subtitle_styling_outside_mkv() {
+    use chrysopoeia_core::{Goal, SubtitlePolicy, TranscodeProfile};
+    use chrysopoeia_worker::replace_loss;
+    let styled = probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            audio(1, "aac", 2, 48_000, Some("jpn")),
+            subtitle(2, "ass", Some("eng")),
+        ],
+    );
+    let compatible = TranscodeProfile::from_goal(Goal::Compatible);
+    assert_eq!(
+        replace_loss(&styled, &compatible).as_deref(),
+        Some(
+            "MP4 can't hold this file's 1 styled subtitle, so it was left unchanged. To convert \
+             it, choose an MKV goal or save converted files to a separate folder; Convert anyway \
+             converts it without them"
+        )
+    );
+    let mut webm = profile(VideoCodec::Vp9, AudioCodec::Opus, Container::Webm);
+    assert!(
+        replace_loss(&styled, &webm).unwrap().starts_with(
+            "WebM can't hold this file's 1 styled subtitle, so it was left unchanged."
+        )
+    );
+    // MKV keeps ASS as it is, and old SSA becomes ASS (styling kept).
+    let mut ssa = styled.clone();
+    ssa.streams.push(subtitle(3, "ssa", Some("eng")));
+    assert_eq!(
+        replace_loss(&ssa, &TranscodeProfile::from_goal(Goal::Balanced)),
+        None
+    );
+    let both = replace_loss(&ssa, &compatible).unwrap();
+    assert!(
+        both.starts_with("MP4 can't hold this file's 2 styled subtitles, so"),
+        "{both}"
+    );
+    // Not kept anyway: dropped subtitles, or another language (forced
+    // tracks are always kept, so they count).
+    webm.subtitles = SubtitlePolicy::Drop;
+    assert_eq!(replace_loss(&styled, &webm), None);
+    let mut french = compatible.clone();
+    french.subtitle_languages = vec!["fre".into()];
+    assert_eq!(replace_loss(&styled, &french), None);
+    let mut forced = styled.clone();
+    forced.streams[2].is_forced = true;
+    assert!(replace_loss(&forced, &french).is_some());
+    // With its font: both are named.
+    let mut with_font = styled.clone();
+    with_font.streams.push(attachment(3));
+    assert!(
+        replace_loss(&with_font, &compatible)
+            .unwrap()
+            .starts_with("MP4 can't hold this file's 1 styled subtitle and 1 subtitle font, so")
+    );
+}
+
+/// Cover images (ffprobe: a one-picture video stream marked as attached)
+/// are kept by MKV and, as JPEG, PNG or BMP, by MP4; WebM holds none.
+#[test]
+fn replacing_would_lose_cover_images_only_where_they_cant_be_kept() {
+    use chrysopoeia_core::{Goal, TranscodeProfile};
+    use chrysopoeia_worker::replace_loss;
+    let cover = |index: u32, codec: &str| StreamInfo {
+        is_attached_pic: true,
+        is_default: false,
+        ..video(index, codec, 600, 600)
+    };
+    let with_jpeg = probe_of(
+        "matroska",
+        vec![
+            video(0, "h264", 1920, 1080),
+            audio(1, "aac", 2, 48_000, None),
+            cover(2, "mjpeg"),
+        ],
+    );
+    let compatible = TranscodeProfile::from_goal(Goal::Compatible);
+    let balanced = TranscodeProfile::from_goal(Goal::Balanced);
+    assert_eq!(replace_loss(&with_jpeg, &compatible), None);
+    assert_eq!(replace_loss(&with_jpeg, &balanced), None);
+    let webm = profile(VideoCodec::Vp9, AudioCodec::Opus, Container::Webm);
+    assert_eq!(
+        replace_loss(&with_jpeg, &webm).as_deref(),
+        Some(
+            "WebM can't hold this file's 1 cover image, so it was left unchanged. To convert it, \
+             choose an MKV goal or save converted files to a separate folder; Convert anyway \
+             converts it without them"
+        )
+    );
+    // MP4 has no place for a GIF or WebP cover.
+    let mut odd = with_jpeg.clone();
+    odd.streams.push(cover(3, "gif"));
+    odd.streams.push(cover(4, "webp"));
+    assert!(
+        replace_loss(&odd, &compatible)
+            .unwrap()
+            .starts_with("MP4 can't hold this file's 2 cover images, so it was left unchanged.")
+    );
+    assert_eq!(replace_loss(&odd, &balanced), None);
+    // Every kind of loss in one sentence.
+    let mut all = odd.clone();
+    all.streams.push(subtitle(5, "hdmv_pgs_subtitle", None));
+    all.streams.push(subtitle(6, "ass", None));
+    all.streams.push(attachment(7));
+    assert!(replace_loss(&all, &compatible).unwrap().starts_with(
+        "MP4 can't hold this file's 1 picture-based subtitle, 1 styled subtitle, 1 subtitle \
+             font and 2 cover images, so it was left unchanged."
+    ));
 }

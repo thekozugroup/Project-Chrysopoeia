@@ -127,23 +127,15 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             (db, Some(note))
         }
     };
-    let pool = db.pool();
-    let (mut settings, first_run) = match db::settings::load(pool).await? {
-        Some(s) => (s, false),
-        None => {
-            let s = crate::services::settings::first_run_settings(&config);
-            db::settings::save(pool, &s).await?;
-            (s, true)
-        }
-    };
-    let hw_note = apply_hw_accel(pool, &config, &mut settings, first_run).await?;
-    let paused = db::settings::get_flag(pool, db::settings::QUEUE_PAUSED_KEY)
-        .await?
-        .unwrap_or(false);
-    let clean_shutdown = db::settings::get_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY)
-        .await?
-        .unwrap_or(first_run);
-    db::settings::set_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY, false).await?;
+    let (settings, first_run, hw_note, paused, clean_shutdown) =
+        match startup_state(&db, &config).await {
+            Ok(state) => state,
+            Err(e) if db::is_disk_full(&db_path, &e).await => {
+                db.close().await;
+                return Err(e.context(db::disk_full_message(&db_path)));
+            }
+            Err(e) => return Err(e),
+        };
 
     let state = AppState::new(config, db, toolkit, settings, paused);
     lock(&state.leftovers).searching = !clean_shutdown;
@@ -200,6 +192,34 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             requeued_jobs,
         },
     ))
+}
+
+/// What the start-up needs from the database: the settings (created on
+/// the first start), whether this is the first start, a note about
+/// `HW_ACCEL`, whether the queue is paused and whether the last stop was
+/// clean (which is then marked as not yet clean again).
+async fn startup_state(
+    db: &Db,
+    config: &Config,
+) -> anyhow::Result<(Settings, bool, Option<String>, bool, bool)> {
+    let pool = db.pool();
+    let (mut settings, first_run) = match db::settings::load(pool).await? {
+        Some(s) => (s, false),
+        None => {
+            let s = crate::services::settings::first_run_settings(config);
+            db::settings::save(pool, &s).await?;
+            (s, true)
+        }
+    };
+    let hw_note = apply_hw_accel(pool, config, &mut settings, first_run).await?;
+    let paused = db::settings::get_flag(pool, db::settings::QUEUE_PAUSED_KEY)
+        .await?
+        .unwrap_or(false);
+    let clean_shutdown = db::settings::get_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY)
+        .await?
+        .unwrap_or(first_run);
+    db::settings::set_flag(pool, db::settings::CLEAN_SHUTDOWN_KEY, false).await?;
+    Ok((settings, first_run, hw_note, paused, clean_shutdown))
 }
 
 /// `HW_ACCEL` sets the hardware preference on the first start, and again

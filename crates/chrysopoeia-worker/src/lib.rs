@@ -14,8 +14,8 @@ pub mod run;
 pub mod validate;
 
 pub use plan::{
-    Decision, FfmpegPlan, PlanRequest, StreamSummary, build_plan, decide, decide_forced,
-    replace_loss,
+    CoverFile, Decision, FfmpegPlan, PlanRequest, StreamSummary, build_plan, cover_extract_args,
+    decide, decide_forced, replace_loss,
 };
 pub use run::{JobOutcome, JobSpec, RunConfig, run_job};
 pub use validate::{ValidateRequest, validate_output};

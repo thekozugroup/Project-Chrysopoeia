@@ -469,6 +469,59 @@ fn extra_samples(dir: &Path) -> Result<(), &'static str> {
     if !cover {
         return Err("cover art");
     }
+
+    // MKV with a cover image (a JPEG attachment, which ffprobe shows as an
+    // attached picture), a styled ASS subtitle and its font.
+    let mkv_cover = ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "color=c=blue:size=120x120",
+        "-frames:v",
+        "1",
+        ".cover.jpg",
+    ]) && ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=25:duration=3",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=450:duration=3",
+        "-i",
+        ".styled.ass",
+        "-attach",
+        ".font.ttf",
+        "-attach",
+        ".cover.jpg",
+        "-metadata:s:t:0",
+        "mimetype=application/x-truetype-font",
+        "-metadata:s:t:1",
+        "mimetype=image/jpeg",
+        "-metadata:s:t:1",
+        "filename=cover.jpg",
+        "-map",
+        "0:v",
+        "-map",
+        "1:a",
+        "-map",
+        "2:s",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-c:s",
+        "ass",
+        "Cover.mkv",
+    ]);
+    if !mkv_cover {
+        return Err("MKV cover image");
+    }
     review_samples(dir, &ffmpeg)
 }
 

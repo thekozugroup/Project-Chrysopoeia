@@ -1436,29 +1436,42 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
     }
 
     /// Encoders that ignore SIGTERM while they flush (x265, SVT-AV1) must
-    /// not keep a cancelled job running: it stops well within a second.
+    /// not keep a cancelled job running: the process is killed outright,
+    /// without asking it to stop first (a request it could ignore for as
+    /// long as it likes). The script notes any SIGTERM it gets, so no
+    /// timing is needed to tell; the time bound only shows the job doesn't
+    /// wait for the minute the script would run.
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_does_not_wait_for_a_process_ignoring_sigterm() {
-        let args = vec![
-            "-c".to_string(),
-            "trap '' TERM; sleep 30; sleep 30".to_string(),
-        ];
+        let dir = tempfile::tempdir().unwrap();
+        let asked = dir.path().join("asked-to-stop");
+        // `sleep & wait` so the shell runs its trap as soon as a TERM comes.
+        let script = format!(
+            "trap 'echo term > \"{}\"' TERM; echo ready >&2; sleep 30 & wait; sleep 30 & wait",
+            asked.display()
+        );
+        let args = vec!["-c".to_string(), script];
         let cancel = CancellationToken::new();
         let cmd = FfmpegCommand::new(Path::new("sh"), &args);
-        let cancelled_at = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            cancel.cancel();
-            std::time::Instant::now()
+        let trigger = cancel.clone();
+        // Cancel once the script is running (its first line on stderr).
+        let mut on_stderr = move |line: &str| {
+            if line.contains("ready") {
+                trigger.cancel();
+            }
         };
-        let (mut on_progress, mut on_stderr) = (|_: &ProgressBlock| {}, |_: &str| {});
-        let (exit, cancelled_at) = tokio::join!(
-            run_ffmpeg(&cmd, &cancel, &mut on_progress, &mut on_stderr),
-            cancelled_at
-        );
+        let started = std::time::Instant::now();
+        let exit = run_ffmpeg(&cmd, &cancel, &mut |_| {}, &mut on_stderr).await;
         assert_eq!(exit, FfmpegExit::Cancelled);
-        let took = cancelled_at.elapsed();
-        assert!(took < Duration::from_millis(1000), "took {took:?}");
+        let took = started.elapsed();
+        assert!(took < Duration::from_secs(20), "took {took:?}");
+        // Give a trap that did fire time to write (it never should).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !asked.exists(),
+            "the process was asked to stop before it was killed"
+        );
     }
 
     #[cfg(unix)]
@@ -1655,15 +1668,20 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
 
     /// ffmpeg 7 keeps printing progress blocks while it is stuck; a process
     /// that repeats the same block forever is hung all the same.
+    ///
+    /// The stall timeout is 80 times the pace of the output, so a machine
+    /// many times slower than usual still delivers every block well within
+    /// it: only the repeating counts against the process.
     #[cfg(unix)]
     #[tokio::test]
     async fn repeating_the_same_progress_block_counts_as_stalled() {
+        const STALL: Duration = Duration::from_secs(4);
         let stuck = "while true; do printf 'frame=59\\nfps=0.0\\nout_time_us=5900000\\n\
 total_size=48000\\nspeed=0.5x\\nprogress=continue\\n'; echo 'decoder error' >&2; \
 sleep 0.05; done";
         let args = vec!["-c".to_string(), stuck.to_string()];
         let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
-        cmd.stall_timeout = Duration::from_millis(500);
+        cmd.stall_timeout = STALL;
         let mut blocks = 0;
         let started = std::time::Instant::now();
         let exit = run_ffmpeg(
@@ -1674,16 +1692,22 @@ sleep 0.05; done";
         )
         .await;
         assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
+        // It kept printing (the same block) the whole time it was stuck.
         assert!(blocks > 3, "{blocks} blocks");
-        assert!(started.elapsed() < Duration::from_secs(10));
+        // Stopped after the stall timeout, not left running (it never ends).
+        assert!(started.elapsed() >= STALL, "{:?}", started.elapsed());
+        assert!(started.elapsed() < STALL * 15, "{:?}", started.elapsed());
 
-        // The same pace with the position moving is progress.
-        let working = "i=0; while [ $i -lt 30 ]; do i=$((i+1)); printf \"frame=$i\\n\
+        // The same pace with the position moving is progress, however long
+        // it takes in all (here more than the stall timeout).
+        let working = "i=0; while [ $i -lt 100 ]; do i=$((i+1)); printf \"frame=$i\\n\
 out_time_us=${i}00000\\nprogress=continue\\n\"; sleep 0.05; done";
         let args = vec!["-c".to_string(), working.to_string()];
         let mut cmd = FfmpegCommand::new(Path::new("sh"), &args);
-        cmd.stall_timeout = Duration::from_millis(500);
+        cmd.stall_timeout = STALL;
+        let started = std::time::Instant::now();
         let exit = run_ffmpeg(&cmd, &CancellationToken::new(), &mut |_| {}, &mut |_| {}).await;
         assert!(matches!(exit, FfmpegExit::Success { .. }), "{exit:?}");
+        assert!(started.elapsed() >= STALL, "{:?}", started.elapsed());
     }
 }

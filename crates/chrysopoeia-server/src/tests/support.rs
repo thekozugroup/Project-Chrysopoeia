@@ -918,11 +918,21 @@ impl TestApp {
         .await;
     }
 
-    /// Rescan a library and wait for it.
+    /// Rescan a library and wait for it. A scan the server started by itself
+    /// (after a job, say) may still be running on a busy machine: that one
+    /// is waited for first, so the rescan sees everything written before.
     pub async fn rescan(&self, id: &str) {
-        let r = self.post_empty(&format!("/api/libraries/{id}/scan")).await;
-        assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
-        self.wait_scan(id).await;
+        for _ in 0..50 {
+            let r = self.post_empty(&format!("/api/libraries/{id}/scan")).await;
+            if r.status == StatusCode::CONFLICT {
+                self.wait_scan(id).await;
+                continue;
+            }
+            assert_eq!(r.status, StatusCode::ACCEPTED, "{}", r.text);
+            self.wait_scan(id).await;
+            return;
+        }
+        panic!("the library never stopped scanning long enough to be rescanned");
     }
 
     /// Files of a library, keyed by file name.

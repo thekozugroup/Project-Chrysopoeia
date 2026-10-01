@@ -103,6 +103,11 @@ async fn paused_queue_starts_nothing() {
     app.pause().await;
     app.write("Movies/a.mkv", h264());
     app.add_library("Movies", json!({})).await;
+    let app_ref = &app;
+    wait_until("the job to be queued", || async {
+        app_ref.get("/api/queue").await.json["queued"] == 1
+    })
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(app.fake.started().is_empty());
     let q = app.get("/api/queue").await;
@@ -127,10 +132,13 @@ async fn active_hours_hold_jobs() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text);
     app.write("Movies/a.mkv", h264());
     app.add_library("Movies", json!({})).await;
+    let app_ref = &app;
+    wait_until("the queue to wait for its hours", || async {
+        app_ref.get("/api/queue").await.json["waiting_for_schedule"] == true
+    })
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(app.fake.started().is_empty());
-    let q = app.get("/api/queue").await;
-    assert_eq!(q.json["waiting_for_schedule"], true);
 
     // Opening the window starts the job right away.
     app.patch("/api/settings", json!({ "active_hours": null }))
@@ -538,7 +546,7 @@ async fn a_disk_filled_by_parallel_jobs_is_retried_once() {
     use chrysopoeia_core::ProblemKind;
     let app = TestApp::new().await;
     app.pause().await;
-    app.patch("/api/settings", json!({ "max_jobs": 2 })).await;
+    app.patch("/api/settings", json!({ "max_jobs": 1 })).await;
     app.write("Movies/long.mkv", h264());
     app.write("Movies/big.mkv", h264());
     let full = "The disk ran out of space while the new file was being written in the work folder.";
@@ -548,7 +556,30 @@ async fn a_disk_filled_by_parallel_jobs_is_retried_once() {
         Behavior::FailWith(ProblemKind::DiskFull, full.into()),
     );
     app.add_library("Movies", json!({})).await;
+    // The long job runs first, so the disk fills while it runs (started
+    // together, a busy machine could run the other one first, alone).
+    wait_until("both jobs queued", || async {
+        queued_job_ids(&app).await.len() == 2
+    })
+    .await;
+    let jobs = queued_job_ids(&app).await;
+    let long = jobs
+        .iter()
+        .find(|(_, n)| n == "long.mkv")
+        .unwrap()
+        .0
+        .clone();
+    app.post(
+        &format!("/api/jobs/{long}/priority"),
+        json!({ "priority": 10 }),
+    )
+    .await;
     app.resume().await;
+    wait_until("long.mkv runs", || async {
+        app.fake.started() == ["long.mkv"] && app.fake.running.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    app.patch("/api/settings", json!({ "max_jobs": 2 })).await;
     wait_until("big.mkv is put back", || async {
         app.fake
             .started()

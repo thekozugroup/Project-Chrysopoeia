@@ -2207,11 +2207,14 @@ mod live_tests {
         let (_watcher, mut events) = started(dir.path());
         let path = dir.path().join("Movie (2020).mkv");
 
+        // The copy takes longer than the settle time, but its writes come
+        // far more often than that (16 times, so a slow machine still
+        // writes well within it).
         let mut file = tokio::fs::File::create(&path).await.unwrap();
-        for _ in 0..6 {
-            file.write_all(&[7u8; 64 * 1024]).await.unwrap();
+        for _ in 0..24 {
+            file.write_all(&[7u8; 16 * 1024]).await.unwrap();
             file.flush().await.unwrap();
-            tokio::time::sleep(SETTLE / 4).await;
+            tokio::time::sleep(SETTLE / 16).await;
             assert!(events.try_recv().is_err(), "reported while still copying");
         }
         file.sync_all().await.unwrap();
@@ -2617,57 +2620,72 @@ mod live_tests {
         let (watcher, mut events) = LibraryWatcher::start(SETTLE).unwrap();
         let watcher = Arc::new(watcher);
 
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
         // Another root being set up (a large library on slow disks) keeps
-        // the watcher busy for a while.
+        // the watcher busy until the test lets it go (at most a minute).
         let (busy_tx, busy_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let other_root = {
             let shared = Arc::clone(&watcher.shared);
             std::thread::spawn(move || {
                 let _arming = lock(&shared.arming);
                 busy_tx.send(()).unwrap();
-                std::thread::sleep(Duration::from_millis(800));
+                let _ = release_rx.recv_timeout(Duration::from_secs(60));
             })
         };
         busy_rx.recv().unwrap();
 
-        // Records when the runtime's only worker thread was free.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Counts the turns the runtime's only worker thread was free for.
+        let stop = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
         let ticker = {
-            let stop = Arc::clone(&stop);
+            let (stop, ticks) = (Arc::clone(&stop), Arc::clone(&ticks));
             tokio::spawn(async move {
-                let mut ticks = Vec::new();
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                while !stop.load(Ordering::Relaxed) {
                     tokio::time::sleep(Duration::from_millis(5)).await;
-                    ticks.push(Instant::now());
+                    ticks.fetch_add(1, Ordering::Relaxed);
                 }
-                ticks
             })
         };
-        let started = Instant::now();
+        let began = Arc::new(AtomicBool::new(false));
         let waiting = {
-            let watcher = Arc::clone(&watcher);
+            let (watcher, began) = (Arc::clone(&watcher), Arc::clone(&began));
             let root = dir.path().to_path_buf();
             tokio::spawn(async move {
+                began.store(true, Ordering::SeqCst);
                 watcher.watch(&root).unwrap();
-                Instant::now()
             })
         };
-        let done = waiting.await.unwrap();
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let ticks = ticker.await.unwrap();
-        other_root.join().unwrap();
-
-        assert!(
-            done - started >= Duration::from_millis(500),
-            "watch() did not wait"
-        );
-        let (from, to) = (started + Duration::from_millis(100), done);
-        let free = ticks.iter().filter(|&&t| t > from && t < to).count();
+        while !began.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // While watch() waits for the other root, the runtime keeps
+        // running. (Were it blocked, nothing here would run until the other
+        // root let go, and watch() would be done by then.) No clock is
+        // involved: the other root waits for this test.
+        let at_start = ticks.load(Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while ticks.load(Ordering::Relaxed) < at_start + 20
+            && !waiting.is_finished()
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let free = ticks.load(Ordering::Relaxed) - at_start;
         assert!(
             free >= 20,
-            "the runtime was blocked while watch() waited ({free} ticks in {:?})",
-            to - from
+            "the runtime was blocked while watch() waited ({free} turns)"
         );
+        assert!(
+            !waiting.is_finished(),
+            "watch() did not wait for the other root"
+        );
+        let _ = release_tx.send(());
+        waiting.await.unwrap();
+        stop.store(true, Ordering::Relaxed);
+        ticker.await.unwrap();
+        other_root.join().unwrap();
 
         // And the root is watched once the wait is over.
         let movie = dir.path().join("Movie.mkv");

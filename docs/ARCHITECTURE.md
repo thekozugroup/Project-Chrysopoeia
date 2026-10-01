@@ -86,8 +86,14 @@ moved aside as `chrysopoeia.db.damaged-<UTC time>` (with its `-wal`/`-shm`
 files) and a new one is started; the feed says so at WARN ("The database was
 damaged, so Chrysopoeia moved it aside to … and started with a new one. Your
 media files were not touched. Add your libraries and settings again."), so a
-container set to restart doesn't loop. Other open errors still stop the
-start with the data-folder advice.
+container set to restart doesn't loop. A data folder on a full disk stops
+the start with "The disk that holds the data folder (…) is full, so the
+database there couldn't be opened. Free some space on that disk, then start
+Chrysopoeia again" (`db::is_disk_full`: SQLite's `SQLITE_FULL` or the
+system's "no space left", or any database error while less than 1 MiB is
+free there; a new database fails with the former, an existing one with a
+disk I/O error). This covers opening, migrating and the first writes of the
+start. Other open errors still stop the start with the data-folder advice.
 
 At stop, after the HTTP server and the jobs have wound down, the process
 waits at most 2 s for work still on blocking threads (a system call stuck on
@@ -425,10 +431,27 @@ anyway") is `decide` without the efficiency and same-format rules; a job
 with `JobSpec.force` uses it when `decide` says skip.
 
 **build_plan**:
-- Explicit `-map 0:<index>` per kept stream. Primary video only (no cover art,
-  no data/timecode streams). Audio filtered by `audio_languages` (never drop all
-  audio). Subtitles per `Container::subtitle_action` and `subtitle_languages`;
-  attachments only for MKV.
+- Explicit `-map 0:<index>` per kept stream. The primary video (no other
+  video tracks, no data/timecode streams). Audio filtered by
+  `audio_languages` (never drop all audio). Subtitles per
+  `Container::subtitle_action` and `subtitle_languages`; attachments only for
+  MKV.
+- Cover images (`StreamInfo.is_attached_pic`: an MKV picture attachment such
+  as `cover.jpg`, MP4 cover art) are kept where the container holds them.
+  MP4 keeps JPEG, PNG and BMP covers as copied picture streams marked as the
+  cover (`-c:v:N copy -disposition:v:N attached_pic`); every video option
+  then names the video alone (`-c:v:0`, `-filter:v:0`, `-crf:v:0`,
+  `-tag:v:0 hvc1`, …) and a decoder named for the input (`-c:v h264_qsv`)
+  names the video's stream index (`-c:<index>`), or ffmpeg would filter the
+  cover or read it as video. MKV keeps every cover as an attachment: ffmpeg's
+  MKV writer would store a copied picture as a second video track, so each
+  cover is copied out of the original first (`FfmpegPlan::covers`,
+  `plan::cover_extract_args`: `-map 0:<index> -c copy -frames:v 1 -f rawvideo`,
+  byte for byte) to `<work file stem>.cover-<n>.<ext>` next to the work file
+  and attached (`-attach`, with `mimetype` and `filename` from the cover's
+  own tags, `StreamInfo.filename`/`mimetype`, else from its codec and
+  `cover.<ext>`). WebM holds no cover. Verification and the stream counts
+  ignore cover images (they read back as attached pictures).
 - `-map_metadata 0 -map_chapters 0`, `-max_muxing_queue_size 9999`,
   `-analyzeduration 100M -probesize 100M` on input, `-f <muxer>`.
 - Audio per output stream: copy when the profile says copy (or source already in
@@ -475,15 +498,33 @@ with `JobSpec.force` uses it when `decide` says skip.
    unchanged; Convert anyway converts it all the same"; converted anyway,
    the job notes "The original has another hard link (for example a seeding
    torrent), so replacing it freed no space"), and one whose target
-   container can't hold its wanted picture-based subtitles or its
-   attachments (`plan::replace_loss`: "MP4 can't hold this file's 2
-   picture-based subtitles and 1 subtitle font, so it was left unchanged. To
-   convert it, choose an MKV goal or save converted files to a separate
-   folder; Convert anyway converts it without them"). Cancel and Stop end
-   the job at once even while these checks wait on a share.
+   container can't hold everything it has (`plan::replace_loss`): wanted
+   picture-based subtitles (MP4, WebM), wanted ASS/SSA subtitles that would
+   become plain text (MP4, WebM: positions, colours and fonts are lost and
+   overlapping lines cut short; ffprobe can't tell a styled track from a
+   plain one, so every such track counts), attachments (only MKV holds
+   them; fonts count only while subtitles are kept) and cover images (WebM;
+   MP4 for covers other than JPEG, PNG or BMP). The reason always starts
+   "{container} can't hold this file's {losses}, so it was left unchanged."
+   (the web UI matches it), the losses being "N picture-based
+   subtitle(s)", "N styled subtitle(s)", "N subtitle font(s)" (or "N
+   attached file(s)" when not all are fonts) and "N cover image(s)", in that
+   order, joined as "a, b and c": "MP4 can't hold this file's 2
+   picture-based subtitles, 1 styled subtitle and 1 subtitle font, so it was
+   left unchanged. To convert it, choose an MKV goal or save converted files
+   to a separate folder; Convert anyway converts it without them". Cancel and
+   Stop end the job at once even while these checks wait on a share.
 2. Transcoding: for each candidate, an attempt with `hw_decode` as given; a
    failed hardware attempt is retried with CPU decoding, then the next
-   candidate. Stop at the first success. A failure that any encoder would
+   candidate. Stop at the first success. Cover images a new MKV attaches
+   are copied out of the original once, before the first attempt that
+   needs them, and deleted when the job ends however it ends (crash
+   recovery deletes leftovers: their names carry the job's `.tmp.` marker).
+   A cover that can't be copied out fails the job (`other`, the original
+   untouched): "The file's cover image couldn't be copied for the new file,
+   so the file wasn't converted and the original was left unchanged. The
+   job's log has the details." (a full disk or a folder that can't be
+   written is described as for an encode). A failure that any encoder would
    hit the same way ends the job at once, without the "None of the N ways"
    prefix: a `disk_full`, `work_folder` or `destination` problem, or ffmpeg
    not starting at all. Cancellation kills ffmpeg at once
@@ -570,7 +611,13 @@ group gets a job note ("The new file couldn't keep the original's group
 (group 1001), so it is in group 100. If your media server can't open it,
 run Chrysopoeia as the owner of your media (PUID and PGID)"). MP4 and WebM
 can't hold attachments: the plan notes the fonts it leaves out ("Left out 2
-subtitle fonts because MP4 can't hold attachments"). After a crash,
+subtitle fonts because MP4 can't hold attachments"; "Left out 1 attached
+file because …" when not all are fonts). Every loss `replace_loss` counts
+gets a job note when the file is converted anyway or into an output folder:
+"Removed 2 picture-based subtitles because MP4 can't hold them", "Converted
+1 styled subtitle to plain text because MP4 can't keep its styling", the
+attachment notes above, and "Left out 1 cover image because WebM can't hold
+it" ("Left out 2 cover images because WebM can't hold them"). After a crash,
 `resume_replace(input, final_path, job_id)` reports `Placed` (and deletes the
 backup) when the job's backup exists and the new file is in place — the
 original's name taken again (same path) or free with the new name present
