@@ -11,10 +11,12 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use super::extract::ApiQuery;
 use crate::error::{ApiError, ApiResult};
+use crate::services::fs_guard;
 use crate::state::AppState;
 use crate::toolkit::Toolkit;
 
@@ -55,7 +57,7 @@ pub struct BrowseEntry {
 }
 
 /// Response of `GET /api/fs/browse`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BrowseResponse {
     pub path: String,
     pub parent: Option<String>,
@@ -391,7 +393,7 @@ fn browse_blocking(
         entries,
         media_count: own.map(|c| c.videos),
         media_count_capped: own.map(|c| c.capped),
-    }))
+    })
 }
 
 #[cfg(test)]

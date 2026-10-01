@@ -184,6 +184,22 @@ fn normalize_host_name(value: &str) -> String {
     crate::guard::split_host_port(v).0.to_string()
 }
 
+/// Parse `LOG_LEVEL`: `error`, `warn` (or `warning`), `info`, `debug` or
+/// `trace`, in any case. Anything else is refused: `tracing` would read an
+/// unknown word as the name of a module and silence every message, errors
+/// included. (`RUST_LOG` takes full filter directives for those who need
+/// them.)
+pub fn parse_log_level(value: &str) -> anyhow::Result<&'static str> {
+    Ok(match value.trim().to_ascii_lowercase().as_str() {
+        "" | "info" => "info",
+        "error" => "error",
+        "warn" | "warning" => "warn",
+        "debug" => "debug",
+        "trace" => "trace",
+        _ => bail!("LOG_LEVEL must be error, warn, info, debug or trace (got \"{value}\")"),
+    })
+}
+
 fn parse_bool(value: &str) -> anyhow::Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "" | "0" | "false" | "no" | "off" | "n" => Ok(false),
@@ -241,7 +257,7 @@ impl Cli {
             max_jobs,
             hw: parse_hw_preference(&self.hw)?,
             libraries: path_list(&self.libraries),
-            log_level: non_empty(&self.log_level).unwrap_or("info").to_string(),
+            log_level: parse_log_level(&self.log_level)?.to_string(),
             dev_cors: match self.dev_cors.as_deref() {
                 None => false,
                 Some(v) => parse_bool(v)?,
@@ -333,6 +349,28 @@ mod tests {
         let err = parse(&["--hw", "gpu9000"]).unwrap_err().to_string();
         assert!(err.contains("HW_ACCEL"), "{err}");
         assert!(parse(&["--port", "http"]).is_err());
+    }
+
+    /// An unknown LOG_LEVEL used to turn off every message, errors included.
+    #[test]
+    fn log_levels_are_checked() {
+        for (given, level) in [
+            ("", "info"),
+            ("info", "info"),
+            ("WARN", "warn"),
+            ("warning", "warn"),
+            (" Error ", "error"),
+            ("debug", "debug"),
+            ("TRACE", "trace"),
+        ] {
+            assert_eq!(parse(&["--log-level", given]).unwrap().log_level, level);
+        }
+        assert_eq!(parse(&[]).unwrap().log_level, "info");
+        for bad in ["verbose", "info,sqlx=debug", "5"] {
+            let err = parse(&["--log-level", bad]).unwrap_err().to_string();
+            assert!(err.contains("LOG_LEVEL must be"), "{err}");
+            assert!(err.contains(bad), "{err}");
+        }
     }
 
     #[test]

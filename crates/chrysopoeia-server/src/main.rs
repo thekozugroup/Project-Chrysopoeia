@@ -23,6 +23,7 @@ fn main() -> ExitCode {
     };
     chrysopoeia_server::init_tracing(&config.log_level);
     chrysopoeia_server::install_panic_hook();
+    chrysopoeia_server::http::raise_open_file_limit();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

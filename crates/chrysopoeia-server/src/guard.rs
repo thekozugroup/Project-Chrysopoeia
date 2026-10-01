@@ -8,11 +8,20 @@
 //!   on Chrysopoeia's own address. Browsers always send `Origin` on those, so
 //!   it is compared with the address the request was sent to (`Host`, or
 //!   `X-Forwarded-Host` behind a reverse proxy). When that address has no
-//!   port (reverse proxies such as Nginx Proxy Manager pass `Host` without
-//!   the port the browser used), only the host names are compared; the
-//!   host allowlist below still keeps other websites' names out. Requests
-//!   without `Origin` or `Referer` (curl, scripts) are not browser requests
-//!   and pass.
+//!   port and the request came through a reverse proxy (it carries
+//!   `X-Forwarded-*`, `Forwarded` or `X-Real-IP`: Nginx Proxy Manager and
+//!   others pass `Host` without the port the browser used), only the host
+//!   names are compared; the host allowlist below still keeps other
+//!   websites' names out. Without a proxy, a `Host` without a port means the
+//!   browser used the default port, so a page on another port of the same
+//!   host is refused. Requests without `Origin` or `Referer` (curl,
+//!   scripts) are not browser requests and pass.
+//! - **Fetch metadata**: browsers mark every request with `Sec-Fetch-Site`.
+//!   A request to `/api` marked `cross-site` (sent by a page of another
+//!   website, even a plain read, such as a hidden image that makes the
+//!   folder picker spin up disks) is refused, and so is one marked
+//!   `same-site` (a page on another port of the same host) unless its
+//!   origin checks out as above. Scripts don't send the header.
 //! - **DNS rebinding**: a hostile domain that resolves to the server's LAN
 //!   address makes the browser treat the API as that domain's own. So the
 //!   `Host` header must be an IP address, `localhost`, a local name
@@ -48,6 +57,16 @@ const LOCAL_SUFFIXES: &[&str] = &[
     ".ts.net",
     // Home networks behind an AVM FRITZ!Box router.
     ".fritz.box",
+];
+
+/// Headers a reverse proxy adds. A request carrying one came through a
+/// proxy, whose `Host` may lack the port the browser used.
+const PROXY_HEADERS: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
 ];
 
 /// Advice added to refusals that a reverse proxy can cause.
@@ -121,17 +140,35 @@ impl RequestGuard {
         if self.dev_cors {
             return Ok(());
         }
+        let refused = || {
+            ApiError::forbidden(
+                "forbidden_origin",
+                format!(
+                    "This request came from another website, so Chrysopoeia refused it. Open \
+                     Chrysopoeia at its own address to make changes. {PROXY_ADVICE}"
+                ),
+            )
+        };
+        // What the browser says about where the request comes from.
+        let fetch_site = header_str(headers, "sec-fetch-site").map(str::to_ascii_lowercase);
+        if fetch_site.as_deref() == Some("cross-site") {
+            return Err(refused());
+        }
         let changes_something = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
         let websocket = header_str(headers, UPGRADE.as_str())
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        if !changes_something && !websocket {
+        let same_site = fetch_site.as_deref() == Some("same-site");
+        if !changes_something && !websocket && !same_site {
             return Ok(());
         }
         let source =
             header_str(headers, ORIGIN.as_str()).or_else(|| header_str(headers, REFERER.as_str()));
         let Some(source) = source else {
-            return Ok(());
+            // Not a browser request (curl, scripts), unless the browser said
+            // it came from a neighbouring site and hid where from.
+            return if same_site { Err(refused()) } else { Ok(()) };
         };
+        let proxied = PROXY_HEADERS.iter().any(|h| headers.contains_key(*h));
         let targets = [
             host,
             header_str(headers, "x-forwarded-host")
@@ -141,17 +178,11 @@ impl RequestGuard {
         if targets
             .into_iter()
             .flatten()
-            .any(|target| same_origin(source, target))
+            .any(|target| same_origin(source, target, proxied))
         {
             return Ok(());
         }
-        Err(ApiError::forbidden(
-            "forbidden_origin",
-            format!(
-                "This request came from another website, so Chrysopoeia refused it. Open \
-                 Chrysopoeia at its own address to make changes. {PROXY_ADVICE}"
-            ),
-        ))
+        Err(refused())
     }
 }
 
@@ -180,11 +211,12 @@ pub fn split_host_port(value: &str) -> (&str, Option<&str>) {
 }
 
 /// Whether `source` (an `Origin` or `Referer` URL) points at `target` (a
-/// `Host` value). A port left out of `source` means the scheme's default
-/// port. A `target` without a port matches any port: reverse proxies (Nginx
-/// Proxy Manager, Traefik, Caddy) often pass the host name alone, even when
-/// the browser used a port such as 8443.
-fn same_origin(source: &str, target: &str) -> bool {
+/// `Host` value). A port left out of either means the default port of
+/// `source`'s scheme. Behind a reverse proxy (`proxied`), a `target` without
+/// a port matches any port: proxies (Nginx Proxy Manager, Traefik, Caddy)
+/// often pass the host name alone, even when the browser used a port such
+/// as 8443.
+fn same_origin(source: &str, target: &str, proxied: bool) -> bool {
     let Some((scheme, rest)) = source.split_once("://") else {
         // `Origin: null` (sandboxed pages, file://) and anything unparsable.
         return false;
@@ -203,9 +235,10 @@ fn same_origin(source: &str, target: &str) -> bool {
     if !source_name.eq_ignore_ascii_case(target_name) {
         return false;
     }
+    let source_port = source_port.unwrap_or(default_port);
     match target_port {
-        Some(port) => source_port.unwrap_or(default_port) == port,
-        None => true,
+        Some(port) => source_port == port,
+        None => proxied || source_port == default_port,
     }
 }
 
@@ -291,32 +324,132 @@ mod tests {
 
     #[test]
     fn origins_compare_by_name_and_port() {
-        assert!(same_origin("http://tower:8080", "tower:8080"));
-        assert!(same_origin("http://TOWER:8080", "tower:8080"));
-        assert!(same_origin(
-            "https://media.example.com",
-            "media.example.com"
-        ));
-        assert!(same_origin(
-            "https://media.example.com",
-            "media.example.com:443"
-        ));
-        assert!(same_origin("http://tower:8080/queue?x=1", "tower:8080"));
-        assert!(same_origin("http://[::1]:8080", "[::1]:8080"));
-        assert!(!same_origin("http://tower:3000", "tower:8080"));
-        assert!(!same_origin("http://evil.example", "tower:8080"));
+        for proxied in [false, true] {
+            assert!(same_origin("http://tower:8080", "tower:8080", proxied));
+            assert!(same_origin("http://TOWER:8080", "tower:8080", proxied));
+            assert!(same_origin(
+                "https://media.example.com",
+                "media.example.com",
+                proxied
+            ));
+            assert!(same_origin(
+                "https://media.example.com",
+                "media.example.com:443",
+                proxied
+            ));
+            assert!(same_origin(
+                "http://tower:8080/queue?x=1",
+                "tower:8080",
+                proxied
+            ));
+            assert!(same_origin("http://[::1]:8080", "[::1]:8080", proxied));
+            assert!(same_origin("http://tower", "tower", proxied));
+            assert!(!same_origin("http://tower:3000", "tower:8080", proxied));
+            assert!(!same_origin("http://evil.example", "tower:8080", proxied));
+            assert!(!same_origin(
+                "https://evil.example:8443",
+                "media.example.com",
+                proxied
+            ));
+            assert!(!same_origin("null", "tower:8080", proxied));
+            assert!(!same_origin("file:///x", "tower:8080", proxied));
+        }
         // A proxy that passes the host name without the port.
         assert!(same_origin(
             "https://media.example.com:8443",
-            "media.example.com"
+            "media.example.com",
+            true
         ));
-        assert!(same_origin("http://tower:8080", "tower"));
+        assert!(same_origin("http://tower:8080", "tower", true));
+        // Without a proxy, a Host without a port is the default port: a
+        // page on another port of the same host is another site.
+        assert!(!same_origin("http://127.0.0.1:9999", "127.0.0.1", false));
         assert!(!same_origin(
-            "https://evil.example:8443",
-            "media.example.com"
+            "https://media.example.com:8443",
+            "media.example.com",
+            false
         ));
-        assert!(!same_origin("null", "tower:8080"));
-        assert!(!same_origin("file:///x", "tower:8080"));
+    }
+
+    /// A page on another port of the same host (SEC-2), and requests the
+    /// browser marks as coming from another site (SEC-3).
+    #[test]
+    fn neighbouring_and_cross_site_pages_are_refused() {
+        let g = guard(&[]);
+        let post = Method::POST;
+        let get = Method::GET;
+        let code = |r: Result<(), ApiError>| r.err().map(|e| e.code.to_string());
+        // Direct access on port 80: another port of the same host is refused.
+        let h = headers(&[("host", "127.0.0.1"), ("origin", "http://127.0.0.1:9999")]);
+        assert_eq!(
+            code(g.check(&post, None, &h)),
+            Some("forbidden_origin".to_string())
+        );
+        let h = headers(&[("host", "127.0.0.1"), ("origin", "http://127.0.0.1")]);
+        assert!(g.check(&post, None, &h).is_ok());
+        // Through a proxy that drops the port, the names are compared.
+        for proxy in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "forwarded",
+            "x-real-ip",
+        ] {
+            let h = headers(&[
+                ("host", "tower.lan"),
+                ("origin", "https://tower.lan:8443"),
+                (proxy, "192.168.1.2"),
+            ]);
+            assert!(g.check(&post, None, &h).is_ok(), "{proxy}");
+        }
+        // Cross-site, even a read, even without Origin.
+        let h = headers(&[("host", "tower:8080"), ("sec-fetch-site", "cross-site")]);
+        assert_eq!(
+            code(g.check(&post, None, &h)),
+            Some("forbidden_origin".to_string())
+        );
+        assert_eq!(
+            code(g.check(&get, None, &h)),
+            Some("forbidden_origin".to_string())
+        );
+        let h = headers(&[
+            ("host", "tower:8080"),
+            ("origin", "http://evil.example"),
+            ("sec-fetch-site", "Cross-Site"),
+        ]);
+        assert!(g.check(&get, None, &h).is_err());
+        // Same-site reads must come from Chrysopoeia's own address.
+        let h = headers(&[
+            ("host", "tower:8080"),
+            ("sec-fetch-site", "same-site"),
+            ("referer", "http://tower:80/Dashboard"),
+        ]);
+        assert!(g.check(&get, None, &h).is_err());
+        let h = headers(&[("host", "tower:8080"), ("sec-fetch-site", "same-site")]);
+        assert!(g.check(&get, None, &h).is_err(), "no origin to check");
+        // The UI itself, and scripts, pass.
+        for site in ["same-origin", "none"] {
+            let h = headers(&[("host", "tower:8080"), ("sec-fetch-site", site)]);
+            assert!(g.check(&get, None, &h).is_ok(), "{site}");
+            let h = headers(&[
+                ("host", "tower:8080"),
+                ("sec-fetch-site", site),
+                ("origin", "http://tower:8080"),
+            ]);
+            assert!(g.check(&post, None, &h).is_ok(), "{site}");
+        }
+        let h = headers(&[("host", "tower:8080")]);
+        assert!(g.check(&get, None, &h).is_ok());
+        // --dev-cors (next dev on another port) is same-site: allowed.
+        let dev = RequestGuard::new(&Config {
+            dev_cors: true,
+            ..Config::default()
+        });
+        let h = headers(&[
+            ("host", "localhost:8080"),
+            ("origin", "http://localhost:3000"),
+            ("sec-fetch-site", "same-site"),
+        ]);
+        assert!(dev.check(&get, None, &h).is_ok());
     }
 
     #[test]
@@ -353,11 +486,20 @@ mod tests {
         assert!(g.check(&get, None, &h).is_ok());
         let h = headers(&[("host", "tower:8080")]);
         assert!(g.check(&post, None, &h).is_ok());
-        // Nginx Proxy Manager: Host without the port the browser used.
+        // Nginx Proxy Manager: Host without the port the browser used (and
+        // the X-Forwarded-For it always adds).
         let g2 = guard(&["name"]);
-        let h = headers(&[("host", "name"), ("origin", "https://name:8443")]);
+        let h = headers(&[
+            ("host", "name"),
+            ("origin", "https://name:8443"),
+            ("x-forwarded-for", "192.168.1.20"),
+        ]);
         assert!(g2.check(&post, None, &h).is_ok());
-        let h = headers(&[("host", "name"), ("origin", "https://other:8443")]);
+        let h = headers(&[
+            ("host", "name"),
+            ("origin", "https://other:8443"),
+            ("x-forwarded-for", "192.168.1.20"),
+        ]);
         assert_eq!(
             g2.check(&post, None, &h).unwrap_err().code,
             "forbidden_origin"

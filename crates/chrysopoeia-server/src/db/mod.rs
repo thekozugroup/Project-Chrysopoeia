@@ -179,9 +179,10 @@ pub fn is_damaged(e: &anyhow::Error) -> bool {
 /// as `<name>.damaged-<UTC time>`, so a new database can be started. Returns
 /// where the database file went.
 pub fn move_damaged_aside(path: &Path) -> anyhow::Result<PathBuf> {
-    let name = path
-        .file_name()
-        .map_or_else(|| DB_FILE_NAME.to_string(), |n| n.to_string_lossy().into_owned());
+    let name = path.file_name().map_or_else(
+        || DB_FILE_NAME.to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
     let aside_name = format!("{name}.damaged-{}", Utc::now().format("%Y%m%d-%H%M%S"));
     let aside = path.with_file_name(&aside_name);
     std::fs::rename(path, &aside).with_context(|| {

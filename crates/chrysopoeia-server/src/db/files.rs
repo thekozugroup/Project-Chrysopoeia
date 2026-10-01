@@ -57,7 +57,6 @@ fn from_row(row: &SqliteRow, with_probe: bool) -> sqlx::Result<MediaFile> {
         saved_bytes: row.try_get("saved_bytes")?,
         skip_reason: row.try_get("skip_reason")?,
         job_id: opt_uuid_col(row, "job_id")?,
-        #[allow(clippy::cast_possible_truncation)]
         progress: progress.map(|p| p as f32),
         probe,
         scanned_at: ts_col(row, "scanned_at")?,

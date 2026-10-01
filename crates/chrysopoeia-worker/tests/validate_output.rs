@@ -440,7 +440,7 @@ async fn missing_audio_fails_the_track_check() {
     assert_eq!(label, "All tracks present");
     assert_eq!(
         detail,
-        "Expected 1 video and 2 audio tracks but found 1 video track"
+        "Expected 1 video track and 2 audio tracks but found 1 video track"
     );
 }
 

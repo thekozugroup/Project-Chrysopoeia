@@ -247,11 +247,38 @@ struct Prepared {
     created_dirs: Vec<PathBuf>,
     /// Disk space promised to this job; released when the job ends.
     _space: SpaceGuard,
+    /// The original has other hard links (a seeding torrent's copy), so
+    /// replacing it frees no space.
+    shared: bool,
 }
 
 /// The reason given when the original changed during the job.
 fn original_changed() -> String {
     OriginalChanged.to_string()
+}
+
+/// When the original is no longer the file the job started on (replaced by
+/// a newer version, or moved away), the job's outcome: skipped as "original
+/// changed", or failed as gone. `None` while it is unchanged.
+async fn original_moved_on(
+    input: &Path,
+    identity: FileIdentity,
+    encoder: &str,
+    output_size: u64,
+) -> Option<JobOutcome> {
+    match FileIdentity::read(input).await {
+        Ok(now) if now == identity => None,
+        Ok(_) => Some(JobOutcome::Skipped {
+            reason: original_changed(),
+            encoder: Some(encoder.to_string()),
+            output_size: Some(output_size),
+        }),
+        Err(_) => Some(failed(
+            ProblemKind::SourceChanged,
+            "The file is no longer there. It was moved or deleted while it was being converted. \
+             If it was moved, scan the library again to find it.",
+        )),
+    }
 }
 
 /// A failed attempt, kept so the final error can describe it.
@@ -309,6 +336,22 @@ impl Job<'_> {
             None
         } else {
             self.spec.profile.min_savings_pct
+        }
+    }
+
+    /// How large the encode may grow while it is written, in tenths of the
+    /// original's size. Converting to a less efficient codec ("Plays
+    /// everywhere" turning HEVC or AV1 into H.264) often makes files two to
+    /// four times larger; without a size rule nothing stops a larger
+    /// result either.
+    fn encode_growth_tenths(&self) -> u64 {
+        let source = self.spec.probe.video_codec().map(codec_efficiency);
+        let target = codec_efficiency(self.spec.profile.video_codec.ffprobe_name());
+        match source.map_or(0, |s| s - target) {
+            s if s >= 2 => 40,
+            1 => 30,
+            _ if self.min_savings_pct().is_none() => 15,
+            _ => 11,
         }
     }
 
@@ -382,6 +425,18 @@ impl Job<'_> {
                 output_size: None,
             });
         }
+        // A file with another hard link (the TRaSH-guides layout: the
+        // library file and the seeding torrent are one file) keeps its data
+        // on disk through the other name, so replacing it adds the new
+        // file's size instead of saving space.
+        let shared = hard_links(&input_meta) > 1;
+        if cfg.output_mode == OutputMode::Replace && shared && !spec.force {
+            return Err(JobOutcome::Skipped {
+                reason: SHARED_ORIGINAL.to_string(),
+                encoder: None,
+                output_size: None,
+            });
+        }
         // Replacing the original with a file that can't hold all of its
         // subtitles or attachments would lose them for good; converting
         // anyway (or into a separate folder, which keeps the original) is
@@ -411,7 +466,7 @@ impl Job<'_> {
             return Err(failed(
                 ProblemKind::Destination,
                 "Saving converted files to a separate folder is turned on, but no folder is \
-                 chosen. Choose one in Settings > Output.",
+                 chosen. Choose one in Settings › Output.",
             ));
         }
 
@@ -483,12 +538,15 @@ impl Job<'_> {
             final_path,
             created_dirs,
             _space: space,
+            shared,
         })
     }
 
-    /// Reserve room for the encode in the temp folder (about 1.1x the
-    /// original) and, when the result will be copied to another filesystem,
-    /// for the copy there. Waits while other running jobs hold the room.
+    /// Reserve room for the encode in the temp folder (what it may grow to,
+    /// see [`Self::encode_growth_tenths`]; the job fails only when not even
+    /// 1.1x the original fits) and, when the result will be copied to
+    /// another filesystem, for the copy there. Waits while other running
+    /// jobs hold the room.
     ///
     /// Only the temp folder can fail the job here: the new file's size is
     /// unknown until it is made, and converting to save space on a nearly
@@ -503,6 +561,9 @@ impl Job<'_> {
         final_path: &Path,
     ) -> Result<SpaceGuard, JobOutcome> {
         let needed = input_size.saturating_add(input_size / 10);
+        let expected = (input_size / 10)
+            .saturating_mul(self.encode_growth_tenths())
+            .max(needed);
         let largest_kept = match self.min_savings_pct() {
             Some(p) => input_size / 100 * u64::from(100u8.saturating_sub(p)),
             None => input_size,
@@ -512,13 +573,15 @@ impl Job<'_> {
         let needs = vec![
             SpaceNeed {
                 dir: temp_dir,
-                bytes: needed,
+                bytes: expected,
+                floor: needed,
                 file: Some(temp.to_path_buf()),
                 strict: true,
             },
             SpaceNeed {
                 dir: final_dir,
                 bytes: largest_kept,
+                floor: 0,
                 file: None,
                 strict: false,
             },
@@ -716,22 +779,11 @@ impl Job<'_> {
 
             // The encode read the file that was here when the job started;
             // if it has been replaced since, the result is of an old version.
-            match FileIdentity::read(&spec.input).await {
-                Ok(now) if now == prepared.identity => {}
-                Ok(_) => {
-                    return JobOutcome::Skipped {
-                        reason: original_changed(),
-                        encoder: Some(candidate.name.clone()),
-                        output_size: Some(output_size),
-                    };
-                }
-                Err(_) => {
-                    return failed(
-                        ProblemKind::SourceChanged,
-                        "The file is no longer there. It was moved or deleted while it was being \
-                         converted. If it was moved, scan the library again to find it.",
-                    );
-                }
+            if let Some(outcome) =
+                original_moved_on(&spec.input, prepared.identity, &candidate.name, output_size)
+                    .await
+            {
+                return outcome;
             }
 
             let validation = if cfg.validation == ValidationLevel::Off {
@@ -766,6 +818,15 @@ impl Job<'_> {
             };
 
             if let Some(report) = validation.as_ref().filter(|r| !r.passed) {
+                // The checks read the original again: one replaced meanwhile
+                // (a Sonarr or Radarr upgrade) makes them fail for a reason
+                // that has nothing to do with the new file.
+                if let Some(outcome) =
+                    original_moved_on(&spec.input, prepared.identity, &candidate.name, output_size)
+                        .await
+                {
+                    return outcome;
+                }
                 // Too short, and the encoder saw the input end early: the
                 // original is what's incomplete, not the new file.
                 let too_short =
@@ -843,6 +904,9 @@ impl Job<'_> {
 
             let mut notes = plan.notes;
             notes.extend(placed.notes);
+            if prepared.shared && cfg.output_mode == OutputMode::Replace {
+                notes.push(SHARED_ORIGINAL_NOTE.to_string());
+            }
             if let Some(first) = first.filter(|_| attempt > 1) {
                 notes.push(fallback_note(first, candidate));
             }
@@ -1104,12 +1168,12 @@ async fn folder_not_writable(dir: &Path, place: Place, mode: OutputMode) -> Opti
         Some(match (place, blocked) {
             (Place::WorkFolder, WriteBlock::ReadOnly) => format!(
                 "The work folder {shown} is on a read-only drive, so nothing can be converted \
-                 there. Choose another work folder in Settings > Output."
+                 there. Choose another work folder in Settings › Output."
             ),
             (Place::WorkFolder, WriteBlock::Denied) => format!(
                 "Chrysopoeia doesn't have permission to write in the work folder {shown}. Check \
                  its permissions (in Docker, the PUID/PGID user needs write access), or choose \
-                 another work folder in Settings > Output."
+                 another work folder in Settings › Output."
             ),
             (Place::Destination, blocked) => destination_blocked(existing, mode, blocked),
         })
@@ -1124,8 +1188,8 @@ async fn folder_not_writable(dir: &Path, place: Place, mode: OutputMode) -> Opti
 fn destination_blocked(dir: &Path, mode: OutputMode, blocked: WriteBlock) -> String {
     let folder = destination_name(dir, mode);
     let other_place = match mode {
-        OutputMode::Folder => "choose another output folder in Settings > Output",
-        OutputMode::Replace => "save converted files to a separate folder in Settings > Output",
+        OutputMode::Folder => "choose another output folder in Settings › Output",
+        OutputMode::Replace => "save converted files to a separate folder in Settings › Output",
     };
     match blocked {
         WriteBlock::ReadOnly => format!(
@@ -1176,7 +1240,7 @@ fn write_access(dir: &Path) -> Result<(), WriteBlock> {
 /// The problem and message when the folder for the new file (`dir`, in
 /// `place`) couldn't be created, e.g. "The work folder /temp can't be used
 /// because a file with that name is in the way. Fix it, or choose another
-/// work folder, in Settings > Output."
+/// work folder, in Settings › Output."
 fn folder_unusable(
     dir: &Path,
     place: Place,
@@ -1187,12 +1251,12 @@ fn folder_unusable(
     let (what, fix, problem) = match (place, mode) {
         (Place::WorkFolder, _) => (
             format!("The work folder {}", dir.display()),
-            "Fix it, or choose another work folder, in Settings > Output.",
+            "Fix it, or choose another work folder, in Settings › Output.",
             ProblemKind::WorkFolder,
         ),
         (Place::Destination, OutputMode::Folder) => (
             capitalize_first(&destination_name(dir, mode)),
-            "Fix it, or choose another output folder, in Settings > Output.",
+            "Fix it, or choose another output folder, in Settings › Output.",
             ProblemKind::Destination,
         ),
         (Place::Destination, OutputMode::Replace) => (
@@ -1240,17 +1304,17 @@ fn no_room_message(dir: &Path, bytes: u64, place: Place, mode: OutputMode) -> St
         (Place::WorkFolder, _) => format!(
             "There isn't enough free space in the work folder {shown} to convert this file (it \
              needs about {size}). Free up some space there, or choose a work folder on a bigger \
-             disk in Settings > Output."
+             disk in Settings › Output."
         ),
         (Place::Destination, OutputMode::Folder) => format!(
             "There isn't enough free space in the output folder {shown} for this file (it needs \
              about {size}). Free up some space there, or choose another output folder in \
-             Settings > Output."
+             Settings › Output."
         ),
         (Place::Destination, OutputMode::Replace) => format!(
             "There isn't enough free space next to the original in {shown} to convert this file \
              (it needs about {size}). Free up some space on that disk, or choose a work folder \
-             on another disk in Settings > Output."
+             on another disk in Settings › Output."
         ),
     }
 }
@@ -1258,6 +1322,40 @@ fn no_room_message(dir: &Path, bytes: u64, place: Place, mode: OutputMode) -> St
 /// What to say when a job's original file is gone before it started.
 const SOURCE_GONE: &str = "The file is no longer there. It may have been moved or deleted. If \
     it was moved, scan the library again to find it.";
+
+/// How much picture a codec fits in a byte, roughly: each step is about
+/// half the size for the same picture.
+fn codec_efficiency(ffprobe_name: &str) -> i8 {
+    match ffprobe_name {
+        "av1" => 3,
+        "hevc" | "vp9" => 2,
+        "h264" | "vc1" => 1,
+        _ => 0,
+    }
+}
+
+/// Why a file with other hard links is left alone when originals are
+/// replaced.
+pub const SHARED_ORIGINAL: &str = "This file has another hard link (for example a torrent \
+    that is still seeding), so replacing it would use more space instead of saving it. It was \
+    left unchanged; Convert anyway converts it all the same";
+
+/// The note on a file with other hard links converted anyway.
+pub const SHARED_ORIGINAL_NOTE: &str = "The original has another hard link (for example a \
+    seeding torrent), so replacing it freed no space";
+
+/// How many names (hard links) a file has.
+fn hard_links(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::MetadataExt::nlink(meta)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        1
+    }
+}
 
 /// How long the original may take to answer when the job starts.
 const INPUT_CHECK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1359,14 +1457,14 @@ fn encode_failure(
         let fix = match (place, mode) {
             (Place::WorkFolder, _) => {
                 "Free up some space there, or choose a work folder on a bigger disk in \
-                 Settings > Output."
+                 Settings › Output."
             }
             (Place::Destination, OutputMode::Folder) => {
-                "Free up some space there, or choose another output folder in Settings > Output."
+                "Free up some space there, or choose another output folder in Settings › Output."
             }
             (Place::Destination, OutputMode::Replace) => {
                 "Free up some space on that disk, or choose a work folder on another disk in \
-                 Settings > Output."
+                 Settings › Output."
             }
         };
         let what = match place {
@@ -1393,11 +1491,11 @@ fn encode_failure(
         let (what, other_place) = match (place, mode) {
             (Place::WorkFolder, _) => (
                 format!("the work folder {shown}"),
-                ", or choose another work folder in Settings > Output",
+                ", or choose another work folder in Settings › Output",
             ),
             (Place::Destination, OutputMode::Folder) => (
                 destination_name(folder, mode),
-                ", or choose another output folder in Settings > Output",
+                ", or choose another output folder in Settings › Output",
             ),
             (Place::Destination, OutputMode::Replace) => (destination_name(folder, mode), ""),
         };
@@ -1476,7 +1574,7 @@ async fn remove_empty_dirs(created: &[PathBuf]) {
 
 /// What to do after a failed verification; the job's error ends with it.
 const VERIFICATION_FIX: &str =
-    "The original was kept. Try again, or choose lighter checks in Settings > Output.";
+    "The original was kept. Try again, or choose lighter checks in Settings › Output.";
 
 /// Why a result failed verification, and what to do, for the job's error
 /// and the activity feed. A check's label says what passing means ("Same
@@ -1488,11 +1586,12 @@ pub(crate) fn verification_error(report: &ValidationReport) -> String {
     format!("{}. {VERIFICATION_FIX}", what.trim_end_matches('.'))
 }
 
-/// A check's detail without a trailing similarity score ("… (similarity
-/// 0.50)"), a number that means little to most people; the report keeps it.
+/// A check's detail without a trailing similarity score ("… (50.0%
+/// similar)"), a number that means little to most people; the report keeps
+/// it.
 fn without_score(detail: &str) -> &str {
     match detail.rfind(" (") {
-        Some(i) if detail.ends_with(')') && detail[i..].contains("similarity") => {
+        Some(i) if detail.ends_with(" similar)") || detail[i..].contains("similarity") => {
             detail[..i].trim_end()
         }
         _ => detail,
@@ -1608,7 +1707,13 @@ impl Reservation {
 #[derive(Debug, Clone)]
 struct SpaceNeed {
     dir: PathBuf,
+    /// Room to reserve: what the file may grow to. Other jobs wait while it
+    /// is promised.
     bytes: u64,
+    /// The least room without which the job can't run at all (strict needs
+    /// fail when the disk can't offer even that); `bytes` above it is an
+    /// estimate, so a job alone on the disk goes ahead with less.
+    floor: u64,
     file: Option<PathBuf>,
     /// Fail when the room can never be found. A non-strict need only waits
     /// for other jobs, and is reserved as it is otherwise.
@@ -1684,10 +1789,10 @@ fn try_reserve_with(
                 dir: need.dir.clone(),
             });
         }
-        if need.strict {
+        if need.strict && free.saturating_sub(held) < need.floor {
             return Err(Shortfall::Never {
                 dir: need.dir.clone(),
-                bytes: need.bytes,
+                bytes: need.floor,
             });
         }
     }
@@ -2037,9 +2142,59 @@ mod tests {
         SpaceNeed {
             dir: PathBuf::from(dir),
             bytes,
+            floor: bytes,
             file: file.map(Path::to_path_buf),
             strict: true,
         }
+    }
+
+    /// An encode that may grow past the original ("Plays everywhere" from
+    /// HEVC) reserves what it may grow to, so parallel jobs take turns
+    /// instead of all running out of room; alone on the disk it still runs
+    /// when at least 1.1x the original fits.
+    #[test]
+    fn growing_encodes_reserve_their_growth() {
+        let fs =
+            |dir: &Path| -> Option<(u64, u64)> { dir.starts_with("/ssd").then_some((903, 1600)) };
+        let growing = |dir: &str| SpaceNeed {
+            dir: PathBuf::from(dir),
+            bytes: 1100,
+            floor: 300,
+            file: None,
+            strict: true,
+        };
+        let first = try_reserve_with(&[growing("/ssd/a")], &fs).unwrap();
+        // 1600 free, 1100 promised: the second job waits for the first.
+        match try_reserve_with(&[growing("/ssd/b")], &fs) {
+            Err(Shortfall::Busy { .. }) => {}
+            other => panic!("expected Busy, got {other:?}"),
+        }
+        drop(first);
+        // Alone, a job goes ahead with less than its estimate...
+        let big = SpaceNeed {
+            bytes: 5000,
+            floor: 1100,
+            ..growing("/ssd/c")
+        };
+        drop(try_reserve_with(&[big], &fs).unwrap());
+        // ...but not with less than its floor.
+        let too_big = SpaceNeed {
+            bytes: 9000,
+            floor: 2000,
+            ..growing("/ssd/d")
+        };
+        match try_reserve_with(&[too_big], &fs) {
+            Err(Shortfall::Never { bytes, .. }) => assert_eq!(bytes, 2000),
+            other => panic!("expected Never, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codecs_rank_by_efficiency() {
+        assert_eq!(codec_efficiency("av1") - codec_efficiency("h264"), 2);
+        assert_eq!(codec_efficiency("hevc") - codec_efficiency("h264"), 1);
+        assert_eq!(codec_efficiency("vp9"), codec_efficiency("hevc"));
+        assert!(codec_efficiency("mpeg2video") < codec_efficiency("h264"));
     }
 
     #[test]
@@ -2086,6 +2241,7 @@ mod tests {
         // ...unless it is only an estimate (the destination of a copy).
         let estimate = SpaceNeed {
             strict: false,
+            floor: 0,
             ..need("/array/n", 5000, None)
         };
         match try_reserve_with(std::slice::from_ref(&estimate), &fs) {
@@ -2145,7 +2301,7 @@ mod tests {
         assert_eq!(
             verification_error(&report),
             "The new file doesn't play start to finish. Found a playback error. The original \
-             was kept. Try again, or choose lighter checks in Settings > Output."
+             was kept. Try again, or choose lighter checks in Settings › Output."
         );
     }
 
@@ -2184,35 +2340,35 @@ mod tests {
             (
                 "streams",
                 "All tracks present",
-                "Expected 1 video and 2 audio tracks but found 1 video track",
-                "The new file doesn't have the tracks it should. Expected 1 video and 2 audio \
-                 tracks but found 1 video track",
+                "Expected 1 video track and 2 audio tracks but found 1 video track",
+                "The new file doesn't have the tracks it should. Expected 1 video track and 2 \
+                 audio tracks but found 1 video track",
             ),
             (
                 "visual",
                 "Looks like the original",
-                "A frame near 0:10 looks very different from the original (similarity 0.40)",
+                "A frame near 0:10 looks very different from the original (40.0% similar)",
                 "The new file doesn't look like the original. A frame near 0:10 looks very \
                  different from the original",
             ),
             (
                 "visual",
                 "Looks like the original",
-                "The picture near 1:05 doesn't match the original (similarity 0.70)",
+                "The picture near 1:05 doesn't match the original (70.0% similar)",
                 "The new file doesn't look like the original. The picture near 1:05 doesn't \
                  match the original",
             ),
             (
                 "visual",
                 "Looks like the original",
-                "The picture from 10.0 s to 11.7 s is damaged (similarity 0.20)",
+                "The picture from 10.0 s to 11.7 s is damaged (20.0% similar)",
                 "The new file doesn't look like the original. The picture from 10.0 s to 11.7 s \
                  is damaged",
             ),
             (
                 "visual",
                 "Looks like the original",
-                "The picture from 1:00 to 1:02 suddenly looks different (similarity 0.35)",
+                "The picture from 1:00 to 1:02 suddenly looks different (35.0% similar)",
                 "The new file doesn't look like the original. The picture from 1:00 to 1:02 \
                  suddenly looks different",
             ),
@@ -2248,7 +2404,7 @@ mod tests {
             let error = verification_error(&failing(id, label, detail));
             assert_eq!(error, format!("{expected}. {VERIFICATION_FIX}"), "{id}");
             assert!(!error.contains(label), "{id}: {error}");
-            assert!(!error.contains("similarity"), "{id}: {error}");
+            assert!(!error.contains("similar"), "{id}: {error}");
         }
     }
 
@@ -2296,7 +2452,7 @@ mod tests {
             error,
             "The disk ran out of space while the new file was being written in the work folder \
              /temp, so the original was left unchanged. Free up some space there, or choose a \
-             work folder on a bigger disk in Settings > Output."
+             work folder on a bigger disk in Settings › Output."
         );
 
         let read_only = failed_run(
@@ -2328,7 +2484,7 @@ mod tests {
             error.starts_with("The new file couldn't be written in the output folder /out:"),
             "{error}"
         );
-        assert!(error.ends_with("or choose another output folder in Settings > Output."));
+        assert!(error.ends_with("or choose another output folder in Settings › Output."));
         let (_, error) = encode_failure(
             &disk_full,
             HwApi::Software,
@@ -2436,7 +2592,7 @@ mod tests {
         assert_eq!(
             error,
             "The work folder /temp can't be used because a file with that name is in the way. \
-             Fix it, or choose another work folder, in Settings > Output."
+             Fix it, or choose another work folder, in Settings › Output."
         );
         let full = std::io::Error::from_raw_os_error(28);
         let (problem, error) = folder_unusable(
@@ -2449,7 +2605,7 @@ mod tests {
         assert_eq!(
             error,
             "The output folder /out/TV can't be created because the disk is full. Free up some \
-             space there. Fix it, or choose another output folder, in Settings > Output."
+             space there. Fix it, or choose another output folder, in Settings › Output."
         );
         let odd = std::io::Error::from_raw_os_error(5);
         let (problem, error) = folder_unusable(
@@ -2473,14 +2629,14 @@ mod tests {
         assert_eq!(
             destination_blocked(dir, OutputMode::Folder, WriteBlock::ReadOnly),
             "The output folder /out/TV is on a read-only drive, so the converted file can't be \
-             put there. Make the drive writable, or choose another output folder in Settings > \
+             put there. Make the drive writable, or choose another output folder in Settings › \
              Output."
         );
         assert_eq!(
             destination_blocked(dir, OutputMode::Folder, WriteBlock::Denied),
             "Chrysopoeia doesn't have permission to write in the output folder /out/TV, so the \
              converted file can't be put there. Check the folder's permissions (in Docker, the \
-             PUID/PGID user needs write access), or choose another output folder in Settings > \
+             PUID/PGID user needs write access), or choose another output folder in Settings › \
              Output."
         );
         let dir = Path::new("/media/Films");
@@ -2488,7 +2644,7 @@ mod tests {
             destination_blocked(dir, OutputMode::Replace, WriteBlock::ReadOnly),
             "The original's folder /media/Films is on a read-only drive, so the converted file \
              can't be put there. Make the drive writable, or save converted files to a \
-             separate folder in Settings > Output."
+             separate folder in Settings › Output."
         );
         assert!(
             destination_blocked(dir, OutputMode::Replace, WriteBlock::Denied).starts_with(
@@ -2510,7 +2666,7 @@ mod tests {
             ),
             "There isn't enough free space in the work folder /temp to convert this file (it \
              needs about 1.5 GB). Free up some space there, or choose a work folder on a bigger \
-             disk in Settings > Output."
+             disk in Settings › Output."
         );
         assert!(
             no_room_message(

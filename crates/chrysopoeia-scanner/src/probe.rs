@@ -288,9 +288,21 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     chrysopoeia_core::process::end_with_parent(command.as_std_mut());
-    let child = command
-        .spawn()
-        .map_err(|error| ProbeError::Spawn(describe_spawn_error(ffprobe, &error)))?;
+    // Too many files open is a busy moment, not this file's problem: wait
+    // it out (the caller's timeout still applies).
+    let mut delays = chrysopoeia_core::process::SPAWN_RETRY_DELAYS.iter();
+    let child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error) if chrysopoeia_core::process::out_of_file_handles(&error) => {
+                match delays.next() {
+                    Some(delay) => tokio::time::sleep(*delay).await,
+                    None => return Err(ProbeError::Spawn(describe_spawn_error(ffprobe, &error))),
+                }
+            }
+            Err(error) => return Err(ProbeError::Spawn(describe_spawn_error(ffprobe, &error))),
+        }
+    };
 
     // When the caller's timeout drops this future, the child goes with it,
     // which kills ffprobe thanks to `kill_on_drop`.
@@ -380,8 +392,8 @@ fn describe_ffprobe_failure(stderr: &[u8], input: &Path, status: ExitStatus) -> 
         ),
         (
             "moov atom not found",
-            "This file can't be read as a video: it has no MP4 index, so it's incomplete or \
-             not really a video.",
+            "This file can't be read as a video: it's incomplete (perhaps still being \
+             downloaded or copied) or not really a video.",
         ),
         (
             "ebml header parsing failed",
@@ -1365,8 +1377,8 @@ mod tests {
         // One clean sentence (the server shows it as is).
         assert_eq!(
             describe_ffprobe_failure(fake, input, exit_status(1)),
-            "This file can't be read as a video: it has no MP4 index, so it's incomplete or not \
-             really a video."
+            "This file can't be read as a video: it's incomplete (perhaps still being \
+             downloaded or copied) or not really a video."
         );
         let invalid = b"/media/Broken/Fake.mp4: Invalid data found when processing input\n";
         assert_eq!(

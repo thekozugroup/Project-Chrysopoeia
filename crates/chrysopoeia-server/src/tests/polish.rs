@@ -83,7 +83,7 @@ async fn a_requeued_done_file_whose_job_is_skipped_stays_done() {
     assert_eq!(job["state"], "skipped");
     assert_eq!(job["skip_reason"], "Already AV1");
     let feed = app.get("/api/activity").await.json["items"].to_string();
-    assert!(feed.contains("Kept a.mkv as it is — Already AV1"), "{feed}");
+    assert!(feed.contains("Kept a.mkv as it is: Already AV1"), "{feed}");
     let ov = app.get("/api/overview").await;
     assert_eq!(ov.json["totals"]["done"], 1);
     assert_eq!(ov.json["totals"]["saved_bytes"], saved);

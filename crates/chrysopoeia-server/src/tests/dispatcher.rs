@@ -291,7 +291,7 @@ async fn skipped_failed_and_panicking_outcomes() {
         .map(|e| e["message"].as_str().unwrap().to_string())
         .collect();
     assert!(
-        messages.contains(&"Skipped small.mkv — Only 3% smaller — kept the original".to_string())
+        messages.contains(&"Skipped small.mkv: Only 3% smaller — kept the original".to_string())
     );
     assert!(
         messages.contains(&"Failed bad.mkv: The encoder stopped: invalid frame size".to_string())
@@ -386,4 +386,196 @@ async fn projected_savings_after_three_files() {
             .any(|c| c["name"] == "h264" && c["files"] == 1)
     );
     assert_eq!(ov.json["resolutions"][0]["name"], "1080p");
+}
+
+/// A share that stops answering: the job starting on one of its files used
+/// to stay "preparing" for good, holding its slot (every other library
+/// waited) and ignoring Cancel. Now Cancel ends it at once, and when the
+/// file doesn't answer in time the job goes back to the queue with its
+/// library marked offline, so other libraries' files are converted.
+#[tokio::test]
+async fn a_file_on_a_share_that_stopped_answering_does_not_hold_the_queue() {
+    use crate::services::fs_guard::hang;
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.patch("/api/settings", json!({ "max_jobs": 1 })).await;
+    let stuck = app.write("Share/stuck.mkv", h264());
+    app.write("Healthy/fine.mkv", h264());
+    let share = app.add_library("Share", json!({})).await;
+    let stuck = std::fs::canonicalize(&stuck).unwrap();
+    // The share's file goes first.
+    let job = app.get("/api/jobs?state=queued").await.json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["file_name"] == "stuck.mkv")
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.post(
+        &format!("/api/jobs/{job}/priority"),
+        json!({ "priority": 10 }),
+    )
+    .await;
+    app.add_library("Healthy", json!({})).await;
+
+    // Cancel works while the file doesn't answer.
+    let hung = hang::hang(&stuck);
+    app.resume().await;
+    let state = app.state.clone();
+    wait_until("the job starts", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_count() == 1 }
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let r = app.post_empty(&format!("/api/jobs/{job}/cancel")).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let state = app.state.clone();
+    wait_until("the cancelled job lets go of its slot", move || {
+        let state = state.clone();
+        async move { state.dispatcher.running_count() == 0 }
+    })
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    let j = app.get(&format!("/api/jobs/{job}")).await;
+    assert_eq!(j.json["state"], "cancelled", "{}", j.json);
+    app.wait_queue_idle().await;
+    assert_eq!(
+        app.fake.started(),
+        ["fine.mkv"],
+        "the healthy library went on"
+    );
+
+    // Queued again while the share still hangs: back in the queue, the
+    // library shown offline, nothing converted.
+    app.pause().await;
+    let r = app
+        .post_empty(&format!(
+            "/api/files/{}/queue",
+            j.json["file_id"].as_str().unwrap()
+        ))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    app.resume().await;
+    let share_id = share["id"].as_str().unwrap().to_string();
+    wait_until("the share is shown offline", {
+        let app_state = app.state.clone();
+        move || {
+            let state = app_state.clone();
+            let id = share_id.clone();
+            async move {
+                crate::db::libraries::list(state.db.pool()).await.is_ok()
+                    && state
+                        .dispatcher
+                        .offline_reason(uuid::Uuid::parse_str(&id).unwrap())
+                        .is_some_and(|r| r.contains("isn't responding"))
+            }
+        }
+    })
+    .await;
+    assert_eq!(app.state.dispatcher.running_count(), 0);
+    let queued = app.get("/api/jobs?state=queued").await;
+    assert_eq!(queued.json["total"], 1, "{}", queued.json);
+    assert_eq!(app.fake.started(), ["fine.mkv"]);
+    drop(hung);
+}
+
+/// A replaced original that has another hard link (a seeding torrent's
+/// copy) frees no space: the overview and the chart count nothing saved.
+#[cfg(unix)]
+#[tokio::test]
+async fn converting_a_hard_linked_original_saves_nothing() {
+    let app = TestApp::new().await;
+    app.pause().await;
+    let file = app.write(
+        "Movies/Movie (2020).mp4",
+        &format!("{}{}", h264(), "p".repeat(900)),
+    );
+    let torrent = app.media.join("torrent-copy.mp4");
+    std::fs::hard_link(&file, &torrent).unwrap();
+    let lib = app
+        .add_library("Movies", json!({ "goal": "save_space" }))
+        .await;
+    let lib_id = lib["id"].as_str().unwrap().to_string();
+    app.resume().await;
+    app.wait_queue_idle().await;
+
+    let files = app.files_by_name(&lib_id).await;
+    let f = &files["Movie (2020).mkv"];
+    assert_eq!(f["status"], "done", "{f}");
+    assert_eq!(f["saved_bytes"], 0, "{f}");
+    let ov = app.get("/api/overview").await;
+    assert_eq!(ov.json["totals"]["saved_bytes"], 0, "{}", ov.json);
+    let today = ov.json["savings_history"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()
+        .clone();
+    assert_eq!(today["saved_bytes"], 0, "{today}");
+    let act = app.get("/api/activity").await;
+    assert!(
+        act.text.contains("Converted Movie (2020).mp4") && !act.text.contains("saved"),
+        "{}",
+        act.text
+    );
+    assert!(torrent.exists());
+}
+
+/// A job that runs out of disk space while another job writes to the same
+/// disk is put back once and tried again (the space reservation makes it
+/// wait its turn); alone, running out of space fails it as before.
+#[tokio::test]
+async fn a_disk_filled_by_parallel_jobs_is_retried_once() {
+    use chrysopoeia_core::ProblemKind;
+    let app = TestApp::new().await;
+    app.pause().await;
+    app.patch("/api/settings", json!({ "max_jobs": 2 })).await;
+    app.write("Movies/long.mkv", h264());
+    app.write("Movies/big.mkv", h264());
+    let full = "The disk ran out of space while the new file was being written in the work folder.";
+    app.fake.set_behavior("long.mkv", Behavior::Hold);
+    app.fake.set_behavior(
+        "big.mkv",
+        Behavior::FailWith(ProblemKind::DiskFull, full.into()),
+    );
+    app.add_library("Movies", json!({})).await;
+    app.resume().await;
+    wait_until("big.mkv is put back", || async {
+        app.fake
+            .started()
+            .iter()
+            .filter(|n| *n == "big.mkv")
+            .count()
+            == 1
+            && app.get("/api/jobs?state=queued").await.json["total"] == 1
+    })
+    .await;
+    assert_eq!(app.get("/api/files?status=failed").await.json["total"], 0);
+    // Tried again once the other job is done: this time it fits.
+    app.fake
+        .set_behavior("big.mkv", Behavior::Done { ratio: 0.5 });
+    app.fake.release.add_permits(1);
+    app.wait_queue_idle().await;
+    assert_eq!(app.get("/api/files?status=done").await.json["total"], 2);
+
+    // Alone on the disk, a full disk fails the file.
+    app.pause().await;
+    app.write("Movies/alone.mkv", h264());
+    app.fake.set_behavior(
+        "alone.mkv",
+        Behavior::FailWith(ProblemKind::DiskFull, full.into()),
+    );
+    let lib = app.get("/api/libraries").await.json[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    app.rescan(&lib).await;
+    app.resume().await;
+    app.wait_queue_idle().await;
+    let failed = app.get("/api/files?status=failed").await;
+    assert_eq!(failed.json["total"], 1, "{}", failed.json);
+    assert_eq!(failed.json["items"][0]["problem"], "disk_full");
 }

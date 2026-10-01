@@ -1,10 +1,10 @@
 //! Helpers shared by the `plan_*` integration tests: stream builders, argument
-//! inspection, a small ffprobe-to-`ProbeInfo` reader and synthetic media.
-//!
-//! The real prober lives in `chrysopoeia-scanner`; this reader exists so the
-//! planner can be tested against real files independently of it.
+//! inspection, probing with the scanner's parser, and synthetic media.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared by several test binaries, each using part of it"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +14,6 @@ use chrysopoeia_core::{
     AudioCodec, Container, EncoderCandidate, Goal, HdrFormat, ProbeInfo, QualityLevel, SpeedPreset,
     StreamInfo, StreamKind, SubtitlePolicy, TranscodeProfile, VideoCodec,
 };
-use serde_json::Value;
 
 // ---------------------------------------------------------------------------
 // Builders
@@ -701,10 +700,10 @@ fn review_samples(dir: &Path, ffmpeg: &dyn Fn(&[&str]) -> bool) -> Result<(), &'
 }
 
 // ---------------------------------------------------------------------------
-// ffprobe → ProbeInfo (test-only)
+// ffprobe → ProbeInfo
 
-/// Probe a file with ffprobe and map the JSON onto `ProbeInfo`, covering the
-/// fields the planner reads.
+/// Probe a file the way the server does: ffprobe's JSON read by the
+/// scanner's own parser, so the planner is tested on the probe it gets.
 pub fn probe_file(path: &Path) -> ProbeInfo {
     let out = Command::new("ffprobe")
         .args([
@@ -725,102 +724,8 @@ pub fn probe_file(path: &Path) -> ProbeInfo {
         path.display(),
         String::from_utf8_lossy(&out.stderr)
     );
-    let json: Value = serde_json::from_slice(&out.stdout).expect("ffprobe JSON");
-    parse_probe(&json)
-}
-
-fn num<T: std::str::FromStr>(v: &Value) -> Option<T> {
-    match v {
-        Value::String(s) => s.parse().ok(),
-        Value::Number(n) => n.to_string().parse().ok(),
-        _ => None,
-    }
-}
-
-fn text(v: &Value) -> Option<String> {
-    v.as_str().map(str::to_string)
-}
-
-fn rate(v: &Value) -> Option<f64> {
-    let s = v.as_str()?;
-    let (n, d) = s.split_once('/')?;
-    let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
-    (d > 0.0 && n > 0.0).then(|| n / d)
-}
-
-pub fn parse_probe(json: &Value) -> ProbeInfo {
-    let format = &json["format"];
-    let streams = json["streams"]
-        .as_array()
-        .map(|a| a.iter().map(parse_stream).collect())
-        .unwrap_or_default();
-    ProbeInfo {
-        container: format["format_name"]
-            .as_str()
-            .unwrap_or_default()
-            .split(',')
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        format_long_name: text(&format["format_long_name"]),
-        duration_secs: num(&format["duration"]),
-        bit_rate: num(&format["bit_rate"]),
-        size_bytes: num(&format["size"]).unwrap_or(0),
-        start_time: num(&format["start_time"]),
-        chapters: json["chapters"]
-            .as_array()
-            .map_or(0, |c| u32::try_from(c.len()).unwrap_or(0)),
-        streams,
-    }
-}
-
-fn parse_stream(s: &Value) -> StreamInfo {
-    let kind = match s["codec_type"].as_str() {
-        Some("video") => Some(StreamKind::Video),
-        Some("audio") => Some(StreamKind::Audio),
-        Some("subtitle") => Some(StreamKind::Subtitle),
-        Some("attachment") => Some(StreamKind::Attachment),
-        Some("data") => Some(StreamKind::Data),
-        _ => None,
-    };
-    let disposition = &s["disposition"];
-    let flag = |name: &str| disposition[name].as_i64() == Some(1);
-    let transfer = text(&s["color_transfer"]);
-    let hdr = match transfer.as_deref() {
-        Some("smpte2084") => Some(HdrFormat::Hdr10),
-        Some("arib-std-b67") => Some(HdrFormat::Hlg),
-        _ => None,
-    };
-    let field_order = s["field_order"].as_str().unwrap_or("progressive");
-    StreamInfo {
-        index: num(&s["index"]).unwrap_or(0),
-        kind,
-        codec: text(&s["codec_name"]).unwrap_or_default(),
-        profile: text(&s["profile"]),
-        language: text(&s["tags"]["language"]),
-        title: text(&s["tags"]["title"]),
-        is_default: flag("default"),
-        is_forced: flag("forced"),
-        is_attached_pic: flag("attached_pic"),
-        bit_rate: num(&s["bit_rate"]),
-        width: num(&s["width"]),
-        height: num(&s["height"]),
-        pix_fmt: text(&s["pix_fmt"]),
-        bit_depth: num(&s["bits_per_raw_sample"]),
-        frame_rate: rate(&s["avg_frame_rate"]).or_else(|| rate(&s["r_frame_rate"])),
-        color_primaries: text(&s["color_primaries"]),
-        color_transfer: transfer,
-        color_space: text(&s["color_space"]),
-        color_range: text(&s["color_range"]),
-        hdr,
-        dolby_vision_without_base_layer: false,
-        interlaced: matches!(field_order, "tt" | "bb" | "tb" | "bt"),
-        mastering_display: None,
-        content_light: None,
-        channels: num(&s["channels"]),
-        channel_layout: text(&s["channel_layout"]),
-        sample_rate: num(&s["sample_rate"]),
-    }
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    chrysopoeia_scanner::parse_ffprobe_json(&out.stdout, size).expect("ffprobe JSON")
 }
 
 /// Run ffmpeg with `args`. Returns its warnings (stderr) on success and the

@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -210,6 +210,41 @@ const MIGRATION_V6: &[&str] = &[
     ),
 ];
 
+/// Version 7: portrait videos get the resolution label of the same picture
+/// turned sideways (1080x1920 is 1080p, not 1440p), as
+/// `chrysopoeia_core::media::resolution_label` now gives it. Only rows whose
+/// main picture (the first video track that isn't cover art) is taller than
+/// wide change; the `CASE` is that function for a landscape picture.
+const MIGRATION_V7: &[&str] = &["UPDATE files SET resolution = COALESCE(( \
+        SELECT CASE \
+            WHEN MAX(w, h) >= 7000 OR MIN(w, h) >= 4000 THEN '8K' \
+            WHEN MAX(w, h) >= 3200 OR MIN(w, h) >= 2000 THEN '4K' \
+            WHEN MAX(w, h) >= 2300 OR MIN(w, h) >= 1400 THEN '1440p' \
+            WHEN MAX(w, h) >= 1700 OR MIN(w, h) >= 1000 THEN '1080p' \
+            WHEN MAX(w, h) >= 1200 OR MIN(w, h) >= 700 THEN '720p' \
+            WHEN MAX(w, h) >= 1000 OR MIN(w, h) >= 560 THEN '576p' \
+            WHEN MIN(w, h) >= 470 THEN '480p' \
+            ELSE 'SD' END \
+        FROM (SELECT json_extract(s.value, '$.width') AS w, \
+                     json_extract(s.value, '$.height') AS h \
+              FROM json_each(files.probe, '$.streams') AS s \
+              WHERE json_extract(s.value, '$.kind') = 'video' \
+                AND COALESCE(json_extract(s.value, '$.is_attached_pic'), 0) = 0 \
+              ORDER BY s.key LIMIT 1) \
+        WHERE w IS NOT NULL AND h IS NOT NULL AND h > w \
+     ), resolution) \
+     WHERE probe IS NOT NULL AND resolution IS NOT NULL AND json_valid(probe)"];
+
+/// Version 8: `library_mounts`, the drives and shares mounted inside a
+/// library folder that scans have seen. When one of them is unmounted, its
+/// mount point is left behind empty; a scan then keeps its files listed
+/// (with their state, such as "Skipped by you") instead of removing them.
+const MIGRATION_V8: &[&str] = &["CREATE TABLE library_mounts (
+        library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+        path       TEXT NOT NULL,
+        PRIMARY KEY (library_id, path)
+    )"];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -217,6 +252,8 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (4, MIGRATION_V4),
     (5, MIGRATION_V5),
     (6, MIGRATION_V6),
+    (7, MIGRATION_V7),
+    (8, MIGRATION_V8),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -334,6 +371,7 @@ mod tests {
                 "files",
                 "jobs",
                 "libraries",
+                "library_mounts",
                 "savings",
                 "settings"
             ]
@@ -766,6 +804,132 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(jobs, expected);
+    }
+
+    /// Portrait videos are relabelled like the same picture turned
+    /// sideways; everything else keeps its label.
+    #[tokio::test]
+    async fn version_7_relabels_portrait_videos() {
+        use chrysopoeia_core::media::resolution_label;
+        use chrysopoeia_core::{ProbeInfo, StreamInfo, StreamKind};
+        let video = |w: u32, h: u32, cover: bool| StreamInfo {
+            kind: Some(StreamKind::Video),
+            codec: "h264".into(),
+            width: Some(w),
+            height: Some(h),
+            is_attached_pic: cover,
+            ..Default::default()
+        };
+        let probe = |streams: Vec<StreamInfo>| {
+            serde_json::to_string(&ProbeInfo {
+                streams,
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // (probe, label before, label after)
+        let mut rows: Vec<(Option<String>, Option<String>, Option<String>)> = Vec::new();
+        // Every class boundary, turned on its side.
+        for (w, h) in [
+            (7680, 4320),
+            (6999, 4000),
+            (3840, 2160),
+            (3200, 1000),
+            (2560, 1440),
+            (2300, 900),
+            (1920, 1080),
+            (1920, 800),
+            (1700, 900),
+            (1280, 720),
+            (1200, 500),
+            (1024, 576),
+            (1000, 400),
+            (854, 480),
+            (720, 470),
+            (640, 360),
+        ] {
+            let old = [
+                resolution_label(w, h),
+                "1440p", // what 1080x1920 used to read as
+            ];
+            rows.push((
+                Some(probe(vec![video(h, w, false)])),
+                Some(old[1].to_string()),
+                Some(resolution_label(w, h).to_string()),
+            ));
+            // Landscape pictures keep their label.
+            rows.push((
+                Some(probe(vec![video(w, h, false)])),
+                Some(old[0].to_string()),
+                Some(old[0].to_string()),
+            ));
+        }
+        // Portrait cover art before a landscape picture: not the picture.
+        rows.push((
+            Some(probe(vec![video(600, 900, true), video(1280, 720, false)])),
+            Some("720p".into()),
+            Some("720p".into()),
+        ));
+        // Cover art ahead of the portrait picture is skipped.
+        rows.push((
+            Some(probe(vec![video(500, 500, true), video(1080, 1920, false)])),
+            Some("1440p".into()),
+            Some("1080p".into()),
+        ));
+        // No size, no probe, not JSON: unchanged.
+        rows.push((
+            Some(probe(vec![StreamInfo {
+                kind: Some(StreamKind::Video),
+                ..Default::default()
+            }])),
+            Some("SD".into()),
+            Some("SD".into()),
+        ));
+        rows.push((None, None, None));
+        rows.push((
+            Some("not json".into()),
+            Some("720p".into()),
+            Some("720p".into()),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v6.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 6).await.unwrap();
+            sqlx::query(
+                "INSERT INTO libraries (id, name, path, profile, created_at) \
+                 VALUES ('l', 'Movies', '/m', '{}', '2026-01-01T00:00:00.000Z')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            for (i, (probe, before, _)) in rows.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, probe, resolution, scanned_at, \
+                     updated_at) VALUES (?, 'l', ?, 'x', 'x', 1, 'x', 'done', ?, ?, 'x', 'x')",
+                )
+                .bind(format!("f{i:03}"))
+                .bind(format!("/m/{i}.mkv"))
+                .bind(probe)
+                .bind(before)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let got: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT resolution FROM files ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        let expected: Vec<Option<String>> = rows.into_iter().map(|(_, _, after)| after).collect();
+        assert_eq!(got, expected);
     }
 
     #[tokio::test]

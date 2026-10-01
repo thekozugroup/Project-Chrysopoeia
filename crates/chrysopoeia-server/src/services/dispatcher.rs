@@ -63,7 +63,11 @@ const PROGRESS_WRITE_INTERVAL: Duration = Duration::from_secs(2);
 /// How long the file a job starts on may take to answer before its library
 /// counts as offline. Generous: an array disk that has to spin up first
 /// takes several seconds.
-const INPUT_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+const INPUT_CHECK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(1)
+} else {
+    Duration::from_secs(30)
+};
 /// How long a folder may take to list a job's leftovers.
 const LEFTOVER_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard upper bound on concurrent jobs.
@@ -119,6 +123,9 @@ pub struct DispatcherHandle {
     hardware_wait: std::sync::Mutex<HashSet<Uuid>>,
     /// Whether the feed already says that conversions wait for a busy GPU.
     hardware_wait_announced: AtomicBool,
+    /// Jobs put back once after the disk filled up while other jobs were
+    /// writing to it too (see [`space_was_shared`]).
+    disk_retried: std::sync::Mutex<HashSet<Uuid>>,
 }
 
 impl DispatcherHandle {
@@ -134,6 +141,7 @@ impl DispatcherHandle {
             deferred: std::sync::Mutex::new(HashMap::new()),
             hardware_wait: std::sync::Mutex::new(HashSet::new()),
             hardware_wait_announced: AtomicBool::new(false),
+            disk_retried: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -558,28 +566,27 @@ fn start_job(state: &AppState, job: Job, software: bool) {
         tracing::debug!(job = %job.id, file = %job.file_path, "job started");
 
         let (disposition, ctx) = execute(&state, &job, cancel).await;
+        let disposition = space_was_shared(&state, &job, disposition);
         let intent = guard.intent();
         // A file moved during its conversion (a folder renamed by Sonarr or
         // Radarr, say) leaves the temp file written next to it in the
-        // folder's new place, where this job can't find it; a scan cleans it
-        // up. (With watching off, the next scan does.)
-        let source_gone = matches!(
+        // folder's new place, where this job can't find it (the converter
+        // then reports the new file missing): once the job has ended, the
+        // library is searched for this job's leftovers.
+        let may_have_left_files = matches!(
             &disposition,
-            Disposition::Finished(JobOutcome::Failed {
-                problem: ProblemKind::SourceChanged,
-                ..
-            })
+            Disposition::Finished(JobOutcome::Failed { .. })
         ) && ctx.worker_ran
-            && {
-                let settings = state.settings();
-                settings.watch_folders && run_config(&state, &settings).temp_dir.is_none()
-            };
+            && run_config(&state, &state.settings()).temp_dir.is_none();
         // The slot stays taken until the result is recorded.
         record(&state, &job, disposition, intent, &ctx).await;
         // Free the slot before announcing, so the queue state is current.
         drop(guard);
-        if source_gone && !state.shutdown.is_cancelled() {
-            let _ = library::start_scan(&state, job.library_id);
+        if may_have_left_files && !state.shutdown.is_cancelled() && input_vanished(&ctx).await {
+            let (state, library_id, job_id) = (state.clone(), job.library_id, job.id);
+            tokio::spawn(async move {
+                library::sweep_job_leftovers(&state, library_id, job_id).await;
+            });
         }
         state.broadcast_job(job.id).await;
         state.broadcast_file(job.file_id).await;
@@ -600,6 +607,36 @@ fn start_job(state: &AppState, job: Job, software: bool) {
     });
 }
 
+/// How long a job put back after running out of disk space waits before
+/// it may start again.
+const DISK_RETRY_DELAY: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(60)
+};
+
+/// A job that ran out of disk space while other jobs were writing to the
+/// same disks may well fit alone: put it back once (the space reservation
+/// then makes it wait its turn) instead of failing it for good.
+fn space_was_shared(state: &AppState, job: &Job, disposition: Disposition) -> Disposition {
+    let full = matches!(
+        &disposition,
+        Disposition::Finished(JobOutcome::Failed {
+            problem: ProblemKind::DiskFull,
+            ..
+        })
+    );
+    // This job still counts as running.
+    if full
+        && state.dispatcher.running_count() > 1
+        && !state.shutdown.is_cancelled()
+        && lock(&state.dispatcher.disk_retried).insert(job.id)
+    {
+        return Disposition::Requeue(Requeue::DiskShared);
+    }
+    disposition
+}
+
 /// What `apply_outcome` needs to know about how the job ran.
 #[derive(Debug, Clone)]
 struct ExecContext {
@@ -609,6 +646,9 @@ struct ExecContext {
     output_mode: OutputMode,
     /// The worker ran (so it may have written a temp file).
     worker_ran: bool,
+    /// The original has other hard links and is being replaced: its data
+    /// stays on disk through them, so the conversion saves no space.
+    shared_original: bool,
 }
 
 impl ExecContext {
@@ -626,6 +666,8 @@ impl ExecContext {
 enum Requeue {
     /// The library folder can't be reached (the reason says why).
     LibraryOffline(String),
+    /// The disk filled up while other jobs were writing to it too.
+    DiskShared,
     /// The file changed moments ago and may still be being copied.
     Settling,
     /// The file needs the GPU chosen in Settings, CPU fallback is off, and
@@ -699,6 +741,7 @@ async fn execute(
         library_name: None,
         output_mode: settings.output_mode,
         worker_ran: false,
+        shared_original: false,
     };
     let done = |outcome: JobOutcome, ctx: ExecContext| (Disposition::Finished(outcome), ctx);
     let file = match db::files::get(state.db.pool(), job.file_id, true).await {
@@ -778,6 +821,11 @@ async fn execute(
             }
         }
     };
+    #[cfg(unix)]
+    {
+        ctx.shared_original = ctx.output_mode == OutputMode::Replace
+            && std::os::unix::fs::MetadataExt::nlink(&meta) > 1;
+    }
     let modified: DateTime<Utc> = meta
         .modified()
         .map(DateTime::<Utc>::from)
@@ -1139,6 +1187,12 @@ async fn apply_requeue(
                 .defer(job.id, Instant::now() + state.config.settle);
             false
         }
+        Requeue::DiskShared => {
+            state
+                .dispatcher
+                .defer(job.id, Instant::now() + DISK_RETRY_DELAY);
+            false
+        }
         Requeue::HardwareBusy(_) => {
             state.dispatcher.wait_for_hardware(job.library_id);
             // Check again in a few minutes for as long as jobs wait.
@@ -1168,6 +1222,14 @@ async fn apply_requeue(
         Requeue::LibraryOffline(_) => {}
         Requeue::Settling => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the file to finish copying");
+        }
+        Requeue::DiskShared => {
+            tracing::info!(
+                job = %job.id,
+                "{} ran out of disk space while other conversions were running; it will be \
+                 tried again on its own",
+                crate::log_text(&job.file_name)
+            );
         }
         Requeue::HardwareBusy(problem) => {
             tracing::debug!(job = %job.id, file = %job.file_path, "waiting for the chosen GPU");
@@ -1301,7 +1363,13 @@ async fn apply_outcome(
                 }
                 None => output_size,
             };
-            let saved_total = db::i64_of(first_original) - db::i64_of(current_size);
+            // A hard-linked original keeps its data on disk through its
+            // other name (a seeding torrent): nothing was freed.
+            let saved_total = if ctx.shared_original {
+                ctx.file.as_ref().and_then(|f| f.saved_bytes).unwrap_or(0)
+            } else {
+                db::i64_of(first_original) - db::i64_of(current_size)
+            };
             sqlx::query(
                 "UPDATE files SET status = 'done', original_size_bytes = ?, saved_bytes = ?, \
                  skip_reason = NULL, error = NULL, problem = NULL, job_id = ?, updated_at = ? \
@@ -1314,12 +1382,19 @@ async fn apply_outcome(
             .bind(job.file_id.to_string())
             .execute(&mut *tx)
             .await?;
-            let saved_now = db::i64_of(original_size) - db::i64_of(output_size);
+            let saved_now = if ctx.shared_original {
+                0
+            } else {
+                db::i64_of(original_size) - db::i64_of(output_size)
+            };
             db::stats::add_savings(&mut tx, job.library_id, saved_now).await?;
             tx.commit().await?;
 
             let pct = format::percent(saved_now, original_size);
-            let mut message = if saved_now >= 0 {
+            let mut message = if ctx.shared_original {
+                // Its note says why nothing was saved.
+                format!("Converted {name}")
+            } else if saved_now >= 0 {
                 format!(
                     "Converted {name} — saved {} ({pct}%)",
                     format::bytes(saved_now.unsigned_abs())
@@ -1377,9 +1452,9 @@ async fn apply_outcome(
             tx.commit().await?;
             if exists {
                 let message = if kept_done {
-                    format!("Kept {name} as it is — {reason}")
+                    format!("Kept {name} as it is: {reason}")
                 } else {
-                    format!("Skipped {name} — {reason}")
+                    format!("Skipped {name}: {reason}")
                 };
                 state.activity(ActivityLevel::Info, message, refs).await;
             }
@@ -1694,6 +1769,7 @@ pub async fn complete_interrupted(state: &AppState) -> u64 {
                 OutputMode::Folder
             },
             worker_ran: true,
+            shared_original: false,
         };
         let outcome = JobOutcome::Done {
             output_path: target,

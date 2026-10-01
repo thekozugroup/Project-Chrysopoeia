@@ -688,7 +688,7 @@ fn the_late_audio_sample_really_fools_a_quick_probe() {
     let probe = probe_file(&media.join(TS_LATE_AUDIO));
     let audio: Vec<_> = probe.audio_streams().collect();
     assert_eq!(audio.len(), 1);
-    assert_eq!(audio[0].channels, Some(0), "{:?}", audio[0]);
+    assert_eq!(audio[0].channels, None, "{:?}", audio[0]);
 }
 
 #[test]

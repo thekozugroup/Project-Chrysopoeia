@@ -33,7 +33,7 @@ pub async fn list(
         Some(s) => JobFilter::parse(s).ok_or_else(|| {
             ApiError::bad_request(
                 "invalid_state",
-                "Filter jobs by active, running, queued or history.",
+                "Filter jobs by all, active, running, queued or history.",
             )
         })?,
     };

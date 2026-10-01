@@ -494,6 +494,33 @@ pub fn explain_failure(message: &str) -> Option<&'static str> {
         .map(|(_, hint)| *hint)
 }
 
+/// Start a program with `spawn`, waiting and trying again (after each of
+/// `delays`) while too many files are open: a busy moment shouldn't fail a
+/// job for good. `Ok(None)` when cancelled while waiting.
+pub(crate) async fn spawn_patiently<T>(
+    mut spawn: impl FnMut() -> std::io::Result<T>,
+    delays: &[Duration],
+    cancel: &CancellationToken,
+) -> std::io::Result<Option<T>> {
+    let mut delays = delays.iter();
+    loop {
+        match spawn() {
+            Ok(child) => return Ok(Some(child)),
+            Err(e) if chrysopoeia_core::process::out_of_file_handles(&e) => {
+                let Some(delay) = delays.next() else {
+                    return Err(e);
+                };
+                tracing::debug!("too many files are open to start a program; waiting {delay:?}");
+                tokio::select! {
+                    () = cancel.cancelled() => return Ok(None),
+                    () = tokio::time::sleep(*delay) => {}
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Why a program couldn't be started, and what to do about it.
 fn not_started_message(program: &Path, e: &std::io::Error) -> String {
     let shown = program.display();
@@ -737,8 +764,15 @@ pub async fn run_ffmpeg(
         .kill_on_drop(true);
     chrysopoeia_core::process::end_with_parent(command.as_std_mut());
 
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let spawned = spawn_patiently(
+        || command.spawn(),
+        &chrysopoeia_core::process::SPAWN_RETRY_DELAYS,
+        cancel,
+    )
+    .await;
+    let mut child = match spawned {
+        Ok(Some(child)) => child,
+        Ok(None) => return FfmpegExit::Cancelled,
         Err(e) => {
             let error = not_started_message(cmd.program, &e);
             return FfmpegExit::NotStarted { error };
@@ -1437,6 +1471,63 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
         assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
     }
 
+    /// Running out of file handles is waited out; other errors are not.
+    #[tokio::test]
+    async fn starting_waits_while_too_many_files_are_open() {
+        let delays = [Duration::from_millis(10); 3];
+        let cancel = CancellationToken::new();
+        let mut tries = 0;
+        let started = spawn_patiently(
+            || {
+                tries += 1;
+                if tries < 3 {
+                    Err(std::io::Error::from_raw_os_error(24))
+                } else {
+                    Ok(tries)
+                }
+            },
+            &delays,
+            &cancel,
+        )
+        .await;
+        assert_eq!(started.unwrap(), Some(3));
+
+        let mut tries = 0;
+        let never = spawn_patiently(
+            || -> std::io::Result<()> {
+                tries += 1;
+                Err(std::io::Error::from_raw_os_error(24))
+            },
+            &delays,
+            &cancel,
+        )
+        .await;
+        assert_eq!(never.unwrap_err().raw_os_error(), Some(24));
+        assert_eq!(tries, 4, "the first try and one per wait");
+
+        let mut tries = 0;
+        let missing = spawn_patiently(
+            || -> std::io::Result<()> {
+                tries += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            &delays,
+            &cancel,
+        )
+        .await;
+        assert!(missing.is_err());
+        assert_eq!(tries, 1);
+
+        cancel.cancel();
+        let cancelled = spawn_patiently(
+            || -> std::io::Result<()> { Err(std::io::Error::from_raw_os_error(23)) },
+            &[Duration::from_secs(60)],
+            &cancel,
+        )
+        .await;
+        assert!(matches!(cancelled, Ok(None)));
+    }
+
     #[test]
     fn only_blocks_that_move_count_as_progress() {
         let mut live = Liveness::default();
@@ -1465,6 +1556,101 @@ out_time_us=2000000\\nprogress=end\\n'; echo 'warning line' >&2; exit 3";
         assert!(live.stderr("warning A"));
         assert!(!live.stderr("warning A"));
         assert!(live.stderr("warning B"));
+    }
+
+    /// The real thing: ffmpeg 7 (the Docker image ships jellyfin-ffmpeg 7)
+    /// reading an input that stops delivering keeps printing the same
+    /// progress block every half second; it still counts as stalled. Runs
+    /// when `CHRYSOPOEIA_TEST_FFMPEG7` names an ffmpeg 7 binary with the
+    /// libvpx encoder (Playwright's build has it); ffmpeg 6 makes the
+    /// sample frames.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg7_stuck_on_its_input_counts_as_stalled() {
+        let Some(ffmpeg7) = std::env::var_os("CHRYSOPOEIA_TEST_FFMPEG7") else {
+            eprintln!("CHRYSOPOEIA_TEST_FFMPEG7 not set; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let frames = dir.path().join("frames.mjpeg");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=320x240:rate=10",
+            ])
+            .args(["-frames:v", "60", "-c:v", "mjpeg", "-f", "image2pipe"])
+            .arg(&frames)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("ffmpeg can't make sample frames; skipping");
+            return;
+        }
+        // A pipe that delivers the frames, then stays open and silent, like
+        // a share that stopped answering mid-file.
+        let fifo = dir.path().join("input");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.is_ok_and(|s| s.success()));
+        let (fifo_w, frames_r) = (fifo.clone(), frames.clone());
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let Ok(mut pipe) = std::fs::OpenOptions::new().write(true).open(&fifo_w) else {
+                return;
+            };
+            if pipe
+                .write_all(&std::fs::read(&frames_r).unwrap_or_default())
+                .is_ok()
+            {
+                let _ = done_rx.recv_timeout(Duration::from_secs(60));
+            }
+        });
+        let out = dir.path().join("out.webm");
+        let args: Vec<String> = [
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            "-readrate",
+            "1",
+            "-f",
+            "image2pipe",
+            "-c:v",
+            "mjpeg",
+            "-framerate",
+            "10",
+            "-i",
+        ]
+        .iter()
+        .map(|a| (*a).to_string())
+        .chain([fifo.to_string_lossy().into_owned()])
+        .chain(["-c:v", "libvpx", "-f", "webm"].map(String::from))
+        .chain([out.to_string_lossy().into_owned()])
+        .collect();
+        let program = PathBuf::from(ffmpeg7);
+        let mut cmd = FfmpegCommand::new(&program, &args);
+        cmd.stall_timeout = Duration::from_secs(4);
+        let mut blocks = 0;
+        let started = std::time::Instant::now();
+        let exit = run_ffmpeg(
+            &cmd,
+            &CancellationToken::new(),
+            &mut |_| blocks += 1,
+            &mut |_| {},
+        )
+        .await;
+        let _ = done_tx.send(());
+        writer.join().unwrap();
+        assert!(matches!(exit, FfmpegExit::Stalled { .. }), "{exit:?}");
+        assert!(started.elapsed() < Duration::from_secs(40));
+        // ffmpeg 7 kept printing while it was stuck (a block every half
+        // second): about 12 while the frames came in, and more after.
+        assert!(blocks >= 16, "{blocks} blocks");
     }
 
     /// ffmpeg 7 keeps printing progress blocks while it is stuck; a process

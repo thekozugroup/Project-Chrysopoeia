@@ -1,15 +1,18 @@
-//! Shared helpers for the worker integration tests: synthetic media, a small
-//! ffprobe-to-`ProbeInfo` parser (the scanner crate may be a stub), and ffmpeg
-//! wrappers. Tests that need ffmpeg call [`require_ffmpeg!`] first and are
-//! skipped when it is not installed.
+//! Shared helpers for the worker integration tests: synthetic media,
+//! probing with the scanner's own parser, and ffmpeg wrappers. Tests that
+//! need ffmpeg call [`require_ffmpeg!`] first and are skipped when it is not
+//! installed.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "shared by several test binaries, each using part of it"
+)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use chrysopoeia_core::{ProbeInfo, StreamInfo, StreamKind};
+use chrysopoeia_core::{ProbeInfo, StreamKind};
 use chrysopoeia_worker::StreamSummary;
 
 /// Skip the current test (with a note) when ffmpeg/ffprobe are missing.
@@ -108,7 +111,8 @@ pub fn ffmpeg(args: &[&str]) {
     );
 }
 
-/// Probe a file into the core `ProbeInfo` shape.
+/// Probe a file the way the server does: ffprobe's JSON read by the
+/// scanner's own parser (HDR metadata, bit depth and all).
 pub fn probe(path: &Path) -> ProbeInfo {
     let output = Command::new("ffprobe")
         .args([
@@ -118,6 +122,7 @@ pub fn probe(path: &Path) -> ProbeInfo {
             "json",
             "-show_format",
             "-show_streams",
+            "-show_chapters",
         ])
         .arg(path)
         .output()
@@ -127,70 +132,8 @@ pub fn probe(path: &Path) -> ProbeInfo {
         "ffprobe failed on {}",
         path.display()
     );
-    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("ffprobe json");
-    let num = |v: &serde_json::Value, key: &str| -> Option<f64> {
-        v.get(key)?.as_str()?.parse::<f64>().ok()
-    };
-    let ratio = |s: Option<&str>| -> Option<f64> {
-        let (n, d) = s?.split_once('/')?;
-        let (n, d): (f64, f64) = (n.parse().ok()?, d.parse().ok()?);
-        (n > 0.0 && d > 0.0).then(|| n / d)
-    };
-    let streams = json["streams"]
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .map(|s| {
-            let kind = match s["codec_type"].as_str() {
-                Some("video") => Some(StreamKind::Video),
-                Some("audio") => Some(StreamKind::Audio),
-                Some("subtitle") => Some(StreamKind::Subtitle),
-                Some("attachment") => Some(StreamKind::Attachment),
-                Some("data") => Some(StreamKind::Data),
-                _ => None,
-            };
-            let pix_fmt = s["pix_fmt"].as_str().map(str::to_string);
-            let bit_depth = pix_fmt
-                .as_deref()
-                .map(|p| if p.contains("10") { 10 } else { 8 });
-            StreamInfo {
-                index: s["index"].as_u64().unwrap_or(0) as u32,
-                kind,
-                codec: s["codec_name"].as_str().unwrap_or_default().to_string(),
-                language: s["tags"]["language"].as_str().map(str::to_string),
-                is_attached_pic: s["disposition"]["attached_pic"].as_i64() == Some(1),
-                width: s["width"].as_u64().map(|w| w as u32),
-                height: s["height"].as_u64().map(|h| h as u32),
-                pix_fmt,
-                bit_depth,
-                frame_rate: ratio(s["avg_frame_rate"].as_str())
-                    .or_else(|| ratio(s["r_frame_rate"].as_str())),
-                interlaced: matches!(s["field_order"].as_str(), Some("tt" | "bb" | "tb" | "bt")),
-                channels: s["channels"].as_u64().map(|c| c as u32),
-                channel_layout: s["channel_layout"].as_str().map(str::to_string),
-                sample_rate: s["sample_rate"].as_str().and_then(|r| r.parse().ok()),
-                ..Default::default()
-            }
-        })
-        .collect();
-    let format = &json["format"];
-    ProbeInfo {
-        container: format["format_name"]
-            .as_str()
-            .unwrap_or_default()
-            .split(',')
-            .next()
-            .unwrap_or_default()
-            .to_string(),
-        format_long_name: format["format_long_name"].as_str().map(str::to_string),
-        duration_secs: num(format, "duration"),
-        bit_rate: format["bit_rate"].as_str().and_then(|b| b.parse().ok()),
-        size_bytes: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
-        start_time: num(format, "start_time"),
-        chapters: 0,
-        streams,
-    }
+    let size = std::fs::metadata(path).map_or(0, |m| m.len());
+    chrysopoeia_scanner::parse_ffprobe_json(&output.stdout, size).expect("ffprobe json")
 }
 
 /// Stream counts of a probe (video excludes cover art).

@@ -160,10 +160,13 @@ impl AppState {
         refs: ActivityRefs,
     ) {
         let message = message.into();
+        // The feed keeps the text as is; the log gets it on one line (a
+        // file name can hold line breaks).
+        let line = crate::log_text(&message);
         match level {
-            ActivityLevel::Error => tracing::warn!("{message}"),
-            ActivityLevel::Warning => tracing::warn!("{message}"),
-            _ => tracing::info!("{message}"),
+            ActivityLevel::Error => tracing::warn!("{line}"),
+            ActivityLevel::Warning => tracing::warn!("{line}"),
+            _ => tracing::info!("{line}"),
         }
         if self.closed() {
             return;

@@ -33,9 +33,12 @@ tower-http = { workspace = true, features = ["catch-panic"] }
 sqlx = { workspace = true }
 globset = { workspace = true }
 serde_path_to_error = "0.1"
+# The HTTP server's connection limits (see `http.rs`); axum already uses both.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

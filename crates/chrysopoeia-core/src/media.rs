@@ -150,7 +150,9 @@ impl ProbeInfo {
 
     /// Short resolution label: `8K`, `4K`, `1440p`, `1080p`, `720p`, `576p`,
     /// `480p` or `SD`. Uses the larger of width-based and height-based classes
-    /// so cropped widescreen (e.g. 1920x800) still reads as 1080p.
+    /// so cropped widescreen (e.g. 1920x800) still reads as 1080p, and reads
+    /// a portrait picture as if it were turned sideways (1080x1920 is
+    /// 1080p, like the size limit that converts it).
     pub fn resolution_label(&self) -> Option<&'static str> {
         let v = self.primary_video()?;
         let (w, h) = (v.width?, v.height?);
@@ -164,6 +166,9 @@ impl ProbeInfo {
 
 /// See [`ProbeInfo::resolution_label`].
 pub fn resolution_label(width: u32, height: u32) -> &'static str {
+    // Classes describe landscape pictures: a phone's portrait 1080x1920 is
+    // a 1080p picture on its side, not 1440p.
+    let (width, height) = (width.max(height), width.min(height));
     let by_width = match width {
         w if w >= 7000 => 6,
         w if w >= 3200 => 5,
@@ -206,6 +211,18 @@ mod tests {
         assert_eq!(resolution_label(720, 576), "576p");
         assert_eq!(resolution_label(720, 480), "480p");
         assert_eq!(resolution_label(320, 240), "SD");
+    }
+
+    /// A portrait picture has the class of the same picture turned
+    /// sideways, as the size limit judges it.
+    #[test]
+    fn portrait_labels_match_landscape() {
+        assert_eq!(resolution_label(1080, 1920), "1080p");
+        assert_eq!(resolution_label(720, 1280), "720p");
+        assert_eq!(resolution_label(2160, 3840), "4K");
+        assert_eq!(resolution_label(1440, 2560), "1440p");
+        assert_eq!(resolution_label(480, 854), "480p");
+        assert_eq!(resolution_label(800, 1920), "1080p");
     }
 
     #[test]

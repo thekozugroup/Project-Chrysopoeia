@@ -67,17 +67,39 @@ container templates) mean "not set".
 | `--hw` | `HW_ACCEL` | `auto` | auto, cpu, nvenc/nvidia, qsv/intel, vaapi, amf, videotoolbox, rkmpp, v4l2m2m. Sets the `hardware` setting on the first run and again whenever the value changes; otherwise the Settings choice is kept |
 | `--library` | `LIBRARIES` (comma-sep) | none | Libraries created on the first run |
 | `--allowed-host` | `ALLOWED_HOSTS` (comma-sep) | none | Extra host names (e.g. a reverse proxy's domain; `.example.com` covers a domain; `*` = any) |
-| `--log-level` | `LOG_LEVEL` | `info` | `RUST_LOG` wins when set |
+| `--log-level` | `LOG_LEVEL` | `info` | `error`, `warn` (or `warning`), `info`, `debug` or `trace`, in any case; anything else stops the start with a plain message (an unknown word would otherwise silence every log line). `RUST_LOG` (full filter directives) wins when set |
 | `--dev-cors` | `DEV_CORS` | false | Permissive CORS and no origin check, for `next dev` on another port |
 
 Not configurable: a file must go 20 s without changes (size and mtime) before
 it is picked up or converted (the settle time); the database busy timeout is
 30 s. Active hours use the local time zone (`TZ`).
 
-Start order: exclusive lock on `$DATA_DIR/chrysopoeia.lock` (a second
+Start order: raise the soft limit on open files to the hard limit (at most
+65 536; Docker often starts with 1 024) → exclusive lock on
+`$DATA_DIR/chrysopoeia.lock` (a second
 Chrysopoeia on the same data folder exits with "Another Chrysopoeia is already
 using the data folder …" and changes nothing; filesystems that can't lock
 only log a warning) → bind the port → open the database → recovery.
+
+A database file SQLite finds damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
+moved aside as `chrysopoeia.db.damaged-<UTC time>` (with its `-wal`/`-shm`
+files) and a new one is started; the feed says so at WARN ("The database was
+damaged, so Chrysopoeia moved it aside to … and started with a new one. Your
+media files were not touched. Add your libraries and settings again."), so a
+container set to restart doesn't loop. Other open errors still stop the
+start with the data-folder advice.
+
+At stop, after the HTTP server and the jobs have wound down, the process
+waits at most 2 s for work still on blocking threads (a system call stuck on
+a share that stopped answering never returns), so `docker stop` ends cleanly.
+
+**HTTP server** (`http.rs`, hyper with a timer instead of `axum::serve`): a
+request's headers must arrive within 30 s (which also closes a kept-open
+connection idle that long), at most 256 connections are served at once (a
+WebSocket keeps its place while open; further connections wait in the
+system's queue), and a WebSocket client may send messages of at most 64 KB.
+Starting ffmpeg/ffprobe while too many files are open (`EMFILE`/`ENFILE`) is
+retried for about 30 s instead of failing the file.
 
 ## Database (SQLite, WAL)
 
@@ -107,6 +129,7 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id)
 savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, saved_bytes INT,
         files INT, PK(date, library_id))
+library_mounts(library_id FK→libraries ON DELETE CASCADE, path, PK(library_id, path))
 ```
 
 Versions: 1 = base schema; 2 = job-list indexes and `finished_at` on every
@@ -128,10 +151,22 @@ a full disk or quota → `disk_full`; an unusable temp folder →
 `hardware_unavailable`; no write permission, a name already taken, no
 output folder or a failed move → `destination`; an encoder that stopped,
 hung or wrote nothing → `encoder`; the rest become `other`.
+7 = portrait videos relabelled: `files.resolution` of a picture taller than
+wide is the class of the same picture turned sideways (1080×1920 is
+`1080p`, not `1440p`, as `core::media::resolution_label` now gives it and
+as the size limit judges it). 8 = `library_mounts`: drives and shares
+mounted inside a library folder that scans have seen (see File and job
+lifecycle).
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
   lowercase strings. Write transactions use `BEGIN IMMEDIATE`.
+- A connection whose transaction ended badly is closed, never reused: when a
+  write fails because the disk is full (or on an I/O error), SQLite rolls
+  the transaction back itself and sqlx would keep counting the connection
+  as inside one, so every later write would fail until a restart. The pool
+  checks each connection when it is returned and before it is handed out,
+  and `write_tx` tries another connection if one slips through.
 - `problem` goes with `error`: every write that sets a file's or job's
   `error` sets its `problem`, and every write that clears the error (queued
   again, converted, skipped, kept as converted) clears it. Reads enforce the
@@ -164,7 +199,8 @@ scan/watch ─► probe ─► decide(profile)
 dispatcher claims job ─► running(preparing ► transcoding ► verifying ► finalizing)
    ├─ Done     → file: done, size=new size, original_size, saved_bytes;
    │             savings[today, library] += saved
-   ├─ Skipped  → file: skipped + reason (e.g. "Only 3% smaller — kept the original")
+   ├─ Skipped  → file: skipped + reason (e.g. "Only 3% smaller — kept the original");
+   │             activity "Skipped <name>: <reason>"
    ├─ Failed   → file: failed + error + problem; original untouched
    └─ Cancelled→ file: pending (queued again after "Stop now" or shutdown; skipped after "Skip")
    A file converted before (original_size set) stays done with its savings
@@ -186,6 +222,23 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   from the DB (their jobs cascade), except below folders the walk couldn't
   read or left alone, and never when a library that had files walks empty
   (an unmounted share). A file that is still on disk is never removed.
+- Drives and shares mounted inside a library folder: each scan reads the
+  mount points under the library from `/proc/self/mountinfo` and remembers
+  them (`library_mounts`). One that is no longer mounted and whose folder is
+  empty or missing counts as offline: its files stay listed with their state
+  ("Skipped by you" included), and the feed says once that "the drive or
+  share mounted there isn't connected, so its files stay in the list until
+  it's back". It is forgotten once its folder has files without being a
+  mount. (When the folder doesn't answer, every known mount counts as
+  offline.)
+- Leftovers in library folders: every scan hands the temp and backup files
+  its walk finds (`WalkResult.artifacts`) to `recover_artifact`, except
+  those of running jobs: a temp file left in a folder renamed during a
+  conversion is deleted, and an original a crash left moved aside is put
+  back (and stays listed). A job that fails after its conversion started
+  and whose file is gone from its folder (a folder renamed meanwhile; the
+  converter then finds no new file at the old path) has the library
+  searched for its own temp files at once.
 - Scans at start (after recovery and once the watcher is armed): every
   enabled library when `watch_folders` is on or `rescan_interval_hours` > 0
   (catching what changed while the server was down), otherwise only
@@ -210,10 +263,19 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   finds the job's backup of the original next to a file under
   `jobs.final_path`; in folder mode when the job was `finalizing`, its output
   file exists and no other finished job claims that path. Then jobs `running`
-  → `queued` (attempt reset), files `processing` → `queued`. Then every
+  → `queued` (attempt reset), files `processing` → `queued`, and each such
+  job's own temp and backup files (named with its id) in its file's folder
+  and its destination folder are recovered right away, whatever the last
+  stop recorded: an original moved aside is put back before the job runs
+  again. (A job that starts and finds its file gone looks for its own backup
+  once more, for a folder that was out of reach at the start.) Then every
   temp/backup artifact is passed to `worker::finalize::recover_artifact`: in
   the temp folders always, and in the library folders and the output folder
-  after an unclean shutdown.
+  after an unclean shutdown. A stop is recorded as clean only when no job
+  was running and this search was done everywhere: a stop during it, or a
+  library or output folder that was out of reach (missing, not responding,
+  or a library with files that is empty now), keeps it due, and a scan that
+  reaches such a library does the search there.
 
 ## Folder watching
 
@@ -249,7 +311,20 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   enabled library; marked running in the same transaction.
 - Jobs of a library whose folder is offline (missing, unreadable or empty)
   wait, and the folder is checked again every 15 s; a job whose file changed
-  moments ago waits for it to settle.
+  moments ago waits for it to settle. A job whose file doesn't answer within
+  30 s (a share whose server went away) goes back to the queue with its
+  library offline ("The folder … isn't responding…"), so it doesn't hold its
+  slot; Cancel and Stop end such a job at once.
+- Folder checks that may hang (`services::fs_guard`): library checks, the
+  job's look at its file, leftover searches and the folder picker run on a
+  blocking thread, one at a time per folder and kind of check (a caller that
+  comes while one is running waits for its answer, up to its own timeout),
+  and at most 64 at once; a check that can't start counts as not
+  responding. A hung share therefore costs one thread, not one per page
+  load.
+- A job that runs out of disk space (`disk_full`) while other jobs are
+  running is put back in the queue once and tried again a minute later (the
+  space reservation then makes it wait its turn); alone, it fails.
 - Each running job has a `CancellationToken`. Cancel → file `pending` (a
   file converted before stays `done`);
   "Stop now" and shutdown → job and file back to `queued`; deleting a library
@@ -296,7 +371,12 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   ("hardware detection finished", with hwdetect's own summary at DEBUG);
   each finished job logs one plain INFO line, its activity entry ("Converted
   …", "Skipped …", "Cancelled …"; failures at WARN). Job starts, attempts
-  and fallbacks are logged at DEBUG.
+  and fallbacks are logged at DEBUG. Every log message stays on one line:
+  line breaks (and, in activity lines, other control characters) in file
+  names are written as escapes, so a file name can't forge a log line.
+- A converted original with other hard links, converted anyway, saves
+  nothing: `files.saved_bytes`, the savings history and the activity line
+  ("Converted <name>", with the job's note) count no saving.
 - Watch events for a file are ignored while it is `queued`/`processing`;
   after its job ends the file is looked at again (as a watch event would).
   A file moved or deleted during its job (gone while its library folder is
@@ -358,11 +438,29 @@ with `JobSpec.force` uses it when `decide` says skip.
   returned as plain-language `notes`.
 
 **run_job**:
-1. Preparing: the input exists, `decide` agrees (`decide_forced` with
-   `force`), the destination is free and
-   its folder writable, and the temp folder has room (1.1× the original,
-   counting space promised to other running jobs; a job waits for room other
-   jobs hold). The input's size+mtime (`FileIdentity`) is recorded.
+1. Preparing: the input exists (answering within 60 s), `decide` agrees
+   (`decide_forced` with `force`), the destination is free and its folder
+   writable (a new name longer than 255 bytes, or one that can't be checked,
+   is refused here, not after the encode), and the temp folder has room.
+   The room reserved is what the encode may grow to: 1.1× the original,
+   1.5× without a size rule, 3× when the source codec is one step more
+   efficient than the target (HEVC/VP9 → H.264, AV1 → HEVC) and 4× for two
+   steps (AV1 → H.264), counting space promised to other running jobs (a
+   job waits for room other jobs hold); a job alone on the disk still runs
+   when 1.1× fits. The input's size+mtime (`FileIdentity`) is recorded.
+   When originals are replaced (and not with `force`), two kinds of file
+   are left as they are (`Skipped`): one with other hard links ("This file
+   has another hard link (for example a torrent that is still seeding), so
+   replacing it would use more space instead of saving it. It was left
+   unchanged; Convert anyway converts it all the same"; converted anyway,
+   the job notes "The original has another hard link (for example a seeding
+   torrent), so replacing it freed no space"), and one whose target
+   container can't hold its wanted picture-based subtitles or its
+   attachments (`plan::replace_loss`: "MP4 can't hold this file's 2
+   picture-based subtitles and 1 subtitle font, so it was left unchanged. To
+   convert it, choose an MKV goal or save converted files to a separate
+   folder; Convert anyway converts it without them"). Cancel and Stop end
+   the job at once even while these checks wait on a share.
 2. Transcoding: for each candidate, an attempt with `hw_decode` as given; a
    failed hardware attempt is retried with CPU decoding, then the next
    candidate. Stop at the first success. A failure that any encoder would
@@ -371,7 +469,11 @@ with `JobSpec.force` uses it when `decide` says skip.
    not starting at all. Cancellation kills ffmpeg at once
    (SIGKILL: the temp output is discarded anyway, and x265/SVT-AV1 ignore
    SIGTERM for seconds while they flush) and removes the temp file. A
-   process silent for 10 min counts as hung and is killed the same way.
+   process that makes no progress for 10 min counts as hung and is killed
+   the same way: progress is a progress block whose frame count, output
+   time or bytes written moved, or a new stderr line. (ffmpeg 7, as in the
+   Docker image, keeps printing identical blocks every half second while
+   it is stuck; those don't count.)
 3. A cut-off original: when ffmpeg reported damaged input or verification
    found the result too short, and the encode ended clearly before the length
    the container claims (> max(2 s, 5 %)), the job fails with "The original
@@ -388,7 +490,9 @@ with `JobSpec.force` uses it when `decide` says skip.
    Sonarr/Radarr upgrade) gives `Skipped` ("The original changed while it was
    being converted, so it was left alone").
 6. Verifying (below). A hardware result that fails moves on to the next
-   attempt; any other failure fails the job.
+   attempt; any other failure fails the job, unless the original changed
+   while it was being checked (the checks read it again): that is the
+   `Skipped` of step 5, not a failed check.
 7. Finalizing (below).
 
 stderr noise that means nothing (libnuma's `set_mempolicy: Operation not
@@ -423,9 +527,11 @@ child is started with `core::process::end_with_parent` (Linux
   from the original"); a `visual` check that couldn't compare the pictures
   at all (no video track found, no picture readable) leads with "The new
   file couldn't be compared with the original." A similarity score stays in
-  the check's detail (the report), never in the error, and every error ends
-  with what to do: "The original was kept. Try again, or choose lighter
-  checks in Settings > Output."
+  the check's detail (the report) as a percentage, like the UI shows it
+  ("Matches the original at 4 points (99.8% similar on average)"), never in
+  the error, and every error ends with what to do: "The original was kept.
+  Try again, or choose lighter checks in Settings › Output." Track counts
+  name each kind ("1 video track and 2 audio tracks").
 
 **finalize**: the verified temp file is first staged under a hidden name in the
 destination folder (a rename, or across filesystems a copy that is flushed to
@@ -437,8 +543,14 @@ checked to be the file the job read, a new name must still be free when the
 new file moves in, and any failure puts the backup back. (A backup name longer
 than 255 bytes: the new file is renamed in first, then a renamed original is
 deleted.) Folder mode: create folders, never overwrite, never touch the
-original. The new file gets the original's permission bits (and owner where
-allowed) and, with `keep_file_dates`, its times. After a crash,
+original. The new file gets the original's permission bits, its owner and
+group where allowed (the group alone when only that is), and, with
+`keep_file_dates`, its times; a new file that couldn't keep the owner or
+group gets a job note ("The new file couldn't keep the original's group
+(group 1001), so it is in group 100. If your media server can't open it,
+run Chrysopoeia as the owner of your media (PUID and PGID)"). MP4 and WebM
+can't hold attachments: the plan notes the fonts it leaves out ("Left out 2
+subtitle fonts because MP4 can't hold attachments"). After a crash,
 `resume_replace(input, final_path, job_id)` reports `Placed` (and deletes the
 backup) when the job's backup exists and the new file is in place — the
 original's name taken again (same path) or free with the new name present
@@ -459,8 +571,8 @@ and picks the fix by this code, never by reading sentences.
 |---|---|---|
 | `unreadable_source` | The original can't be read as a video, or stops early | ffprobe rejects it at scan time; a cut-off download ("The original file appears damaged or incomplete (it stops after 0.1 s)…"); no readable audio track; no read permission |
 | `work_folder` | The work folder (`settings.temp_dir` / `TEMP_DIR`) can't be used | a file in the way of its name; no write permission; a read-only drive |
-| `destination` | The new file can't be put where it belongs | a read-only library or no write permission (checked before encoding); a file already using the new name; folder mode without an output folder |
-| `disk_full` | Not enough room | the work folder can't hold ~1.1× the original even with no other job running; the disk filled up while encoding or copying |
+| `destination` | The new file can't be put where it belongs | a read-only library or no write permission (checked before encoding); a file already using the new name; a new name too long for the disk; folder mode without an output folder |
+| `disk_full` | Not enough room | the work folder can't hold ~1.1× the original even with no other job running; the disk filled up while encoding or copying (with other jobs running, the job is first tried again once) |
 | `encoder` | The encoder failed on every attempt | ffmpeg stops with an error, stops making progress for 10 min, or writes nothing |
 | `hardware_unavailable` | The hardware chosen in Settings can't make the codec and CPU fallback is off | also a worker given no encoder at all |
 | `verification` | The new file failed its checks on the last attempt | "The new file is shorter than the original …" |
@@ -475,7 +587,7 @@ only the job records it.
 activity feed, setup hints, API errors) is one or two plain sentences: what
 happened, then what to do ("The work folder /temp can't be used because a
 file with that name is in the way. Fix it, or choose another work folder, in
-Settings > Output."). Messages never carry raw OS errors or error numbers
+Settings › Output."). Messages never carry raw OS errors or error numbers
 (`chrysopoeia_core::plain::io_reason` turns an `io::Error` into a few words
 such as "the disk is full"), encoder names ("Converting on the NVIDIA GPU
 didn't work…", not `hevc_nvenc`), exit codes, or paths without saying what
@@ -538,8 +650,11 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 Other codes: 404 `not_found` (unknown path), `library_not_found`,
 `file_not_found`, `job_not_found`; 405 `method_not_allowed`; 400
 `invalid_json`, `invalid_request` (with `field` when serde names one),
-`invalid_query`, `invalid_path_param`, `invalid_status`, `invalid_sort`,
-`invalid_state`, `invalid_library`; 403 `host_not_allowed`,
+`invalid_query` (plain words naming the parameter, with `field`: "The value
+of "offset" isn't valid. It must be a whole number, 0 or more."),
+`invalid_path_param` (""not-a-uuid" isn't a valid id. …", never the
+parser's text), `invalid_status`, `invalid_sort`, `invalid_state` ("Filter
+jobs by all, active, running, queued or history."), `invalid_library`; 403 `host_not_allowed`,
 `forbidden_origin`; 409 `job_finished`; 413 `body_too_large`; 415
 `unsupported_media_type`. An ignore pattern that can't be used is refused
 with a plain reason naming it (`The ignore pattern "Movies/[abc" has a [
@@ -559,13 +674,22 @@ CORS preflight, which is never granted); it only serves the origin check
 below, for proxies that pass the upstream address as `Host`. Requests that
 change something and WebSocket upgrades carrying an `Origin`/`Referer` must
 come from the same host as `Host` or `X-Forwarded-Host`; else 403
-`forbidden_origin`. When `Host` (or
-`X-Forwarded-Host`) has no port, as reverse proxies such as Nginx Proxy
-Manager send it, only the host names are compared (`Origin:
-https://name:8443` matches `Host: name`); the host allowlist still keeps
-other websites out. Both refusals end with "If you use a reverse proxy,
-make it pass the original Host header." Requests without either (curl,
-scripts) pass. No CORS headers are sent (except with `--dev-cors`).
+`forbidden_origin`. A port left out means the default port of the origin's
+scheme. When `Host` (or `X-Forwarded-Host`) has no port and the request
+came through a reverse proxy (it carries `X-Forwarded-For`,
+`X-Forwarded-Host`, `X-Forwarded-Proto`, `Forwarded` or `X-Real-IP`), as
+Nginx Proxy Manager and others send it, only the host names are compared
+(`Origin: https://name:8443` matches `Host: name`); without a proxy, a page
+on another port of the same host is refused. The host allowlist still keeps
+other websites out. Browsers mark requests with `Sec-Fetch-Site`: `/api`
+requests marked `cross-site` are refused (reads too, e.g. a hidden image
+that makes the folder picker spin disks up), and `same-site` ones (a page
+on another port of the same host) must pass the origin check, so one
+without `Origin`/`Referer` is refused. Both refusals end with "If you use a
+reverse proxy, make it pass the original Host header." Requests without
+`Origin`, `Referer` and `Sec-Fetch-Site` (curl, scripts) pass. No CORS
+headers are sent (except with `--dev-cors`, which also skips the
+`Sec-Fetch-Site` check).
 
 ## Hardware detection (normative)
 

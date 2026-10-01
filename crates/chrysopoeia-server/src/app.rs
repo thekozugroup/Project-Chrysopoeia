@@ -113,7 +113,10 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
                 return Err(e);
             };
             tracing::error!("{damaged}");
-            let aside = db::move_damaged_aside(&db_path)?;
+            let to_move = db_path.clone();
+            let aside = tokio::task::spawn_blocking(move || db::move_damaged_aside(&to_move))
+                .await
+                .context("moving the damaged database aside was interrupted")??;
             let note = format!(
                 "The database was damaged, so Chrysopoeia moved it aside to {} and started \
                  with a new one. Your media files were not touched. Add your libraries and \
@@ -266,7 +269,8 @@ fn temp_dirs(state: &AppState) -> Vec<PathBuf> {
 /// an unmounted share); a scan that reaches one searches it later.
 pub async fn recover_artifacts(state: &AppState, include_libraries: bool) -> Vec<PathBuf> {
     // (folder, whether it must be searched later when it can't be now)
-    let mut roots: Vec<(PathBuf, bool)> = temp_dirs(state).into_iter().map(|d| (d, false)).collect();
+    let mut roots: Vec<(PathBuf, bool)> =
+        temp_dirs(state).into_iter().map(|d| (d, false)).collect();
     let mut libraries_with_files: Vec<PathBuf> = Vec::new();
     if include_libraries {
         match db::libraries::list(state.db.pool()).await {
@@ -405,11 +409,8 @@ pub async fn bind(config: &Config) -> anyhow::Result<TcpListener> {
 /// Serve HTTP until shutdown begins.
 pub async fn serve(state: AppState, listener: TcpListener) -> anyhow::Result<()> {
     let router = crate::web::app(state.clone()).await;
-    let shutdown = state.shutdown.clone();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await
-        .context("the HTTP server stopped")
+    crate::http::serve(listener, router, state.shutdown.clone()).await;
+    Ok(())
 }
 
 /// Begin shutting down: no new jobs, running jobs back to the queue, scans

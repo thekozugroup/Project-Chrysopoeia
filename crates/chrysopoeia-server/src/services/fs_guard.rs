@@ -80,10 +80,7 @@ async fn wait<T: Clone + 'static>(
 ) -> Option<T> {
     let answered = tokio::time::timeout(timeout, rx.wait_for(Option::is_some)).await;
     match answered {
-        Ok(Ok(answer)) => answer
-            .as_ref()
-            .and_then(|a| a.downcast_ref::<T>())
-            .cloned(),
+        Ok(Ok(answer)) => answer.as_ref().and_then(|a| a.downcast_ref::<T>()).cloned(),
         // Timed out, or the check panicked (its sender is gone).
         _ => None,
     }
@@ -97,9 +94,48 @@ pub async fn metadata(
 ) -> Option<Result<std::fs::Metadata, std::io::ErrorKind>> {
     let p = path.to_path_buf();
     guarded("metadata", path, timeout, move || {
+        #[cfg(test)]
+        hang::wait_while_hung(&p);
         std::fs::metadata(&p).map_err(|e| e.kind())
     })
     .await
+}
+
+/// Tests stand in for a share that stopped answering: [`metadata`] of a
+/// path marked hung blocks until the mark is lifted.
+#[cfg(test)]
+pub mod hang {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+    use std::time::Duration;
+
+    use crate::state::lock;
+
+    static HUNG: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+    /// Make [`super::metadata`] of `path` hang until the returned guard is
+    /// dropped (even by a failing test, whose runtime would otherwise wait
+    /// for the stuck thread forever).
+    pub fn hang(path: &Path) -> Hung {
+        lock(&HUNG).insert(path.to_path_buf());
+        Hung(path.to_path_buf())
+    }
+
+    /// Lets the path answer again when dropped.
+    pub struct Hung(PathBuf);
+
+    impl Drop for Hung {
+        fn drop(&mut self) {
+            lock(&HUNG).remove(&self.0);
+        }
+    }
+
+    pub(super) fn wait_while_hung(path: &Path) {
+        while lock(&HUNG).contains(path) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]

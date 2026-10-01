@@ -993,25 +993,24 @@ fn streams_check(output: &MediaProbe, expected: StreamSummary) -> CheckResult {
     }
 }
 
-/// "1 video, 2 audio and 1 subtitle tracks".
+/// "1 video track, 2 audio tracks and 1 subtitle track".
 fn describe_counts(c: StreamSummary) -> String {
-    let mut parts = vec![format!("{} video", c.video)];
+    let count =
+        |n: u32, kind: &str| format!("{n} {kind} {}", if n == 1 { "track" } else { "tracks" });
+    let mut parts = vec![count(c.video, "video")];
     if c.audio > 0 || c.subtitle > 0 {
-        parts.push(format!("{} audio", c.audio));
+        parts.push(count(c.audio, "audio"));
     }
     if c.subtitle > 0 {
-        parts.push(format!("{} subtitle", c.subtitle));
+        parts.push(count(c.subtitle, "subtitle"));
     }
-    let total = c.video + c.audio + c.subtitle;
-    let noun = if total == 1 { "track" } else { "tracks" };
-    let list = match parts.len() {
+    match parts.len() {
         1 => parts.remove(0),
         _ => {
             let last = parts.pop().unwrap_or_default();
             format!("{} and {last}", parts.join(", "))
         }
-    };
-    format!("{list} {noun}")
+    }
 }
 
 /// Source and output lengths measured the same way: picture and sound
@@ -1507,29 +1506,33 @@ fn summarize_segments(segments: &[SegmentStats]) -> VisualOutcome {
     let result = match (worst_frame, worst_segment) {
         (Some((at, v)), _) if v < FRAME_SSIM_FAIL => CheckResult::fail(
             format!(
-                "A frame near {} looks very different from the original (similarity {v:.2})",
-                format_time(at)
+                "A frame near {} looks very different from the original ({} similar)",
+                format_time(at),
+                similarity(v)
             ),
             Some(ssim_avg),
         ),
         (_, Some((at, v))) if v < SEGMENT_SSIM_FAIL => CheckResult::fail(
             format!(
-                "The picture near {} doesn't match the original (similarity {v:.2})",
-                format_time(at)
+                "The picture near {} doesn't match the original ({} similar)",
+                format_time(at),
+                similarity(v)
             ),
             Some(ssim_avg),
         ),
         _ if ssim_avg < OVERALL_SSIM_WARN => CheckResult::warn(
             format!(
-                "Noticeably softer than the original (average similarity {ssim_avg:.3} at {} points)",
+                "Noticeably softer than the original ({} similar on average at {} points)",
+                similarity(ssim_avg),
                 segments.len()
             ),
             Some(ssim_avg),
         ),
         _ => CheckResult::pass(
             format!(
-                "Matches the original at {} points (average similarity {ssim_avg:.3})",
-                segments.len()
+                "Matches the original at {} points ({} similar on average)",
+                segments.len(),
+                similarity(ssim_avg)
             ),
             Some(ssim_avg),
         ),
@@ -1642,6 +1645,17 @@ fn longest_run(values: &[f64], bad: impl Fn(f64) -> bool) -> Option<BadRun> {
     best
 }
 
+/// A similarity score (SSIM, 0 to 1) as the percentage the UI shows:
+/// `0.998` is "99.8%", and anything that rounds to 100 is "100%".
+fn similarity(ssim: f64) -> String {
+    let pct = ssim * 100.0;
+    if pct >= 99.95 {
+        "100%".to_string()
+    } else {
+        format!("{pct:.1}%")
+    }
+}
+
 /// Fold the full-length scan into the segment result.
 fn merge_scan(segments: CheckResult, scan: &ScanOutcome, align: &Alignment) -> CheckResult {
     let rate = if align.rate > 0.0 { align.rate } else { 25.0 };
@@ -1656,9 +1670,10 @@ fn merge_scan(segments: CheckResult, scan: &ScanOutcome, align: &Alignment) -> C
             };
             CheckResult::fail(
                 format!(
-                    "The picture from {} to {} {what} (similarity {low:.2})",
+                    "The picture from {} to {} {what} ({} similar)",
                     format_time(from),
-                    format_time(to)
+                    format_time(to),
+                    similarity(low)
                 ),
                 segments.value,
             )
@@ -2438,7 +2453,18 @@ async fn probe_media(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     chrysopoeia_core::process::end_with_parent(command.as_std_mut());
-    let child = command.spawn().map_err(|e| {
+    let spawned = crate::ffmpeg::spawn_patiently(
+        || command.spawn(),
+        &chrysopoeia_core::process::SPAWN_RETRY_DELAYS,
+        cancel,
+    )
+    .await;
+    let child = match spawned {
+        Ok(Some(child)) => Ok(child),
+        Ok(None) => return Err(ProbeError::Cancelled),
+        Err(e) => Err(e),
+    };
+    let child = child.map_err(|e| {
         ProbeError::Failed(if e.kind() == std::io::ErrorKind::NotFound {
             format!("ffprobe was not found at {}", ffprobe.display())
         } else {
@@ -2676,10 +2702,17 @@ mod tests {
             subtitle,
         };
         assert_eq!(describe_counts(c(1, 0, 0)), "1 video track");
-        assert_eq!(describe_counts(c(1, 1, 0)), "1 video and 1 audio tracks");
+        assert_eq!(
+            describe_counts(c(1, 1, 0)),
+            "1 video track and 1 audio track"
+        );
         assert_eq!(
             describe_counts(c(1, 2, 1)),
-            "1 video, 2 audio and 1 subtitle tracks"
+            "1 video track, 2 audio tracks and 1 subtitle track"
+        );
+        assert_eq!(
+            describe_counts(c(2, 0, 3)),
+            "2 video tracks, 0 audio tracks and 3 subtitle tracks"
         );
     }
 
@@ -2804,7 +2837,7 @@ mod tests {
         assert_eq!(result.status, CheckStatus::Fail);
         assert_eq!(
             result.detail,
-            "The picture from 10.0 s to 11.7 s is damaged (similarity 0.20)"
+            "The picture from 10.0 s to 11.7 s is damaged (20.0% similar)"
         );
         let result = merge_scan(
             CheckResult::pass("Matches the original at 10 points", Some(0.99)),

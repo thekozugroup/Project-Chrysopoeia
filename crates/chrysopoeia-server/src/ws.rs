@@ -18,9 +18,16 @@ use crate::state::AppState;
 /// Interval between server pings.
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Largest message a client may send. The UI only answers pings and
+/// closes; the default (64 MB) would let one client make the server hold a
+/// lot of memory.
+pub const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
+
 /// Upgrade handler.
 pub async fn handler(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| session(state, socket))
+    ws.max_message_size(MAX_CLIENT_MESSAGE)
+        .max_frame_size(MAX_CLIENT_MESSAGE)
+        .on_upgrade(move |socket| session(state, socket))
 }
 
 fn encode(event: &Event) -> Option<Message> {
