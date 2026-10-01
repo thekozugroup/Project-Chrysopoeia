@@ -457,6 +457,16 @@ export function FolderPicker({
         )}
       </div>
 
+      {/* Right above the button it explains, so it is in view on a phone. */}
+      {conflict ? (
+        <p id={conflictId} role="status" className="border-t border-warning/30 bg-warning-soft px-4 py-2.5 text-[0.8125rem] font-medium text-fg">
+          {conflict}
+        </p>
+      ) : error ? (
+        <p role="alert" className="border-t border-danger/30 bg-danger-soft px-4 py-2.5 text-[0.8125rem] font-medium text-danger">
+          {error}
+        </p>
+      ) : null}
       <div className="flex flex-col gap-2 border-t border-line bg-sunken/60 px-3 py-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="min-w-0 text-[0.8125rem] text-muted">
           <span className="sr-only">Current folder: </span>
@@ -478,15 +488,6 @@ export function FolderPicker({
           )}
         </Button>
       </div>
-      {conflict ? (
-        <p id={conflictId} role="status" className="border-t border-warning/30 bg-warning-soft px-4 py-2.5 text-[0.8125rem] font-medium text-fg">
-          {conflict}
-        </p>
-      ) : error ? (
-        <p role="alert" className="border-t border-danger/30 bg-danger-soft px-4 py-2.5 text-[0.8125rem] font-medium text-danger">
-          {error}
-        </p>
-      ) : null}
     </div>
   );
 }

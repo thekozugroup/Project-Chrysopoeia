@@ -1168,11 +1168,8 @@ export function LibraryScreen({ id, route }: { id: string; route: Route }) {
       <Header library={library} />
       {library.path_error ? (
         <Callout tone="warning" title="Chrysopoeia can't read this folder" className="mb-6">
+          {/* The server's sentence says what to check for this kind of problem. */}
           <p>{library.path_error}</p>
-          <p className="mt-1">
-            Make sure the folder is mapped into the container (for example{" "}
-            <code className="font-mono text-xs">-v /mnt/user/media:/media</code>) and readable, then scan again.
-          </p>
         </Callout>
       ) : null}
       <Summary library={library} />

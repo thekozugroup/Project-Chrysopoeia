@@ -1693,7 +1693,8 @@ pub async fn root_unavailable(path: &str) -> Option<String> {
 fn check_path(path: &str) -> Option<String> {
     match std::fs::metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(format!(
-            "The folder {path} is missing. If it's on a drive or network share, check that it's connected."
+            "The folder {path} is missing. If it's on a drive or network share, check that it's connected; \
+             in Docker, check that it's mapped into the container."
         )),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(format!(
             "Chrysopoeia doesn't have permission to open {path}. Check the folder's permissions \
