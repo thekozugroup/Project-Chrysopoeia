@@ -631,6 +631,10 @@ impl Job<'_> {
         outcome
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is the job's outcome, made once per job and returned at once"
+    )]
     async fn prepare(&self) -> Result<Prepared, JobOutcome> {
         let (cfg, spec) = (self.cfg, self.spec);
         if let Some(gone) = slow_fs::first_unmounted(&spec.mounts).await {
@@ -811,6 +815,10 @@ impl Job<'_> {
     /// There the reservation (at most the largest result the size rule
     /// keeps) only makes parallel jobs take turns, and `finalize` checks the
     /// real size before copying.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is the job's outcome, made once per job and returned at once"
+    )]
     async fn reserve_space(
         &self,
         input_size: u64,
@@ -874,6 +882,10 @@ impl Job<'_> {
     /// [`crate::plan::CoverFile`]). Each is copied once per job: every
     /// attempt attaches the same files. A cover that can't be copied fails
     /// the job (the original is left unchanged) rather than being lost.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is the job's outcome, made once per job and returned at once"
+    )]
     async fn extract_covers(
         &self,
         covers: &[CoverFile],

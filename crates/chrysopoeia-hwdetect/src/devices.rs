@@ -405,7 +405,7 @@ fn sorted_entries(dir: &Path) -> Vec<(String, PathBuf)> {
         .filter_map(Result::ok)
         .map(|e| (e.file_name().to_string_lossy().into_owned(), e.path()))
         .collect();
-    out.sort_by(|a, b| natural_key(&a.0).cmp(&natural_key(&b.0)));
+    out.sort_by_key(|e| natural_key(&e.0));
     out
 }
 

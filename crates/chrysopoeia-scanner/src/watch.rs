@@ -1145,12 +1145,8 @@ impl Pending {
         }
         match readable {
             Some(true) => return Verdict::Ready,
-            Some(false) => {
-                if self.in_trouble_too_long(now, settle) {
-                    return Verdict::GiveUp;
-                }
-            }
-            None => {}
+            Some(false) if self.in_trouble_too_long(now, settle) => return Verdict::GiveUp,
+            Some(false) | None => {}
         }
         let due = self.stable_since.max(self.last_event) + settle;
         self.next_check = if due > now { due } else { now + settle };
