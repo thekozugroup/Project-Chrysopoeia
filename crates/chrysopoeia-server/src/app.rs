@@ -21,7 +21,9 @@ use tokio::net::TcpListener;
 use crate::config::Config;
 use crate::db::activity::ActivityRefs;
 use crate::db::{self, DB_FILE_NAME, Db};
-use crate::services::{dispatcher, hardware, library, library_admin, rescan, watcher};
+use crate::services::{
+    dispatcher, hardware, library, library_admin, rescan, share_mounts, watcher,
+};
 use crate::state::{AppState, lock};
 use crate::toolkit::Toolkit;
 
@@ -189,6 +191,10 @@ pub async fn build(config: Config, toolkit: Toolkit) -> anyhow::Result<(AppState
             }
         }
     }
+    // What is mounted at the mount points an older version remembered
+    // without it is noted before anything looks at a folder (only the list
+    // of mounts is read).
+    share_mounts::note_unknown(&state).await;
     dispatcher::complete_interrupted(&state).await;
     let requeued_jobs = db::jobs::recover_interrupted(&state.db).await?;
     if requeued_jobs > 0 {
@@ -416,6 +422,7 @@ pub fn start_background(state: &AppState, startup: Startup) {
     tokio::spawn(hardware::recheck_loop(state.clone()));
     tokio::spawn(rescan::run(state.clone()));
     tokio::spawn(rescan::trim_history_loop(state.clone()));
+    tokio::spawn(share_mounts::note_unknown_loop(state.clone()));
 }
 
 /// Scans at start: libraries never scanned, and, when changes are meant to

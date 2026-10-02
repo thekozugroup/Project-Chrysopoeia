@@ -926,18 +926,18 @@ async fn run_scan(state: &AppState, id: Uuid, cancel: &CancellationToken) -> any
     };
     let started = Instant::now();
     state.emit(scan_progress(&lib, ScanPhase::Discovering, 0, 0, 0));
-    // The share the library is on isn't mounted: its mount point is an
-    // ordinary folder, whose files (or lack of them) say nothing about the
+    // The share the library is on isn't mounted (or something else is
+    // mounted in its place): its mount point is an ordinary folder, or
+    // another drive, whose files (or lack of them) say nothing about the
     // library's.
-    if let Mounted::No(mount) = share_mounts::check(state, Path::new(&lib.path)).await {
+    if let Some(problem) = share_mounts::check(state, Path::new(&lib.path))
+        .await
+        .problem()
+    {
         state
             .library_activity(
                 ActivityLevel::Error,
-                format!(
-                    "Couldn't scan {}. {}",
-                    lib.name,
-                    share_mounts::not_connected(&mount)
-                ),
+                format!("Couldn't scan {}. {problem}", lib.name),
                 id,
             )
             .await;
@@ -1828,27 +1828,27 @@ pub async fn path_problem(path: &str) -> Folder {
 
 /// Whether a folder the app uses (the output folder, the work folder, a
 /// library folder as the folder picker shows it) can be used right now:
-/// the drive or share it was seen mounted from is still mounted (see
-/// [`share_mounts`]), and [`path_problem`].
+/// the drive or share it was seen mounted from is still mounted, and
+/// nothing else in its place (see [`share_mounts`]), and [`path_problem`].
 pub async fn folder_unavailable(state: &AppState, path: &str) -> Folder {
     match share_mounts::check(state, Path::new(path)).await {
         Mounted::Yes(_) => path_problem(path).await,
-        Mounted::No(mount) => Folder::Problem(share_mounts::not_connected(&mount)),
         Mounted::Unknown => Folder::Unknown,
+        unmounted => Folder::Problem(unmounted.problem().unwrap_or_default()),
     }
 }
 
 /// Whether a library folder can hold the files the queue expects right now:
-/// the drive or share it was seen mounted from is still mounted (an
-/// unmounted share leaves its mount point behind as an ordinary folder, see
-/// [`share_mounts`]), [`path_problem`], and a folder with nothing in it at
+/// the drive or share it was seen mounted from is still mounted, and
+/// nothing else in its place (an unmounted share leaves its mount point
+/// behind as an ordinary folder, see [`share_mounts`]), [`path_problem`], and a folder with nothing in it at
 /// all, which for a library with files almost always means an unmounted
 /// drive or share too (one not seen mounted yet), is a problem as well.
 pub async fn root_unavailable(state: &AppState, path: &str) -> Folder {
     match share_mounts::check(state, Path::new(path)).await {
         Mounted::Yes(_) => {}
-        Mounted::No(mount) => return Folder::Problem(share_mounts::not_connected(&mount)),
         Mounted::Unknown => return Folder::Unknown,
+        unmounted => return Folder::Problem(unmounted.problem().unwrap_or_default()),
     }
     let p = path.to_string();
     let looked = fs_guard::guarded(
@@ -1903,12 +1903,7 @@ fn check_path(path: &str) -> Option<String> {
     }
 }
 
-fn assemble(
-    row: LibraryRow,
-    stats: LibraryStats,
-    scanning: bool,
-    path_error: Option<String>,
-) -> Library {
+fn assemble(row: LibraryRow, stats: LibraryStats, scanning: bool, problem: Problem) -> Library {
     Library {
         id: row.id,
         name: row.name,
@@ -1918,19 +1913,42 @@ fn assemble(
         stats,
         scanning,
         last_scan_at: row.last_scan_at,
-        path_error,
+        path_error: problem.reason,
+        changed_mount: problem.changed_mount,
         created_at: row.created_at,
     }
 }
 
+/// Why a library's folder can't be used (see [`library_problem`]).
+#[derive(Debug, Default)]
+struct Problem {
+    reason: Option<String>,
+    /// The problem is another drive mounted where one was seen: there.
+    changed_mount: Option<String>,
+}
+
 /// Why a library's folder can't be used: a problem with the folder itself,
 /// or the reason the queue is waiting for it (e.g. a share mounted empty).
-async fn library_problem(state: &AppState, row: &LibraryRow) -> Option<String> {
-    match folder_unavailable(state, &row.path).await {
+/// When that is another drive mounted where a folder its jobs use was seen
+/// mounted from, the mount point too, so the user can say to use that one.
+async fn library_problem(state: &AppState, row: &LibraryRow) -> Problem {
+    let reason = match folder_unavailable(state, &row.path).await {
         Folder::Problem(p) => Some(p),
         // Not looked at (too many checks stuck elsewhere): no problem is
         // claimed for it.
         Folder::Fine | Folder::Unknown => state.dispatcher.offline_reason(row.id),
+    };
+    let Some(reason) = reason else {
+        return Problem::default();
+    };
+    let changed = share_mounts::changed_mounts(state, row.id, Path::new(&row.path)).await;
+    let changed_mount = changed
+        .iter()
+        .find(|m| reason == share_mounts::different_drive(m))
+        .map(|m| m.display().to_string());
+    Problem {
+        reason: Some(reason),
+        changed_mount,
     }
 }
 

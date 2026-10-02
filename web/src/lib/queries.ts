@@ -45,6 +45,8 @@ export const keys = {
   job: (id: string) => ["job", id] as const,
   queue: ["queue"] as const,
   settings: ["settings"] as const,
+  /** The output and work folders in use and their drives (see `useSettingsFolders`). */
+  settingsFolders: ["settings-folders"] as const,
   hardware: ["hardware"] as const,
   presets: ["presets"] as const,
   browse: (path: string | undefined) => ["browse", path ?? ""] as const,
@@ -141,6 +143,20 @@ export function useQueueState() {
 
 export function useSettings() {
   return useQuery({ queryKey: keys.settings, queryFn: ({ signal }) => api.settings(signal) });
+}
+
+/**
+ * The output and work folders in use, and whether the drives and shares
+ * they sit on are connected as they were (`GET /api/settings/folders`).
+ * Looked at again every 15 s while shown, as a share comes and goes by
+ * itself.
+ */
+export function useSettingsFolders() {
+  return useQuery({
+    queryKey: keys.settingsFolders,
+    queryFn: ({ signal }) => api.settingsFolders(signal),
+    refetchInterval: 15_000,
+  });
 }
 
 /**

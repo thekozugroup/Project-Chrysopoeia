@@ -18,7 +18,7 @@ use chrysopoeia_core::{
 };
 use chrysopoeia_worker::finalize::hold::{self, Step};
 use chrysopoeia_worker::run::{JobOutcome, JobSpec, RunConfig, run_job_with, take_unfinished};
-use chrysopoeia_worker::slow_fs::{FOLDER_CHECK_TIMEOUT, hang};
+use chrysopoeia_worker::slow_fs::{FOLDER_CHECK_TIMEOUT, KnownMount, hang};
 use chrysopoeia_worker::{Decision, FfmpegPlan, PlanRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -349,13 +349,16 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 /// The output folder is a share that isn't mounted when the job starts,
-/// or is unmounted while it encodes: its mount point is an ordinary folder
-/// then, and the job writes nothing there. It ends with `NotResponding`
-/// for the share, and the original is left alone.
+/// or is unmounted while it encodes, or has another filesystem mounted in
+/// its place while it encodes (a tmpfs, the bare folder bind-mounted onto
+/// itself): its mount point is not the share then, and the job writes
+/// nothing there. It ends with `NotResponding` for the share, and the
+/// original is left alone. Before, another filesystem at the mount point
+/// was taken for the share, and the new file went there.
 #[tokio::test]
 async fn nothing_is_written_where_a_share_was_unmounted() {
     require_ffmpeg!();
-    for mid_encode in [false, true] {
+    for (mid_encode, other) in [(false, false), (true, false), (true, true)] {
         let (dir, lib, input, original) = library();
         let (out, work) = (dir.path().join("out"), dir.path().join("work"));
         std::fs::create_dir(&out).unwrap();
@@ -367,8 +370,12 @@ async fn nothing_is_written_where_a_share_was_unmounted() {
             ..config()
         };
         let mut spec = spec(&input, &lib);
-        spec.mounts = vec![out.clone()];
+        spec.mounts = vec![KnownMount {
+            point: out.clone(),
+            identity: Some(hang::share_at(&out)),
+        }];
         let mut mounted = mid_encode.then(|| hang::mount(&out));
+        let mut replaced = None;
         let (tx, mut rx) = mpsc::channel(1024);
         let job = tokio::spawn({
             let (cfg, spec) = (cfg.clone(), spec.clone());
@@ -388,6 +395,9 @@ async fn nothing_is_written_where_a_share_was_unmounted() {
             while let Some(p) = rx.recv().await {
                 if p.stage == chrysopoeia_core::JobStage::Transcoding && p.progress > 0.0 {
                     mounted = None;
+                    if other {
+                        replaced = Some(hang::mount_other(&out, "tmpfs"));
+                    }
                     break;
                 }
             }
@@ -400,10 +410,11 @@ async fn nothing_is_written_where_a_share_was_unmounted() {
         assert_eq!(
             outcome,
             JobOutcome::NotResponding { path: out.clone() },
-            "mid encode: {mid_encode}"
+            "mid encode: {mid_encode}, another filesystem: {other}"
         );
         assert!(names(&out).is_empty(), "nothing written: {:?}", names(&out));
         assert_eq!(std::fs::read(&input).unwrap(), original);
         wait_for("the temp file to go", || names(&work).is_empty()).await;
+        drop(replaced);
     }
 }

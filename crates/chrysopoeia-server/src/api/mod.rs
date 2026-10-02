@@ -71,6 +71,10 @@ pub fn router() -> Router<AppState> {
                 .delete(libraries::delete),
         )
         .route("/libraries/{id}/scan", post(libraries::scan))
+        .route(
+            "/libraries/{id}/relearn-mounts",
+            post(libraries::relearn_mounts),
+        )
         .route("/scan", post(libraries::scan_all))
         .route("/files", get(files::list))
         .route("/files/bulk", post(files::bulk))
@@ -87,6 +91,8 @@ pub fn router() -> Router<AppState> {
         .route("/queue/resume", post(queue::resume))
         .route("/queue/stop", post(queue::stop))
         .route("/settings", get(settings::get).patch(settings::update))
+        .route("/settings/folders", get(settings::folders))
+        .route("/settings/relearn-mounts", post(settings::relearn_mounts))
         .route("/hardware", get(hardware::get))
         .route("/hardware/detect", post(hardware::detect))
         .route("/presets", get(presets::get))

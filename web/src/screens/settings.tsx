@@ -10,6 +10,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Minus, Plus } from "lucide-react";
 import { useEffect, useId, useState, type ReactNode } from "react";
 import { toast } from "sonner";
+import { UseDriveButton, UseDriveConfirm } from "@/components/drive-change";
 import { FolderField } from "@/components/folder-field";
 import { ProfileEditor } from "@/components/profile-editor";
 import { SaveBar } from "@/components/save-bar";
@@ -30,6 +31,7 @@ import {
   usePresets,
   useQueueState,
   useSettings,
+  useSettingsFolders,
   useSetupProblems,
   useSystem,
 } from "@/lib/queries";
@@ -45,7 +47,7 @@ import {
   type ProfileErrors,
   type SectionId,
 } from "@/lib/settings-form";
-import type { Goal, QueueState, Settings, SystemInfo, ValidationLevel } from "@/lib/types";
+import type { FolderSetting, Goal, QueueState, Settings, SystemInfo, ValidationLevel } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { HardwareSection } from "./settings-hardware";
 
@@ -368,7 +370,67 @@ function RecentProblem({ kinds }: { kinds: SetupProblem[] }) {
   return null;
 }
 
-function OutputSection({ draft, onChange, errors, focus }: SectionProps & { focus: string | null }) {
+/**
+ * The drive or share the output or work folder (as saved) sits on isn't
+ * connected as it was: said where the folder is chosen, in the server's
+ * words. When another drive is mounted in its place, the user can say to
+ * use that one, after a confirmation that says what it means. (Picking
+ * the same folder again changes nothing: the bare mount point of a share
+ * that isn't connected must never be taken for the share.) Hidden while
+ * another folder is picked in the draft.
+ */
+export function FolderDriveNotice({ setting, shown }: { setting: FolderSetting; shown: boolean }) {
+  const client = useQueryClient();
+  const folders = useSettingsFolders();
+  const [confirming, setConfirming] = useState(false);
+  const status = folders.data?.find((f) => f.setting === setting);
+  const mount = status?.changed_mount ?? null;
+  const relearn = useMutation({
+    mutationFn: () => api.relearnFolderMounts(),
+    onSuccess: (next) => {
+      client.setQueryData(keys.settingsFolders, next);
+      void client.invalidateQueries({ queryKey: keys.libraries });
+      void client.invalidateQueries({ queryKey: keys.queue });
+      setConfirming(false);
+      toast.success("Using the drive that's there now", {
+        description: `New files go to the drive mounted at ${mount ?? "that place"}.`,
+      });
+    },
+    onError: (err) => {
+      setConfirming(false);
+      toast.error("Couldn't change that", { description: errorMessage(err) });
+    },
+  });
+  if (!shown || !status?.problem) return null;
+  return (
+    <>
+      <Callout
+        tone="warning"
+        title={mount ? "A different drive is mounted" : "This folder's drive isn't connected"}
+        action={mount ? <UseDriveButton onClick={() => setConfirming(true)} /> : null}
+      >
+        <p>{status.problem}</p>
+      </Callout>
+      {mount ? (
+        <UseDriveConfirm
+          open={confirming}
+          onOpenChange={setConfirming}
+          mount={mount}
+          loading={relearn.isPending}
+          onConfirm={() => relearn.mutate()}
+        />
+      ) : null}
+    </>
+  );
+}
+
+function OutputSection({
+  draft,
+  onChange,
+  errors,
+  focus,
+  saved,
+}: SectionProps & { focus: string | null; saved: Settings }) {
   const name = useId();
   const tempName = useId();
   const system = useSystem();
@@ -381,6 +443,10 @@ function OutputSection({ draft, onChange, errors, focus }: SectionProps & { focu
         anchor="output_folder"
       >
         <RecentProblem kinds={["destination"]} />
+        <FolderDriveNotice
+          setting="output_folder"
+          shown={draft.output_mode === "folder" && draft.output_folder === saved.output_folder}
+        />
         <fieldset className="flex flex-col gap-3">
           <legend className="sr-only">Where finished files go</legend>
           <ChoiceCard
@@ -432,6 +498,7 @@ function OutputSection({ draft, onChange, errors, focus }: SectionProps & { focu
         anchor="temp_dir"
       >
         <RecentProblem kinds={["work_folder", "disk_full"]} />
+        <FolderDriveNotice setting="temp_dir" shown={draft.temp_dir === saved.temp_dir} />
         <fieldset className="flex flex-col gap-3">
           <legend className="sr-only">Work folder</legend>
           <ChoiceCard
@@ -699,6 +766,7 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
     onSuccess: (next) => {
       client.setQueryData(keys.settings, next);
       void client.invalidateQueries({ queryKey: keys.queue });
+      void client.invalidateQueries({ queryKey: keys.settingsFolders });
       setBase(next);
       setDraft(next);
       setErrors({});
@@ -724,7 +792,7 @@ function SettingsForm({ settings, section, focus }: { settings: Settings; sectio
   return (
     <>
       {section === "processing" ? <ProcessingSection {...sectionProps} /> : null}
-      {section === "output" ? <OutputSection {...sectionProps} focus={focus} /> : null}
+      {section === "output" ? <OutputSection {...sectionProps} focus={focus} saved={base} /> : null}
       {section === "hardware" ? <HardwareSection draft={draft} onChange={onChange} /> : null}
       {/* Kept mounted while hidden, so text typed there (valid or not) isn't
           lost on switching sections, and invalid text keeps blocking Save. */}

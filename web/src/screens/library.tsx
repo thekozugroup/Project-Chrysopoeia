@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
+import { UseDriveButton, UseDriveConfirm } from "@/components/drive-change";
 import { FileName } from "@/components/file-name";
 import { LibraryBar, LibraryLegend, countedFiles } from "@/components/library-bar";
 import { ProfileEditor } from "@/components/profile-editor";
@@ -121,6 +122,58 @@ function useLibraryActions(library: Library) {
   });
 
   return { scan, setEnabled, remove };
+}
+
+/**
+ * What keeps the library's folder from being used, as the server says it.
+ * When that is another drive mounted where the library's drive (or the
+ * output or work folder's) was, the user can say to use the one there now,
+ * after a confirmation that says what that means.
+ */
+export function FolderProblem({ library }: { library: Library }) {
+  const client = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const mount = library.changed_mount ?? null;
+  const relearn = useMutation({
+    mutationFn: () => api.relearnMounts(library.id),
+    onSuccess: (updated) => {
+      client.setQueryData<Library[]>(keys.libraries, (old) => old?.map((l) => (l.id === updated.id ? updated : l)));
+      void client.invalidateQueries({ queryKey: keys.libraries });
+      void client.invalidateQueries({ queryKey: keys.queue });
+      void client.invalidateQueries({ queryKey: keys.settingsFolders });
+      setConfirming(false);
+      toast.success("Using the drive that's there now", {
+        description: `${library.name} goes on with the drive mounted at ${mount ?? "that place"}.`,
+      });
+    },
+    onError: (err) => {
+      setConfirming(false);
+      toast.error("Couldn't change that", { description: errorMessage(err) });
+    },
+  });
+  if (!library.path_error) return null;
+  return (
+    <>
+      <Callout
+        tone="warning"
+        title={mount ? "A different drive is mounted" : "Chrysopoeia can't read this folder"}
+        className="mb-6"
+        action={mount ? <UseDriveButton onClick={() => setConfirming(true)} /> : null}
+      >
+        {/* The server's sentence says what to check for this kind of problem. */}
+        <p>{library.path_error}</p>
+      </Callout>
+      {mount ? (
+        <UseDriveConfirm
+          open={confirming}
+          onOpenChange={setConfirming}
+          mount={mount}
+          loading={relearn.isPending}
+          onConfirm={() => relearn.mutate()}
+        />
+      ) : null}
+    </>
+  );
 }
 
 function ScanBanner({ library }: { library: Library }) {
@@ -1166,12 +1219,7 @@ export function LibraryScreen({ id, route }: { id: string; route: Route }) {
   return (
     <div>
       <Header library={library} />
-      {library.path_error ? (
-        <Callout tone="warning" title="Chrysopoeia can't read this folder" className="mb-6">
-          {/* The server's sentence says what to check for this kind of problem. */}
-          <p>{library.path_error}</p>
-        </Callout>
-      ) : null}
+      <FolderProblem library={library} />
       <Summary library={library} />
       <ScanBanner library={library} />
       <SetupNotice library={library} />

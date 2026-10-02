@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -316,6 +316,22 @@ const MIGRATION_V12: &[&str] = &["CREATE TABLE folder_mounts (
         PRIMARY KEY (folder, mount)
     )"];
 
+/// Version 13: what was mounted at each remembered mount point
+/// (`folder_mounts.fstype`, `source` and `root`, from
+/// `/proc/self/mountinfo`), so another filesystem mounted at that place (a
+/// tmpfs, the bare folder bind-mounted onto itself) isn't taken for the
+/// share; and `jobs.final_mount`, the mount the folder a job's new file goes
+/// into was on when it started (JSON: `point`, `fstype`, `source`, `root`),
+/// so its new file is only looked for on that mount when its placing is
+/// settled. The mount points remembered before are noted with what is
+/// mounted there at the next look at them.
+const MIGRATION_V13: &[&str] = &[
+    "ALTER TABLE folder_mounts ADD COLUMN fstype TEXT",
+    "ALTER TABLE folder_mounts ADD COLUMN source TEXT",
+    "ALTER TABLE folder_mounts ADD COLUMN root TEXT",
+    "ALTER TABLE jobs ADD COLUMN final_mount TEXT",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -329,6 +345,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (10, MIGRATION_V10),
     (11, MIGRATION_V11),
     (12, MIGRATION_V12),
+    (13, MIGRATION_V13),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -1251,7 +1268,11 @@ mod tests {
             .unwrap();
         assert_eq!(inner, ["/mnt/nas/Movies/USB"]);
         let mut tx = db.write_tx().await.unwrap();
-        crate::db::folder_mounts::add(&mut tx, "/mnt/nas/Movies", &["/mnt/nas".to_string()])
+        let nas = crate::db::folder_mounts::FolderMount {
+            mount: "/mnt/nas".to_string(),
+            identity: None,
+        };
+        crate::db::folder_mounts::add(&mut tx, "/mnt/nas/Movies", std::slice::from_ref(&nas))
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -1259,8 +1280,77 @@ mod tests {
             crate::db::folder_mounts::get(db.pool(), "/mnt/nas/Movies")
                 .await
                 .unwrap(),
-            ["/mnt/nas"]
+            [nas]
         );
+    }
+
+    /// Version 13 keeps the mount points remembered before, with nothing
+    /// noted about what was mounted there; the first look at one notes it,
+    /// and later looks don't change it.
+    #[tokio::test]
+    async fn version_13_notes_what_is_mounted_at_remembered_mount_points() {
+        use crate::db::folder_mounts::{self, FolderMount};
+        use chrysopoeia_worker::slow_fs::MountIdentity;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v12.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 12).await.unwrap();
+            sqlx::query("INSERT INTO folder_mounts (folder, mount) VALUES (?, ?)")
+                .bind("/out")
+                .bind("/out")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let unknown = FolderMount {
+            mount: "/out".to_string(),
+            identity: None,
+        };
+        assert_eq!(
+            folder_mounts::get(db.pool(), "/out").await.unwrap(),
+            [unknown]
+        );
+        let share = MountIdentity {
+            fstype: "nfs4".to_string(),
+            source: "nas:/export".to_string(),
+            root: "/".to_string(),
+        };
+        let other = MountIdentity {
+            fstype: "tmpfs".to_string(),
+            source: "tmpfs".to_string(),
+            root: "/".to_string(),
+        };
+        for seen in [&share, &other] {
+            let mut tx = db.write_tx().await.unwrap();
+            let m = FolderMount {
+                mount: "/out".to_string(),
+                identity: Some(seen.clone()),
+            };
+            folder_mounts::add(&mut tx, "/out", &[m]).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        let noted = folder_mounts::get(db.pool(), "/out").await.unwrap();
+        assert_eq!(noted[0].identity.as_ref(), Some(&share));
+        // Told to use the other one.
+        let mut tx = db.write_tx().await.unwrap();
+        folder_mounts::set_identity(&mut tx, "/out", "/out", &other)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let noted = folder_mounts::get(db.pool(), "/out").await.unwrap();
+        assert_eq!(noted[0].identity.as_ref(), Some(&other));
+        let final_mount: Option<String> =
+            sqlx::query_scalar("SELECT final_mount FROM jobs LIMIT 1")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap()
+                .flatten();
+        assert_eq!(final_mount, None);
     }
 
     #[tokio::test]

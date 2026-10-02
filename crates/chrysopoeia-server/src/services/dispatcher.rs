@@ -32,7 +32,7 @@ use chrysopoeia_core::{
 use chrysopoeia_scanner::WatchEvent;
 use chrysopoeia_worker::finalize::{Interrupted, Unreadable, final_output_path, output_name_taken};
 use chrysopoeia_worker::run::Unfinished;
-use chrysopoeia_worker::slow_fs::{self, NotAnswering, WATCH_INTERVAL};
+use chrysopoeia_worker::slow_fs::{self, KnownMount, NotAnswering, WATCH_INTERVAL};
 use chrysopoeia_worker::{Decision, JobOutcome, JobSpec, RunConfig};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -637,6 +637,16 @@ enum Recheck {
     Back,
 }
 
+/// Check every offline library folder again now (normally every
+/// [`OFFLINE_RECHECK`]), and let the jobs of those that are back run.
+pub async fn recheck_all_offline(state: &AppState) {
+    for o in lock(&state.dispatcher.offline).values_mut() {
+        o.next_check = Instant::now();
+    }
+    recheck_offline(state).await;
+    state.dispatcher.wake();
+}
+
 /// Check offline library folders that are due, and let the jobs of those
 /// that are back run again.
 async fn recheck_offline(state: &AppState) {
@@ -668,7 +678,7 @@ async fn recheck_offline(state: &AppState) {
             // answering inside it (or elsewhere) answers too: "not found"
             // is an answer, an error is not (a share that answers with
             // errors is still out of reach).
-            Folder::Fine => match job_folders(state, &lib.path).await {
+            Folder::Fine => match job_folders(state, lib.id, &lib.path).await {
                 Connected::No { reason, .. } => Recheck::Offline(reason),
                 Connected::Unknown => Recheck::Unknown,
                 Connected::Yes(_) => match &check {
@@ -1244,7 +1254,7 @@ async fn execute(
     // A share the job's folders are on that is no longer mounted leaves an
     // ordinary folder where it was: nothing is read from it, settled on it
     // or written into it. The job waits for it.
-    let mounts = match or_cancelled!(job_folders(state, &lib.path)) {
+    let mut mounts = match or_cancelled!(job_folders(state, lib.id, &lib.path)) {
         Connected::Yes(mounts) => mounts,
         Connected::No { reason, check } => return offline(reason, check, ctx),
         Connected::Unknown => return busy(ctx),
@@ -1463,10 +1473,25 @@ async fn execute(
         Path::new(&lib.path),
     );
     let goal = db::files::profile_json(&lib.profile).ok();
+    // The mount the new file goes into (a share mounted inside the output
+    // folder, or reached through a link, say): its new file is only looked
+    // for on it when its placing has to be settled, and the worker writes
+    // nothing once it isn't mounted there as it is now.
+    let final_mount = match final_path.parent() {
+        Some(folder) if converts => or_cancelled!(share_mounts::mount_of(folder)),
+        _ => None,
+    };
     if let Some(p) = final_path.to_str() {
         let place = converts.then_some(p);
-        match db::jobs::claim_destination(&state.db, job.id, file.id, place, goal.as_deref()).await
-        {
+        let claimed = db::jobs::claim_destination(
+            &state.db,
+            job.id,
+            file.id,
+            place,
+            goal.as_deref(),
+            final_mount.as_ref(),
+        );
+        match claimed.await {
             Ok(None) => {}
             Ok(Some(owner)) => {
                 return done(
@@ -1489,6 +1514,7 @@ async fn execute(
         }
     }
     let (output_mode, output_folder) = (cfg.output_mode, cfg.output_folder.clone());
+    add_mounts(&mut mounts, final_mount);
     let spec = JobSpec {
         job_id: job.id,
         file_id: file.id,
@@ -1501,6 +1527,7 @@ async fn execute(
         mounts,
     };
 
+    let spec_mounts = spec.mounts.clone();
     let (tx, rx) = mpsc::channel::<JobProgress>(64);
     let forwarder = tokio::spawn(forward_progress(state.clone(), rx));
     ctx.worker_ran = true;
@@ -1601,10 +1628,21 @@ async fn execute(
     if let JobOutcome::NotResponding { path } = &outcome {
         let (reason, check) = tokio::select! {
             looked = async {
-                match job_folders(state, &lib.path).await {
+                match job_folders(state, lib.id, &lib.path).await {
                     Connected::No { reason, check } => (reason, check),
                     Connected::Yes(_) | Connected::Unknown => {
-                        (offline_reason(state, &lib.path, path).await, Some(path.clone()))
+                        // The mount the new file goes into, no longer
+                        // mounted as it was (the worker names it).
+                        let gone = match spec_mounts.iter().find(|m| m.point == *path) {
+                            Some(mount) => share_mounts::still_mounted(mount).await.problem(),
+                            None => None,
+                        };
+                        match gone {
+                            Some(reason) => (reason, Some(path.clone())),
+                            None => {
+                                (offline_reason(state, &lib.path, path).await, Some(path.clone()))
+                            }
+                        }
                     }
                 }
             } => looked,
@@ -2608,7 +2646,7 @@ async fn input_now(state: &AppState, ctx: &ExecContext) -> InputNow {
     let root = root.to_string_lossy();
     // A share the job writes to that is no longer mounted (its output or
     // work folder) may well be why it failed.
-    match job_folders(state, &root).await {
+    match job_folders(state, file.library_id, &root).await {
         Connected::Yes(_) => {}
         Connected::No { reason, check } => return InputNow::Unreachable { reason, check },
         Connected::Unknown => return InputNow::Unknown,
@@ -2644,9 +2682,9 @@ async fn input_now(state: &AppState, ctx: &ExecContext) -> InputNow {
 /// (see [`job_folders`]).
 #[derive(Debug)]
 enum Connected {
-    /// They are: these mount points (the worker makes sure they still are
-    /// before it writes anything).
-    Yes(Vec<PathBuf>),
+    /// They are: these mount points, with what is mounted there (the worker
+    /// makes sure they still are before it writes anything).
+    Yes(Vec<KnownMount>),
     /// One isn't: why the job waits, and what to look at again (`None`:
     /// the library folder).
     No {
@@ -2657,34 +2695,72 @@ enum Connected {
     Unknown,
 }
 
-/// Whether the drives and shares the folders of a job in the library at
-/// `lib_path` were seen mounted from are all mounted (see
-/// [`share_mounts`]): the library folder's, the work folder's and, in
-/// folder mode, the output folder's. One that isn't leaves its mount point
-/// behind as an ordinary folder, which must not be taken for the share.
-async fn job_folders(state: &AppState, lib_path: &str) -> Connected {
-    let cfg = run_config(state, &state.settings());
-    let mut folders = vec![(PathBuf::from(lib_path), true)];
-    folders.extend(cfg.temp_dir.map(|dir| (dir, false)));
-    if cfg.output_mode == OutputMode::Folder {
-        folders.extend(cfg.output_folder.map(|dir| (dir, false)));
-    }
-    let mut mounts = Vec::new();
-    for (folder, library) in folders {
-        match share_mounts::check(state, &folder).await {
+/// Whether the drives and shares the folders of a job in library `lib_id`
+/// (at `lib_path`) were seen mounted from are all mounted, with nothing
+/// else in their place (see [`share_mounts`]): the library folder's, the
+/// work folder's and, in folder mode, the output folder's, and the mounts
+/// the new files of the library's jobs whose placing isn't settled yet go
+/// into (a share mounted inside the output folder, say). One that isn't
+/// leaves its mount point behind as an ordinary folder (or another drive),
+/// which must not be taken for the share.
+async fn job_folders(state: &AppState, lib_id: Uuid, lib_path: &str) -> Connected {
+    let folders = share_mounts::folders_of_jobs(state, Path::new(lib_path));
+    let mut mounts: Vec<KnownMount> = Vec::new();
+    let output = state.settings().output_folder.map(PathBuf::from);
+    for (i, folder) in folders.into_iter().enumerate() {
+        let library = i == 0;
+        let checked = if !library && output.as_ref() == Some(&folder) {
+            share_mounts::check_output(state, &folder).await
+        } else {
+            share_mounts::check(state, &folder).await
+        };
+        match checked {
             Mounted::Yes(points) => mounts.extend(points),
-            Mounted::No(mount) => {
+            Mounted::Unknown => return Connected::Unknown,
+            unmounted => {
                 return Connected::No {
-                    reason: share_mounts::not_connected(&mount),
-                    check: (!library).then_some(mount),
+                    reason: unmounted.problem().unwrap_or_default(),
+                    check: unmounted
+                        .mount_point()
+                        .filter(|_| !library)
+                        .map(Path::to_path_buf),
                 };
             }
-            Mounted::Unknown => return Connected::Unknown,
         }
     }
-    mounts.sort();
-    mounts.dedup();
+    let placing = match db::jobs::placing_final_mounts(state.db.pool(), lib_id).await {
+        Ok(placing) => placing,
+        Err(e) => {
+            tracing::debug!(library = %lib_id, "could not look up where unsettled conversions go: {e}");
+            return Connected::Unknown;
+        }
+    };
+    for mount in placing {
+        match share_mounts::still_mounted(&mount).await {
+            Mounted::Yes(_) => {}
+            Mounted::Unknown => return Connected::Unknown,
+            unmounted => {
+                return Connected::No {
+                    reason: unmounted.problem().unwrap_or_default(),
+                    check: Some(mount.point),
+                };
+            }
+        }
+    }
+    add_mounts(&mut mounts, []);
     Connected::Yes(mounts)
+}
+
+/// Add `more` to `mounts`, one entry per mount point (what is known about
+/// what is mounted there wins over nothing known).
+fn add_mounts(mounts: &mut Vec<KnownMount>, more: impl IntoIterator<Item = KnownMount>) {
+    mounts.extend(more);
+    mounts.sort_by(|a, b| {
+        a.point
+            .cmp(&b.point)
+            .then_with(|| b.identity.is_some().cmp(&a.identity.is_some()))
+    });
+    mounts.dedup_by(|later, first| later.point == first.point);
 }
 
 /// Why a library's jobs wait when `stuck` (in it, or a folder the jobs use)
@@ -3014,6 +3090,7 @@ async fn settle_locked(
         placed,
         size,
         original_size,
+        final_mount,
     } = marked;
     // Where the file is now (a scan follows a renamed file): without it,
     // the wrong place would be looked at.
@@ -3033,6 +3110,22 @@ async fn settle_locked(
         .as_deref()
         .is_none_or(|t| t.parent() == input.parent());
     let dirs = job_dirs(&input, final_path.as_deref());
+    // Nothing is looked at, nor touched, while a drive or share the job's
+    // files are on isn't mounted as it was: its mount point is then an
+    // ordinary folder, or another drive, where the new file (or the
+    // backup) not being found says nothing.
+    if let Err(e) = mounts_are_there(
+        state,
+        &job,
+        target.as_deref(),
+        replace,
+        final_mount.as_ref(),
+    )
+    .await
+    {
+        tracing::debug!(job = %id, "{e:?}; looked at again later");
+        return e.settled();
+    }
     let found = match &target {
         _ if unplaced => Ok(None),
         // Found in place before: only the backup is left to remove.
@@ -3325,6 +3418,61 @@ async fn folders_are_there(
                 Folder::Fine => {}
                 Folder::Problem(reason) => return Err(Unsure::problem(&output, reason)),
                 Folder::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &output)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the drives and shares `job`'s files are on are mounted, as they
+/// were (see [`share_mounts`]): its library folder's, in folder mode the
+/// output folder's (when `target`, where its new file goes, is in it), and
+/// `final_mount`, the mount the folder its new file goes into was on when
+/// it started (a share mounted inside the output folder, or reached
+/// through a link). One that isn't (or has another drive in its place) is
+/// [`Unsure`], with the reason.
+async fn mounts_are_there(
+    state: &AppState,
+    job: &Job,
+    target: Option<&Path>,
+    replace: bool,
+    final_mount: Option<&KnownMount>,
+) -> Result<(), Unsure> {
+    let lib = db::libraries::get(state.db.pool(), job.library_id)
+        .await
+        .map_err(|_| Unsure::Database)?;
+    let mut folders: Vec<PathBuf> = lib.iter().map(|l| PathBuf::from(&l.path)).collect();
+    if !replace && let Some(target) = target {
+        folders.extend(
+            state
+                .settings()
+                .output_folder
+                .map(PathBuf::from)
+                .filter(|o| target.starts_with(o)),
+        );
+    }
+    for folder in folders {
+        match share_mounts::check(state, &folder).await {
+            Mounted::Yes(_) => {}
+            Mounted::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &folder)),
+            unmounted => {
+                let at = unmounted.mount_point().unwrap_or(&folder).to_path_buf();
+                return Err(Unsure::problem(
+                    &at,
+                    unmounted.problem().unwrap_or_default(),
+                ));
+            }
+        }
+    }
+    if let Some(mount) = final_mount {
+        match share_mounts::still_mounted(mount).await {
+            Mounted::Yes(_) => {}
+            Mounted::Unknown => return Err(Unsure::no_answer(NoAnswer::Busy, &mount.point)),
+            unmounted => {
+                return Err(Unsure::problem(
+                    &mount.point,
+                    unmounted.problem().unwrap_or_default(),
+                ));
             }
         }
     }

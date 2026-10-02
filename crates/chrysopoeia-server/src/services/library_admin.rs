@@ -410,6 +410,49 @@ pub async fn update(state: &AppState, id: Uuid, patch: LibraryPatch) -> ApiResul
     Ok(lib)
 }
 
+/// The user put another drive (or share) where one the folders of a
+/// library's jobs were seen mounted from, on purpose: take what is mounted
+/// there now as the usual one (see [`share_mounts::relearn_library`]), so
+/// its library and jobs go on with it. A mount point with nothing mounted
+/// stays "not connected". Answers `409 nothing_changed` when no folder of
+/// the library has another drive in its share's place.
+pub async fn relearn_mounts(state: &AppState, id: Uuid) -> ApiResult<Library> {
+    let row = db::libraries::get(state.db.pool(), id)
+        .await?
+        .ok_or_else(library_not_found)?;
+    let taken = share_mounts::relearn_library(state, id, Path::new(&row.path))
+        .await
+        .map_err(ApiError::internal)?;
+    if taken.is_empty() {
+        return Err(ApiError::conflict(
+            "nothing_changed",
+            "No other drive is mounted in place of the ones this library's folders were on. \
+             If one isn't connected, reconnect it.",
+        ));
+    }
+    let places: Vec<String> = taken.iter().map(|p| p.display().to_string()).collect();
+    state
+        .library_activity(
+            ActivityLevel::Info,
+            format!(
+                "{} now uses the drive mounted at {}.",
+                row.name,
+                places.join(" and ")
+            ),
+            id,
+        )
+        .await;
+    // Its jobs (and those of other libraries waiting for the same folders)
+    // are looked at again now.
+    crate::services::dispatcher::recheck_all_offline(state).await;
+    let lib = view_by_id(state, id).await?.ok_or_else(library_not_found)?;
+    state.emit(Event::LibraryUpdated {
+        library: lib.clone(),
+    });
+    state.broadcast_queue_state().await;
+    Ok(lib)
+}
+
 /// Remove a library from Chrysopoeia. Media files are never touched.
 pub async fn delete(state: &AppState, id: Uuid) -> ApiResult<()> {
     let row = db::libraries::get(state.db.pool(), id)

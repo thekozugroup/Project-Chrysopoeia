@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./api";
 import { profileForGoal } from "./profile";
-import { changedKeys, errorsFrom, profileFieldOf, saveBarMessage, sectionFor, settingForField } from "./settings-form";
+import {
+  changedKeys,
+  errorsFrom,
+  profileFieldOf,
+  saveBarMessage,
+  sectionFor,
+  settingForField,
+} from "./settings-form";
 import type { Settings } from "./types";
 
 const base: Settings = {
@@ -41,6 +48,16 @@ describe("changedKeys", () => {
     expect(changedKeys({ ...base, default_profile: { ...reordered, quality: "best" } }, base)).toEqual([
       "default_profile",
     ]);
+  });
+});
+
+describe("a folder picked again as it was", () => {
+  const saved: Settings = { ...base, output_mode: "folder", output_folder: "/out", temp_dir: "/work" };
+
+  it("is no change: saving it again wouldn't take the drive there now (Settings offers that on its own)", () => {
+    expect(changedKeys({ ...saved, output_folder: "/out" }, saved)).toEqual([]);
+    expect(changedKeys({ ...saved, temp_dir: "/work" }, saved)).toEqual([]);
+    expect(changedKeys({ ...saved, output_folder: "/elsewhere" }, saved)).toEqual(["output_folder"]);
   });
 });
 

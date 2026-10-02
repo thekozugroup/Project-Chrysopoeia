@@ -37,7 +37,9 @@ pub use job::{Job, JobProgress, JobStage, JobState, ProblemKind};
 pub use library::{FileStatus, Library, LibraryStats, MediaFile};
 pub use media::{ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind};
 pub use profile::{Goal, QualityLevel, SpeedPreset, SubtitlePolicy, TranscodeProfile};
-pub use settings::{ActiveHours, OutputMode, Settings, ValidationLevel};
+pub use settings::{
+    ActiveHours, FolderSetting, FolderStatus, OutputMode, Settings, ValidationLevel,
+};
 pub use stats::{CodecCount, Overview, SavingsPoint};
 pub use system::SystemInfo;
 pub use validation::{CheckStatus, ValidationCheck, ValidationReport};

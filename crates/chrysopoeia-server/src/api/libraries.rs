@@ -129,6 +129,16 @@ pub async fn scan(
     }
 }
 
+/// `POST /api/libraries/{id}/relearn-mounts`: take the drive mounted now
+/// where one the library's folders were seen mounted from (another one
+/// put there on purpose) as the usual one.
+pub async fn relearn_mounts(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<Uuid>,
+) -> ApiResult<Json<Library>> {
+    Ok(Json(library_admin::relearn_mounts(&state, id).await?))
+}
+
 /// `POST /api/scan`
 pub async fn scan_all(State(state): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
     let started = library::scan_all(&state).await?;

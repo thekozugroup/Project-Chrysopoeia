@@ -140,7 +140,7 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
      freed_bytes INT NULL, profile TEXT JSON NULL, placing INT DEFAULT 0,
-     placing_size INT NULL, placing_original_size INT NULL)
+     placing_size INT NULL, placing_original_size INT NULL, final_mount TEXT JSON NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs, partial INDEX(placing) of marked jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
@@ -148,7 +148,7 @@ activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, libra
 savings(date TEXT 'YYYY-MM-DD', library_id FK→libraries ON DELETE CASCADE, saved_bytes INT,
         files INT, PK(date, library_id))
 library_mounts(library_id FK→libraries ON DELETE CASCADE, path, PK(library_id, path))
-folder_mounts(folder, mount, PK(folder, mount))
+folder_mounts(folder, mount, fstype NULL, source NULL, root NULL, PK(folder, mount))
 ```
 
 Versions: 1 = base schema; 2 = job-list indexes and `finished_at` on every
@@ -196,6 +196,20 @@ jobs are kept by history trimming and clearing until that is settled.
 folder and the work folder were seen on or under (see "Drives and shares
 the folders sit on" under File and job lifecycle). Nothing is known for
 the folders in use before: they are learned from the next look at them.
+13 = what was mounted at each remembered mount point
+(`folder_mounts.fstype`, `source` and `root`, as `/proc/self/mountinfo`
+gives them), so another filesystem mounted at that place isn't taken for
+the share, and `jobs.final_mount` (JSON `point`, `fstype`, `source`,
+`root`): the mount the folder a job's new file goes into was on when it
+started. The mount points remembered before keep no note of what was
+mounted there until a look finds something mounted there: at start-up
+(before anything looks at a folder), every 15 s after while any are left
+(`share_mounts::note_unknown`), and at every look at their folder. Until
+then nothing mounted there is not connected, and the folder below bound
+onto itself (see "Drives and shares the folders sit on") is another drive,
+never noted. Another filesystem mounted there before that first look (a
+tmpfs, or a host folder bound into a container) can't be told from the
+share and is noted as it; the user then says which one to use as below.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -277,29 +291,80 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Drives and shares the folders sit on (`services::share_mounts`). An
   unmounted share leaves its mount point behind as an ordinary folder on
   the disk below: empty, or holding whatever was there before the share
-  was mounted over it. So the mount points each library folder, the
+  was mounted over it; and another filesystem may be mounted in its place
+  (a tmpfs, or the bare folder bind-mounted onto itself, which is what a
+  Docker bind mount shows when the container started before the host
+  mounted the share: on Unraid, a remote share Unassigned Devices mounts
+  after the array started). So the mount points each library folder, the
   output folder and the work folder sit on or under (from
   `/proc/self/mountinfo`, read without touching any share; not `/`, and
   not a share an automounter mounts on demand on an `autofs` mount, which
-  comes back by itself when looked at) are remembered (`folder_mounts`),
-  adding any found mounted whenever the folder is looked at: when a
-  library is added, when the output or work folder is chosen in Settings,
-  at start-up, and by every library view, scan and job. While one of them
-  isn't mounted, the folder is not connected ("The drive or share mounted
-  at /mnt/remotes/nas isn't connected. Reconnect it, and its conversions
-  continue."), whatever the folder below holds: the library shows that
-  as its `path_error`, a scan of it stops there (an error entry, nothing
+  comes back by itself when looked at) are remembered (`folder_mounts`)
+  with what is mounted there: its filesystem type, source and root (the
+  folder of that filesystem mounted there; a bind mount of a folder names
+  it). Not the mount's id or device number: both are handed out again to
+  whatever is mounted next. So another share mounted at that place with
+  the same type, source and root is taken for the usual one: for NFS and
+  SMB the source names the share, so that is the same share. Of several
+  mounts at one place the one on top (the one the folder shows) counts.
+  The folder below bound onto itself (a mount of the filesystem the
+  folder above it is on, the same type and source, with the folder at
+  that place as its root, or that filesystem as a whole;
+  `slow_fs::shows_folder_below`) is never taken for a share remembered
+  without what was mounted there (by an older version, see Database 13):
+  it is another drive. A host folder bound into a container comes from
+  another filesystem than the container's, so it can't be told from a
+  share this way. A folder given as a link is followed
+  (`slow_fs::real_path`, a bounded check with a 5 s limit; the last answer
+  is used, and found out again in the background once a minute old), so
+  the share a link leads to is remembered too; and for the output folder,
+  drives and shares mounted inside it (`out/Movies` on a share of its own)
+  are remembered with it. Any found mounted is added whenever the folder
+  is looked at: when a library is added, when the output or work folder
+  is chosen in Settings, at start-up, and by every library view, scan and
+  job. While one of them isn't mounted, the folder is not connected ("The
+  drive or share mounted at /mnt/remotes/nas isn't connected. Reconnect
+  it, and its conversions continue."), and while something else is
+  mounted there it is not connected either ("A different drive is mounted
+  at /mnt/remotes/nas than before. Reconnect the usual one, or tell
+  Chrysopoeia to use the one there now."), whatever the folder holds: the
+  library shows that as its `path_error` (with `changed_mount`, the place,
+  for another drive), a scan of it stops there (an error entry, nothing
   taken for removed or added), its jobs and every job that uses the
   output or work folder wait with their library offline (checked again
-  every 15 s; nothing is read from or written into the bare mount point),
-  the start-up search for leftovers leaves it for later, and a job whose
-  new file may have been put in place is never settled on it. Once the
-  share is mounted again (any mount at that place), it is connected.
+  every 15 s; nothing is read from or written into the mount point), the
+  start-up search for leftovers leaves it for later, and a job whose new
+  file may have been put in place is never settled on it. Once the share
+  is mounted again (the same filesystem, source and root; the mount's id
+  may differ), it is connected. Each job also notes the mount the folder
+  its new file goes into is on when it starts (`jobs.final_mount`, with
+  `final_path`; links followed): the worker writes nothing once that isn't
+  mounted as it was, and a job whose placing isn't settled is only settled
+  on it (its library waits for it meanwhile).
+  Another drive put there on purpose is taken as the usual one when the
+  user says so: "Use the drive that's there now" on the library's page
+  (`POST /api/libraries/{id}/relearn-mounts`) takes, for the folders the
+  library's jobs use (its folder, the work folder, the output folder) and
+  for the mounts its unsettled conversions go into, what is mounted now at
+  every place with something else mounted than before as the usual one
+  (a place with nothing mounted stays not connected), and checks the
+  waiting libraries again at once. Settings shows the same for the output
+  and work folders where they are chosen (`GET /api/settings/folders`),
+  with the same action for them (`POST /api/settings/relearn-mounts`, which
+  also takes the drive for the unsettled conversions whose new file goes
+  there). Saving Settings learns a folder's drives afresh only when the
+  folder changes: another place, links followed (`share_mounts::same_folder`,
+  each path found out within 5 s). Saved again as it was (picked again, or
+  sent with another setting), or given another way that leads to the same
+  place (a link), it keeps what was remembered (carried over to the new
+  way), whatever is mounted there now: with the share unmounted or another
+  drive in its place it stays not connected, and isn't written into to
+  check it.
   Mounts are only forgotten when a folder stops being used for that, so
   a share removed for good is moved off like this: a library is removed
-  and added again (its mounts are learned afresh from that moment), the
-  output or work folder is changed in Settings (the folder it replaces is
-  forgotten; choosing the old one again later learns it afresh, as an
+  and added again (its mounts are learned afresh from that moment), or
+  the output or work folder is changed in Settings (the folder it replaces
+  is forgotten; choosing the old one again later learns it afresh, as an
   ordinary folder when nothing is mounted there).
 - Leftovers in library folders: every scan hands the temp and backup files
   its walk finds (`WalkResult.artifacts`) to `recover_artifact`, except
@@ -353,7 +418,9 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   that timed out, a FUSE share whose server stopped), or isn't there as it
   should be (its library folder missing or empty, a share mounted in the
   library disconnected, the library or output folder on a share seen
-  mounted there that isn't now) leaves its job marked and touches nothing: the job
+  mounted there that isn't now or has another drive in its place, the
+  mount its new file went into not mounted as it was when the job
+  started) leaves its job marked and touches nothing: the job
   settles itself when it runs again (before
   it does anything with its file), a job that can't run again is settled
   every 15 s in the background, and a search for leftovers that finds its
@@ -505,8 +572,16 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
 - Folder checks that may hang (`chrysopoeia_worker::slow_fs`, used through
   `services::fs_guard`): library checks, every check of a job (server and
   worker share them), leftover searches and the folder picker run on a
-  blocking thread, one at a time per path and kind of check (a caller that
-  comes while one is running waits for its answer, up to its own timeout).
+  blocking thread, one at a time per path, kind of check and mount (a
+  caller that comes while one is running on the same mount waits for its
+  answer, up to its own timeout). A share that hung, was unmounted lazily
+  (`umount -l`) and was mounted again at the same place is another mount:
+  a check there starts afresh instead of waiting for the one stuck on the
+  old mount, which may never answer. A check about to be refused at once
+  because the checks of its mount are stuck reads the list of mounts again
+  first (unless it was read in the last second), so the first look after
+  such a remount already goes to the new mount, and a library on it comes
+  back at its next check.
   Checks are counted by the mount they are on: the longest mount point
   above the path in `/proc/self/mountinfo` (read without touching the
   share; read again in the background every 30 s, and at most once a
@@ -718,13 +793,17 @@ with `JobSpec.force` uses it when `decide` says skip.
   returned as plain-language `notes`.
 
 **run_job**: `JobSpec.mounts` are the mount points the library folder,
-the work folder and the output folder were seen on (see "Drives and
-shares the folders sit on"). Before the job creates its temp file and
-before it starts putting the new file in place, it reads
-`/proc/self/mountinfo` again (`slow_fs::first_unmounted`): one that is
-no longer mounted (a share unmounted while the job ran) ends the job with
+the work folder, the output folder (with the drives mounted inside it)
+and the folder the new file goes into were seen on, each with what was
+mounted there (`slow_fs::KnownMount`; see "Drives and shares the folders
+sit on"). Before the job creates its temp file and before it starts
+putting the new file in place, it reads `/proc/self/mountinfo` again
+(`slow_fs::first_unmounted`): one that is no longer mounted, or has
+something else mounted there (a share unmounted while the job ran, a
+tmpfs or the bare folder mounted in its place), ends the job with
 `NotResponding { path: <mount point> }`, nothing written, its temp file
-removed, and the dispatcher's wait says the share isn't connected.
+removed, and the dispatcher's wait says the share isn't connected (or
+that a different drive is mounted there).
 1. Preparing: the input exists (answering within 30 s; otherwise the job
    ends with `JobOutcome::NotResponding { path }`, which the dispatcher
    turns into a requeue with the library offline), `decide` agrees
@@ -924,14 +1003,19 @@ for a folder that doesn't answer): an error other than "not found" (a
 soft-mounted share that timed out answers "read or write error", a FUSE
 share whose server stopped "not connected"; `finalize::Unreadable`), a
 folder whose listing fails, a leftover that couldn't be put back or
-removed, and a database that couldn't be read. "Not in place" also needs
-the job's folders to be there as they should be, since an unmounted share
-leaves an empty folder, or none, where nothing is found: the drives and
-shares the library folder (and in folder mode the output folder) were
-seen mounted from are mounted (see "Drives and shares the folders sit
-on"; a share cleanly unmounted while the server was down leaves an
-ordinary folder, which may even hold files of its own, and is "not
-connected"), the library folder answers, can be read and isn't empty, no
+removed, and a database that couldn't be read. Nothing at all is looked
+at, nor touched, while the drives and shares the job's files are on
+aren't mounted as they were: the library folder's, in folder mode the
+output folder's (and those mounted inside it), and the mount the folder
+its new file goes into was on when the job started (`jobs.final_mount`:
+a share mounted inside the output folder, or reached through a link). An
+unmounted share leaves an empty folder, or one with files of its own,
+where nothing is found, and another drive mounted in its place holds
+neither the new file nor the backup (see "Drives and shares the folders
+sit on"); the job waits, "not connected" or "A different drive is
+mounted at …". "Not in place" also needs
+the job's folders to be there as they should be: the library folder
+answers, can be read and isn't empty, no
 drive or share known to be mounted in the library above the file is
 disconnected, and in folder mode the output folder answers and can be
 read. A job that settles itself
@@ -1046,12 +1130,13 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /health` | | `{"ok":true,"version":"0.2.0"}` |
 | `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `CHRYSOPOEIA_VERSION` when it differs from `version`, else null) |
 | `GET /overview` | | `Overview` (`totals` and `savings_history` cover the same libraries; `resolutions` has a "No video" bucket for files without a video stream, "Unknown" for pictures whose size couldn't be read) |
-| `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline, or on a drive or share seen mounted there that isn't now: "The drive or share mounted at … isn't connected. …") |
+| `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline, or on a drive or share seen mounted there that isn't now: "The drive or share mounted at … isn't connected. …", or has another drive in its place: "A different drive is mounted at … than before. …", with `changed_mount` the place, also when that is the output or work folder's or where an unsettled conversion's new file goes) |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`folder_not_allowed`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. `folder_not_allowed`: the folder (as the disk has it, links followed) is `/`, the data folder or inside it or above it, `/config`, `/app` or the web folder or inside them, or `/proc`, `/sys` or `/dev` or inside them; the `LIBRARIES` start-up list follows the same rule. Starts a scan. |
 | `GET /libraries/{id}` | | `Library` |
 | `PATCH /libraries/{id}` | `{"name"?, "enabled"?, "profile"?}` (profile is normalized; response includes it) | `Library`. Profile changes re-decide `pending`/`skipped` files (not done/failed; files skipped by the user stay skipped); a file being converted is decided again when its job ends (see "Verdicts and goal changes"). |
 | `DELETE /libraries/{id}` | | 204. Removes DB rows only (files, jobs and its share of the savings history), never media. Cancels its running jobs. |
 | `POST /libraries/{id}/scan` | | 202 `{"started":true}` (409 `scan_running`, 409 `library_disabled`) |
+| `POST /libraries/{id}/relearn-mounts` | | `Library`. Takes the drive mounted now as the usual one at every place, among those the library's folder, the work folder and the output folder sit on and those its unsettled conversions' new files go into, where something else is mounted than before; places with nothing mounted stay "not connected". Logs "<library> now uses the drive mounted at …", and checks the waiting libraries again. 409 `nothing_changed` when no such place has another drive. |
 | `POST /scan` | | 202, scans all enabled libraries |
 | `GET /files` | `status`, `library`, `q` (substring of the name or path, or of a name the file had before a conversion renamed it), `sort` (`name`,`size`,`updated`,`status`; prefix `-` for desc), `limit` (≤500, default 100), `offset` | `{"items": MediaFile[], "total"}` (no `probe`; `problem` with every `error`) |
 | `GET /files/{id}` | | `{"file": MediaFile (with probe), "jobs": Job[] (newest first, ≤10)}` |
@@ -1067,7 +1152,9 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /queue/pause` / `POST /queue/resume` | | `QueueState` |
 | `POST /queue/stop` | | `QueueState` (cancel running, re-queue them, pause) |
 | `GET /settings` | | `Settings` |
-| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes) |
+| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes). An output or work folder saved again as it was (or through a link to the same place) keeps the drives remembered for it, and one whose drive isn't connected as it was isn't written into to check it; only a folder that changes is learned afresh. |
+| `GET /settings/folders` | | `FolderStatus[]` `{setting: "output_folder"\|"temp_dir", path, problem, changed_mount}`: the output folder (folder mode) and the work folder in use (`temp_dir`, else the one the server was started with), `problem` the same sentence as a library's `path_error` when its drive isn't connected as it was, `changed_mount` the place when another drive is mounted there. No disk is touched. |
+| `POST /settings/relearn-mounts` | | `FolderStatus[]`. Takes the drive mounted now as the usual one where the output or work folder's drive was and something else is mounted (also for the unsettled conversions whose new file goes there); places with nothing mounted stay "not connected". Logs "The output folder … now uses the drive mounted at …", and checks the waiting libraries again. 409 `nothing_changed` when no such place has another drive. |
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
@@ -1245,7 +1332,14 @@ Screens:
    the library's progress and the file table with search, status filters
    (with counts), sort, pages and bulk Convert / Skip, plus the
    files-still-copying count (`LibraryStats.settling`) and the folder's
-   `path_error`; Settings holds the library's goal, quality, speed and
+   `path_error` (in a callout at the top; when that is another drive
+   mounted in place of the usual one, `changed_mount`, the callout is
+   "A different drive is mounted" with **Use the drive that's there now**,
+   which asks first: "Chrysopoeia will take the drive mounted at … as the
+   usual one from now on: it reads files from it and saves new files to
+   it. Only do this if you replaced the drive or share on purpose. If the
+   usual one just isn't connected yet, reconnect it instead: files saved
+   now would end up on the drive that's there now."); Settings holds the library's goal, quality, speed and
    advanced format choices, its name, and pausing or removing the library
    (media is never touched). "Scan now" is in the library's menu.
 5. **Settings**, in sections: **Processing** (Files at once: Automatic (n,
@@ -1260,7 +1354,15 @@ Screens:
    **Advanced** (ignored files, minimum file size in MB, defaults for new
    libraries); and **About** (version, build, and a copyable bug-report
    summary). Changes are saved with one save bar; a field error is shown
-   next to the field named by the API's `field` and in the save bar.
+   next to the field named by the API's `field` and in the save bar. The
+   output or work folder picked again as it is is no change. When the
+   drive the saved output or work folder sits on isn't connected as it
+   was (`GET /api/settings/folders`, looked at again every 15 s), its
+   block says so in a callout with the server's sentence ("This folder's
+   drive isn't connected", or "A different drive is mounted" with **Use
+   the drive that's there now** and the same confirmation as a library's,
+   which calls `POST /api/settings/relearn-mounts`); hidden while another
+   folder is picked.
 
 Plain language first: "Smaller files", not "CRF 32"; codecs are secondary
 detail; problems are grouped by `problem` and each comes with its fix;

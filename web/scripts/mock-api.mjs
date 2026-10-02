@@ -679,6 +679,7 @@ function createLibrary(name, path, goal) {
     scanning: false,
     last_scan_at: ago(3600),
     path_error: null,
+    changed_mount: null,
     created_at: ago(86400 * 30),
   };
   libraries.set(library.id, library);
@@ -1610,6 +1611,7 @@ route("POST", "/api/libraries", async (_p, _q, req) => {
     scanning: false,
     last_scan_at: null,
     path_error: null,
+    changed_mount: null,
     created_at: iso(Date.now()),
   };
   libraries.set(library.id, library);
@@ -1652,6 +1654,20 @@ route("POST", "/api/libraries/:id/scan", ({ id }) => {
   if (!lib.enabled) throw new HttpError(409, "library_disabled", "This library is turned off. Turn it on to scan it.");
   if (!simulateScan(lib, false)) throw new HttpError(409, "scan_running", "This library is already being scanned.");
   return [202, { started: true }];
+});
+// Take the drive mounted where the library's drive was as the usual one.
+route("POST", "/api/libraries/:id/relearn-mounts", ({ id }) => {
+  const lib = getLibrary(id);
+  if (!lib.changed_mount)
+    throw new HttpError(
+      409,
+      "nothing_changed",
+      "No other drive is mounted in place of the ones this library's folders were on. If one isn't connected, reconnect it.",
+    );
+  emitActivity(addActivity("info", `${lib.name} now uses the drive mounted at ${lib.changed_mount}.`, { library_id: lib.id }));
+  lib.changed_mount = null;
+  lib.path_error = null;
+  return libraryView(lib);
 });
 route("POST", "/api/scan", () => {
   for (const lib of libraries.values()) if (lib.enabled) simulateScan(lib, false);
@@ -1897,6 +1913,46 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
   emitQueue();
   startJobs();
   return settings;
+});
+
+// The output and work folders in use and their drives (all connected here;
+// set MOCK_SWAPPED_DRIVE=1 to see another drive in the output share's place).
+const swappedDrive = { on: process.env.MOCK_SWAPPED_DRIVE === "1" };
+function folderStatuses() {
+  const out = [];
+  if (settings.output_mode === "folder" && settings.output_folder) {
+    const mount = swappedDrive.on ? settings.output_folder : null;
+    out.push({
+      setting: "output_folder",
+      path: settings.output_folder,
+      problem: mount
+        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.`
+        : null,
+      changed_mount: mount,
+    });
+  }
+  out.push({ setting: "temp_dir", path: settings.temp_dir ?? "/temp", problem: null, changed_mount: null });
+  return out;
+}
+route("GET", "/api/settings/folders", () => folderStatuses());
+route("POST", "/api/settings/relearn-mounts", () => {
+  const changed = folderStatuses().filter((f) => f.changed_mount);
+  if (!changed.length)
+    throw new HttpError(
+      409,
+      "nothing_changed",
+      "No other drive is mounted in place of the ones the output and work folders were on. If one isn't connected, reconnect it.",
+    );
+  for (const f of changed)
+    emitActivity(
+      addActivity(
+        "info",
+        `The ${f.setting === "output_folder" ? "output" : "work"} folder ${f.path} now uses the drive mounted at ${f.changed_mount}.`,
+        {},
+      ),
+    );
+  swappedDrive.on = false;
+  return folderStatuses();
 });
 
 route("GET", "/api/hardware", () => (DETECT_MS > 0 && Date.now() - STARTED < DETECT_MS ? detectingPlaceholder() : hardware));
