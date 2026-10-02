@@ -1,19 +1,19 @@
 [package]
 name = "chrysopoeia-hwdetect"
-description = "Hardware capability detection for Chrysopeia transcoding"
+description = "Hardware and encoder detection for Chrysopoeia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-oximedia = ["dep:oximedia-accel"]
-
 [dependencies]
+chrysopoeia-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
-chrysopoeia-core = { workspace = true }
-oximedia-accel = { workspace = true, optional = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

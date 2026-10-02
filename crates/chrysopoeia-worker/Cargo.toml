@@ -1,34 +1,39 @@
 [package]
 name = "chrysopoeia-worker"
-description = "Transcoding worker for Chrysopeia job processing"
+description = "ffmpeg job planning, execution, verification and file replacement for Chrysopoeia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-oximedia = [
-    "dep:oximedia-transcode",
-    "dep:oximedia-accel",
-    "dep:oximedia-jobs",
-    "dep:oximedia-presets",
-    "dep:oximedia-compat-ffmpeg",
-]
-
 [dependencies]
+chrysopoeia-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-tokio-util = "0.7"
-chrysopoeia-core = { workspace = true }
-chrysopoeia-hwdetect = { workspace = true }
-oximedia-transcode = { workspace = true, optional = true }
-oximedia-accel = { workspace = true, optional = true }
-oximedia-jobs = { workspace = true, optional = true }
-oximedia-presets = { workspace = true, optional = true }
-oximedia-compat-ffmpeg = { workspace = true, optional = true }
+# Copying the original's modification/access times onto the new file.
+filetime = "0.2"
+# Scratch directory for SSIM/PSNR statistics during verification.
+tempfile = { workspace = true }
+
+[features]
+# Test seams: folders that stop answering (`slow_fs::hang`) and steps of
+# `finalize` held at a chosen point (`finalize::hold`), with short timeouts.
+# For tests only (the server's tests turn it on); never in a release build.
+test-hooks = []
+
+[target.'cfg(unix)'.dependencies]
+# Free-space checks (statvfs) and graceful termination of ffmpeg (SIGTERM).
+rustix = { version = "1", features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+chrysopoeia-scanner = { workspace = true }
+# The integration tests use the test seams (`slow_fs::hang`, `finalize::hold`).
+chrysopoeia-worker = { path = ".", features = ["test-hooks"] }

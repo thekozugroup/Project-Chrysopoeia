@@ -1,96 +1,173 @@
 name: CI
 
+# Pull requests cover branches; pushes run only for main, so a branch with an
+# open pull request is not built twice.
 on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Dwarnings"
+  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+  # Default pnpm when web/package.json has no "packageManager" field.
+  PNPM_VERSION: "10.33.0"
+  # Drives web/e2e/smoke.mjs (scripts/e2e-browser.sh) against the built image.
+  PLAYWRIGHT_VERSION: "1.56.1"
 
 jobs:
-  rust-check:
-    name: Rust Check & Lint
+  lint-files:
+    name: Workflows, scripts and templates (actionlint, shellcheck, xmllint, compose)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          toolchain: stable
-          components: clippy
+      - name: actionlint
+        # The image bundles shellcheck, so `run:` blocks are checked too.
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+      - name: shellcheck
+        run: shellcheck docker/*.sh scripts/*.sh
 
-      - name: Install system dependencies
+      - name: Unraid template is well-formed XML
+        run: |
+          command -v xmllint >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils; }
+          xmllint --noout unraid/chrysopoeia.xml
+
+      - name: Compose files are valid
+        run: |
+          docker compose -f docker-compose.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.nvidia.yml config --quiet
+          docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml config --quiet
+
+  rust:
+    name: Rust (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install ffmpeg (tests encode and verify real media)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg libvulkan-dev pkg-config
+          sudo apt-get install -y --no-install-recommends ffmpeg
 
-      - name: Cargo check
-        run: cargo check --workspace
+      - name: Format
+        run: cargo fmt --all --check
 
-      - name: Cargo clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-      - name: Cargo test
-        run: cargo test --workspace
-        continue-on-error: true
+      - name: Test
+        run: cargo test --workspace --locked
 
-  web-build:
-    name: Web Build & Lint
+  web:
+    name: Web (lint, typecheck, tests, build)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
 
-      - uses: pnpm/action-setup@v4
-        with:
-          version: latest
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
 
-      - name: Install dependencies
+      - name: Enable pnpm
+        run: |
+          corepack enable pnpm
+          corepack install -g "pnpm@${PNPM_VERSION}"
+          echo "STORE_DIR=$(pnpm store path --silent)" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_DIR }}
+          key: pnpm-${{ runner.os }}-${{ hashFiles('web/pnpm-lock.yaml') }}
+          restore-keys: pnpm-${{ runner.os }}-
+
+      - name: Install
         run: pnpm install --frozen-lockfile
 
       - name: Lint
         run: pnpm lint
 
-      - name: Build
-        run: pnpm build
+      - name: Typecheck
+        run: pnpm typecheck
 
-  docker-build:
-    name: Docker Build
+      - name: Unit tests
+        run: pnpm test
+
+      - name: Build (static export)
+        run: |
+          pnpm build
+          test -f out/index.html || { echo "::error::web/out/index.html is missing; next.config.ts must set output: \"export\"."; exit 1; }
+
+  docker:
+    name: Docker image (build, entrypoint and end-to-end tests)
     runs-on: ubuntu-latest
-    needs: [rust-check, web-build]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Build linux/amd64
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          tags: chrysopoeia:ci-${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+          load: true
+          tags: chrysopoeia:ci
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=amd64
+          cache-to: type=gha,mode=max,scope=amd64
+
+      - name: Image size
+        run: docker image ls chrysopoeia:ci
+
+      - name: Entrypoint tests (PUID/PGID, GPU groups, privilege drop)
+        run: docker/test-entrypoint.sh chrysopoeia:ci
+
+      - name: End-to-end smoke test (API)
+        run: scripts/e2e-smoke.sh chrysopoeia:ci
+
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --global "playwright@${PLAYWRIGHT_VERSION}"
+          playwright install --with-deps chromium
+
+      - name: End-to-end smoke test (first run in a browser)
+        run: scripts/e2e-browser.sh chrysopoeia:ci
+        env:
+          E2E_SCREENSHOTS: ${{ runner.temp }}/e2e-screenshots
+
+      - name: Upload browser screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: ${{ runner.temp }}/e2e-screenshots
+          if-no-files-found: ignore

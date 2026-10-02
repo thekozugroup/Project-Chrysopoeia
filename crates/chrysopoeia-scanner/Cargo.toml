@@ -1,15 +1,13 @@
 [package]
 name = "chrysopoeia-scanner"
-description = "Media library scanner with filesystem watching for Chrysopeia"
+description = "Media library walking, probing and folder watching for Chrysopoeia"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
-[features]
-default = []
-oximedia = ["dep:oximedia-io", "dep:oximedia-container"]
-
 [dependencies]
+chrysopoeia-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
@@ -17,10 +15,15 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 chrono = { workspace = true }
-uuid = { workspace = true }
-chrysopoeia-core = { workspace = true }
-oximedia-io = { workspace = true, optional = true }
-oximedia-container = { workspace = true, optional = true }
 walkdir = { workspace = true }
 globset = { workspace = true }
 notify = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Already used by notify; watches each root for the kernel dropping its
+# watches (unmounts), which notify does not report.
+inotify = { version = "0.10.2", default-features = false }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+uuid = { workspace = true }

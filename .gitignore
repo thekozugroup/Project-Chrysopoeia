@@ -6,10 +6,12 @@ target/
 web/node_modules/
 web/.next/
 web/out/
+*.tsbuildinfo
 
-# Database
+# SQLite database and its WAL/shared-memory companions
 *.db
 *.db-journal
+*.db-shm
 *.db-wal
 
 # Environment
@@ -27,8 +29,23 @@ Thumbs.db
 *.swp
 *.swo
 
-# Docker
+# Docker: local overrides and the folders docker-compose.yml bind-mounts
+# next to itself (./config, ./media, ./temp by default)
 docker-compose.override.yml
+/config/
+/media/
+/temp/
 
-# Media (local dev)
-media/
+# Local data from `make dev-api` / `make run`
+/data/
+
+# Test artifacts
+/test-results/
+/playwright-report/
+/coverage/
+web/coverage/
+web/test-results/
+*.log
+
+# Agent worktrees
+.claude/worktrees/
