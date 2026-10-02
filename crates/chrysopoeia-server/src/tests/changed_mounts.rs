@@ -358,6 +358,116 @@ async fn saving_the_output_folder_again_while_its_share_is_away_waits_for_it() {
     assert_eq!(path_error(&app, &lib).await, None);
 }
 
+/// The work folder the server was started with (`TEMP_DIR`) is on a share
+/// that is unmounted, and the user picks that same folder in Settings (from
+/// Automatic to "A specific folder"): that is no change. The share stays
+/// remembered for it, nothing is written into the bare mount point, and
+/// the job keeps waiting until the share is back. Before, the setting was
+/// taken for a new folder: it was written into to check it, what was
+/// remembered for it was forgotten, and the job's work file went into the
+/// bare mount point.
+#[tokio::test]
+async fn picking_the_started_with_work_folder_in_settings_keeps_its_share() {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mounted = hang::mount(&work);
+    let app = TestApp::start(TestOptions {
+        dir: Some(dir),
+        configure: Box::new(|c, root| c.temp_dir = Some(root.join("work"))),
+        ..TestOptions::default()
+    })
+    .await;
+    app.write("Movies/film.mp4", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    wait("the first file to be converted", async || {
+        done(&app).await == 1
+    })
+    .await;
+    app.pause().await;
+    let work_key = work.to_str().unwrap();
+    let known = crate::db::folder_mounts::get(app.state.db.pool(), work_key)
+        .await
+        .unwrap();
+    assert!(
+        known.iter().any(|m| m.mount == work_key),
+        "the share is remembered for the work folder: {known:?}"
+    );
+
+    let away = unmount(&work, mounted);
+    app.write("Movies/later.mp4", h264());
+    app.rescan(lib["id"].as_str().unwrap()).await;
+    app.resume().await;
+    wait("the library to wait for the work folder", async || {
+        path_error(&app, &lib)
+            .await
+            .is_some_and(|e| e.contains("isn't connected"))
+    })
+    .await;
+    let r = app
+        .patch("/api/settings", json!({ "temp_dir": work_key }))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    app.state.dispatcher.recheck_now(uuid(&lib["id"]));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !app.fake.started().iter().any(|n| n == "later.mp4"),
+        "the job waits"
+    );
+    assert!(
+        names(&work).is_empty(),
+        "nothing written: {:?}",
+        names(&work)
+    );
+    let reason = path_error(&app, &lib).await.unwrap_or_default();
+    assert!(reason.contains("isn't connected"), "{reason}");
+    let known = crate::db::folder_mounts::get(app.state.db.pool(), work_key)
+        .await
+        .unwrap();
+    assert!(
+        known.iter().any(|m| m.mount == work_key),
+        "still remembered: {known:?}"
+    );
+
+    mend(&work, &away);
+    let _mounted = hang::mount(&work);
+    app.state.dispatcher.recheck_now(uuid(&lib["id"]));
+    wait("the file to be converted", async || done(&app).await == 2).await;
+    assert_eq!(path_error(&app, &lib).await, None);
+}
+
+/// Choosing an output folder on a share that stopped answering doesn't
+/// hold the save: it is refused within seconds, saying the folder isn't
+/// responding, and nothing changes. Before, the save waited on the share
+/// for as long as it hung.
+#[tokio::test]
+async fn choosing_a_folder_that_isnt_responding_answers_at_once() {
+    let app = TestApp::new().await;
+    let out = app.dir.path().join("hung-out");
+    std::fs::create_dir_all(&out).unwrap();
+    let _hung = hang::hang(&out);
+    let started = Instant::now();
+    let r = app
+        .patch(
+            "/api/settings",
+            json!({ "output_mode": "folder", "output_folder": out.to_str().unwrap() }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.text);
+    assert_eq!(r.json["field"], "output_folder", "{}", r.json);
+    let message = r.json["error"].as_str().unwrap_or_default();
+    assert!(message.contains("isn't responding"), "{message}");
+    assert_eq!(
+        app.get("/api/settings").await.json["output_mode"],
+        "replace"
+    );
+}
+
 /// A work folder on a share with another drive put in its place: the
 /// library whose job waits for it names the place (`changed_mount`), and
 /// its "Use the drive that's there now" action takes it for the work

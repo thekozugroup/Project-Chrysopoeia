@@ -1,6 +1,7 @@
 //! Settings changes: merge, validate, persist, and apply.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrysopoeia_core::{ActivityLevel, Event, FolderSetting, FolderStatus, OutputMode, Settings};
 use chrysopoeia_scanner::validate_ignore_pattern;
@@ -10,6 +11,9 @@ use crate::db;
 use crate::db::activity::ActivityRefs;
 use crate::error::{ApiError, ApiResult, describe_value_error};
 use crate::services::dispatcher::MAX_JOBS_LIMIT;
+use chrysopoeia_worker::slow_fs;
+
+use crate::services::fs_guard::{self, NoAnswer};
 use crate::services::share_mounts::{self, Mounted};
 use crate::services::{hardware, watcher};
 use crate::state::AppState;
@@ -68,6 +72,53 @@ fn blank_to_none(value: &mut Option<String>) {
     }
 }
 
+/// How long a folder chosen in Settings may take to answer the checks
+/// below: a share that stopped answering doesn't hold the save.
+const FOLDER_CHECK_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(15)
+};
+
+/// What [`check_writable_dir`] found, on its blocking thread.
+#[derive(Debug, Clone, Copy)]
+enum Writable {
+    Yes,
+    NotAFolder,
+    Missing,
+    ReadOnly,
+    Full,
+    Denied,
+}
+
+fn writable_now(path: &Path) -> Writable {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Writable::NotAFolder,
+        Err(_) => return Writable::Missing,
+    }
+    let probe = path.join(format!(
+        ".chrysopoeia-write-check-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            Writable::Yes
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Writable::ReadOnly,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ) =>
+        {
+            Writable::Full
+        }
+        Err(_) => Writable::Denied,
+    }
+}
+
 /// Check that `dir` is an existing, writable folder. `field` names the
 /// setting in errors.
 async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiResult<()> {
@@ -78,60 +129,37 @@ async fn check_writable_dir(dir: &str, what: &str, field: &'static str) -> ApiRe
             format!("The {what} must be a full path starting with /."),
         ));
     }
-    match tokio::fs::metadata(path).await {
-        Ok(m) if m.is_dir() => {}
-        Ok(_) => {
-            return Err(invalid_field(
-                field,
-                format!("The {what} {dir} is a file, not a folder."),
-            ));
-        }
-        Err(_) => {
-            return Err(invalid_field(
-                field,
-                format!(
-                    "The {what} {dir} doesn't exist on the server. In Docker, check that it is \
-                     mounted."
-                ),
-            ));
-        }
-    }
-    let probe = path.join(format!(
-        ".chrysopoeia-write-check-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    match tokio::fs::write(&probe, b"ok").await {
-        Ok(()) => {
-            let _ = tokio::fs::remove_file(&probe).await;
-            Ok(())
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Err(invalid_field(
-            field,
-            format!(
-                "The {what} {dir} is on a read-only drive. Choose a folder Chrysopoeia can write to."
-            ),
-        )),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
-            ) =>
-        {
-            Err(invalid_field(
-                field,
-                format!(
-                    "The {what} {dir} is on a full disk. Free up some space there, or choose another folder."
-                ),
-            ))
-        }
-        Err(_) => Err(invalid_field(
-            field,
-            format!(
-                "Chrysopoeia can't write to the {what} {dir}. Check its permissions (in Docker, \
-                 the PUID/PGID user needs write access)."
-            ),
-        )),
-    }
+    let p = path.to_path_buf();
+    let found = fs_guard::guarded("writable", path, FOLDER_CHECK_TIMEOUT, move || {
+        writable_now(&p)
+    })
+    .await;
+    let message = match found {
+        Ok(Writable::Yes) => return Ok(()),
+        Ok(Writable::NotAFolder) => format!("The {what} {dir} is a file, not a folder."),
+        Ok(Writable::Missing) => format!(
+            "The {what} {dir} doesn't exist on the server. In Docker, check that it is mounted."
+        ),
+        Ok(Writable::ReadOnly) => format!(
+            "The {what} {dir} is on a read-only drive. Choose a folder Chrysopoeia can write to."
+        ),
+        Ok(Writable::Full) => format!(
+            "The {what} {dir} is on a full disk. Free up some space there, or choose another folder."
+        ),
+        Ok(Writable::Denied) => format!(
+            "Chrysopoeia can't write to the {what} {dir}. Check its permissions (in Docker, the \
+             PUID/PGID user needs write access)."
+        ),
+        Err(NoAnswer::NotAnswering) => format!(
+            "The {what} {dir} isn't responding. If it's on a network share or an external drive, \
+             check the connection, then save again."
+        ),
+        Err(NoAnswer::Busy) => format!(
+            "Chrysopoeia couldn't check the {what} {dir} right now because other folders aren't \
+             responding. Try again in a moment."
+        ),
+    };
+    Err(invalid_field(field, message))
 }
 
 /// The scanner's reason an ignore pattern can't be used, as a settings
@@ -157,6 +185,18 @@ pub struct Kept {
     pub temp_dir: bool,
 }
 
+/// The work folder `settings` have in use: their own, else the one the
+/// server was started with.
+fn work_folder(state: &AppState, settings: &Settings) -> Option<String> {
+    settings.temp_dir.clone().or_else(|| {
+        state
+            .config
+            .temp_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
 /// Normalize and validate new settings. `old` are the settings they
 /// replace: an ignore pattern saved before patterns were checked this
 /// strictly doesn't block other changes (scans skip it and say so), and a
@@ -167,13 +207,17 @@ pub struct Kept {
 pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> ApiResult<Kept> {
     blank_to_none(&mut s.temp_dir);
     blank_to_none(&mut s.output_folder);
+    // The work folder in use is the setting, else the one the server was
+    // started with (TEMP_DIR): choosing that same folder in Settings is no
+    // change.
+    let (work_before, work_after) = (work_folder(state, old), work_folder(state, s));
     let (output_folder, temp_dir) = tokio::join!(
         share_mounts::same_folder(
             state,
             old.output_folder.as_deref(),
             s.output_folder.as_deref()
         ),
-        share_mounts::same_folder(state, old.temp_dir.as_deref(), s.temp_dir.as_deref()),
+        share_mounts::same_folder(state, work_before.as_deref(), work_after.as_deref()),
     );
     let kept = Kept {
         output_folder,
@@ -222,7 +266,7 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
         _ => false,
     };
     if let Some(dir) = s.temp_dir.clone()
-        && !away(kept.temp_dir, old.temp_dir.as_deref()).await
+        && !away(kept.temp_dir, work_before.as_deref()).await
     {
         check_writable_dir(&dir, "work folder", "temp_dir").await?;
     }
@@ -236,9 +280,9 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
         if !away(kept.output_folder, old.output_folder.as_deref()).await {
             check_writable_dir(&dir, "output folder", "output_folder").await?;
         }
-        let out = tokio::fs::canonicalize(&dir)
+        let out = slow_fs::real_path(Path::new(&dir), FOLDER_CHECK_TIMEOUT)
             .await
-            .unwrap_or_else(|_| Path::new(&dir).to_path_buf());
+            .unwrap_or_else(|| Path::new(&dir).to_path_buf());
         for lib in db::libraries::list(state.db.pool()).await? {
             if out.starts_with(&lib.path) {
                 return Err(invalid_field(
@@ -261,6 +305,7 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     let old = state.settings();
     let mut new = merge(&old, patch)?;
     let kept = validate(state, &old, &mut new).await?;
+    let (work_before, work_after) = (work_folder(state, &old), work_folder(state, &new));
     let folders = [
         (
             FolderSetting::OutputFolder,
@@ -270,8 +315,8 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
         ),
         (
             FolderSetting::TempDir,
-            &old.temp_dir,
-            &new.temp_dir,
+            &work_before,
+            &work_after,
             kept.temp_dir,
         ),
     ];

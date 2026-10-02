@@ -551,12 +551,10 @@ folder saved again keeps the share it was on. A share mounted again with the
 same type, source and root (for NFS and SMB, the same server and share name) is
 taken for the usual one. Folders given as links are followed to the share
 they lead to, and a share mounted inside the output folder (`/output/Movies`
-on a drive of its own) is remembered with it. After an upgrade from a version
-that didn't note what was mounted, Chrysopoeia notes it as soon as it sees the
-share mounted; a drive standing in for the share before that (other than the
-bare folder bound onto itself) can't be told apart, so check that your shares
-are mounted when you upgrade. If you removed the share for good, tell
-Chrysopoeia: remove the library and add it again, or choose another output or
+on a drive of its own) is remembered with it. Chrysopoeia learns where your
+shares are while they are mounted (after an upgrade from a version that didn't,
+on its first start), so make sure your shares are mounted when you first start
+it. If you removed the share for good, tell Chrysopoeia: remove the library and add it again, or choose another output or
 work folder in Settings (and, if you like, the old folder again afterwards).
 
 **What happens to files when I change a library's goal?**
