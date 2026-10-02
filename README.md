@@ -545,11 +545,19 @@ one, or tell Chrysopoeia to use the one there now.* Restart the container once
 the share is mounted on the host (or map the share with the *RW/Slave* access
 mode, `rslave` in Docker, so a share mounted later reaches the container), or,
 if you swapped the drive on purpose, press **Use the drive that's there now**
-on the library's page. Folders given as links are followed to the share
+on the library's page (for the output or work folder, also under Settings >
+Output). Saving Settings never does that by itself: the same output or work
+folder saved again keeps the share it was on. A share mounted again with the
+same type, source and root (for NFS and SMB, the same server and share name) is
+taken for the usual one. Folders given as links are followed to the share
 they lead to, and a share mounted inside the output folder (`/output/Movies`
-on a drive of its own) is remembered with it. If you removed the share for
-good, tell Chrysopoeia: remove the library and add it again, or choose the
-output or work folder again in Settings (pick the same folder again and save).
+on a drive of its own) is remembered with it. After an upgrade from a version
+that didn't note what was mounted, Chrysopoeia notes it as soon as it sees the
+share mounted; a drive standing in for the share before that (other than the
+bare folder bound onto itself) can't be told apart, so check that your shares
+are mounted when you upgrade. If you removed the share for good, tell
+Chrysopoeia: remove the library and add it again, or choose another output or
+work folder in Settings (and, if you like, the old folder again afterwards).
 
 **What happens to files when I change a library's goal?**
 Files that were skipped or are waiting are decided again under the new goal; a

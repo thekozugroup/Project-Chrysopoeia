@@ -12,6 +12,7 @@ mod hung_share;
 mod interrupted_placing;
 mod libraries;
 mod library_folders;
+mod older_mounts;
 mod output_clash;
 mod polish;
 mod problems;

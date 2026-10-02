@@ -60,34 +60,6 @@ export function changedKeys(a: Settings, b: Settings): (keyof Settings)[] {
   );
 }
 
-/** The folder settings that can be saved again as they are. */
-export type FolderSetting = "output_folder" | "temp_dir";
-
-const FOLDER_SETTINGS: readonly FolderSetting[] = ["output_folder", "temp_dir"];
-
-/**
- * The folders picked again as they were saved, once `patch` is applied to
- * the draft (`base` is what is saved). Saving one again tells the server to
- * take the drive mounted there now as the usual one (another drive put in
- * place of its share on purpose), so it counts as a change.
- */
-export function rechosenAfter(rechosen: readonly FolderSetting[], patch: Partial<Settings>, base: Settings): FolderSetting[] {
-  let next = [...rechosen];
-  for (const key of FOLDER_SETTINGS) {
-    if (!(key in patch)) continue;
-    const value = patch[key];
-    const again = Boolean(value) && value === base[key];
-    next = next.filter((k) => k !== key);
-    if (again) next.push(key);
-  }
-  return next;
-}
-
-/** What a save sends: the settings that changed, and the folders picked again as they were. */
-export function keysToSave(changed: readonly (keyof Settings)[], rechosen: readonly FolderSetting[]): (keyof Settings)[] {
-  return [...changed, ...rechosen.filter((key) => !changed.includes(key))];
-}
-
 /** Words in an error message that name the setting it is about. */
 const MESSAGE_FIELDS: [RegExp, keyof Settings][] = [
   [/output folder/i, "output_folder"],

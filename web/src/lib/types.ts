@@ -593,6 +593,28 @@ export interface Overview {
   queue: QueueState;
 }
 
+/** A setting that names a folder Chrysopoeia writes into. */
+export type FolderSetting = "output_folder" | "temp_dir";
+
+/**
+ * `GET /settings/folders`: a folder in use (the output folder in folder
+ * mode; the work folder, the one Chrysopoeia was started with while
+ * `temp_dir` is unset) and whether the drives and shares it sits on are
+ * connected as they were.
+ */
+export interface FolderStatus {
+  setting: FolderSetting;
+  path: string;
+  /** Why it can't be used now, in the server's words; `null` when it can. */
+  problem: string | null;
+  /**
+   * Set (with `problem`) when another drive is mounted where its drive was:
+   * that place. `POST /settings/relearn-mounts` takes the drive there now
+   * as the usual one.
+   */
+  changed_mount: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // system.rs
 // ---------------------------------------------------------------------------

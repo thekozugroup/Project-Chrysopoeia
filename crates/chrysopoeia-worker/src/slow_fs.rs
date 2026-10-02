@@ -701,7 +701,9 @@ impl std::fmt::Display for MountIdentity {
 }
 
 /// A mount point a folder was seen on, and what was mounted there then
-/// (`None`: not known yet, from an older version; any mount there counts).
+/// (`None`: not known yet, from an older version; any mount there counts,
+/// except the folder at that place on the filesystem below, see
+/// [`shows_folder_below`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnownMount {
     /// Where it is mounted.
@@ -798,12 +800,46 @@ pub async fn first_unmounted(known: &[KnownMount]) -> Option<PathBuf> {
 
 /// Whether `known` is mounted among `now` (the mount points listed, the one
 /// on top at each place), with what was mounted there before when that is
-/// known.
+/// known. When it isn't known (a place remembered by an older version),
+/// anything mounted there counts but the folder at that place on the
+/// filesystem below ([`shows_folder_below`]).
 pub fn mounted_as(now: &[MountPoint], known: &KnownMount) -> bool {
     match now.iter().rfind(|m| m.path == known.point && !m.on_demand) {
         None => false,
-        Some(m) => known.identity.as_ref().is_none_or(|id| *id == m.identity),
+        Some(m) => match &known.identity {
+            Some(id) => *id == m.identity,
+            None => !shows_folder_below(now, m),
+        },
     }
+}
+
+/// Whether the mount `m` (one of `now`) shows nothing but the folder at its
+/// place on the filesystem below it: the filesystem the folder above is on
+/// (the same type and source), mounted again with the folder at that place
+/// as its root (the bare folder bind-mounted onto itself) or as a whole.
+/// That is what an unmounted share's place shows when the bare folder is
+/// bind-mounted onto itself, as a Docker bind mount is when the container
+/// started before the share was mounted and both are on one disk, so it is
+/// never taken for the share. (A bind mount from another filesystem than
+/// the folder above, as a Docker bind mount of a host folder usually is,
+/// can't be told apart from a share this way.)
+pub fn shows_folder_below(now: &[MountPoint], m: &MountPoint) -> bool {
+    let Some(below) = now
+        .iter()
+        .filter(|p| p.path != m.path && m.path.starts_with(&p.path))
+        .max_by_key(|p| p.path.components().count())
+    else {
+        return false;
+    };
+    if below.identity.fstype != m.identity.fstype || below.identity.source != m.identity.source {
+        return false;
+    }
+    let Ok(inside) = m.path.strip_prefix(&below.path) else {
+        return false;
+    };
+    let root = Path::new(&m.identity.root);
+    let below_root = Path::new(&below.identity.root);
+    root == below_root.join(inside) || root == below_root
 }
 
 /// One line of `/proc/self/mountinfo`.
@@ -1142,6 +1178,50 @@ pub mod hang {
                 root: "/".to_string(),
             },
         ));
+        marked
+    }
+
+    /// What [`mount_disk`] mounts.
+    pub fn disk() -> MountIdentity {
+        MountIdentity {
+            fstype: "disk".to_string(),
+            source: "/dev/test-disk".to_string(),
+            root: "/".to_string(),
+        }
+    }
+
+    /// Mount a local disk at `path` (the filesystem the folders under it
+    /// are on, with [`disk`] as what is mounted).
+    pub fn mount_disk(path: &Path) -> Marked {
+        let marked = mark(&MOUNTS, path);
+        lock(&OTHERS).push((marked.id, disk()));
+        marked
+    }
+
+    /// Bind-mount the folder at `path` onto itself (what a Docker bind
+    /// mount shows when the container started before the share was mounted
+    /// there on the host): the filesystem of the mount above it (see
+    /// [`mount_disk`]) mounted again with that folder as its root.
+    pub fn bind_folder_below(path: &Path) -> Marked {
+        let below = live()
+            .into_iter()
+            .filter(|l| l.mount.point != path && path.starts_with(&l.mount.point))
+            .max_by_key(|l| l.mount.point.components().count());
+        let identity = match below {
+            Some(below) => MountIdentity {
+                root: Path::new(&below.identity.root)
+                    .join(path.strip_prefix(&below.mount.point).unwrap_or(path))
+                    .display()
+                    .to_string(),
+                ..below.identity
+            },
+            None => MountIdentity {
+                root: path.display().to_string(),
+                ..disk()
+            },
+        };
+        let marked = mark(&MOUNTS, path);
+        lock(&OTHERS).push((marked.id, identity));
         marked
     }
 
@@ -1819,13 +1899,102 @@ mod tests {
         assert_eq!(at_nas(bind).root, "/mnt/nas");
         let gone = b"22 1 8:1 / / rw - ext4 /dev/vda rw\n";
         assert!(!mounted_as(&listed(gone), &known), "not mounted");
-        // Not known yet (an older version): any mount there counts.
+        // Not known yet (an older version): any mount there counts, but
+        // nothing mounted, and the bare folder bound onto itself.
         let unknown = KnownMount {
             point: PathBuf::from("/mnt/nas"),
             identity: None,
         };
+        assert!(mounted_as(&listed(share), &unknown));
         assert!(mounted_as(&listed(tmpfs), &unknown));
         assert!(!mounted_as(&listed(gone), &unknown));
+        assert!(!mounted_as(&listed(bind), &unknown), "the bare folder");
+    }
+
+    /// The bare folder bind-mounted onto itself, or the filesystem below
+    /// mounted again at that place, shows nothing but the folder below;
+    /// a share, another disk, a bind of another folder, or a host folder
+    /// bound into a container (another filesystem than the one above) is
+    /// something else.
+    #[test]
+    fn the_folder_below_bound_onto_itself_is_told_apart() {
+        let below = |text: &[u8], at: &str| {
+            let now = points_of(parse_listed(text));
+            let m = now
+                .iter()
+                .rfind(|m| m.path == Path::new(at))
+                .unwrap()
+                .clone();
+            shows_folder_below(&now, &m)
+        };
+        // On the root filesystem, and on a btrfs subvolume.
+        assert!(below(
+            b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+              52 22 8:1 /srv/out /srv/out rw - ext4 /dev/vda rw\n",
+            "/srv/out"
+        ));
+        assert!(below(
+            b"22 1 0:30 /@ / rw - btrfs /dev/sdb2 rw\n\
+              52 22 0:30 /@/srv/out /srv/out rw - btrfs /dev/sdb2 rw\n",
+            "/srv/out"
+        ));
+        // In a container: a host folder bound at /media, and the folder
+        // under it bound onto itself again.
+        assert!(below(
+            b"400 300 0:50 / / rw - overlay overlay rw\n\
+              401 400 8:3 /mnt/user/media /media rw - xfs /dev/sdc1 rw\n\
+              402 401 8:3 /mnt/user/media/out /media/out rw - xfs /dev/sdc1 rw\n",
+            "/media/out"
+        ));
+        // The filesystem below mounted again as a whole.
+        assert!(below(
+            b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+              52 22 8:1 / /srv/out rw - ext4 /dev/vda rw\n",
+            "/srv/out"
+        ));
+        // Not the folder below: a share, a tmpfs, another disk, another
+        // folder of the same disk, a host folder bound into a container.
+        for (text, at) in [
+            (
+                &b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+                   52 22 0:60 / /srv/out rw - nfs4 nas:/export rw\n"[..],
+                "/srv/out",
+            ),
+            (
+                &b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+                   52 22 0:61 / /srv/out rw - tmpfs otherfs rw\n"[..],
+                "/srv/out",
+            ),
+            (
+                &b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+                   52 22 8:17 / /srv/out rw - ext4 /dev/sdb1 rw\n"[..],
+                "/srv/out",
+            ),
+            (
+                &b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+                   52 22 8:1 /data/out /srv/out rw - ext4 /dev/vda rw\n"[..],
+                "/srv/out",
+            ),
+            (
+                &b"400 300 0:50 / / rw - overlay overlay rw\n\
+                   401 400 8:3 /mnt/user/out /output rw - xfs /dev/sdc1 rw\n"[..],
+                "/output",
+            ),
+        ] {
+            assert!(!below(text, at), "{}", String::from_utf8_lossy(text));
+        }
+        // The share mounted over the bare folder bound there shows.
+        assert!(!below(
+            b"22 1 8:1 / / rw - ext4 /dev/vda rw\n\
+              40 22 8:1 /srv/out /srv/out rw - ext4 /dev/vda rw\n\
+              41 40 0:41 / /srv/out rw - nfs4 nas:/export rw\n",
+            "/srv/out"
+        ));
+        // Nothing above it listed: can't tell.
+        assert!(!below(
+            b"52 22 8:1 /srv/out /srv/out rw - ext4 /dev/vda rw\n",
+            "/srv/out"
+        ));
     }
 
     /// Of several mounts at one place, the one on top is the one its folder

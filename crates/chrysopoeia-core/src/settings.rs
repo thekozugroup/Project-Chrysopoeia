@@ -16,6 +16,34 @@ pub enum OutputMode {
     Folder,
 }
 
+/// A setting that names a folder Chrysopoeia writes into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderSetting {
+    /// `Settings::output_folder` (used in folder mode).
+    OutputFolder,
+    /// `Settings::temp_dir`, or the work folder Chrysopoeia was started
+    /// with while that is unset.
+    TempDir,
+}
+
+/// Whether the drives and shares a folder in use sits on are connected as
+/// they were (`GET /api/settings/folders`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderStatus {
+    pub setting: FolderSetting,
+    /// The folder in use.
+    pub path: String,
+    /// Why it can't be used now ("The drive or share mounted at … isn't
+    /// connected. …", "A different drive is mounted at … than before. …"),
+    /// `None` when it can.
+    pub problem: Option<String>,
+    /// Set (with `problem`) when another drive is mounted where its drive
+    /// was: that place. `POST /api/settings/relearn-mounts` takes the drive
+    /// there now as the usual one.
+    pub changed_mount: Option<String>,
+}
+
 /// How hard to check each finished file before it replaces the original.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -13,6 +13,7 @@ import type {
   CreateLibraryRequest,
   FileDetail,
   FileQuery,
+  FolderStatus,
   FsBrowse,
   HardwareInfo,
   Health,
@@ -257,6 +258,10 @@ export const api = {
   stopQueue: () => request<QueueState>("/queue/stop", { method: "POST" }),
 
   settings: (signal?: AbortSignal) => request<Settings>("/settings", { signal }),
+  /** The output and work folders in use, and whether their drives are connected as they were. */
+  settingsFolders: (signal?: AbortSignal) => request<FolderStatus[]>("/settings/folders", { signal }),
+  /** Take the drive mounted now where the output or work folder's drive was as the usual one. */
+  relearnFolderMounts: () => request<FolderStatus[]>("/settings/relearn-mounts", { method: "POST" }),
   updateSettings: (patch: Partial<Settings>) =>
     request<Settings>("/settings", { method: "PATCH", body: patch }),
 

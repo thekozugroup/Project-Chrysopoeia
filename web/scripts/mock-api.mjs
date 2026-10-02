@@ -1915,6 +1915,46 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
   return settings;
 });
 
+// The output and work folders in use and their drives (all connected here;
+// set MOCK_SWAPPED_DRIVE=1 to see another drive in the output share's place).
+const swappedDrive = { on: process.env.MOCK_SWAPPED_DRIVE === "1" };
+function folderStatuses() {
+  const out = [];
+  if (settings.output_mode === "folder" && settings.output_folder) {
+    const mount = swappedDrive.on ? settings.output_folder : null;
+    out.push({
+      setting: "output_folder",
+      path: settings.output_folder,
+      problem: mount
+        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.`
+        : null,
+      changed_mount: mount,
+    });
+  }
+  out.push({ setting: "temp_dir", path: settings.temp_dir ?? "/temp", problem: null, changed_mount: null });
+  return out;
+}
+route("GET", "/api/settings/folders", () => folderStatuses());
+route("POST", "/api/settings/relearn-mounts", () => {
+  const changed = folderStatuses().filter((f) => f.changed_mount);
+  if (!changed.length)
+    throw new HttpError(
+      409,
+      "nothing_changed",
+      "No other drive is mounted in place of the ones the output and work folders were on. If one isn't connected, reconnect it.",
+    );
+  for (const f of changed)
+    emitActivity(
+      addActivity(
+        "info",
+        `The ${f.setting === "output_folder" ? "output" : "work"} folder ${f.path} now uses the drive mounted at ${f.changed_mount}.`,
+        {},
+      ),
+    );
+  swappedDrive.on = false;
+  return folderStatuses();
+});
+
 route("GET", "/api/hardware", () => (DETECT_MS > 0 && Date.now() - STARTED < DETECT_MS ? detectingPlaceholder() : hardware));
 route("POST", "/api/hardware/detect", async () => {
   await new Promise((r) => setTimeout(r, 2500));

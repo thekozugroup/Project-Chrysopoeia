@@ -41,6 +41,16 @@ pub async fn get(pool: &SqlitePool, folder: &str) -> sqlx::Result<Vec<FolderMoun
         .collect()
 }
 
+/// The mount points remembered without what was mounted there (by an
+/// older version), with their folder: `(folder, mount)`.
+pub async fn unnoted(pool: &SqlitePool) -> sqlx::Result<Vec<(String, String)>> {
+    sqlx::query_as(
+        "SELECT folder, mount FROM folder_mounts WHERE fstype IS NULL ORDER BY folder, mount",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Remember `mounts` for `folder` too. What was mounted at one already
 /// remembered is noted only when it wasn't before (see [`set_identity`]).
 pub async fn add(

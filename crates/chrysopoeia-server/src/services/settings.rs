@@ -1,15 +1,17 @@
 //! Settings changes: merge, validate, persist, and apply.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use chrysopoeia_core::{Event, OutputMode, Settings};
+use chrysopoeia_core::{ActivityLevel, Event, FolderSetting, FolderStatus, OutputMode, Settings};
 use chrysopoeia_scanner::validate_ignore_pattern;
 use serde_json::Value;
 
 use crate::db;
+use crate::db::activity::ActivityRefs;
 use crate::error::{ApiError, ApiResult, describe_value_error};
 use crate::services::dispatcher::MAX_JOBS_LIMIT;
-use crate::services::{hardware, share_mounts, watcher};
+use crate::services::share_mounts::{self, Mounted};
+use crate::services::{hardware, watcher};
 use crate::state::AppState;
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -146,12 +148,37 @@ fn ignore_pattern_error(reason: &str) -> String {
     format!("{}.", reason.trim().trim_end_matches('.'))
 }
 
+/// Which folder settings name the same folder as before (see
+/// [`share_mounts::same_folder`]): saved again as they were, they keep the
+/// drives and shares remembered for them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Kept {
+    pub output_folder: bool,
+    pub temp_dir: bool,
+}
+
 /// Normalize and validate new settings. `old` are the settings they
 /// replace: an ignore pattern saved before patterns were checked this
-/// strictly doesn't block other changes (scans skip it and say so).
-pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> ApiResult<()> {
+/// strictly doesn't block other changes (scans skip it and say so), and a
+/// folder saved again as it was while its drive isn't connected as it was
+/// (its share unmounted, another drive in its place) isn't written into to
+/// check it, nor refused for that (it was checked when it was chosen; its
+/// jobs wait for it meanwhile).
+pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> ApiResult<Kept> {
     blank_to_none(&mut s.temp_dir);
     blank_to_none(&mut s.output_folder);
+    let (output_folder, temp_dir) = tokio::join!(
+        share_mounts::same_folder(
+            state,
+            old.output_folder.as_deref(),
+            s.output_folder.as_deref()
+        ),
+        share_mounts::same_folder(state, old.temp_dir.as_deref(), s.temp_dir.as_deref()),
+    );
+    let kept = Kept {
+        output_folder,
+        temp_dir,
+    };
     s.ignore_patterns = s
         .ignore_patterns
         .iter()
@@ -188,7 +215,15 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
             return Err(invalid_field("ignore_patterns", ignore_pattern_error(&e)));
         }
     }
-    if let Some(dir) = s.temp_dir.clone() {
+    // What is remembered for a folder saved again is stored under the path
+    // it was saved as.
+    let away = async |kept: bool, before: Option<&str>| match before {
+        Some(before) if kept => share_mounts::away(state, Path::new(before)).await,
+        _ => false,
+    };
+    if let Some(dir) = s.temp_dir.clone()
+        && !away(kept.temp_dir, old.temp_dir.as_deref()).await
+    {
         check_writable_dir(&dir, "work folder", "temp_dir").await?;
     }
     if s.output_mode == OutputMode::Folder {
@@ -198,7 +233,9 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
                 "Choose an output folder, or switch back to replacing the originals.",
             ));
         };
-        check_writable_dir(&dir, "output folder", "output_folder").await?;
+        if !away(kept.output_folder, old.output_folder.as_deref()).await {
+            check_writable_dir(&dir, "output folder", "output_folder").await?;
+        }
         let out = tokio::fs::canonicalize(&dir)
             .await
             .unwrap_or_else(|_| Path::new(&dir).to_path_buf());
@@ -215,18 +252,38 @@ pub async fn validate(state: &AppState, old: &Settings, s: &mut Settings) -> Api
             }
         }
     }
-    Ok(())
+    Ok(kept)
 }
 
 /// Apply a partial update: merge, validate, persist, publish and apply.
 pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     let _guard = state.settings_write.lock().await;
     let old = state.settings();
-    // A folder sent again as it was is chosen again (see below).
-    let sent = |key: &str| patch.get(key).is_some_and(|v| !v.is_null());
-    let (output_sent, temp_sent) = (sent("output_folder"), sent("temp_dir"));
     let mut new = merge(&old, patch)?;
-    validate(state, &old, &mut new).await?;
+    let kept = validate(state, &old, &mut new).await?;
+    let folders = [
+        (
+            FolderSetting::OutputFolder,
+            &old.output_folder,
+            &new.output_folder,
+            kept.output_folder,
+        ),
+        (
+            FolderSetting::TempDir,
+            &old.temp_dir,
+            &new.temp_dir,
+            kept.temp_dir,
+        ),
+    ];
+    // The same folder given another way (through a link, say) keeps what
+    // is remembered for it, from before anything looks at it that way.
+    for (_, before, after, same) in folders {
+        if let (true, Some(before), Some(after)) = (same, before, after)
+            && before != after
+        {
+            share_mounts::carry_over(state, Path::new(before), Path::new(after)).await;
+        }
+    }
     db::settings::save(state.db.pool(), &new).await?;
     state.replace_settings(new.clone());
     state.emit(Event::SettingsUpdated {
@@ -244,32 +301,115 @@ pub async fn patch(state: &AppState, patch: Value) -> ApiResult<Settings> {
     {
         watcher::sync(state).await;
     }
-    // A work or output folder chosen anew (moved off a share, say), or
-    // saved again as it was (another drive put in its share's place on
-    // purpose), has its drives and shares learned afresh, from now (it was
-    // just found usable); the one it replaces is forgotten.
-    for (before, after, sent, output) in [
-        (&old.output_folder, &new.output_folder, output_sent, true),
-        (&old.temp_dir, &new.temp_dir, temp_sent, false),
-    ] {
-        if before == after && !(sent && after.is_some()) {
+    // A work or output folder chosen anew (moved off a share, say) has its
+    // drives and shares learned afresh, from now (it was just found
+    // usable), and the one it replaces is forgotten. One saved again as it
+    // was (or given another way that leads to the same place, through a
+    // link say) keeps what was remembered for it: what is mounted there
+    // now may be the bare mount point of a share that isn't connected, or
+    // another drive in its place, which only the user's word takes as the
+    // usual one (`relearn-mounts`).
+    for (setting, before, after, same) in folders {
+        if same {
+            if let (Some(before), Some(after)) = (before, after)
+                && before != after
+            {
+                share_mounts::forget_unless_used(state, Path::new(before)).await;
+            }
             continue;
         }
-        if let Some(before) = before.as_ref().filter(|_| before != after) {
+        if let Some(before) = before {
             share_mounts::forget_unless_used(state, Path::new(before)).await;
         }
         if let Some(after) = after {
-            share_mounts::forget(state, Path::new(after)).await;
-            if output {
-                share_mounts::check_output(state, Path::new(after)).await;
-            } else {
-                share_mounts::check(state, Path::new(after)).await;
+            let after = Path::new(after);
+            // What is remembered for a folder also used for something else
+            // stays (it is still that folder).
+            if !share_mounts::used_besides(state, after, setting).await {
+                share_mounts::forget(state, after).await;
             }
+            match setting {
+                FolderSetting::OutputFolder => share_mounts::check_output(state, after).await,
+                FolderSetting::TempDir => share_mounts::check(state, after).await,
+            };
         }
     }
     state.dispatcher.wake();
     state.broadcast_queue_state().await;
     Ok(new)
+}
+
+/// The output folder (in folder mode) and the work folder in use, with
+/// whether the drives and shares they sit on are connected as they were.
+/// Nothing is learned (but what is mounted at a place remembered without
+/// it, see [`share_mounts::status`]), and no disk is touched.
+pub async fn folder_statuses(state: &AppState) -> Vec<FolderStatus> {
+    let mut out = Vec::new();
+    for (setting, folder) in share_mounts::configured_folders(state) {
+        let mounted = share_mounts::status(state, &folder).await;
+        out.push(FolderStatus {
+            setting,
+            path: folder.display().to_string(),
+            problem: mounted.problem(),
+            changed_mount: match &mounted {
+                Mounted::Different(point) => Some(point.display().to_string()),
+                _ => None,
+            },
+        });
+    }
+    out
+}
+
+/// The user put another drive (or share) where one the output or work
+/// folder was seen on, on purpose: take what is mounted there now as the
+/// usual one (see [`share_mounts::relearn`]), also for the conversions
+/// whose new file went there and isn't settled yet, so the jobs waiting for
+/// it go on with it. A mount point with nothing mounted stays "not
+/// connected". Answers `409 nothing_changed` when neither folder has
+/// another drive in its share's place.
+pub async fn relearn_folders(state: &AppState) -> ApiResult<Vec<FolderStatus>> {
+    let mut taken: Vec<PathBuf> = Vec::new();
+    for (setting, folder) in share_mounts::configured_folders(state) {
+        let points = share_mounts::relearn(state, &folder)
+            .await
+            .map_err(ApiError::internal)?;
+        if points.is_empty() {
+            continue;
+        }
+        let what = match setting {
+            FolderSetting::OutputFolder => "The output folder",
+            FolderSetting::TempDir => "The work folder",
+        };
+        let places: Vec<String> = points.iter().map(|p| p.display().to_string()).collect();
+        state
+            .activity(
+                ActivityLevel::Info,
+                format!(
+                    "{what} {} now uses the drive mounted at {}.",
+                    folder.display(),
+                    places.join(" and ")
+                ),
+                ActivityRefs::default(),
+            )
+            .await;
+        taken.extend(points);
+    }
+    if taken.is_empty() {
+        return Err(ApiError::conflict(
+            "nothing_changed",
+            "No other drive is mounted in place of the ones the output and work folders were on. \
+             If one isn't connected, reconnect it.",
+        ));
+    }
+    taken.sort();
+    taken.dedup();
+    share_mounts::relearn_placing_at(state, &taken)
+        .await
+        .map_err(ApiError::internal)?;
+    // The jobs waiting for these folders are looked at again now.
+    crate::services::dispatcher::recheck_all_offline(state).await;
+    state.broadcast_queue_state().await;
+    Ok(folder_statuses(state).await)
 }
 
 /// Build the settings to save on first run from the command line. `MAX_JOBS`

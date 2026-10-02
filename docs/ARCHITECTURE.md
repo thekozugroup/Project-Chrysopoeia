@@ -202,10 +202,14 @@ gives them), so another filesystem mounted at that place isn't taken for
 the share, and `jobs.final_mount` (JSON `point`, `fstype`, `source`,
 `root`): the mount the folder a job's new file goes into was on when it
 started. The mount points remembered before keep no note of what was
-mounted there until the next look at one finds something mounted there,
-which is then noted (whatever it is: an upgrade made while another drive
-stands in for a share takes that drive, and the user says which one to use
-as below).
+mounted there until a look finds something mounted there: at start-up
+(before anything looks at a folder), every 15 s after while any are left
+(`share_mounts::note_unknown`), and at every look at their folder. Until
+then nothing mounted there is not connected, and the folder below bound
+onto itself (see "Drives and shares the folders sit on") is another drive,
+never noted. Another filesystem mounted there before that first look (a
+tmpfs, or a host folder bound into a container) can't be told from the
+share and is noted as it; the user then says which one to use as below.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -299,8 +303,18 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   with what is mounted there: its filesystem type, source and root (the
   folder of that filesystem mounted there; a bind mount of a folder names
   it). Not the mount's id or device number: both are handed out again to
-  whatever is mounted next. Of several mounts at one place the one on top
-  (the one the folder shows) counts. A folder given as a link is followed
+  whatever is mounted next. So another share mounted at that place with
+  the same type, source and root is taken for the usual one: for NFS and
+  SMB the source names the share, so that is the same share. Of several
+  mounts at one place the one on top (the one the folder shows) counts.
+  The folder below bound onto itself (a mount of the filesystem the
+  folder above it is on, the same type and source, with the folder at
+  that place as its root, or that filesystem as a whole;
+  `slow_fs::shows_folder_below`) is never taken for a share remembered
+  without what was mounted there (by an older version, see Database 13):
+  it is another drive. A host folder bound into a container comes from
+  another filesystem than the container's, so it can't be told from a
+  share this way. A folder given as a link is followed
   (`slow_fs::real_path`, a bounded check with a 5 s limit; the last answer
   is used, and found out again in the background once a minute old), so
   the share a link leads to is remembered too; and for the output folder,
@@ -334,15 +348,24 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   for the mounts its unsettled conversions go into, what is mounted now at
   every place with something else mounted than before as the usual one
   (a place with nothing mounted stays not connected), and checks the
-  waiting libraries again at once; saving the output or work folder again
-  in Settings (the same folder picked again) learns it afresh.
+  waiting libraries again at once. Settings shows the same for the output
+  and work folders where they are chosen (`GET /api/settings/folders`),
+  with the same action for them (`POST /api/settings/relearn-mounts`, which
+  also takes the drive for the unsettled conversions whose new file goes
+  there). Saving Settings learns a folder's drives afresh only when the
+  folder changes: another place, links followed (`share_mounts::same_folder`,
+  each path found out within 5 s). Saved again as it was (picked again, or
+  sent with another setting), or given another way that leads to the same
+  place (a link), it keeps what was remembered (carried over to the new
+  way), whatever is mounted there now: with the share unmounted or another
+  drive in its place it stays not connected, and isn't written into to
+  check it.
   Mounts are only forgotten when a folder stops being used for that, so
   a share removed for good is moved off like this: a library is removed
-  and added again (its mounts are learned afresh from that moment), the
-  output or work folder is changed in Settings (the folder it replaces is
-  forgotten; choosing the old one again later learns it afresh, as an
-  ordinary folder when nothing is mounted there), or saved again as it
-  is.
+  and added again (its mounts are learned afresh from that moment), or
+  the output or work folder is changed in Settings (the folder it replaces
+  is forgotten; choosing the old one again later learns it afresh, as an
+  ordinary folder when nothing is mounted there).
 - Leftovers in library folders: every scan hands the temp and backup files
   its walk finds (`WalkResult.artifacts`) to `recover_artifact`, except
   those of running jobs and of jobs whose new file is still being put in
@@ -1129,7 +1152,9 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /queue/pause` / `POST /queue/resume` | | `QueueState` |
 | `POST /queue/stop` | | `QueueState` (cancel running, re-queue them, pause) |
 | `GET /settings` | | `Settings` |
-| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes) |
+| `PATCH /settings` | partial `Settings` JSON (merged at top level; `default_profile` replaced whole) | `Settings`. 400 `invalid_settings`/`unknown_setting` with `field` (e.g. folder mode without folder, unwritable temp dir, an added ignore pattern that is invalid; patterns already saved don't block other changes). An output or work folder saved again as it was (or through a link to the same place) keeps the drives remembered for it, and one whose drive isn't connected as it was isn't written into to check it; only a folder that changes is learned afresh. |
+| `GET /settings/folders` | | `FolderStatus[]` `{setting: "output_folder"\|"temp_dir", path, problem, changed_mount}`: the output folder (folder mode) and the work folder in use (`temp_dir`, else the one the server was started with), `problem` the same sentence as a library's `path_error` when its drive isn't connected as it was, `changed_mount` the place when another drive is mounted there. No disk is touched. |
+| `POST /settings/relearn-mounts` | | `FolderStatus[]`. Takes the drive mounted now as the usual one where the output or work folder's drive was and something else is mounted (also for the unsettled conversions whose new file goes there); places with nothing mounted stay "not connected". Logs "The output folder … now uses the drive mounted at …", and checks the waiting libraries again. 409 `nothing_changed` when no such place has another drive. |
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
@@ -1330,9 +1355,14 @@ Screens:
    libraries); and **About** (version, build, and a copyable bug-report
    summary). Changes are saved with one save bar; a field error is shown
    next to the field named by the API's `field` and in the save bar. The
-   output or work folder picked again as it is counts as a change, and
-   saving it learns the drives it is on afresh (another drive put in
-   place of its share on purpose).
+   output or work folder picked again as it is is no change. When the
+   drive the saved output or work folder sits on isn't connected as it
+   was (`GET /api/settings/folders`, looked at again every 15 s), its
+   block says so in a callout with the server's sentence ("This folder's
+   drive isn't connected", or "A different drive is mounted" with **Use
+   the drive that's there now** and the same confirmation as a library's,
+   which calls `POST /api/settings/relearn-mounts`); hidden while another
+   folder is picked.
 
 Plain language first: "Smaller files", not "CRF 32"; codecs are secondary
 detail; problems are grouped by `problem` and each comes with its fix;

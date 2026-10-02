@@ -183,10 +183,15 @@ async fn another_drive_at_the_output_share_waits_until_the_user_says_to_use_it()
     drop(away);
 }
 
-/// The same, told in Settings: saving the output folder again (as it was)
-/// takes the drive mounted there now as the usual one.
+/// Saving Settings with the output folder as it was (picked again, or
+/// sent with another output option) keeps the drive remembered for it:
+/// another drive in the share's place is not taken for it, the job keeps
+/// waiting, and nothing is written there. The Settings page's own action
+/// (`POST /api/settings/relearn-mounts`) takes the drive there now, after
+/// `GET /api/settings/folders` says what is wrong. Before, saving the same
+/// folder again learned whatever was mounted there.
 #[tokio::test]
-async fn saving_the_output_folder_again_uses_the_drive_there_now() {
+async fn saving_the_output_folder_again_keeps_the_usual_drive() {
     let app = TestApp::new().await;
     let (lib, out, mounted) = output_share_in_use(&app).await;
     let _away = unmount(&out, mounted);
@@ -200,23 +205,217 @@ async fn saving_the_output_folder_again_uses_the_drive_there_now() {
             .is_some_and(|e| e.contains("A different drive is mounted at"))
     })
     .await;
-    // Another setting saved meanwhile changes nothing.
-    let r = app.patch("/api/settings", json!({ "max_jobs": 2 })).await;
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
-    app.state.dispatcher.recheck_now(uuid(&lib["id"]));
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(!app.fake.started().iter().any(|n| n == "later.mp4"));
+    // Another setting saved meanwhile, and the same folder saved again
+    // (with another output option, and alone): nothing changes.
+    for body in [
+        json!({ "max_jobs": 2 }),
+        json!({ "output_folder": out.to_str().unwrap(), "keep_file_dates": false }),
+        json!({ "output_folder": out.to_str().unwrap() }),
+    ] {
+        let r = app.patch("/api/settings", body.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{body}: {}", r.text);
+        app.state.dispatcher.recheck_now(uuid(&lib["id"]));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !app.fake.started().iter().any(|n| n == "later.mp4"),
+            "{body}: the job waits"
+        );
+        assert!(names(&out).is_empty(), "{body}: {:?}", names(&out));
+        assert_eq!(
+            library(&app, &lib).await["changed_mount"],
+            out.to_str().unwrap(),
+            "{body}"
+        );
+    }
 
+    // Settings says what is wrong with the output folder.
+    let r = app.get("/api/settings/folders").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let output = r
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["setting"] == "output_folder")
+        .cloned();
+    let output = output.unwrap_or_else(|| panic!("{}", r.json));
+    assert_eq!(output["path"], out.to_str().unwrap());
+    assert_eq!(output["changed_mount"], out.to_str().unwrap());
+    assert!(
+        output["problem"]
+            .as_str()
+            .is_some_and(|p| p.contains("A different drive is mounted at")),
+        "{output}"
+    );
+
+    // Its action takes the drive there now.
+    let r = app.post_empty("/api/settings/relearn-mounts").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    let output = r
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["setting"] == "output_folder")
+        .cloned();
+    let output = output.unwrap_or_else(|| panic!("{}", r.json));
+    assert_eq!(output["problem"], Value::Null, "{output}");
+    assert_eq!(output["changed_mount"], Value::Null, "{output}");
+    wait("the file to be converted into it", async || {
+        done(&app).await == 2
+    })
+    .await;
+    assert_eq!(path_error(&app, &lib).await, None);
+    assert_eq!(names(&out), ["later.mkv"]);
+    let feed = app.get("/api/activity?limit=50").await.json.to_string();
+    assert!(
+        feed.contains(&format!(
+            "The output folder {} now uses the drive mounted at {}.",
+            out.display(),
+            out.display()
+        )),
+        "{feed}"
+    );
+    // Nothing is different any more.
+    let r = app.post_empty("/api/settings/relearn-mounts").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text);
+    assert_eq!(r.json["code"], "nothing_changed", "{}", r.json);
+}
+
+/// The same with the share unmounted and nothing in its place: saving the
+/// output folder again as it was, or given through a link to the same
+/// place, doesn't make the bare mount point the output folder. The job
+/// keeps waiting ("isn't connected"), nothing is written into the mount
+/// point, and the Settings action has nothing to take (a place with
+/// nothing mounted stays not connected). Once the share is back, the job
+/// converts onto it. Before, the bare mount point was learned as an
+/// ordinary folder and the new file written into it, hidden under the
+/// share once it was mounted again.
+#[tokio::test]
+async fn saving_the_output_folder_again_while_its_share_is_away_waits_for_it() {
+    let app = TestApp::new().await;
+    let (lib, out, mounted) = output_share_in_use(&app).await;
+    let away = unmount(&out, mounted);
+    app.write("Movies/later.mp4", h264());
+    app.rescan(lib["id"].as_str().unwrap()).await;
+    app.resume().await;
+    wait("the library to wait for the share", async || {
+        path_error(&app, &lib)
+            .await
+            .is_some_and(|e| e.contains("isn't connected"))
+    })
+    .await;
+    let link = app.dir.path().join("out-link");
+    std::os::unix::fs::symlink(&out, &link).unwrap();
+    for (folder, also) in [
+        (&out, json!({ "keep_file_dates": false })),
+        (&out, json!({})),
+        (&link, json!({})),
+    ] {
+        let mut body = also.clone();
+        body["output_folder"] = json!(folder.to_str().unwrap());
+        let r = app.patch("/api/settings", body.clone()).await;
+        assert_eq!(r.status, StatusCode::OK, "{body}: {}", r.text);
+        app.state.dispatcher.recheck_now(uuid(&lib["id"]));
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !app.fake.started().iter().any(|n| n == "later.mp4"),
+            "{body}: the job waits"
+        );
+        assert!(names(&out).is_empty(), "{body}: {:?}", names(&out));
+        let reason = path_error(&app, &lib).await.unwrap_or_default();
+        assert!(
+            reason.contains(&format!(
+                "The drive or share mounted at {} isn't connected",
+                out.display()
+            )),
+            "{body}: {reason}"
+        );
+    }
+    // The link is the output folder now, with the share remembered for it.
+    let known = crate::db::folder_mounts::get(app.state.db.pool(), link.to_str().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        known
+            .iter()
+            .any(|m| m.mount == out.to_str().unwrap() && m.identity == Some(hang::share_at(&out))),
+        "{known:?}"
+    );
+    let r = app.post_empty("/api/settings/relearn-mounts").await;
+    assert_eq!(r.status, StatusCode::CONFLICT, "{}", r.text);
+    let r = app.get("/api/settings/folders").await;
+    assert!(r.json.to_string().contains("isn't connected"), "{}", r.json);
+
+    mend(&out, &away);
+    let _mounted = hang::mount(&out);
+    app.state.dispatcher.recheck_now(uuid(&lib["id"]));
+    wait("the file to be converted onto the share", async || {
+        done(&app).await == 2
+    })
+    .await;
+    assert_eq!(names(&out), ["film.mkv", "later.mkv"]);
+    assert_eq!(path_error(&app, &lib).await, None);
+}
+
+/// A work folder on a share with another drive put in its place: the
+/// library whose job waits for it names the place (`changed_mount`), and
+/// its "Use the drive that's there now" action takes it for the work
+/// folder too, so the job goes on.
+#[tokio::test]
+async fn the_library_action_takes_another_drive_at_the_work_folder() {
+    let app = TestApp::new().await;
+    app.pause().await;
+    let work = app.dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mounted = hang::mount(&work);
     let r = app
         .patch(
             "/api/settings",
-            json!({ "output_folder": out.to_str().unwrap() }),
+            json!({ "temp_dir": work.to_str().unwrap() }),
         )
         .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text);
-    app.state.dispatcher.recheck_now(uuid(&lib["id"]));
-    wait("the file to be converted", async || done(&app).await == 2).await;
+    app.write("Movies/film.mp4", h264());
+    let lib = app.add_library("Movies", json!({})).await;
+    let lib_id = lib["id"].as_str().unwrap().to_string();
+
+    let _away = unmount(&work, mounted);
+    let _other = hang::mount_other(&work, "cache pool");
+    app.resume().await;
+    wait("the library to wait for the work folder", async || {
+        library(&app, &lib).await["changed_mount"] == work.to_str().unwrap()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(app.fake.started().is_empty(), "the job waits");
+    let r = app.get("/api/settings/folders").await;
+    let temp = r
+        .json
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["setting"] == "temp_dir")
+        .cloned();
+    let temp = temp.unwrap_or_else(|| panic!("{}", r.json));
+    assert_eq!(temp["changed_mount"], work.to_str().unwrap(), "{temp}");
+
+    let r = app
+        .post_empty(&format!("/api/libraries/{lib_id}/relearn-mounts"))
+        .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text);
+    wait("the file to be converted", async || done(&app).await == 1).await;
     assert_eq!(path_error(&app, &lib).await, None);
+    let r = app.get("/api/settings/folders").await;
+    assert!(
+        r.json
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["problem"].is_null()),
+        "{}",
+        r.json
+    );
 }
 
 /// The output folder is given as a link to a share's mount point: the share

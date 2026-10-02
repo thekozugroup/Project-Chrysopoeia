@@ -27,14 +27,22 @@
 //! and a job whose new file may have been put in place is never settled on
 //! it. A folder's mount points are forgotten only when it stops being used
 //! for that: a library removed (or added again), the output folder or the
-//! work folder changed in Settings. A different drive put there on purpose
-//! is taken as the usual one when the user says so ([`relearn`]).
+//! work folder changed in Settings (to another place: saved again as it
+//! was, it keeps them). A different drive put there on purpose is taken as
+//! the usual one only when the user says so ([`relearn`]).
+//!
+//! Mount points remembered by an older version, without what was mounted
+//! there, have it noted at the first look that finds something mounted
+//! there ([`note_unknown`], at start-up and every 15 s until none are left,
+//! and at every look at their folder), except the folder below bound onto
+//! itself (`slow_fs::shows_folder_below`), which is never taken for the
+//! share; with nothing mounted there, their folder is not connected.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use chrysopoeia_core::OutputMode;
+use chrysopoeia_core::{FolderSetting, OutputMode};
 use chrysopoeia_worker::slow_fs::{self, KnownMount, MountIdentity, MountPoint};
 use uuid::Uuid;
 
@@ -53,6 +61,14 @@ const RESOLVE_TIMEOUT: Duration = if cfg!(test) {
 /// How long where a folder really is is taken as known before it is found
 /// out again (in the background: the last answer is used meanwhile).
 const RESOLVED_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// How often mount points remembered without what was mounted there are
+/// looked at again (see [`note_unknown_loop`]).
+const NOTE_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(15)
+};
 
 /// The mount points remembered for one folder, with what was mounted there
 /// (`None`: not noted yet).
@@ -120,16 +136,44 @@ pub fn different_drive(mount: &Path) -> String {
     )
 }
 
+/// The mount on top at `point` among `now` (not one an automounter mounts
+/// on demand).
+fn mounted_at<'a>(now: &'a [MountPoint], point: &Path) -> Option<&'a MountPoint> {
+    now.iter().rfind(|m| m.path == point && !m.on_demand)
+}
+
 /// Whether `known` is mounted among `now`, as it was: [`Mounted::No`] or
-/// [`Mounted::Different`] when it isn't, `None` when it is.
+/// [`Mounted::Different`] when it isn't, `None` when it is. When what was
+/// mounted there isn't known (remembered by an older version), anything
+/// mounted there will do but the folder below bound onto itself (see
+/// `slow_fs::shows_folder_below`): that is another drive than the share.
 fn compare(now: &[MountPoint], known: &KnownMount) -> Option<Mounted> {
-    match now.iter().rfind(|m| m.path == known.point && !m.on_demand) {
-        None => Some(Mounted::No(known.point.clone())),
-        Some(m) if known.identity.as_ref().is_some_and(|id| *id != m.identity) => {
-            Some(Mounted::Different(known.point.clone()))
-        }
-        Some(_) => None,
-    }
+    let Some(m) = mounted_at(now, &known.point) else {
+        return Some(Mounted::No(known.point.clone()));
+    };
+    let same = match &known.identity {
+        Some(id) => *id == m.identity,
+        None => !slow_fs::shows_folder_below(now, m),
+    };
+    (!same).then(|| Mounted::Different(known.point.clone()))
+}
+
+/// What is mounted at `point` now, to be noted as what was mounted there
+/// for a mount point remembered without it: `None` when nothing is, or
+/// only the folder below bound onto itself (never taken for the share).
+fn noteable(now: &[MountPoint], point: &Path) -> Option<MountIdentity> {
+    let m = mounted_at(now, point)?;
+    (!slow_fs::shows_folder_below(now, m)).then(|| m.identity.clone())
+}
+
+/// The mount points of `known` not noted yet with what is mounted there
+/// now, where something that may be noted is (see [`noteable`]).
+fn unnoted_now(now: &[MountPoint], known: &Remembered) -> Remembered {
+    known
+        .iter()
+        .filter(|(_, identity)| identity.is_none())
+        .filter_map(|(point, _)| Some((point.clone(), Some(noteable(now, point)?))))
+        .collect()
 }
 
 /// The first of `known` that isn't mounted as it was, the outermost first
@@ -182,6 +226,8 @@ async fn remembered(state: &AppState, folder: &Path, key: &str) -> Option<Rememb
 
 /// Whether the mount points `folder` is known to sit on are all mounted as
 /// they were, without learning anything new or touching any disk.
+/// What was mounted at a mount point remembered without it is noted when
+/// something that may be is mounted there now (see [`noteable`]).
 pub async fn status(state: &AppState, folder: &Path) -> Mounted {
     let Some(key) = folder.to_str() else {
         return Mounted::Yes(Vec::new());
@@ -195,7 +241,16 @@ pub async fn status(state: &AppState, folder: &Path) -> Mounted {
     let Some(now) = slow_fs::mount_points().await else {
         return Mounted::Unknown;
     };
-    first_problem(&now, &known).unwrap_or_else(|| Mounted::Yes(known_mounts(&known)))
+    if let Some(problem) = first_problem(&now, &known) {
+        return problem;
+    }
+    let noted = unnoted_now(&now, &known);
+    let mut all = known;
+    if !noted.is_empty() {
+        all.extend(noted.iter().map(|(p, i)| (p.clone(), i.clone())));
+        save(state, folder, key, &noted).await;
+    }
+    Mounted::Yes(known_mounts(&all))
 }
 
 /// Whether the mount points `folder` is known to sit on (at or above it,
@@ -251,57 +306,119 @@ async fn check_learning(state: &AppState, folder: &Path, inside: bool) -> Mounte
         })
         .map(|m| (m.path.clone(), Some(m.identity.clone())))
         .collect();
-    // New ones, and ones remembered without what was mounted there.
+    // New ones, and ones remembered without what was mounted there (never
+    // the folder below bound onto itself: the share isn't there).
     let mut learned: Remembered = above
         .iter()
         .filter(|(point, _)| !known.contains_key(*point))
         .map(|(point, identity)| (point.clone(), identity.clone()))
         .collect();
-    for (point, identity) in &known {
-        if identity.is_none()
-            && let Some(m) = now.iter().rfind(|m| m.path == *point && !m.on_demand)
-        {
-            learned.insert(point.clone(), Some(m.identity.clone()));
-        }
-    }
+    learned.extend(unnoted_now(&now, &known));
     let mut all = known;
     if !learned.is_empty() {
         all.extend(learned.iter().map(|(p, i)| (p.clone(), i.clone())));
-        {
-            let mut cache = lock(&state.mounts.known);
-            let entry = cache.entry(folder.to_path_buf()).or_default();
-            for (point, identity) in &learned {
-                let noted = entry.entry(point.clone()).or_default();
-                if noted.is_none() {
-                    noted.clone_from(identity);
-                }
-            }
-        }
-        let rows: Vec<FolderMount> = learned
-            .iter()
-            .filter_map(|(point, identity)| {
-                Some(FolderMount {
-                    mount: point.to_str()?.to_string(),
-                    identity: identity.clone(),
-                })
-            })
-            .collect();
-        let saved = async {
-            let mut tx = state.db.write_tx().await?;
-            db::folder_mounts::add(&mut tx, key, &rows).await?;
-            tx.commit().await
-        }
-        .await;
-        match saved {
-            Ok(()) => {
-                tracing::debug!(folder = %folder.display(), mounts = ?learned, "remembered the folder's mounts")
-            }
-            Err(e) => {
-                tracing::warn!(folder = %folder.display(), "could not record the folder's mounts: {e}")
+        save(state, folder, key, &learned).await;
+    }
+    Mounted::Yes(known_mounts(&all))
+}
+
+/// Remember `learned` for `folder` (stored as `key`): new mount points, and
+/// what is mounted at ones remembered without it.
+async fn save(state: &AppState, folder: &Path, key: &str, learned: &Remembered) {
+    // Only into what is loaded already: a folder not loaded yet is read
+    // whole from the database at its first look (an entry made here would
+    // hold these mount points alone, and the folder's others would be
+    // taken as not remembered).
+    if let Some(entry) = lock(&state.mounts.known).get_mut(folder) {
+        for (point, identity) in learned {
+            let noted = entry.entry(point.clone()).or_default();
+            if noted.is_none() {
+                noted.clone_from(identity);
             }
         }
     }
-    Mounted::Yes(known_mounts(&all))
+    let rows: Vec<FolderMount> = learned
+        .iter()
+        .filter_map(|(point, identity)| {
+            Some(FolderMount {
+                mount: point.to_str()?.to_string(),
+                identity: identity.clone(),
+            })
+        })
+        .collect();
+    let saved = async {
+        let mut tx = state.db.write_tx().await?;
+        db::folder_mounts::add(&mut tx, key, &rows).await?;
+        tx.commit().await
+    }
+    .await;
+    match saved {
+        Ok(()) => {
+            tracing::debug!(folder = %folder.display(), mounts = ?learned, "remembered the folder's mounts")
+        }
+        Err(e) => {
+            tracing::warn!(folder = %folder.display(), "could not record the folder's mounts: {e}")
+        }
+    }
+}
+
+/// Note what is mounted at every mount point remembered without it (by an
+/// older version), where something that may be noted is mounted now (see
+/// [`noteable`]): the share, when it is there at the first look. Done at
+/// start-up, before anything looks at a folder, and every
+/// [`NOTE_EVERY`] after ([`note_unknown_loop`]), so it is noted promptly
+/// even while nothing else looks at that folder: another drive put there
+/// later is then told apart. Whether any are left without it.
+pub async fn note_unknown(state: &AppState) -> bool {
+    let rows = match db::folder_mounts::unnoted(state.db.pool()).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!("could not read the mount points to note: {e}");
+            return true;
+        }
+    };
+    if rows.is_empty() {
+        return false;
+    }
+    let Some(now) = slow_fs::mount_points().await else {
+        return true;
+    };
+    let mut by_folder: BTreeMap<String, Remembered> = BTreeMap::new();
+    let mut left = 0;
+    for (folder, mount) in rows {
+        match noteable(&now, Path::new(&mount)) {
+            Some(identity) => {
+                tracing::info!(
+                    folder = %folder,
+                    mount = %mount,
+                    "noted what is mounted at a mount point remembered before ({identity})"
+                );
+                by_folder
+                    .entry(folder)
+                    .or_default()
+                    .insert(PathBuf::from(mount), Some(identity));
+            }
+            None => left += 1,
+        }
+    }
+    for (folder, learned) in &by_folder {
+        save(state, Path::new(folder), folder, learned).await;
+    }
+    left > 0
+}
+
+/// [`note_unknown`] every [`NOTE_EVERY`] until none are left (or the
+/// server shuts down).
+pub async fn note_unknown_loop(state: AppState) {
+    loop {
+        tokio::select! {
+            () = state.shutdown.cancelled() => break,
+            () = tokio::time::sleep(NOTE_EVERY) => {}
+        }
+        if !note_unknown(&state).await {
+            break;
+        }
+    }
 }
 
 /// Take what is mounted now at each mount point remembered for `folder`
@@ -319,12 +436,14 @@ pub async fn relearn(state: &AppState, folder: &Path) -> anyhow::Result<Vec<Path
     let Some(now) = slow_fs::mount_points().await else {
         anyhow::bail!("could not read the list of mounts");
     };
-    let changed: Vec<(PathBuf, MountIdentity)> = known
-        .iter()
-        .filter_map(|(point, identity)| {
-            let m = now.iter().rfind(|m| m.path == *point && !m.on_demand)?;
-            let different = identity.as_ref().is_some_and(|id| *id != m.identity);
-            different.then(|| (point.clone(), m.identity.clone()))
+    let changed: Vec<(PathBuf, MountIdentity)> = known_mounts(&known)
+        .into_iter()
+        .filter_map(|known| {
+            let Some(Mounted::Different(point)) = compare(&now, &known) else {
+                return None;
+            };
+            let m = mounted_at(&now, &point)?;
+            Some((point, m.identity.clone()))
         })
         .collect();
     if !changed.is_empty() {
@@ -485,7 +604,7 @@ pub async fn relearn_library(
         };
         for mount in placing {
             if let Some(Mounted::Different(point)) = compare(&now, &mount)
-                && let Some(m) = now.iter().rfind(|m| m.path == point && !m.on_demand)
+                && let Some(m) = mounted_at(&now, &point)
             {
                 db::jobs::relearn_final_mounts(pool, lib_id, &point, &m.identity).await?;
                 taken.push(point);
@@ -539,6 +658,129 @@ pub async fn forget_unless_used(state: &AppState, folder: &Path) {
         }
     }
     forget(state, folder).await;
+}
+
+/// Whether `folder` is used for something else than the folder setting
+/// `setting`: a library folder, or the other of the output and work
+/// folders. Taken as used when that can't be told (the libraries can't be
+/// read): what is remembered for a folder in use is never forgotten.
+pub async fn used_besides(state: &AppState, folder: &Path, setting: FolderSetting) -> bool {
+    let settings = state.settings();
+    let other = match setting {
+        FolderSetting::OutputFolder => settings
+            .temp_dir
+            .map(PathBuf::from)
+            .or_else(|| state.config.temp_dir.clone()),
+        FolderSetting::TempDir => settings.output_folder.map(PathBuf::from),
+    };
+    if other.as_deref() == Some(folder) {
+        return true;
+    }
+    match db::libraries::list(state.db.pool()).await {
+        Ok(libs) => libs.iter().any(|l| Path::new(&l.path) == folder),
+        Err(e) => {
+            tracing::debug!(folder = %folder.display(), "could not tell whether the folder is in use: {e}");
+            true
+        }
+    }
+}
+
+/// Whether the folder settings `before` (saved) and `after` (being saved)
+/// name the same folder: the same path, or paths that lead to the same
+/// place once links are followed (each found out with a time limit; one
+/// that doesn't answer in time counts as where it was last found to lead,
+/// or as given).
+pub async fn same_folder(state: &AppState, before: Option<&str>, after: Option<&str>) -> bool {
+    match (before, after) {
+        (None, None) => true,
+        (Some(before), Some(after)) => same_place(state, Path::new(before), Path::new(after)).await,
+        _ => false,
+    }
+}
+
+async fn same_place(state: &AppState, before: &Path, after: &Path) -> bool {
+    if before == after {
+        return true;
+    }
+    let (was, now) = tokio::join!(
+        slow_fs::real_path(before, RESOLVE_TIMEOUT),
+        slow_fs::real_path(after, RESOLVE_TIMEOUT),
+    );
+    let was = was
+        .or_else(|| {
+            lock(&state.mounts.resolved)
+                .get(before)
+                .map(|(real, _)| real.clone())
+        })
+        .unwrap_or_else(|| before.to_path_buf());
+    let now = now.unwrap_or_else(|| after.to_path_buf());
+    was == now
+}
+
+/// What is remembered for `from` is remembered for `to` too (the same
+/// folder, given another way: through a link, say).
+pub async fn carry_over(state: &AppState, from: &Path, to: &Path) {
+    let (Some(from_key), Some(to_key)) = (from.to_str(), to.to_str()) else {
+        return;
+    };
+    let Some(known) = remembered(state, from, from_key).await else {
+        tracing::warn!(folder = %from.display(), "could not read the folder's mounts to keep them");
+        return;
+    };
+    if !known.is_empty() {
+        save(state, to, to_key, &known).await;
+    }
+}
+
+/// Whether the drives and shares `folder` is known to sit on aren't
+/// mounted as they were (not connected, or another drive in a share's
+/// place), so nothing may be written there.
+pub async fn away(state: &AppState, folder: &Path) -> bool {
+    matches!(
+        status(state, folder).await,
+        Mounted::No(_) | Mounted::Different(_)
+    )
+}
+
+/// The output folder (in folder mode) and the work folder in use (the one
+/// chosen in Settings, else the one Chrysopoeia was started with), if any.
+pub fn configured_folders(state: &AppState) -> Vec<(FolderSetting, PathBuf)> {
+    let settings = state.settings();
+    let mut folders = Vec::new();
+    if settings.output_mode == OutputMode::Folder
+        && let Some(out) = settings.output_folder
+    {
+        folders.push((FolderSetting::OutputFolder, PathBuf::from(out)));
+    }
+    if let Some(work) = settings
+        .temp_dir
+        .map(PathBuf::from)
+        .or_else(|| state.config.temp_dir.clone())
+    {
+        folders.push((FolderSetting::TempDir, work));
+    }
+    folders
+}
+
+/// Take what is mounted now at each of `points` (places where the user
+/// said to use the drive there now) as the mount the new files of every
+/// conversion whose placing isn't settled go into, where that was there.
+pub async fn relearn_placing_at(state: &AppState, points: &[PathBuf]) -> anyhow::Result<()> {
+    if points.is_empty() {
+        return Ok(());
+    }
+    let Some(now) = slow_fs::mount_points().await else {
+        anyhow::bail!("could not read the list of mounts");
+    };
+    let pool = state.db.pool();
+    for lib in db::libraries::list(pool).await? {
+        for point in points {
+            if let Some(m) = mounted_at(&now, point) {
+                db::jobs::relearn_final_mounts(pool, lib.id, point, &m.identity).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -607,6 +849,51 @@ mod tests {
         assert_eq!(
             first_problem(&inner_other, &known),
             Some(Mounted::Different(PathBuf::from("/mnt/nas/usb")))
+        );
+    }
+
+    /// A mount point remembered without what was mounted there (by an
+    /// older version): with nothing mounted it is not connected; the folder
+    /// below bound onto itself is another drive, never noted as the share;
+    /// anything else there is taken, and noted.
+    #[test]
+    fn a_place_remembered_without_its_drive() {
+        let known: Remembered = [(PathBuf::from("/mnt/nas"), None)].into_iter().collect();
+        let on_disk = |path: &str, root: &str| MountPoint {
+            path: PathBuf::from(path),
+            on_demand: false,
+            identity: MountIdentity {
+                fstype: "ext4".to_string(),
+                source: "/dev/vda".to_string(),
+                root: root.to_string(),
+            },
+        };
+        let root = on_disk("/", "/");
+        let bare = on_disk("/mnt/nas", "/mnt/nas");
+        let share = point("/mnt/nas", "nfs4");
+
+        let gone = [root.clone()];
+        assert_eq!(
+            first_problem(&gone, &known),
+            Some(Mounted::No(PathBuf::from("/mnt/nas")))
+        );
+        assert!(unnoted_now(&gone, &known).is_empty());
+
+        let bound = [root.clone(), bare.clone()];
+        assert_eq!(
+            first_problem(&bound, &known),
+            Some(Mounted::Different(PathBuf::from("/mnt/nas")))
+        );
+        assert!(unnoted_now(&bound, &known).is_empty(), "never noted");
+
+        // The share mounted over the bound folder (listed after it).
+        let back = [root, bare, share.clone()];
+        assert_eq!(first_problem(&back, &known), None);
+        assert_eq!(
+            unnoted_now(&back, &known),
+            [(PathBuf::from("/mnt/nas"), Some(share.identity))]
+                .into_iter()
+                .collect::<Remembered>()
         );
     }
 }

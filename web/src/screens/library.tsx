@@ -15,7 +15,6 @@ import {
   Ellipsis,
   FileWarning,
   FolderSearch,
-  HardDrive,
   Hourglass,
   LoaderCircle,
   Play,
@@ -30,6 +29,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
+import { UseDriveButton, UseDriveConfirm } from "@/components/drive-change";
 import { FileName } from "@/components/file-name";
 import { LibraryBar, LibraryLegend, countedFiles } from "@/components/library-bar";
 import { ProfileEditor } from "@/components/profile-editor";
@@ -140,6 +140,7 @@ export function FolderProblem({ library }: { library: Library }) {
       client.setQueryData<Library[]>(keys.libraries, (old) => old?.map((l) => (l.id === updated.id ? updated : l)));
       void client.invalidateQueries({ queryKey: keys.libraries });
       void client.invalidateQueries({ queryKey: keys.queue });
+      void client.invalidateQueries({ queryKey: keys.settingsFolders });
       setConfirming(false);
       toast.success("Using the drive that's there now", {
         description: `${library.name} goes on with the drive mounted at ${mount ?? "that place"}.`,
@@ -157,37 +158,19 @@ export function FolderProblem({ library }: { library: Library }) {
         tone="warning"
         title={mount ? "A different drive is mounted" : "Chrysopoeia can't read this folder"}
         className="mb-6"
-        action={
-          mount ? (
-            <Button size="sm" variant="secondary" onClick={() => setConfirming(true)} needsServer>
-              <HardDrive aria-hidden />
-              Use the drive that&apos;s there now
-            </Button>
-          ) : null
-        }
+        action={mount ? <UseDriveButton onClick={() => setConfirming(true)} /> : null}
       >
         {/* The server's sentence says what to check for this kind of problem. */}
         <p>{library.path_error}</p>
       </Callout>
       {mount ? (
-        <ConfirmDialog
+        <UseDriveConfirm
           open={confirming}
           onOpenChange={setConfirming}
-          title="Use the drive that's there now?"
-          confirmLabel="Use this drive"
+          mount={mount}
           loading={relearn.isPending}
           onConfirm={() => relearn.mutate()}
-        >
-          <p>
-            Chrysopoeia will take the drive mounted at{" "}
-            <span className="font-mono text-[0.8125rem] text-fg">{mount}</span> as the usual one from now on: it reads
-            files from it and saves new files to it.
-          </p>
-          <p className="font-medium text-fg">
-            Only do this if you replaced the drive or share on purpose. If the usual one just isn&apos;t connected yet,
-            reconnect it instead: files saved now would end up on the drive that&apos;s there now.
-          </p>
-        </ConfirmDialog>
+        />
       ) : null}
     </>
   );
