@@ -21,13 +21,21 @@
     refresh the template; the image itself does not depend on either. To try
     the template from another branch, download it from that branch (see
     docs/UNRAID.md, "Trying a test build").
-  - Repository is :latest, which follows main. A branch is tried with the
-    :edge image, published by running the Release workflow on that branch
-    (Actions > Release > Run workflow).
+  - Repository is :stable, the stable channel: it moves only when a tagged
+    release (vX.Y.Z, not a prerelease) is published, and never backwards, so
+    the Docker tab's update check and the Community Applications auto-update
+    offer releases only. :latest follows every build of main, and :edge is a
+    test build of a branch, published by running the Release workflow on that
+    branch (Actions > Release > Run workflow); a user switches by editing
+    Repository. :stable exists only once the first version tag has been pushed
+    and its Release run has finished. Before that, installing from this
+    template fails with a "manifest unknown" or "not found" pull error, so
+    push the first release before this template reaches main (CONTRIBUTING.md,
+    "Cutting a release").
 -->
 <Container version="2">
   <Name>Chrysopoeia</Name>
-  <Repository>ghcr.io/thekozugroup/chrysopoeia:latest</Repository>
+  <Repository>ghcr.io/thekozugroup/chrysopoeia:stable</Repository>
   <Registry>https://github.com/thekozugroup/Project-Chrysopoeia/pkgs/container/chrysopoeia</Registry>
   <Network>bridge</Network>
   <MyIP/>
@@ -35,7 +43,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/thekozugroup/Project-Chrysopoeia/issues</Support>
   <Project>https://github.com/thekozugroup/Project-Chrysopoeia</Project>
-  <Overview>Chrysopoeia converts your movie and TV library to smaller or more compatible formats (AV1, HEVC, H.264 or VP9) in the background, and replaces an original only after the new file has been fully decoded and visually compared against it. Set Media to the share that holds your videos, then pick a folder and a goal in the web UI; hardware encoders and the number of jobs to run at once are detected automatically. Intel or AMD graphics: install the Intel GPU TOP or Radeon TOP plugin, then click "Add another Path, Port, Variable, Label or Device" below, choose Config Type Device and enter /dev/dri as the Value. NVIDIA: install the Nvidia-Driver plugin, add --runtime=nvidia to Extra Parameters (Advanced View) and set NVIDIA_VISIBLE_DEVICES (under Show more settings) to all.</Overview>
+  <Overview>Chrysopoeia converts your movie and TV library to smaller or more compatible formats (AV1, HEVC, H.264 or VP9) in the background, and replaces an original only after the new file has been fully decoded and visually compared against it. Set Media to the share that holds your videos, then pick a folder and a goal in the web UI; hardware encoders and the number of jobs to run at once are detected automatically. Intel or AMD graphics: install the Intel GPU TOP or Radeon TOP plugin, then click "Add another Path, Port, Variable, Label or Device" below, choose Config Type Device and enter /dev/dri as the Value. NVIDIA: install the Nvidia-Driver plugin, add --runtime=nvidia to Extra Parameters (Advanced View) and set NVIDIA_VISIBLE_DEVICES (under Show more settings) to all. Updates: Repository ends in :stable, which moves only when a tagged release is published, so automatic updates install releases only. For every build of the main branch set it to ghcr.io/thekozugroup/chrysopoeia:latest; :edge is a test build of a branch, for testing.</Overview>
   <Category>MediaApp:Video Tools:</Category>
   <WebUI>http://[IP]:[PORT:8080]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/chrysopoeia.xml</TemplateURL>

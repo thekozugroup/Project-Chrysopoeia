@@ -8,7 +8,7 @@ IMAGE ?= chrysopoeia:dev
 PLATFORM ?= linux/amd64
 
 .DEFAULT_GOAL := help
-.PHONY: help dev-api dev-web web-install build run test lint fmt docker test-docker e2e e2e-browser test-media clean
+.PHONY: help dev-api dev-web web-install build run test lint fmt docker test-docker test-release e2e e2e-browser test-media clean
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -50,6 +50,9 @@ docker: ## Build the Docker image (IMAGE=chrysopoeia:dev, PLATFORM=linux/amd64)
 
 test-docker: docker ## Build the image, then test its entrypoint (PUID/PGID, GPU groups)
 	docker/test-entrypoint.sh $(IMAGE)
+
+test-release: ## Check the release rules: stable never moves backwards, release notes (no Docker needed)
+	scripts/test-release-channel.sh
 
 e2e: docker ## Build the image, then run the end-to-end smoke test (API) against it
 	scripts/e2e-smoke.sh $(IMAGE)

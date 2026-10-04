@@ -60,13 +60,14 @@ Then **Docker > Add Container**, and choose **Chrysopoeia** in the *Template*
 list.
 
 > **Before the first release, or from a branch.** The template, its icon and
-> the image `ghcr.io/thekozugroup/chrysopoeia:latest` (the template's
-> Repository) exist only once the project has been merged to `main`, its
-> Release workflow has published the image, and the package has been made
-> public. Until then the `wget` address above answers *404*, and Unraid's pull
-> of `:latest` is refused (*denied*). Install from the branch instead:
-> replace `main` in the `wget` address with the branch's name, and before
-> clicking **Apply** in step 3 set **Repository** to
+> the image `ghcr.io/thekozugroup/chrysopoeia:stable` (the template's
+> Repository) exist only once the project has been merged to `main`, a first
+> version tag (such as `v0.2.0`) has been pushed, its Release workflow has
+> published the image, and the package has been made public. Until then the
+> `wget` address above answers *404*, and Unraid's pull of `:stable` fails
+> (*manifest unknown*, or *denied* while the package is private). Install from
+> the branch instead: replace `main` in the `wget` address with the branch's
+> name, and before clicking **Apply** in step 3 set **Repository** to
 > `ghcr.io/thekozugroup/chrysopoeia:edge`. The details, including making the
 > package public, are under [Trying a test build](#trying-a-test-build). Or
 > [build the image yourself](../README.md#build-it-yourself) and set
@@ -76,6 +77,7 @@ list.
 
 | Field | What to enter |
 |---|---|
+| Repository | Leave it at `ghcr.io/thekozugroup/chrysopoeia:stable`: the newest tagged release, which only changes when a new release is published. That is the choice for automatic updates. `:latest` follows every build of `main` and `:edge` is a test build; see [Updates](#updates-stable-latest-and-edge). |
 | Web UI port | `8080`, or any free port. |
 | Config | `/mnt/user/appdata/chrysopoeia` (the default). Holds the database; it stays small. Keep it a folder of its own: never choose `/mnt/user/appdata` itself, which other apps share. |
 | Media | **Required.** The share that holds your videos, e.g. `/mnt/user/media/` (click the field to browse). Choose only what you want converted, never all of `/mnt/user/`: Chrysopoeia replaces files in this folder, so other apps' folders (appdata, photo libraries, camera recordings) must stay out of it. Inside the app this folder is `/media`. |
@@ -123,11 +125,14 @@ Click **Apply**. Unraid pulls the image and starts the container.
    is disabled and the picker says why. Choose the folder that holds your videos.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
-   suits old devices; *Archive* keeps near-original quality. Each card shows
-   how fast your hardware handles it, and the one that suits this machine is
-   marked *Best fit*. You can rename the library here. Under *Plays everywhere*
-   a file whose subtitles or attachments MP4 can't hold is skipped, with the
-   reason shown, instead of losing them; see
+   suits old devices; *Archive* keeps near-original quality. Audio follows the
+   goal: *Save space* converts every track to Opus (*Plays everywhere* to
+   AAC), keeping channels, language and flags but not lossless or Atmos
+   sound, while *Balanced* and *Archive* copy the original audio unchanged.
+   Each card shows how fast your hardware handles it, and the one that suits
+   this machine is marked *Best fit*. You can rename the library here. Under
+   *Plays everywhere* a file whose subtitles or attachments MP4 can't hold is
+   skipped, with the reason shown, instead of losing them; see
    [Troubleshooting](#troubleshooting).
 4. Click **Start**. Chrysopoeia scans the folder, queues the files that need
    work, and starts converting. The **Overview** shows the space saved so far
@@ -272,7 +277,7 @@ takes as long as the first time; a different goal converts everything again.
 Your media is not part of this backup: keep a separate backup of anything you
 cannot replace, since conversion replaces files.
 
-## Upgrading
+## Updates: stable, latest and edge
 
 **Docker** tab > **Check for Updates** > **apply update** next to Chrysopoeia.
 Your settings and libraries are kept, and the database is brought up to date on
@@ -283,27 +288,89 @@ Chrysopoeia exits within a few seconds. To see which build is running, open
 the bottom of **Settings** in the app (*About*) or the first lines of the
 container log.
 
-To go back to an older version, set **Repository** to that version and restore
-a backup of the config folder taken before the upgrade: a database written by a
-newer version is refused by an older one with a plain message.
+Which update you are offered depends on the tag at the end of **Repository**.
+Unraid compares the image your container runs with the image currently behind
+that tag, so a tag that rarely moves rarely offers an update.
 
-The `latest` image follows the project's main branch, so every tested change
-arrives as an update. To stay on released versions only, **Edit** the
-container and set **Repository** to a version tag once releases exist, for
-example `ghcr.io/thekozugroup/chrysopoeia:1.2.3` (exactly that release),
-`:1.2` (only fixes for 1.2) or `:1` (the newest 1.x).
+| Repository ends in | A new image appears | What a daily update check does |
+|---|---|---|
+| `:stable` (the template's default) | Only when a new release is published (a `vX.Y.Z` tag that is not a prerelease). Never backwards. | Nothing on most days. On the day a release is published, the next check installs it. Only tested, tagged releases arrive. |
+| `:latest` | After every merge to the `main` branch, released or not. | Installs every change that reached `main` since the last check, so the server runs ahead of the newest release. |
+| `:1.2` | When a new 1.2.x release is published. | Installs fixes for 1.2, never a new minor version. |
+| `:1` | When any new 1.x release is published. | Installs every new 1.x release, never 2.0. |
+| `:1.2.3` | Never. | Never offers anything. To update, **Edit** the container and change the tag. |
+| `:edge` | Whenever someone publishes a branch for testing. | May install a different, unmerged branch from one day to the next. For testing only. |
+
+`:stable` is the choice for automatic updates. `:latest` is not a "latest
+release": it is the newest build of `main`, which is usually ahead of the
+newest release, and it changes whenever the project does. `:edge` is for trying
+a branch (see [Trying a test build](#trying-a-test-build)).
+
+An automatic update recreates the container the same way **apply update** does,
+so a conversion that is running is stopped and starts again from the
+beginning. Set the update time (Community Applications' auto-update, **Auto
+Update Applications** in Settings) outside the hours when Chrysopoeia converts,
+for example at night when *When to convert* is off, or after the schedule's
+window ends.
+
+### Switching an existing install from :latest to :stable
+
+You keep the template the container was installed with: the Config, Media and
+Transcode cache paths, the `/dev/dri` Device for an Intel or AMD GPU, the
+variables, and Extra Parameters such as `--cpus`, `--memory` or
+`--runtime=nvidia`. Unraid saves them for the container in
+`/boot/config/plugins/dockerMan/templates-user/my-Chrysopoeia.xml`, and the
+container's **Edit** page changes that file. Do not count on a change to the
+template in the Apps store to switch a container that is already installed:
+change **Repository** once by hand.
+
+1. Check the version first. Open **Settings** in Chrysopoeia and read the
+   *build* under *About*: `main-<commit>` means the container follows `latest`.
+   Compare it with the newest release on the project's
+   [Releases page](https://github.com/thekozugroup/Project-Chrysopoeia/releases)
+   or in the [changelog](../CHANGELOG.md). `:stable` is the newest *release*,
+   so it can be older than the `main` build you run. Going to an older build
+   works only if it can still read your database: an older build refuses a
+   newer database, stops with *This database was created by a newer version of
+   Chrysopoeia* in the container log, and changes nothing. Then set
+   **Repository** back to `:latest`. So if your build is newer than the newest
+   release, wait for the next release before you switch.
+2. On the **Docker** tab, click the Chrysopoeia icon, then **Edit**. Do not
+   remove the container or install it again from **Apps**: that starts from the
+   template's defaults and you would add the paths, the GPU device and the
+   limits again.
+3. Change **Repository** from `ghcr.io/thekozugroup/chrysopoeia:latest` to
+   `ghcr.io/thekozugroup/chrysopoeia:stable`. Leave every other field as it is.
+   (If the pull then fails with *manifest unknown*, the first release has not
+   been published yet: put `:latest` back.)
+4. Click **Apply**. Unraid pulls the image and recreates the container with
+   all the paths, the device, the variables and the limits you already had. The
+   libraries, settings and history are in the Config folder and are kept.
+5. Check the result: the first lines of the container log and *About* in
+   Settings show the release number as the build (for example `0.3.0`), not
+   `main-<commit>`, and **Settings > Hardware** still lists your GPU.
+
+From then on, Check for Updates and the automatic updater offer releases only.
+To follow `main` again, repeat the steps with `:latest`.
+
+To go back to an older version, set **Repository** to that version (for
+example `ghcr.io/thekozugroup/chrysopoeia:0.2.0`, which never changes) and
+restore a backup of the config folder taken before the upgrade: a database
+written by a newer version is refused by an older one with a plain message.
 
 ## Trying a test build
 
 A branch that is not merged yet is published as
 `ghcr.io/thekozugroup/chrysopoeia:edge` when someone opens **Actions >
 Release > Run workflow** on GitHub and picks that branch. The workflow builds
-the image, runs its tests and pushes it for amd64 and arm64; `latest` is not
-touched. To use it, **Edit** the container, set **Repository** to
-`ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**. After the branch
-is merged to `main`, `latest` carries the same change: set **Repository** back
-to `ghcr.io/thekozugroup/chrysopoeia:latest`. Your settings and libraries are
-kept either way.
+the image, runs its tests and pushes it for amd64 and arm64; `latest` and
+`stable` are not touched. To use it, **Edit** the container, set **Repository**
+to `ghcr.io/thekozugroup/chrysopoeia:edge` and click **Apply**. Afterwards set
+**Repository** back to `ghcr.io/thekozugroup/chrysopoeia:stable` (releases only),
+or, once the branch is merged to `main` and you want the change at once, to
+`ghcr.io/thekozugroup/chrysopoeia:latest`, which then carries it. Your settings
+and libraries are kept either way. Switch back soon: `:edge` changes whenever
+anyone publishes a branch, and a daily auto-update would follow it.
 
 If that run published the very first image, the package on GitHub is still
 private and Unraid's pull is refused (*denied* or *unauthorized* in the pull
@@ -313,10 +380,11 @@ log). The repository owner makes it public once: on GitHub, **Packages** >
 The template's `Icon` and `TemplateURL` point at the `main` branch. Until the
 template and `unraid/chrysopoeia.png` are on `main`, a template installed from
 a branch shows no icon and cannot refresh itself; the container works the same.
-Before the very first release there is also no `latest`: install the template
-from the branch instead (replace `main` in the `wget` address of step 2 with
-the branch name, e.g. `.../Project-Chrysopoeia/my-branch/unraid/chrysopoeia.xml`)
-and set **Repository** to the `edge` image before clicking **Apply**.
+Before the very first release there is also no `stable` (and no `latest` until
+`main` has been built): install the template from the branch instead (replace
+`main` in the `wget` address of step 2 with the branch name, e.g.
+`.../Project-Chrysopoeia/my-branch/unraid/chrysopoeia.xml`) and set
+**Repository** to the `edge` image before clicking **Apply**.
 
 Without waiting for either, you can
 [build the image yourself](../README.md#build-it-yourself) (10 to 15 minutes)
