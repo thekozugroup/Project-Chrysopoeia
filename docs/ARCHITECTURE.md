@@ -39,7 +39,7 @@ shapes here are normative. The Rust source of truth for every shared type is
 
 | Crate | Owns | Public API |
 |---|---|---|
-| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, tying child processes to the server's life | Everything in `src/*.rs` |
+| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, tying child processes to the server's life | Everything in `src/*.rs` |
 | `chrysopoeia-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
 | `chrysopoeia-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
 | `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
@@ -699,7 +699,10 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   so this file wasn't converted. …". When no such job is on record (a file
   someone else put there), the worker's message stays.
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
-  start (older versions didn't read it).
+  start (older versions didn't read it), and so are stored probes of
+  Matroska files that list no statistics tags on any track
+  (`StreamInfo.statistics_tags`, which older versions didn't record), so
+  the conversion can remove them.
 - A failure is logged once, at WARN, through its activity entry.
 - Logging: the start line names the version and, when set, the build
   (`CHRYSOPOEIA_VERSION`); each hardware detection logs one INFO line
@@ -766,6 +769,21 @@ with `JobSpec.force` uses it when `decide` says skip.
   ignore cover images (they read back as attached pictures).
 - `-map_metadata 0 -map_chapters 0`, `-max_muxing_queue_size 9999`,
   `-analyzeduration 100M -probesize 100M` on input, `-f <muxer>`.
+- Matroska statistics tags (`core::tags`): mkvmerge stores `BPS`,
+  `DURATION`, `NUMBER_OF_FRAMES`, `NUMBER_OF_BYTES` and `_STATISTICS_*`
+  with each track, with the language appended when written with one
+  (`DURATION-eng`). ffmpeg copies a track's tags into its output whether it
+  copies or re-encodes the track, and its MKV writer adds only a fresh
+  plain `DURATION`, so a clip cut from a film keeps the film's
+  `DURATION-eng` (2:21:02 next to the clip's 1:01). The scanner records
+  each track's statistics tags as the file names them
+  (`StreamInfo.statistics_tags`), and for MKV and WebM every kept track
+  (video, audio copied or re-encoded, subtitles, attachments) gets
+  `-metadata:s:<v:0|a:N|s:N|t:N> <KEY>=` for each, which removes it and
+  leaves every other tag (title, language, dispositions, HDR metadata) as it
+  was; ffmpeg's MKV writer then adds its own `DURATION` for the new track.
+  MP4 keeps no such tags (checked with ffmpeg 6.1 and 7.0), so it gets none
+  of these options.
 - Audio per output stream: copy when the profile says copy (or source already in
   target codec) and the container can hold it; else encode with
   `AudioCodec::default_bitrate_kbps(channels)`, downmixing past
@@ -896,6 +914,29 @@ child is started with `core::process::end_with_parent` (Linux
 **validate_output** by level (checks stop at the first failure):
 - `quick`: ffprobe opens the output; stream counts match the plan; video codec
   is the target; duration (picture and sound streams) within max(1 s, 0.5 %).
+- How a length is read, for both files (`validate::probe_media`): a
+  stream's length is ffprobe's own stream duration (MP4 and most
+  containers), else its plain Matroska `DURATION` tag, else a localized
+  `DURATION-xx` tag only when the stream has nothing else; among several
+  tags of a kind the one with the first name counts, so the choice never
+  depends on the order ffprobe lists them in (the scanner reads tags by
+  the same rule, `core::tags`, and takes the container's length first).
+  A tag-derived length is then checked against the container's: one longer
+  than the container by more than the tolerance (no stream outlasts its
+  container), or a picture or sound track's shorter by more than it, is not
+  trusted as it is. ffprobe then lists the packets of the last 10 s of the
+  file (`-read_intervals <end-10>% -show_entries packet=…`, no decoding):
+  a stream with packets there takes the end of its last packet; a picture
+  or sound track with none keeps a shorter tag that ends before that part
+  (a subtitle that runs on past the video keeps the container longer);
+  anything else, or every contradicted tag when the packets can't be read,
+  takes the container's length. Without a container length the tags stand.
+  So an out-of-date tag can neither make a new file look "the same length"
+  as a wrongly long original nor make a complete one look cut short. The
+  length the full decode must reach is the new file's picture and sound
+  length read this way, else its container's, else the original's; a
+  conversion that stops early still fails ("The new file is shorter than
+  the original (…)" or "Playback stopped at … of …").
 - `standard`: quick + full decode of every picture and sound track (error/fatal
   lines, "corrupt decoded frame" and concealment count as damage; damage the
   original already has only warns) + visual comparison at 4 segments of 2 s.

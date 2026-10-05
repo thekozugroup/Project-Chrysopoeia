@@ -54,6 +54,13 @@ pub struct StreamInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mimetype: Option<String>,
     pub bit_rate: Option<u64>,
+    /// The track's Matroska statistics tags (`DURATION-eng`, `BPS`,
+    /// `_STATISTICS_WRITING_APP`, … see [`crate::tags`]), named as the file
+    /// spells them. They describe the track as it was when they were
+    /// written, so a conversion removes them (the MKV writer adds a fresh
+    /// `DURATION`). Probes stored by older versions have none listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statistics_tags: Vec<String>,
 
     // Video
     pub width: Option<u32>,

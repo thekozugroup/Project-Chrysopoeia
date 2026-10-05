@@ -1201,9 +1201,97 @@ fn broken_audio_tracks_are_dropped() {
     );
 }
 
+/// Matroska statistics tags the original's tracks carry describe the old
+/// tracks (a clip cut from a film keeps the film's `DURATION-eng`), so
+/// every one is removed from every kept track, copied or re-encoded. Other
+/// tags stay.
 #[test]
-fn statistics_tags_are_cleared_for_reencoded_streams_in_matroska() {
-    let p = probe_of(
+fn statistics_tags_of_every_kept_track_are_cleared_in_matroska() {
+    let tags = |keys: &[&str]| keys.iter().map(|k| k.to_string()).collect::<Vec<String>>();
+    let mut v = video(0, "h264", 1280, 720);
+    v.title = Some("Main feature".into());
+    v.statistics_tags = tags(&[
+        "BPS-eng",
+        "DURATION",
+        "DURATION-eng",
+        "NUMBER_OF_BYTES-eng",
+        "NUMBER_OF_FRAMES-eng",
+        "_STATISTICS_TAGS-eng",
+        "_STATISTICS_WRITING_APP-eng",
+        "_STATISTICS_WRITING_DATE_UTC-eng",
+        // Never anything but statistics, nor a name ffmpeg can't take.
+        "title",
+        "BPS=1",
+    ]);
+    let mut copied = audio(1, "opus", 2, 48_000, Some("ger"));
+    copied.statistics_tags = tags(&["DURATION", "DURATION-ger"]);
+    let mut encoded = audio(2, "ac3", 6, 48_000, Some("eng"));
+    encoded.statistics_tags = tags(&["BPS", "NUMBER_OF_FRAMES"]);
+    let mut subs = subtitle(3, "ass", Some("eng"));
+    subs.statistics_tags = tags(&["DURATION-eng", "BPS-eng"]);
+    let p = probe_of("matroska", vec![v, copied, encoded, subs, attachment(4)]);
+    let mkv = plan(
+        &p,
+        &profile(VideoCodec::Av1, AudioCodec::Opus, Container::Mkv),
+        &software(VideoCodec::Av1),
+    );
+    let args = &mkv.args;
+    assert_eq!(
+        values(args, "-c:a:0"),
+        ["copy"],
+        "the German track is copied"
+    );
+    for key in [
+        "BPS-eng=",
+        "DURATION=",
+        "DURATION-eng=",
+        "NUMBER_OF_BYTES-eng=",
+        "NUMBER_OF_FRAMES-eng=",
+        "_STATISTICS_TAGS-eng=",
+        "_STATISTICS_WRITING_APP-eng=",
+        "_STATISTICS_WRITING_DATE_UTC-eng=",
+    ] {
+        assert!(has_pair(args, "-metadata:s:v:0", key), "{key}: {args:?}");
+    }
+    assert!(has_pair(args, "-metadata:s:a:0", "DURATION-ger="));
+    assert!(has_pair(args, "-metadata:s:a:0", "DURATION="));
+    assert!(has_pair(args, "-metadata:s:a:1", "BPS="));
+    assert!(has_pair(args, "-metadata:s:a:1", "NUMBER_OF_FRAMES="));
+    assert!(has_pair(args, "-metadata:s:s:0", "DURATION-eng="));
+    assert!(has_pair(args, "-metadata:s:s:0", "BPS-eng="));
+    // Titles, languages and attachment names are left alone.
+    assert!(
+        !args.iter().any(|a| a == "title=" || a == "BPS=1="),
+        "{args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.starts_with("-metadata:s:t:")),
+        "{args:?}"
+    );
+    // After the tags are copied over, before the output.
+    let copied_at = pair_pos(args, "-map_metadata", "0").unwrap();
+    let cleared_at = pair_pos(args, "-metadata:s:v:0", "DURATION-eng=").unwrap();
+    assert!(copied_at < cleared_at && cleared_at < args.len() - 1);
+
+    // WebM is Matroska too.
+    let webm = plan(
+        &p,
+        &profile(VideoCodec::Av1, AudioCodec::Opus, Container::Webm),
+        &software(VideoCodec::Av1),
+    );
+    assert!(has_pair(&webm.args, "-metadata:s:v:0", "DURATION-eng="));
+
+    // MP4 keeps no such tags (checked with ffmpeg 6 and 7).
+    let mp4 = plan(
+        &p,
+        &profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mp4),
+        &software(VideoCodec::Av1),
+    );
+    assert_absent(&mp4.args, "-metadata:s:v:0");
+    assert_absent(&mp4.args, "-metadata:s:a:0");
+
+    // A probe that lists no statistics tags clears nothing.
+    let plain = probe_of(
         "matroska",
         vec![
             video(0, "h264", 1280, 720),
@@ -1211,18 +1299,15 @@ fn statistics_tags_are_cleared_for_reencoded_streams_in_matroska() {
         ],
     );
     let mkv = plan(
-        &p,
+        &plain,
         &profile(VideoCodec::Av1, AudioCodec::Opus, Container::Mkv),
         &software(VideoCodec::Av1),
     );
-    assert!(has_pair(&mkv.args, "-metadata:s:v:0", "BPS="));
-    assert!(has_pair(&mkv.args, "-metadata:s:a:0", "NUMBER_OF_FRAMES="));
-    let mp4 = plan(
-        &p,
-        &profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mp4),
-        &software(VideoCodec::Av1),
+    assert!(
+        !mkv.args.iter().any(|a| a.starts_with("-metadata:s:")),
+        "{:?}",
+        mkv.args
     );
-    assert_absent(&mp4.args, "-metadata:s:v:0");
 }
 
 // ---------------------------------------------------------------------------

@@ -367,12 +367,23 @@ pub fn fake_probe(content: &str, size: u64) -> Result<ProbeInfo, ProbeError> {
             ..Default::default()
         });
     }
+    let container = kv.get("container").copied().unwrap_or("matroska");
+    // Matroska tracks carry statistics tags: at least the `DURATION` that
+    // ffmpeg's and mkvmerge's writers add (`statistics=` lists others,
+    // `statistics=none` leaves them out, like a stored probe from before
+    // they were recorded).
+    if container == "matroska" {
+        let tags: Vec<String> = match kv.get("statistics").copied() {
+            Some("none") => Vec::new(),
+            Some(list) => list.split(',').map(|t| t.trim().to_string()).collect(),
+            None => vec!["DURATION".to_string()],
+        };
+        for stream in &mut streams {
+            stream.statistics_tags = tags.clone();
+        }
+    }
     Ok(ProbeInfo {
-        container: kv
-            .get("container")
-            .copied()
-            .unwrap_or("matroska")
-            .to_string(),
+        container: container.to_string(),
         duration_secs: Some(
             kv.get("duration")
                 .and_then(|d| d.parse().ok())
