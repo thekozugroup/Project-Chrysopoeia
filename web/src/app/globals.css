@@ -332,6 +332,33 @@
   animation: progress-sheen 2.4s var(--ease-out-expo) infinite;
 }
 
+/*
+ * A share that isn't known yet (ffmpeg says how many frames it encoded, but
+ * not how far into the file it is): a band moving along the bar instead of a
+ * number it doesn't have. With reduced motion it stands still, striped.
+ */
+.meter-indeterminate {
+  position: relative;
+  overflow: hidden;
+}
+
+.meter-indeterminate-band {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 35%;
+  animation: meter-indeterminate 1.8s ease-in-out infinite;
+}
+
+@keyframes meter-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(290%);
+  }
+}
+
 @keyframes skeleton-pulse {
   0%,
   100% {
@@ -369,6 +396,12 @@
   }
   .progress-live::after {
     display: none;
+  }
+  .meter-indeterminate-band {
+    animation-name: none !important;
+    width: 100%;
+    background-color: transparent;
+    background-image: repeating-linear-gradient(-45deg, var(--meter) 0 4px, transparent 4px 8px);
   }
   .spin {
     animation: spin 1.6s linear infinite !important;

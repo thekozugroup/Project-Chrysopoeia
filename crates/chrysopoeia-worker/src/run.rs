@@ -41,16 +41,16 @@ use std::time::{Duration, Instant};
 
 use chrysopoeia_core::plain::io_reason;
 use chrysopoeia_core::{
-    EncoderCandidate, HwApi, JobProgress, JobStage, OutputMode, ProbeInfo, ProblemKind,
-    TranscodeProfile, ValidationLevel, ValidationReport,
+    AttemptResult, EncoderCandidate, HwApi, JobAttempt, JobProgress, JobStage, OutputMode,
+    ProbeInfo, ProblemKind, TranscodeProfile, ValidationLevel, ValidationReport,
 };
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::ffmpeg::{
-    DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, compute_progress, display_command,
-    is_input_damage, lower_first, run_ffmpeg,
+    DEFAULT_STALL_TIMEOUT, FfmpegCommand, FfmpegExit, Progress, Timeline, display_command,
+    estimate_progress, is_harmless_noise, is_input_damage, lower_first, run_ffmpeg,
 };
 use crate::finalize::{
     FileIdentity, FinalizeRequest, Finalized, OriginalChanged, PlaceError, Undone,
@@ -139,6 +139,8 @@ pub enum JobOutcome {
         command: String,
         /// Plain-language notes about compromises and fallbacks.
         notes: Vec<String>,
+        /// Every attempt, in order, the one that made the file last.
+        attempts: Vec<JobAttempt>,
     },
     /// Nothing written: no work needed, or the result was not worth keeping
     /// (e.g. not smaller). The original is untouched.
@@ -149,6 +151,9 @@ pub enum JobOutcome {
         encoder: Option<String>,
         /// Size of the discarded encode, if any.
         output_size: Option<u64>,
+        /// The attempts made before it was skipped (none when nothing was
+        /// encoded).
+        attempts: Vec<JobAttempt>,
     },
     /// The original is untouched.
     Failed {
@@ -166,6 +171,8 @@ pub enum JobOutcome {
         attempt: u32,
         /// The verification report when verification failed.
         validation: Option<ValidationReport>,
+        /// Every attempt that ran, in order, each with why it failed.
+        attempts: Vec<JobAttempt>,
     },
     /// Stopped on request; no files changed.
     Cancelled,
@@ -186,6 +193,31 @@ pub enum JobOutcome {
         /// What couldn't be looked at.
         path: PathBuf,
     },
+}
+
+impl JobOutcome {
+    /// The attempts the outcome carries (none for the outcomes without any).
+    pub fn attempts(&self) -> &[JobAttempt] {
+        match self {
+            Self::Done { attempts, .. }
+            | Self::Skipped { attempts, .. }
+            | Self::Failed { attempts, .. } => attempts,
+            Self::Cancelled | Self::NotResponding { .. } | Self::ChecksBusy { .. } => &[],
+        }
+    }
+
+    /// The outcome with `history` as its attempts (outcomes without any are
+    /// left as they are).
+    #[must_use]
+    pub fn with_attempts(mut self, history: Vec<JobAttempt>) -> Self {
+        match &mut self {
+            Self::Done { attempts, .. }
+            | Self::Skipped { attempts, .. }
+            | Self::Failed { attempts, .. } => *attempts = history,
+            Self::Cancelled | Self::NotResponding { .. } | Self::ChecksBusy { .. } => {}
+        }
+        self
+    }
 }
 
 /// Builds the ffmpeg command for one attempt (normally [`crate::plan::build_plan`]).
@@ -323,6 +355,7 @@ async fn original_moved_on(
             reason: original_changed(),
             encoder: Some(encoder.to_string()),
             output_size: Some(output_size),
+            attempts: Vec::new(),
         }),
         Ok(Err(_)) => Some(failed(
             ProblemKind::SourceChanged,
@@ -352,6 +385,9 @@ struct Placing {
     notes: Vec<String>,
     /// Notes after the finalize's.
     later_notes: Vec<String>,
+    /// Every attempt, the one that made the new file last (a placing that
+    /// ends after the job reports them itself).
+    attempts: Vec<JobAttempt>,
 }
 
 impl Placing {
@@ -372,6 +408,7 @@ impl Placing {
                     validation: self.validation,
                     command: self.command,
                     notes,
+                    attempts: self.attempts,
                 }
             }
             Err(e) if e.is::<Undone>() => JobOutcome::Cancelled,
@@ -379,6 +416,7 @@ impl Placing {
                 reason: original_changed(),
                 encoder: Some(self.encoder),
                 output_size: Some(self.output_size),
+                attempts: self.attempts,
             },
             Err(e) => {
                 let (problem, error) = match e.downcast_ref::<PlaceError>() {
@@ -401,6 +439,7 @@ impl Placing {
                     encoder: Some(self.encoder),
                     attempt: self.attempt,
                     validation: self.validation,
+                    attempts: self.attempts,
                 }
             }
         }
@@ -506,6 +545,8 @@ struct Failure {
 }
 
 impl Failure {
+    /// The job's outcome; its attempts are added when the job ends (see
+    /// [`Job::run`]).
     fn into_outcome(self) -> JobOutcome {
         JobOutcome::Failed {
             error: self.error,
@@ -515,8 +556,77 @@ impl Failure {
             encoder: self.encoder,
             attempt: self.attempt,
             validation: self.validation,
+            attempts: Vec::new(),
         }
     }
+}
+
+/// Most lines of ffmpeg's output an attempt's record keeps.
+const ATTEMPT_TAIL_LINES: usize = 12;
+
+/// Most characters of ffmpeg's output an attempt's record keeps.
+const ATTEMPT_TAIL_CHARS: usize = 2000;
+
+/// The end of ffmpeg's output worth keeping with an attempt: its last
+/// [`ATTEMPT_TAIL_LINES`] lines that aren't empty or known noise, at most
+/// [`ATTEMPT_TAIL_CHARS`] characters (the end kept).
+fn attempt_tail(tail: Option<&str>) -> Option<String> {
+    let lines: Vec<&str> = tail?
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !is_harmless_noise(l))
+        .collect();
+    let kept = lines[lines.len().saturating_sub(ATTEMPT_TAIL_LINES)..].join("\n");
+    let skip = kept.chars().count().saturating_sub(ATTEMPT_TAIL_CHARS);
+    let kept: String = kept.chars().skip(skip).collect();
+    (!kept.trim().is_empty()).then_some(kept)
+}
+
+/// The record of attempt `number`, made with `candidate` from `started`
+/// by `args` (shown as `command`), as having worked; a failed attempt's
+/// record is filled in by [`failed_attempt`].
+fn attempt_record(
+    number: u32,
+    candidate: &EncoderCandidate,
+    args: &[String],
+    command: &str,
+    started: Instant,
+) -> JobAttempt {
+    // The plan decodes on the CPU after all when the frames can't stay on
+    // the GPU (a deinterlaced source, say): only a GPU decoder in the
+    // command decodes there.
+    let hw_decode =
+        candidate.api.is_hardware() && candidate.hw_decode && args.iter().any(|a| a == "-hwaccel");
+    JobAttempt {
+        attempt: number,
+        encoder: candidate.name.clone(),
+        hw_api: candidate.api,
+        device: candidate.device.clone(),
+        hw_decode,
+        elapsed_secs: (started.elapsed().as_secs_f64() * 10.0).round() / 10.0,
+        result: AttemptResult::Succeeded,
+        error: None,
+        problem: None,
+        failed_check: None,
+        command: Some(command.to_string()),
+        log_tail: None,
+    }
+}
+
+/// `record` as a failed attempt: `failure` says why, `reason` is the plain
+/// reason (a check's failure without the job's advice), `report` the checks
+/// when a check failed.
+fn failed_attempt(
+    mut record: JobAttempt,
+    failure: &Failure,
+    reason: String,
+    report: Option<&ValidationReport>,
+) -> JobAttempt {
+    record.result = AttemptResult::Failed;
+    record.error = Some(reason);
+    record.problem = Some(failure.problem);
+    record.failed_check = report.and_then(|r| r.first_failure().cloned());
+    record.log_tail = attempt_tail(failure.log_tail.as_deref());
+    record
 }
 
 impl From<NotAnswering> for JobOutcome {
@@ -538,6 +648,7 @@ fn failed(problem: ProblemKind, error: impl Into<String>) -> JobOutcome {
         encoder: None,
         attempt: 0,
         validation: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -604,7 +715,10 @@ impl Job<'_> {
 
         let guard = TempGuard::new(prepared.temp.clone());
         let scratch = ScratchFiles::default();
-        let outcome = self.attempts(&prepared, &guard, &scratch).await;
+        let outcome = self
+            .attempts(&prepared, &guard, &scratch)
+            .await
+            .with_attempts(self.reporter.history());
         scratch.remove_all().await;
         match &outcome {
             JobOutcome::Done { .. } => guard.disarm(),
@@ -670,6 +784,7 @@ impl Job<'_> {
                 reason,
                 encoder: None,
                 output_size: None,
+                attempts: Vec::new(),
             });
         }
         // A file with another hard link (the TRaSH-guides layout: the
@@ -682,6 +797,7 @@ impl Job<'_> {
                 reason: SHARED_ORIGINAL.to_string(),
                 encoder: None,
                 output_size: None,
+                attempts: Vec::new(),
             });
         }
         // Replacing the original with a file that can't hold all of its
@@ -696,6 +812,7 @@ impl Job<'_> {
                 reason,
                 encoder: None,
                 output_size: None,
+                attempts: Vec::new(),
             });
         }
         if spec.candidates.is_empty() {
@@ -946,6 +1063,7 @@ impl Job<'_> {
                         encoder: None,
                         attempt,
                         validation: None,
+                        attempts: Vec::new(),
                     });
                 }
             }
@@ -1005,6 +1123,7 @@ impl Job<'_> {
             tried.push(args.clone());
             attempt += 1;
             first.get_or_insert(candidate);
+            let started = Instant::now();
 
             self.reporter
                 .set_attempt(&candidate.name, candidate.api, attempt);
@@ -1020,6 +1139,8 @@ impl Job<'_> {
             }
             let command = display_command(&cfg.ffmpeg, &args);
             tracing::debug!(job = %spec.job_id, attempt, "running {command}");
+            // What this attempt was, for the job's history.
+            let record = || attempt_record(attempt, candidate, &args, &command, started);
 
             let run = match self.encode(&args, &prepared.watched).await {
                 Ok(run) => run,
@@ -1047,6 +1168,12 @@ impl Job<'_> {
                         cfg.output_mode,
                     );
                     let f = failure(problem, error, other.tail().map(str::to_string));
+                    self.reporter.record_attempt(failed_attempt(
+                        record(),
+                        &f,
+                        f.error.clone(),
+                        None,
+                    ));
                     // A full disk or a folder that can't be written stops
                     // every way of converting alike, and so does a converter
                     // that can't be started: say so now instead of starting
@@ -1074,7 +1201,7 @@ impl Job<'_> {
                 Err(e) => return e.at(&prepared.temp).into(),
                 Ok(Ok(m)) if m.len() > 0 => m.len(),
                 Ok(_) => {
-                    last_failure = Some(failure(
+                    let f = failure(
                         ProblemKind::Encoder,
                         format!(
                             "Converting {} finished without writing a new file, so the original \
@@ -1082,7 +1209,14 @@ impl Job<'_> {
                             where_encoded(candidate.api)
                         ),
                         exit.tail().map(str::to_string),
+                    );
+                    self.reporter.record_attempt(failed_attempt(
+                        record(),
+                        &f,
+                        f.error.clone(),
+                        None,
                     ));
+                    last_failure = Some(f);
                     if let Err(e) = guard.clear().await {
                         return e.into();
                     }
@@ -1111,6 +1245,8 @@ impl Job<'_> {
                     damaged_source_message(stop),
                     exit.tail().map(str::to_string),
                 );
+                self.reporter
+                    .record_attempt(failed_attempt(record(), &f, f.error.clone(), None));
                 if conclusive {
                     return f.into_outcome();
                 }
@@ -1129,10 +1265,13 @@ impl Job<'_> {
             if let Some(reason) =
                 size_rule(self.min_savings_pct(), prepared.original_size, output_size)
             {
+                // The attempt worked; its file just wasn't worth keeping.
+                self.reporter.record_attempt(record());
                 return JobOutcome::Skipped {
                     reason,
                     encoder: Some(candidate.name.clone()),
                     output_size: Some(output_size),
+                    attempts: Vec::new(),
                 };
             }
 
@@ -1161,8 +1300,14 @@ impl Job<'_> {
                     expected: plan.expected,
                 };
                 let on_progress = |pct| {
-                    let eta = verify_eta(pct, verify_started.elapsed());
-                    self.reporter.tick(pct, None, None, eta);
+                    self.reporter.tick(
+                        &Progress {
+                            percent: pct,
+                            eta_secs: verify_eta(pct, verify_started.elapsed()),
+                            ..Progress::default()
+                        },
+                        None,
+                    );
                 };
                 let checks =
                     validate_output_at(&request, cfg.low_priority, self.cancel, &on_progress);
@@ -1203,17 +1348,39 @@ impl Job<'_> {
                     let mut f = failure(
                         ProblemKind::UnreadableSource,
                         damaged_source_message(stop),
-                        None,
+                        exit.tail().map(str::to_string),
                     );
+                    self.reporter.record_attempt(failed_attempt(
+                        record(),
+                        &f,
+                        f.error.clone(),
+                        Some(report),
+                    ));
+                    f.log_tail = None;
                     f.validation = Some(report.clone());
                     return f.into_outcome();
                 }
-                let mut f = failure(ProblemKind::Verification, verification_error(report), None);
+                // The encode itself went well, but what it said may still
+                // explain the failed check (timestamps it had to fix, say).
+                let mut f = failure(
+                    ProblemKind::Verification,
+                    verification_error(report),
+                    exit.tail().map(str::to_string),
+                );
+                let reason = failed_check_sentence(report);
+                self.reporter.record_attempt(failed_attempt(
+                    record(),
+                    &f,
+                    reason.clone(),
+                    Some(report),
+                ));
+                f.log_tail = None;
                 f.validation = Some(report.clone());
                 if candidate.api.is_hardware() && !is_last {
                     tracing::debug!(
                         job = %spec.job_id, attempt,
-                        "{} output failed verification; trying the next option", candidate.name
+                        "{} output failed verification ({reason}); trying the next option",
+                        candidate.name
                     );
                     last_failure = Some(f);
                     if let Err(e) = guard.clear().await {
@@ -1227,14 +1394,19 @@ impl Job<'_> {
             if self.cancel.is_cancelled() {
                 return JobOutcome::Cancelled;
             }
-            self.reporter.stage(JobStage::Finalizing, 0.0).await;
+            // Why the attempt before this one failed, for the note below
+            // (taken before this attempt joins the history).
+            let history = self.reporter.history();
+            let previous = history.last().filter(|a| a.result == AttemptResult::Failed);
             let mut later_notes = Vec::new();
             if prepared.shared && cfg.output_mode == OutputMode::Replace {
                 later_notes.push(SHARED_ORIGINAL_NOTE.to_string());
             }
             if let Some(first) = first.filter(|_| attempt > 1) {
-                later_notes.push(fallback_note(first, candidate));
+                later_notes.push(fallback_note(first, candidate, previous));
             }
+            self.reporter.record_attempt(record());
+            self.reporter.stage(JobStage::Finalizing, 0.0).await;
             let placing = Placing {
                 output_path: prepared.final_path.clone(),
                 output_size,
@@ -1246,6 +1418,7 @@ impl Job<'_> {
                 command,
                 notes: plan.notes,
                 later_notes,
+                attempts: self.reporter.history(),
             };
             let outcome = self.place(prepared, placing).await;
             if matches!(outcome, JobOutcome::Done { .. }) {
@@ -1375,6 +1548,10 @@ impl Job<'_> {
             .duration_secs
             .filter(|d| d.is_finite() && *d > 0.0)
             .or_else(|| estimated_duration(&self.spec.probe));
+        let timeline = Timeline {
+            duration_secs: duration,
+            expected_frames: expected_frames(&self.spec.probe),
+        };
         let started = Instant::now();
         let cmd = FfmpegCommand {
             program: &self.cfg.ffmpeg,
@@ -1383,13 +1560,18 @@ impl Job<'_> {
             stall_timeout: DEFAULT_STALL_TIMEOUT,
         };
         let mut encoded_secs: Option<f64> = None;
+        let mut encoded_frames: Option<u64> = None;
         let mut input_damage: Option<String> = None;
         let mut on_progress = |block: &crate::ffmpeg::ProgressBlock| {
             if let Some(t) = block.out_time_secs {
                 encoded_secs = Some(t);
             }
-            let p = compute_progress(block, duration, started.elapsed().as_secs_f64());
-            self.reporter.tick(p.percent, p.fps, p.speed, p.eta_secs);
+            if let Some(frame) = block.frame {
+                encoded_frames = Some(frame);
+            }
+            let elapsed = started.elapsed();
+            let p = estimate_progress(block, timeline, elapsed.as_secs_f64());
+            self.reporter.tick(&p, Some(elapsed));
         };
         let mut on_stderr = |line: &str| {
             if input_damage.is_none() && is_input_damage(line) {
@@ -1407,9 +1589,18 @@ impl Job<'_> {
                 return Err(NotAnswering::at(&path));
             }
         };
+        // ffmpeg 7 may report no output time for a whole encode (one of the
+        // tracks it writes never had a packet, such as a subtitle track
+        // without a line in the clip): its frames tell how far it got.
+        // (Only a frame rate that gives a usable frame count counts.)
+        let rate = self.spec.probe.primary_video().and_then(|v| v.frame_rate);
+        let by_frames = || match (timeline.expected_frames, rate, encoded_frames) {
+            (Some(_), Some(rate), Some(frames)) => Some(frames as f64 / rate),
+            _ => None,
+        };
         Ok(EncodeRun {
             exit,
-            encoded_secs,
+            encoded_secs: encoded_secs.or_else(by_frames),
             input_damage,
         })
     }
@@ -1419,7 +1610,8 @@ impl Job<'_> {
 #[derive(Debug)]
 struct EncodeRun {
     exit: FfmpegExit,
-    /// How far into the source the encode got (the last progress report).
+    /// How far into the source the encode got: the last output time ffmpeg
+    /// reported, else its frames over the source's frame rate.
     encoded_secs: Option<f64>,
     /// The first line in which ffmpeg reported a damaged or cut-off input.
     input_damage: Option<String>,
@@ -1568,6 +1760,29 @@ fn estimated_duration(probe: &ProbeInfo) -> Option<f64> {
     let secs = probe.size_bytes as f64 * 8.0 / bits_per_sec as f64;
     (secs.is_finite() && secs >= 1.0).then_some(secs)
 }
+
+/// How many video frames an encode of the file should give: its length
+/// times its frame rate, when both are known and plausible, so frames
+/// encoded can be turned into a share of the file while ffmpeg reports no
+/// output time (see [`crate::ffmpeg::estimate_progress`]). Only the length
+/// the container states counts (one guessed from the size and bitrate is
+/// too rough), and the frame rate must be an ordinary one: deinterlacing
+/// keeps it (one frame per frame), and nothing else in a plan changes it.
+pub(crate) fn expected_frames(probe: &ProbeInfo) -> Option<f64> {
+    let secs = probe.duration_secs.filter(|d| d.is_finite() && *d >= 1.0)?;
+    let rate = probe
+        .primary_video()?
+        .frame_rate
+        .filter(|r| r.is_finite() && (MIN_FRAME_RATE..=MAX_FRAME_RATE).contains(r))?;
+    let frames = secs * rate;
+    (frames.is_finite() && frames >= 1.0).then_some(frames)
+}
+
+/// Frame rates outside these bounds are taken as misreported (a still
+/// picture, or a container timebase given as the rate), so frames say
+/// nothing about progress.
+const MIN_FRAME_RATE: f64 = 1.0;
+const MAX_FRAME_RATE: f64 = 240.0;
 
 /// Seconds left in verification, estimated from its pace so far.
 fn verify_eta(percent: f32, elapsed: Duration) -> Option<u64> {
@@ -2116,21 +2331,54 @@ pub(crate) fn capitalize_first(text: &str) -> String {
     }
 }
 
-/// Plain-language note about a fallback, for the job's notes.
-fn fallback_note(first: &EncoderCandidate, used: &EncoderCandidate) -> String {
+/// Plain-language note about a fallback, for the job's notes: the first way
+/// tried (`first`), the one that worked (`used`) and, when the attempt just
+/// before it failed a check (`previous`), which check and why, e.g.
+/// "Converting on the GPU (VA-API) made a file that failed a check (Plays
+/// start to finish: playback stopped at 1:01 of 2:21:02), so it was
+/// converted on the CPU".
+fn fallback_note(
+    first: &EncoderCandidate,
+    used: &EncoderCandidate,
+    previous: Option<&JobAttempt>,
+) -> String {
+    let check = previous.and_then(|a| a.failed_check.as_ref()).map(|check| {
+        let label = check.label.trim().trim_end_matches('.');
+        let detail = without_score(check.detail.trim().trim_end_matches('.'));
+        if detail.is_empty() {
+            format!(" made a file that failed a check ({label})")
+        } else {
+            format!(
+                " made a file that failed a check ({label}: {})",
+                lower_first(detail)
+            )
+        }
+    });
     if first.name == used.name && first.hw_decode && !used.hw_decode {
-        "Decoding on the GPU didn't work for this file, so it was decoded on the CPU".to_string()
+        match check {
+            Some(failed) => format!("Decoding on the GPU{failed}, so it was decoded on the CPU"),
+            None => "Decoding on the GPU didn't work for this file, so it was decoded on the CPU"
+                .to_string(),
+        }
     } else if first.api == used.api {
-        format!(
-            "The first way of converting {} didn't work for this file, so another one was used",
-            where_encoded(used.api)
-        )
+        let way = where_encoded(used.api);
+        match check {
+            Some(failed) => {
+                format!("The first way of converting {way}{failed}, so another one was used")
+            }
+            None => format!(
+                "The first way of converting {way} didn't work for this file, so another one \
+                 was used"
+            ),
+        }
     } else {
-        format!(
-            "Converting {} didn't work for this file, so it was converted {}",
-            where_encoded(first.api),
-            where_encoded(used.api)
-        )
+        let (tried, used) = (where_encoded(first.api), where_encoded(used.api));
+        match check {
+            Some(failed) => format!("Converting {tried}{failed}, so it was converted {used}"),
+            None => {
+                format!("Converting {tried} didn't work for this file, so it was converted {used}")
+            }
+        }
     }
 }
 
@@ -2370,6 +2618,11 @@ struct ReporterState {
     hw_api: Option<HwApi>,
     attempt: u32,
     last_sent: Option<Instant>,
+    /// The attempts that ended, in order.
+    history: Vec<JobAttempt>,
+    /// `history` changed since it was last sent: the next stage update
+    /// carries it.
+    history_unsent: bool,
 }
 
 impl Reporter {
@@ -2384,6 +2637,8 @@ impl Reporter {
                 hw_api: None,
                 attempt: 1,
                 last_sent: None,
+                history: Vec::new(),
+                history_unsent: false,
             }),
         }
     }
@@ -2399,47 +2654,83 @@ impl Reporter {
         state.attempt = attempt.max(1);
     }
 
+    /// An attempt ended: it joins the history, which the next stage update
+    /// sends (and the job's outcome carries, see [`Self::history`]).
+    fn record_attempt(&self, attempt: JobAttempt) {
+        let mut state = self.lock();
+        state.history.push(attempt);
+        state.history_unsent = true;
+    }
+
+    /// The attempts that ended so far.
+    fn history(&self) -> Vec<JobAttempt> {
+        self.lock().history.clone()
+    }
+
+    /// The update for `progress` (within the stage), with the time spent
+    /// on the attempt's encode when it is one.
     fn message(
         &self,
         state: &ReporterState,
-        progress: f32,
-        fps: Option<f32>,
-        speed: Option<f32>,
-        eta_secs: Option<u64>,
+        progress: &Progress,
+        elapsed: Option<Duration>,
     ) -> JobProgress {
         JobProgress {
             job_id: self.job_id,
             file_id: self.file_id,
             stage: state.stage,
-            progress: progress.clamp(0.0, 100.0),
-            fps,
-            speed,
-            eta_secs,
+            progress: progress.percent.clamp(0.0, 100.0),
+            fps: progress.fps,
+            speed: progress.speed,
+            eta_secs: progress.eta_secs,
+            progress_basis: elapsed.map(|_| progress.basis),
+            frames: progress.frames,
+            elapsed_secs: elapsed.map(|e| e.as_secs()),
             encoder: state.encoder.clone(),
             hw_api: state.hw_api,
             attempt: state.attempt,
+            attempts: None,
         }
     }
 
-    /// Enter (or finish) a stage. Always sent, waiting briefly for room.
+    /// Enter (or finish) a stage. Always sent, waiting briefly for room,
+    /// with the attempts when one ended since they were last sent.
     async fn stage(&self, stage: JobStage, progress: f32) {
         let msg = {
             let mut state = self.lock();
             state.stage = stage;
             state.last_sent = Some(Instant::now());
-            self.message(&state, progress, None, None, None)
-        };
-        match self.tx.try_send(msg) {
-            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
-            Err(mpsc::error::TrySendError::Full(msg)) => {
-                let _ = tokio::time::timeout(STAGE_SEND_TIMEOUT, self.tx.send(msg)).await;
+            let progress = Progress {
+                percent: progress,
+                ..Progress::default()
+            };
+            let mut msg = self.message(&state, &progress, None);
+            if std::mem::take(&mut state.history_unsent) {
+                msg.attempts = Some(state.history.clone());
             }
+            msg
+        };
+        let sent = match self.tx.try_send(msg) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => true,
+            Err(mpsc::error::TrySendError::Full(msg)) => {
+                tokio::time::timeout(STAGE_SEND_TIMEOUT, self.tx.send(msg))
+                    .await
+                    .is_ok()
+            }
+        };
+        if !sent {
+            // The next stage update tries again (and the outcome carries
+            // them in any case).
+            let mut state = self.lock();
+            state.history_unsent = true;
         }
     }
 
     /// Progress within the current stage; dropped when too soon after the
-    /// previous update or when the channel is full.
-    fn tick(&self, progress: f32, fps: Option<f32>, speed: Option<f32>, eta_secs: Option<u64>) {
+    /// previous update or when the channel is full. `encoding`: the time
+    /// since the attempt's encode started, while it runs (the update then
+    /// says how its percentage was worked out).
+    fn tick(&self, progress: &Progress, encoding: Option<Duration>) {
         let msg = {
             let mut state = self.lock();
             if state
@@ -2449,7 +2740,7 @@ impl Reporter {
                 return;
             }
             state.last_sent = Some(Instant::now());
-            self.message(&state, progress, fps, speed, eta_secs)
+            self.message(&state, progress, encoding)
         };
         let _ = self.tx.try_send(msg);
     }
@@ -2650,9 +2941,28 @@ const COVER_NOT_COPIED: &str = "The file's cover image couldn't be copied for th
 
 #[cfg(test)]
 mod tests {
-    use chrysopoeia_core::{CheckStatus, ValidationCheck, VideoCodec};
+    use chrysopoeia_core::{CheckStatus, ProgressBasis, ValidationCheck, VideoCodec};
 
     use super::*;
+
+    /// A report whose one check, `id`, failed.
+    fn failing(id: &str, label: &str, detail: &str) -> ValidationReport {
+        ValidationReport {
+            passed: false,
+            level: ValidationLevel::Standard,
+            checks: vec![ValidationCheck {
+                id: id.into(),
+                label: label.into(),
+                status: CheckStatus::Fail,
+                detail: detail.into(),
+                value: None,
+            }],
+            ssim_min: None,
+            ssim_avg: None,
+            psnr_avg: None,
+            elapsed_secs: 1.0,
+        }
+    }
 
     fn candidate(name: &str, api: HwApi, hw_decode: bool) -> EncoderCandidate {
         EncoderCandidate {
@@ -3018,21 +3328,6 @@ mod tests {
     /// the check passed ("Same length as the original — The new file is …").
     #[test]
     fn verification_errors_use_failure_phrasing_per_check() {
-        let failing = |id: &str, label: &str, detail: &str| ValidationReport {
-            passed: false,
-            level: ValidationLevel::Standard,
-            checks: vec![ValidationCheck {
-                id: id.into(),
-                label: label.into(),
-                status: CheckStatus::Fail,
-                detail: detail.into(),
-                value: None,
-            }],
-            ssim_min: None,
-            ssim_avg: None,
-            psnr_avg: None,
-            elapsed_secs: 1.0,
-        };
         let cases = [
             (
                 "duration",
@@ -3122,17 +3417,89 @@ mod tests {
         let gpu = candidate("hevc_nvenc", HwApi::Nvenc, true);
         let cpu_decode = candidate("hevc_nvenc", HwApi::Nvenc, false);
         let software = candidate("libx265", HwApi::Software, false);
-        assert!(fallback_note(&gpu, &cpu_decode).contains("decoded on the CPU"));
+        assert!(fallback_note(&gpu, &cpu_decode, None).contains("decoded on the CPU"));
         assert_eq!(
-            fallback_note(&gpu, &software),
+            fallback_note(&gpu, &software, None),
             "Converting on the NVIDIA GPU didn't work for this file, so it was converted on the CPU"
         );
         let qsv = candidate("hevc_qsv", HwApi::Qsv, false);
         let other_qsv = candidate("hevc_qsv_alt", HwApi::Qsv, false);
         assert_eq!(
-            fallback_note(&qsv, &other_qsv),
+            fallback_note(&qsv, &other_qsv, None),
             "The first way of converting with Intel Quick Sync didn't work for this file, so \
              another one was used"
+        );
+    }
+
+    /// When the attempt before the one that worked failed a check, the note
+    /// says which and why (the Atlas report: a metadata problem looked like
+    /// a hardware one). An ffmpeg error keeps the plain note; the job's
+    /// attempts have the details.
+    #[test]
+    fn fallback_notes_name_the_failed_check() {
+        let vaapi = candidate("hevc_vaapi", HwApi::Vaapi, true);
+        let cpu_decode = candidate("hevc_vaapi", HwApi::Vaapi, false);
+        let software = candidate("libx265", HwApi::Software, false);
+        let checked = |id: &str, label: &str, detail: &str| {
+            let failure = Failure {
+                error: String::new(),
+                problem: ProblemKind::Verification,
+                log_tail: None,
+                command: None,
+                encoder: None,
+                attempt: 2,
+                validation: None,
+            };
+            let report = failing(id, label, detail);
+            let record = attempt_record(2, &cpu_decode, &[], "ffmpeg …", Instant::now());
+            failed_attempt(
+                record,
+                &failure,
+                failed_check_sentence(&report),
+                Some(&report),
+            )
+        };
+        let decode = checked(
+            "decode",
+            "Plays start to finish",
+            "Playback stopped at 1:01 of 2:21:02.",
+        );
+        assert_eq!(
+            fallback_note(&vaapi, &software, Some(&decode)),
+            "Converting on the GPU (VA-API) made a file that failed a check (Plays start to \
+             finish: playback stopped at 1:01 of 2:21:02), so it was converted on the CPU"
+        );
+        assert_eq!(
+            fallback_note(&vaapi, &cpu_decode, Some(&decode)),
+            "Decoding on the GPU made a file that failed a check (Plays start to finish: \
+             playback stopped at 1:01 of 2:21:02), so it was decoded on the CPU"
+        );
+        let other = candidate("hevc_vaapi_alt", HwApi::Vaapi, false);
+        assert_eq!(
+            fallback_note(&vaapi, &other, Some(&decode)),
+            "The first way of converting on the GPU (VA-API) made a file that failed a check \
+             (Plays start to finish: playback stopped at 1:01 of 2:21:02), so another one was \
+             used"
+        );
+        // A similarity score stays in the report, not in the note.
+        let visual = checked(
+            "visual",
+            "Looks like the original",
+            "A frame near 0:10 looks very different from the original (41.0% similar)",
+        );
+        assert_eq!(
+            fallback_note(&vaapi, &software, Some(&visual)),
+            "Converting on the GPU (VA-API) made a file that failed a check (Looks like the \
+             original: a frame near 0:10 looks very different from the original), so it was \
+             converted on the CPU"
+        );
+        // An attempt that failed with an ffmpeg error has no check to name.
+        let mut errored = decode.clone();
+        errored.failed_check = None;
+        assert_eq!(
+            fallback_note(&vaapi, &software, Some(&errored)),
+            "Converting on the GPU (VA-API) didn't work for this file, so it was converted on \
+             the CPU"
         );
     }
 
@@ -3418,7 +3785,11 @@ mod tests {
         let reporter = Reporter::new(tx, Uuid::nil(), Uuid::nil());
         reporter.stage(JobStage::Transcoding, 0.0).await;
         for i in 0..50 {
-            reporter.tick(i as f32, None, None, None);
+            let progress = Progress {
+                percent: i as f32,
+                ..Progress::default()
+            };
+            reporter.tick(&progress, None);
         }
         reporter.stage(JobStage::Transcoding, 100.0).await;
         drop(reporter);
@@ -3427,6 +3798,130 @@ mod tests {
             got.push(p.progress);
         }
         assert_eq!(got, [0.0, 100.0]);
+    }
+
+    /// While the encode runs, an update says how its share was worked out,
+    /// with the frames and the time spent: an unknown share as unknown (0,
+    /// no time left), never as a plain 0 %.
+    #[tokio::test]
+    async fn encoding_updates_say_how_progress_was_worked_out() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let reporter = Reporter::new(tx, Uuid::nil(), Uuid::nil());
+        reporter.set_attempt("libx265", HwApi::Software, 3);
+        reporter.stage(JobStage::Transcoding, 0.0).await;
+        tokio::time::sleep(PROGRESS_INTERVAL).await;
+        let block = crate::ffmpeg::ProgressBlock {
+            frame: Some(366),
+            fps: Some(3.66),
+            ..Default::default()
+        };
+        let unknown = estimate_progress(&block, Timeline::default(), 100.0);
+        reporter.tick(&unknown, Some(Duration::from_secs(100)));
+        drop(reporter);
+        let mut got = Vec::new();
+        while let Some(p) = rx.recv().await {
+            got.push(p);
+        }
+        let start = &got[0];
+        assert_eq!(
+            (start.progress_basis, start.frames, start.elapsed_secs),
+            (None, None, None)
+        );
+        let tick = &got[1];
+        assert_eq!(tick.progress_basis, Some(ProgressBasis::Unknown));
+        assert_eq!((tick.progress, tick.eta_secs), (0.0, None));
+        assert_eq!((tick.frames, tick.elapsed_secs), (Some(366), Some(100)));
+        assert_eq!((tick.fps, tick.attempt), (Some(3.66), 3));
+        assert_eq!(tick.attempts, None);
+    }
+
+    /// An attempt that ended goes out once, with the next stage update (the
+    /// server stores it), and stays in the history the outcome carries.
+    #[tokio::test]
+    async fn ended_attempts_go_out_with_the_next_stage_update() {
+        let (tx, mut rx) = mpsc::channel(100);
+        let reporter = Reporter::new(tx, Uuid::nil(), Uuid::nil());
+        let gpu = candidate("hevc_vaapi", HwApi::Vaapi, true);
+        let args = ["-hwaccel".to_string(), "vaapi".to_string()];
+        let record = attempt_record(1, &gpu, &args, "ffmpeg -hwaccel vaapi", Instant::now());
+        reporter.record_attempt(record.clone());
+        reporter.stage(JobStage::Transcoding, 0.0).await;
+        reporter.stage(JobStage::Transcoding, 100.0).await;
+        assert_eq!(reporter.history(), std::slice::from_ref(&record));
+        drop(reporter);
+        let mut sent = Vec::new();
+        while let Some(p) = rx.recv().await {
+            sent.push(p.attempts);
+        }
+        assert_eq!(sent, [Some(vec![record]), None]);
+    }
+
+    /// An attempt's record: what ran, where the original was decoded (on the
+    /// GPU only when the command has a GPU decoder in it), and, failed, why,
+    /// with a short tail of what ffmpeg said.
+    #[test]
+    fn attempt_records() {
+        let gpu = candidate("hevc_vaapi", HwApi::Vaapi, true);
+        let gpu_args = ["-hwaccel".to_string(), "vaapi".to_string()];
+        let started = Instant::now();
+        let record = attempt_record(1, &gpu, &gpu_args, "ffmpeg …", started);
+        assert!(record.hw_decode);
+        assert_eq!(record.result, AttemptResult::Succeeded);
+        assert_eq!(record.command.as_deref(), Some("ffmpeg …"));
+        // The plan decoded on the CPU after all (a deinterlaced source).
+        let cpu_args = ["-i".to_string(), "in.mkv".to_string()];
+        assert!(!attempt_record(1, &gpu, &cpu_args, "ffmpeg …", started).hw_decode);
+
+        let mut lines: Vec<String> = (1..=30).map(|i| format!("[error] line {i}")).collect();
+        lines.insert(5, String::new());
+        lines.push("set_mempolicy: Operation not permitted".into());
+        let failure = Failure {
+            error: "Converting on the CPU stopped with an error, so the original was left \
+                    unchanged."
+                .into(),
+            problem: ProblemKind::Encoder,
+            log_tail: Some(lines.join("\n")),
+            command: None,
+            encoder: None,
+            attempt: 1,
+            validation: None,
+        };
+        let failed = failed_attempt(record, &failure, failure.error.clone(), None);
+        assert_eq!(failed.result, AttemptResult::Failed);
+        assert_eq!(failed.problem, Some(ProblemKind::Encoder));
+        let tail = failed.log_tail.unwrap();
+        assert_eq!(tail.lines().count(), ATTEMPT_TAIL_LINES);
+        assert!(tail.starts_with("[error] line 19\n") && tail.ends_with("[error] line 30"));
+        assert!(!tail.contains("set_mempolicy"));
+        assert_eq!(
+            attempt_tail(Some(&"x".repeat(5000))).unwrap().len(),
+            ATTEMPT_TAIL_CHARS
+        );
+        assert_eq!(attempt_tail(Some(" \n\n")), None);
+    }
+
+    /// The frames an encode should give: length times frame rate, only when
+    /// both are known and plausible.
+    #[test]
+    fn expected_frames_needs_a_plausible_length_and_rate() {
+        let with = |duration: Option<f64>, rate: Option<f64>| ProbeInfo {
+            duration_secs: duration,
+            streams: vec![chrysopoeia_core::StreamInfo {
+                kind: Some(chrysopoeia_core::StreamKind::Video),
+                codec: "hevc".into(),
+                frame_rate: rate,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let frames = expected_frames(&with(Some(61.1), Some(24000.0 / 1001.0))).unwrap();
+        assert!((frames - 1464.9).abs() < 0.1, "{frames}");
+        assert_eq!(expected_frames(&with(None, Some(24.0))), None);
+        assert_eq!(expected_frames(&with(Some(0.5), Some(24.0))), None);
+        assert_eq!(expected_frames(&with(Some(60.0), None)), None);
+        assert_eq!(expected_frames(&with(Some(60.0), Some(90_000.0))), None);
+        assert_eq!(expected_frames(&with(Some(60.0), Some(0.5))), None);
+        assert_eq!(expected_frames(&ProbeInfo::default()), None);
     }
 
     #[tokio::test]

@@ -139,6 +139,49 @@ describe("applyEvent", () => {
     );
   });
 
+  it("job.progress carries how the share was worked out, with the frames and the time spent", () => {
+    const { apply } = setup();
+    apply({
+      type: "job.progress",
+      job_id: JOB_ID,
+      file_id: FILE_ID,
+      stage: "transcoding",
+      progress: 0,
+      fps: 3.7,
+      speed: null,
+      eta_secs: null,
+      progress_basis: "unknown",
+      frames: 366,
+      elapsed_secs: 99,
+      encoder: "libx265",
+      hw_api: "software",
+      attempt: 3,
+    });
+    expect(useLive.getState().jobs[JOB_ID]).toMatchObject({ progress_basis: "unknown", frames: 366, elapsed_secs: 99 });
+  });
+
+  it("job.updated of a running job brings the attempts that ended while it still runs", () => {
+    const { client, apply } = setup();
+    client.setQueryData<ListResponse<Job>>(keys.jobs({ state: "running" }), { items: [job()], total: 1 });
+    const failed = {
+      attempt: 1,
+      encoder: "hevc_vaapi",
+      hw_api: "vaapi" as const,
+      device: "/dev/dri/renderD128",
+      hw_decode: true,
+      elapsed_secs: 128,
+      result: "failed" as const,
+      error: "The new file doesn't play start to finish",
+      problem: "verification" as const,
+      failed_check: null,
+      command: "ffmpeg …",
+      log_tail: null,
+    };
+    apply({ type: "job.updated", job: job({ state: "running", attempt: 2, attempts: [failed] }) });
+    expect(client.getQueryData<Job>(keys.job(JOB_ID))?.attempts).toEqual([failed]);
+    expect(client.getQueryData<ListResponse<Job>>(keys.jobs({ state: "running" }))?.items[0].attempts).toEqual([failed]);
+  });
+
   it("job.updated keeps the conversion notes the job sheet shows", () => {
     const { client, apply } = setup();
     client.setQueryData<ListResponse<Job>>(keys.jobs({ state: "history" }), { items: [job({ state: "done" })], total: 1 });

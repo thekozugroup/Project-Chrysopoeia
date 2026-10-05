@@ -25,8 +25,8 @@ use chrono::{DateTime, Local, Timelike, Utc};
 use chrysopoeia_core::encoder::VIDEO_ENCODERS;
 use chrysopoeia_core::plain::io_reason;
 use chrysopoeia_core::{
-    ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobProgress, JobStage,
-    JobState, MaxJobsSource, MediaFile, OutputMode, ProblemKind, QueueState, Settings,
+    ActivityLevel, EncoderCandidate, Event, FileStatus, HwApi, Job, JobAttempt, JobProgress,
+    JobStage, JobState, MaxJobsSource, MediaFile, OutputMode, ProblemKind, QueueState, Settings,
     TranscodeProfile,
 };
 use chrysopoeia_scanner::WatchEvent;
@@ -996,6 +996,7 @@ async fn hold_placing(
             validation,
             command,
             mut notes,
+            attempts,
         } = outcome
         {
             notes.push(if stop.load(Ordering::SeqCst) {
@@ -1020,6 +1021,7 @@ async fn hold_placing(
                 validation,
                 command,
                 notes,
+                attempts,
             };
             // Recording it done also clears its mark.
             record(&state, &job, Disposition::Finished(outcome), &ctx).await;
@@ -1144,6 +1146,7 @@ fn failed(problem: ProblemKind, error: impl Into<String>) -> JobOutcome {
         encoder: None,
         attempt: 0,
         validation: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -1551,6 +1554,7 @@ async fn execute(
                 validation,
                 command,
                 mut notes,
+                attempts,
             },
             Some(problem),
         ) => {
@@ -1568,6 +1572,7 @@ async fn execute(
                 validation,
                 command,
                 notes,
+                attempts,
             }
         }
         (outcome, _) => outcome,
@@ -1582,6 +1587,7 @@ async fn execute(
             encoder,
             attempt,
             validation,
+            attempts,
         } if output_mode == OutputMode::Folder && output_name_taken(&error) => {
             let owner = match final_path.to_str() {
                 Some(p) => db::jobs::destination_owner(state.db.pool(), p, file.id)
@@ -1608,6 +1614,7 @@ async fn execute(
                 encoder,
                 attempt,
                 validation,
+                attempts,
             }
         }
         outcome => outcome,
@@ -1971,20 +1978,30 @@ fn lacks_statistics_tags(probe: &chrysopoeia_core::ProbeInfo) -> bool {
 }
 
 /// Forward worker progress: every update to the WebSocket, and to the
-/// database when the stage changes or every 2 s.
+/// database when the stage changes or every 2 s. An update that carries the
+/// attempts that ended (one follows the end of each attempt) is always
+/// stored, and the job goes out as `job.updated` with them, so its details
+/// say why an attempt failed while the next one still runs; `job.progress`
+/// itself never carries them.
 async fn forward_progress(state: AppState, mut rx: mpsc::Receiver<JobProgress>) {
     let mut last_write: Option<Instant> = None;
     let mut last_stage: Option<JobStage> = None;
-    while let Some(p) = rx.recv().await {
+    while let Some(mut p) = rx.recv().await {
         let due = last_write.is_none_or(|t| t.elapsed() >= PROGRESS_WRITE_INTERVAL);
         let stage_changed = last_stage != Some(p.stage);
-        if due || stage_changed {
-            if let Err(e) = db::jobs::update_progress(state.db.pool(), &p).await {
+        let attempts_ended = p.attempts.is_some();
+        if due || stage_changed || attempts_ended {
+            let stored = db::jobs::update_progress(state.db.pool(), &p).await;
+            if let Err(e) = &stored {
                 tracing::warn!(job = %p.job_id, "could not store progress: {e}");
             }
             last_write = Some(Instant::now());
             last_stage = Some(p.stage);
+            if attempts_ended && stored.is_ok() {
+                state.broadcast_job(p.job_id).await;
+            }
         }
+        p.attempts = None;
         state.emit(Event::JobProgress(p));
     }
 }
@@ -2211,6 +2228,13 @@ fn hardware_wait_message(problem: &str) -> String {
     )
 }
 
+/// The attempts an outcome brings to store with the job: none (an outcome
+/// that knows of none, such as a job settled from the disk after a restart)
+/// keeps those recorded while it ran.
+fn recorded_attempts(attempts: Vec<JobAttempt>) -> Option<Vec<JobAttempt>> {
+    (!attempts.is_empty()).then_some(attempts)
+}
+
 /// Record how a job ended on the job and file rows, and in the feed.
 async fn apply_outcome(
     state: &AppState,
@@ -2249,6 +2273,7 @@ async fn apply_outcome(
             validation,
             command,
             notes,
+            attempts,
         } => {
             let verified = validation.as_ref().is_some_and(|v| v.passed);
             let replaced = ctx.replaced.clone();
@@ -2266,6 +2291,7 @@ async fn apply_outcome(
                     validation,
                     command: (!command.is_empty()).then_some(command),
                     notes: notes.clone(),
+                    attempts: recorded_attempts(attempts),
                     ..JobFinish::default()
                 },
             )
@@ -2358,6 +2384,7 @@ async fn apply_outcome(
             reason,
             encoder,
             output_size,
+            attempts,
         } => {
             let mut tx = state.db.write_tx().await?;
             let exists = db::jobs::finish(
@@ -2368,6 +2395,7 @@ async fn apply_outcome(
                     skip_reason: Some(reason.clone()),
                     encoder,
                     output_size,
+                    attempts: recorded_attempts(attempts),
                     ..JobFinish::default()
                 },
             )
@@ -2423,6 +2451,7 @@ async fn apply_outcome(
             encoder,
             attempt,
             validation,
+            attempts,
         } => {
             let mut tx = state.db.write_tx().await?;
             let exists = db::jobs::finish(
@@ -2437,6 +2466,7 @@ async fn apply_outcome(
                     validation,
                     command,
                     log_tail,
+                    attempts: recorded_attempts(attempts),
                     ..JobFinish::default()
                 },
             )
@@ -2811,6 +2841,8 @@ fn resumed_outcome(job: &Job, target: PathBuf, size: u64, original_size: u64) ->
         validation: None,
         command: String::new(),
         notes: vec![RESUMED_NOTE.to_string()],
+        // Those its run recorded stay as they are.
+        attempts: Vec::new(),
     }
 }
 

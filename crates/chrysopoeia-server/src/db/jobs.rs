@@ -1,7 +1,8 @@
 //! The `jobs` table: one row per conversion attempt of a file.
 
 use chrysopoeia_core::{
-    FileStatus, HwApi, Job, JobProgress, JobStage, JobState, ProblemKind, ValidationReport,
+    FileStatus, HwApi, Job, JobAttempt, JobProgress, JobStage, JobState, ProblemKind,
+    ProgressBasis, ValidationReport,
 };
 use chrysopoeia_worker::slow_fs::{KnownMount, MountIdentity};
 use sqlx::sqlite::SqliteRow;
@@ -16,7 +17,7 @@ use super::{
 const COLUMNS: &str = "id, file_id, library_id, file_name, file_path, state, stage, priority, \
     progress, fps, speed, eta_secs, encoder, hw_api, attempt, input_size, output_size, error, \
     problem, skip_reason, validation, command, log_tail, notes, force, freed_bytes, final_path, \
-    created_at, started_at, finished_at";
+    attempts, progress_basis, frames, elapsed_secs, created_at, started_at, finished_at";
 
 /// States that count as finished (history).
 pub const FINISHED_STATES: &str = "('done', 'skipped', 'failed', 'cancelled')";
@@ -37,8 +38,21 @@ fn from_row(row: &SqliteRow) -> sqlx::Result<Job> {
     let problem: Option<String> = row.try_get("problem")?;
     let file_name: String = row.try_get("file_name")?;
     let final_path: Option<String> = row.try_get("final_path")?;
+    let attempts: Option<String> = row.try_get("attempts")?;
+    let progress_basis: Option<String> = row.try_get("progress_basis")?;
     let state: JobState = parse_enum(&state)?;
     Ok(Job {
+        attempts: attempts
+            .as_deref()
+            .map(parse_json::<Vec<JobAttempt>>)
+            .transpose()?
+            .unwrap_or_default(),
+        progress_basis: progress_basis
+            .as_deref()
+            .map(parse_enum::<ProgressBasis>)
+            .transpose()?,
+        frames: opt_u64_col(row, "frames")?,
+        elapsed_secs: opt_u64_col(row, "elapsed_secs")?,
         output_name: output_name(state, &file_name, final_path.as_deref()),
         freed_bytes: opt_u64_col(row, "freed_bytes")?,
         problem: super::problem_of(error.as_deref(), problem.as_deref()),
@@ -385,7 +399,8 @@ pub async fn claim_next(
     let mut qb = QueryBuilder::<Sqlite>::new(
         "UPDATE jobs SET state = 'running', stage = 'preparing', progress = 0, fps = NULL, \
          speed = NULL, eta_secs = NULL, attempt = 1, error = NULL, problem = NULL, \
-         skip_reason = NULL, notes = NULL, finished_at = NULL, started_at = ",
+         skip_reason = NULL, notes = NULL, attempts = NULL, progress_basis = NULL, \
+         frames = NULL, elapsed_secs = NULL, finished_at = NULL, started_at = ",
     );
     qb.push_bind(now.clone()).push(
         " WHERE id = (SELECT j.id FROM jobs j JOIN libraries l ON l.id = j.library_id \
@@ -441,21 +456,28 @@ pub async fn claim_next(
     Ok(job)
 }
 
-/// Store live progress.
+/// Store live progress, and the attempts that ended when the update
+/// carries them (an update without them keeps those stored).
 pub async fn update_progress(pool: &SqlitePool, p: &JobProgress) -> sqlx::Result<()> {
+    let attempts = p.attempts.as_ref().map(to_json).transpose()?;
     sqlx::query(
         "UPDATE jobs SET stage = ?, progress = ?, fps = ?, speed = ?, eta_secs = ?, \
-         encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), attempt = ? \
-         WHERE id = ? AND state = 'running'",
+         progress_basis = ?, frames = ?, elapsed_secs = ?, \
+         encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), attempt = ?, \
+         attempts = COALESCE(?, attempts) WHERE id = ? AND state = 'running'",
     )
     .bind(enum_str(&p.stage))
     .bind(f64::from(p.progress))
     .bind(p.fps.map(f64::from))
     .bind(p.speed.map(f64::from))
     .bind(p.eta_secs.map(i64_of))
+    .bind(p.progress_basis.map(|b| enum_str(&b)))
+    .bind(p.frames.map(i64_of))
+    .bind(p.elapsed_secs.map(i64_of))
     .bind(&p.encoder)
     .bind(p.hw_api.map(|a| enum_str(&a)))
     .bind(i64::from(p.attempt))
+    .bind(attempts)
     .bind(p.job_id.to_string())
     .execute(pool)
     .await?;
@@ -478,6 +500,9 @@ pub struct JobFinish {
     pub log_tail: Option<String>,
     /// Plain-language notes about compromises the conversion made.
     pub notes: Vec<String>,
+    /// Every attempt the job made; `None` keeps those stored while it ran
+    /// (a job settled from the disk after a restart knows none of its own).
+    pub attempts: Option<Vec<JobAttempt>>,
 }
 
 /// Mark a job finished. Returns false when the job no longer exists. A job
@@ -495,6 +520,7 @@ pub async fn finish(
     } else {
         Some(to_json(&f.notes)?)
     };
+    let attempts = f.attempts.as_ref().map(to_json).transpose()?;
     // A hard-linked original keeps its data on disk through its other name
     // (a seeding torrent), so replacing it freed nothing; the worker says so
     // in a note on the conversion.
@@ -506,7 +532,8 @@ pub async fn finish(
         "UPDATE jobs SET state = ?, error = ?, problem = ?, skip_reason = ?, \
          encoder = COALESCE(?, encoder), hw_api = COALESCE(?, hw_api), \
          attempt = COALESCE(?, attempt), output_size = ?, validation = ?, command = ?, \
-         log_tail = ?, notes = ?, eta_secs = NULL, \
+         log_tail = ?, notes = ?, attempts = COALESCE(?, attempts), eta_secs = NULL, \
+         progress_basis = NULL, frames = NULL, elapsed_secs = NULL, \
          progress = CASE WHEN ? = 'done' THEN 100 ELSE progress END, \
          freed_bytes = CASE WHEN ? <> 'done' THEN NULL WHEN ? THEN 0 \
              ELSE MAX(input_size - ?, 0) END, \
@@ -532,6 +559,7 @@ pub async fn finish(
     .bind(&f.command)
     .bind(&f.log_tail)
     .bind(notes)
+    .bind(attempts)
     .bind(enum_str(&state))
     .bind(enum_str(&state))
     .bind(shared_original)
@@ -550,7 +578,8 @@ pub async fn finish(
 pub async fn requeue(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<()> {
     sqlx::query(
         "UPDATE jobs SET state = 'queued', stage = ?, progress = 0, fps = NULL, speed = NULL, \
-         eta_secs = NULL, attempt = 0, started_at = NULL, finished_at = NULL WHERE id = ?",
+         eta_secs = NULL, attempt = 0, attempts = NULL, progress_basis = NULL, frames = NULL, \
+         elapsed_secs = NULL, started_at = NULL, finished_at = NULL WHERE id = ?",
     )
     .bind(enum_str(&JobStage::Waiting))
     .bind(id.to_string())
@@ -593,7 +622,8 @@ pub async fn cancel_queued(
 /// job was no longer running.
 pub async fn cancel_running_row(conn: &mut SqliteConnection, id: Uuid) -> sqlx::Result<bool> {
     let file_id: Option<String> = sqlx::query_scalar(
-        "UPDATE jobs SET state = 'cancelled', eta_secs = NULL, finished_at = ? \
+        "UPDATE jobs SET state = 'cancelled', eta_secs = NULL, progress_basis = NULL, \
+         frames = NULL, elapsed_secs = NULL, finished_at = ? \
          WHERE id = ? AND state = 'running' RETURNING file_id",
     )
     .bind(now_ts())
@@ -1174,7 +1204,8 @@ pub async fn recover_interrupted(db: &Db) -> sqlx::Result<u64> {
     let mut tx = db.write_tx().await?;
     let jobs = sqlx::query(
         "UPDATE jobs SET state = 'queued', stage = 'waiting', progress = 0, fps = NULL, \
-         speed = NULL, eta_secs = NULL, attempt = 0, started_at = NULL WHERE state = 'running'",
+         speed = NULL, eta_secs = NULL, attempt = 0, attempts = NULL, progress_basis = NULL, \
+         frames = NULL, elapsed_secs = NULL, started_at = NULL WHERE state = 'running'",
     )
     .execute(&mut *tx)
     .await?
