@@ -199,7 +199,7 @@ describe("needs your attention", () => {
   it("never explains a name clash as a permission problem", () => {
     const libs = [library()];
     const denied =
-      "Chrysopoeia doesn't have permission to write in /media/locked, so the new file couldn't be put there and the original was kept.";
+      "Szalinski doesn't have permission to write in /media/locked, so the new file couldn't be put there and the original was kept.";
     const clash = 'A file named "dup.mkv" is already next to the original, so the new file can\'t take its name.';
     const files = [
       failedFile("p1", "lib-a", "destination", denied),
@@ -216,7 +216,7 @@ describe("needs your attention", () => {
       output_mode: "replace",
     });
     expect(bare.reasons).toEqual([]);
-    expect(bare.detail).toMatch(/^1 file couldn't be converted because of it\. Chrysopoeia can't write to the library folder/);
+    expect(bare.detail).toMatch(/^1 file couldn't be converted because of it\. Szalinski can't write to the library folder/);
   });
 
   it("counts, groups and retries every failed file, not one page of them", () => {

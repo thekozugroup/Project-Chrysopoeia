@@ -67,10 +67,10 @@ describe("errorsFrom", () => {
       "output_folder",
     );
     expect(
-      errorsFrom(invalid("The output folder can't be inside the library Movies, or Chrysopoeia would convert its own results.")),
+      errorsFrom(invalid("The output folder can't be inside the library Movies, or Szalinski would convert its own results.")),
     ).toHaveProperty("output_folder");
     expect(
-      errorsFrom(invalid("Chrysopoeia can't write to the temporary folder /temp. Check its permissions.")),
+      errorsFrom(invalid("Szalinski can't write to the temporary folder /temp. Check its permissions.")),
     ).toHaveProperty("temp_dir");
     expect(errorsFrom(invalid("Jobs at once must be between 1 and 32."))).toHaveProperty("max_jobs");
     expect(errorsFrom(invalid("Active hours must be whole hours from 0 to 23."))).toHaveProperty("active_hours");
@@ -88,8 +88,8 @@ describe("errorsFrom", () => {
   it("falls back to the only key sent, then to a general message", () => {
     expect(errorsFrom(invalid("Something odd."), ["validation"])).toEqual({ validation: "Something odd." });
     expect(errorsFrom(invalid("Something odd."), ["validation", "hardware"])).toEqual({ general: "Something odd." });
-    expect(errorsFrom(new ApiError(0, "network_error", "Can't reach the Chrysopoeia server."), ["max_jobs"])).toEqual({
-      general: "Can't reach the Chrysopoeia server.",
+    expect(errorsFrom(new ApiError(0, "network_error", "Can't reach the Szalinski server."), ["max_jobs"])).toEqual({
+      general: "Can't reach the Szalinski server.",
     });
     expect(errorsFrom(new Error("boom"))).toEqual({ general: "boom" });
   });

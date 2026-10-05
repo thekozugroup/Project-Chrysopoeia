@@ -1,6 +1,6 @@
-# Chrysopoeia web UI
+# Szalinski web UI
 
-The browser interface for Chrysopoeia. It is a Next.js app exported as static
+The browser interface for Szalinski. It is a Next.js app exported as static
 files (`web/out`) that the Rust server hosts next to the API, so the container
 needs no Node at runtime. Everything talks to `/api` on the same origin; see
 `docs/ARCHITECTURE.md` ("REST API", "WebSocket", "Web UI") for the contract.
@@ -41,6 +41,7 @@ MOCK_MAX_JOBS=2 pnpm mock        # the job limit comes from the container's MAX_
 MOCK_HOST=deny pnpm mock         # every request answers 403 host_not_allowed
 MOCK_SETTLE_MS=0 pnpm mock       # files still being copied never settle (default: after 60 s)
 MOCK_FORCE=off pnpm mock         # ignores "Convert anyway", like a server older than it
+MOCK_FS=plain pnpm mock          # a server outside Docker: the folder picker has no "Your folders"
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 
@@ -61,7 +62,7 @@ builds leave it unset so the UI uses the same origin.
 
 ```sh
 scripts/make-test-media.sh /tmp/media 8          # from the repository root
-target/release/chrysopoeia --port 8080 --data-dir "$(mktemp -d)" \
+target/release/szalinski --port 8080 --data-dir "$(mktemp -d)" \
   --web-dir web/out --browse-root /tmp/media &
 cd web && pnpm e2e http://127.0.0.1:8080 --folder /tmp/media --screenshots /tmp/smoke
 ```
@@ -79,7 +80,7 @@ page errors or server errors.
   …) to screens. Detail sheets open from `?job=<id>` and `?file=<id>`.
 - `src/screens` — one file per screen.
 - `src/components` — shared pieces; `ui/` holds the primitives.
-- `src/lib/types.ts` — mirror of `crates/chrysopoeia-core` (keep in sync).
+- `src/lib/types.ts` — mirror of `crates/szalinski-core` (keep in sync).
 - `src/lib/api.ts` — REST client and `ApiError`.
 - `src/lib/live.ts` — WebSocket client that patches the query cache.
 - `src/lib/format.ts`, `labels.ts` — plain-language wording and number formats.

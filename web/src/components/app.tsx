@@ -34,7 +34,7 @@ class ErrorBoundary extends Component<{ children: ReactNode; resetKey: string },
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    console.error("Chrysopoeia UI error", error, info.componentStack);
+    console.error("Szalinski UI error", error, info.componentStack);
   }
 
   componentDidUpdate(prev: { resetKey: string }) {
@@ -107,7 +107,7 @@ function Screen({ route }: { route: Route }) {
             </a>
           }
         >
-          The link may be from an older version of Chrysopoeia.
+          The link may be from an older version of Szalinski.
         </EmptyState>
       );
   }
@@ -132,7 +132,7 @@ function RouteSheets({ route }: { route: Route }) {
 
 function BootScreen() {
   return (
-    <div className="flex min-h-dvh" aria-busy="true" aria-label="Loading Chrysopoeia">
+    <div className="flex min-h-dvh" aria-busy="true" aria-label="Loading Szalinski">
       <div className="hidden w-60 shrink-0 flex-col gap-4 border-r border-line bg-sunken px-5 pt-5 md:flex">
         <Brand />
         <Skeleton className="mt-4 h-8 w-full" />
@@ -168,7 +168,7 @@ export function HostNotAllowed({
         <Brand className="mb-10" />
         {/* The wording of the docs and of the server's own error, so searching for either finds this screen. */}
         <h1 className="font-display text-4xl leading-tight break-words text-fg">
-          {host ? `Chrysopoeia doesn't answer to the address "${host}"` : "Chrysopoeia doesn't answer to this address"}
+          {host ? `Szalinski doesn't answer to the address "${host}"` : "Szalinski doesn't answer to this address"}
         </h1>
         <p className="mt-3 text-sm leading-relaxed text-muted">
           To protect your library, it only answers to addresses it recognises. Add{" "}
@@ -204,7 +204,7 @@ function Unreachable({ error, retrying, onRetry }: { error: unknown; retrying: b
       <div className="w-full max-w-lg">
         <Brand className="mb-10" />
         <h1 className="font-display text-4xl leading-tight text-fg">
-          {network ? "Can't reach Chrysopoeia" : "Chrysopoeia couldn't load"}
+          {network ? "Can't reach Szalinski" : "Szalinski couldn't load"}
         </h1>
         <p className="mt-3 text-sm leading-relaxed text-muted">
           {network
@@ -240,7 +240,7 @@ export function App() {
   const needsSetup = settings.data !== undefined && libraries.data !== undefined && !settings.data.onboarded && libraries.data.length === 0;
 
   useEffect(() => {
-    document.title = needsSetup ? "Welcome — Chrysopoeia" : `${titleFor(route)} — Chrysopoeia`;
+    document.title = needsSetup ? "Welcome — Szalinski" : `${titleFor(route)} — Szalinski`;
   }, [route, needsSetup]);
 
   // Setup is only for the first run; send stale links to the overview.

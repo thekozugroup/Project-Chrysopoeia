@@ -3,7 +3,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /*
- * Chrysopoeia design tokens.
+ * Szalinski design tokens.
  * Warm near-black surfaces with a gold accent (dark), warm paper with an
  * inked gold (light). Gold marks primary actions, current selection and
  * progress only; status colours always come with an icon and a word.
@@ -38,13 +38,13 @@
   /*
    * UI type scale: 15px for everything people read (text-sm), 13px for
    * secondary lines, 12px (text-xs) only for tabular meta and timestamps.
-   * Display sizes (Instrument Serif) are set where they're used.
+   * Display sizes (Newsreader) are set where they're used.
    */
   --text-sm: 0.9375rem;
   --text-sm--line-height: 1.4;
 
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-display: "Instrument Serif", ui-serif, Georgia, "Times New Roman", serif;
+  --font-display: "Newsreader Variable", ui-serif, Georgia, "Times New Roman", serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   --radius-sm: 6px;
@@ -224,10 +224,24 @@
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * Display type is Newsreader, whose optical-size axis follows the font size
+ * on its own: big sizes are drawn tighter and finer, small ones sturdier, so
+ * letters get no extra negative tracking on top (a size may set its own),
+ * and word spaces get a little air back.
+ * Light text on a dark surface looks thinner than it is, so dark mode takes
+ * a little more weight.
+ */
 @utility font-display {
   font-family: var(--font-display);
   font-weight: 400;
-  letter-spacing: -0.01em;
+  font-optical-sizing: auto;
+  letter-spacing: 0;
+  /* The display cut sets word spaces tight ("your videos" nearly runs together). */
+  word-spacing: 0.05em;
+  :where(.dark) & {
+    font-weight: 430;
+  }
 }
 
 /* Visually hidden but read by screen readers. */
@@ -332,6 +346,33 @@
   animation: progress-sheen 2.4s var(--ease-out-expo) infinite;
 }
 
+/*
+ * A share that isn't known yet (ffmpeg says how many frames it encoded, but
+ * not how far into the file it is): a band moving along the bar instead of a
+ * number it doesn't have. With reduced motion it stands still, striped.
+ */
+.meter-indeterminate {
+  position: relative;
+  overflow: hidden;
+}
+
+.meter-indeterminate-band {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 35%;
+  animation: meter-indeterminate 1.8s ease-in-out infinite;
+}
+
+@keyframes meter-indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(290%);
+  }
+}
+
 @keyframes skeleton-pulse {
   0%,
   100% {
@@ -369,6 +410,12 @@
   }
   .progress-live::after {
     display: none;
+  }
+  .meter-indeterminate-band {
+    animation-name: none !important;
+    width: 100%;
+    background-color: transparent;
+    background-image: repeating-linear-gradient(-45deg, var(--meter) 0 4px, transparent 4px 8px);
   }
   .spin {
     animation: spin 1.6s linear infinite !important;

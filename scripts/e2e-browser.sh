@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Browser end-to-end test for a Chrysopoeia Docker image.
+# Browser end-to-end test for a Szalinski Docker image.
 #
-#   scripts/e2e-browser.sh <image>        e.g. scripts/e2e-browser.sh chrysopoeia:dev
+#   scripts/e2e-browser.sh <image>        e.g. scripts/e2e-browser.sh szalinski:dev
 #
 # Starts the image with a fresh /config and a small synthetic library at
 # /media (made with the image's own ffmpeg), then runs web/e2e/smoke.mjs
@@ -43,10 +43,10 @@ for tool in docker node; do
     command -v "$tool" >/dev/null 2>&1 || fail "$tool is required."
 done
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/chrysopoeia-e2e-browser.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/szalinski-e2e-browser.XXXXXX")
 MEDIA="$WORK/media"
 CONFIG="$WORK/config"
-CONTAINER="chrysopoeia-e2e-browser-$$"
+CONTAINER="szalinski-e2e-browser-$$"
 STARTED=0
 mkdir -p "$MEDIA" "$CONFIG"
 

@@ -23,7 +23,7 @@ progress and space saved, occasionally fixing a failed file.
 
 ## Product Purpose
 
-Chrysopoeia converts whole media libraries in the background to efficient
+Szalinski converts whole media libraries in the background to efficient
 codecs (AV1, HEVC, H.264, VP9 with Opus/AAC/FLAC/AC-3/E-AC-3 audio), checks
 every result for corruption and visual artifacts, and only then replaces the
 original. Success: a user deploys the container, picks a folder and a goal,
@@ -62,8 +62,8 @@ against the source) before anything is replaced.
 
 ## Brand Commitments
 
-- Name: Chrysopoeia (alchemical transmutation into gold). Existing identity:
-  warm near-black surfaces, gold accent, Instrument Serif display type with DM
+- Name: Szalinski (alchemical transmutation into gold). Existing identity:
+  warm near-black surfaces, gold accent, Newsreader display type with DM
   Sans for UI and JetBrains Mono for technical values. Keep this identity.
 - Voice: calm, precise, plain. Never cute about failures; never jargon first.
 

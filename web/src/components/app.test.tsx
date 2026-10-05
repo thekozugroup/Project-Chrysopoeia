@@ -8,7 +8,7 @@ describe("the unknown-address screen", () => {
   it("is titled with the wording of the docs and the server's error, with the address in it", () => {
     render(<HostNotAllowed retrying={false} onRetry={() => {}} host="media.example.com" />);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
-      'Chrysopoeia doesn\'t answer to the address "media.example.com"',
+      'Szalinski doesn\'t answer to the address "media.example.com"',
     );
   });
 
@@ -16,13 +16,13 @@ describe("the unknown-address screen", () => {
     // jsdom's page is http://localhost:3000/.
     render(<HostNotAllowed retrying={false} onRetry={() => {}} />);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
-      `Chrysopoeia doesn't answer to the address "${window.location.hostname}"`,
+      `Szalinski doesn't answer to the address "${window.location.hostname}"`,
     );
   });
 
   it("still has a title when the address isn't known", () => {
     render(<HostNotAllowed retrying={false} onRetry={() => {}} host="" />);
-    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Chrysopoeia doesn't answer to this address");
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Szalinski doesn't answer to this address");
   });
 
   it("tells nginx to pass the host with its port, so changes and live updates keep working", () => {

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * DEV-ONLY mock of the Chrysopoeia API, for UI work and screenshots.
+ * DEV-ONLY mock of the Szalinski API, for UI work and screenshots.
  * Every library, file and number here is FAKE sample data. The app never
  * imports this file; run it with `pnpm mock` and build or run the UI with
  * NEXT_PUBLIC_API_URL=http://localhost:8787.
@@ -25,9 +25,11 @@
  *   MOCK_BULK_FAILED=0      add a "Demo Bulk" library with this many files that all
  *                           failed because the work folder can't be used (more than
  *                           one 500-file page: the UI must read them all)
+ *   MOCK_FS=container       "plain" lists "/" without the container's own folders and
+ *                           sends no `user_folders`, like a server outside Docker
  *
  * Error codes, messages and the `field` of validation errors follow the
- * real server (crates/chrysopoeia-server), so the UI's error handling is
+ * real server (crates/szalinski-server), so the UI's error handling is
  * exercised the same way. Also served: `GET /api/system` (with `build`),
  * `Job.notes`, `HardwareInfo.detecting`, and the round-3 additions:
  * `QueueState.max_jobs_source`, `LibraryStats.settling`, HDR10 metadata on
@@ -63,6 +65,15 @@
  * with the worker's sentence ("MP4 can't hold this file's …, so it was left
  * unchanged. …; Convert anyway converts it without them") until converted
  * anyway.
+ *
+ * Round 6: `Job.attempts` (every way a job tried, each with its decoding,
+ * time, command, the check it failed or ffmpeg's error, and a log tail) and
+ * how a running job's share was worked out (`progress_basis` with `frames`
+ * and `elapsed_secs`, on jobs and `job.progress` events). The first running
+ * job is the Atlas CPU fallback: two NVIDIA attempts failed "Plays start to
+ * finish", and the CPU's encode reports frames but no share (`unknown`);
+ * the second estimates its share from frames; the failed-check file in
+ * Movies failed its check on all three attempts.
  */
 
 import { randomUUID } from "node:crypto";
@@ -78,6 +89,7 @@ const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
 const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
+const PLAIN_FS = process.env.MOCK_FS === "plain";
 const FORCE = process.env.MOCK_FORCE ?? "on";
 /** The worker's sentence for a file with other hard links (SHARED_ORIGINAL), left alone when originals are replaced. */
 const HARD_LINK_SKIP =
@@ -87,9 +99,9 @@ const HARD_LINK_NOTE = "The original has another hard link (for example a seedin
 /** The worker's sentence when the goal's container can't hold some of a file's tracks (plan::replace_loss). */
 const lossSkip = (container, lost) =>
   `${container} can't hold this file's ${lost}, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them`;
-/** The server's sentence when the work folder can't be created (chrysopoeia-worker run.rs). */
+/** The server's sentence when the work folder can't be created (szalinski-worker run.rs). */
 const WORK_FOLDER_ERROR =
-  "The work folder /temp can't be created because Chrysopoeia doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
+  "The work folder /temp can't be created because Szalinski doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
 /** Jobs queued with "Convert anyway" (force). */
 const forcedJobs = new Set();
 const STARTED = Date.now();
@@ -112,7 +124,7 @@ const ago = (secs) => iso(NOW - secs * 1000);
 const uuid = () => randomUUID();
 
 // ---------------------------------------------------------------------------
-// Profiles, presets and settings (mirror crates/chrysopoeia-core)
+// Profiles, presets and settings (mirror crates/szalinski-core)
 // ---------------------------------------------------------------------------
 
 function profileForGoal(goal) {
@@ -268,7 +280,7 @@ function detectingPlaceholder() {
       {
         level: "info",
         title: "Checking your hardware…",
-        detail: "Chrysopoeia is testing which encoders work on this machine. This takes a few seconds; conversions start right after.",
+        detail: "Szalinski is testing which encoders work on this machine. This takes a few seconds; conversions start right after.",
         fix: null,
       },
     ],
@@ -322,8 +334,24 @@ const presets = {
 // ---------------------------------------------------------------------------
 
 const BROWSE_ROOTS = ["/"];
+/**
+ * What the server's mount list says was given to the container (Unraid
+ * paths): `user_folders` in the browse answer. The data folder can't be a
+ * library, which is said with `library_blocked`.
+ */
+const USER_FOLDERS = ["/config", "/media", "/output", "/temp"];
+/** The container's own folders: `system: true` on their entries. */
+const SYSTEM_FOLDERS = ["app", "bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "run", "sbin", "sys", "usr", "var"];
 const FS = {
-  "/": ["config", "media", "mnt", "temp"],
+  "/": PLAIN_FS
+    ? ["config", "media", "mnt", "temp"]
+    : [...SYSTEM_FOLDERS, "config", "home", "media", "mnt", "opt", "output", "srv", "temp", "tmp"].sort(),
+  ...Object.fromEntries(SYSTEM_FOLDERS.map((name) => [`/${name}`, []])),
+  "/home": [],
+  "/opt": [],
+  "/srv": [],
+  "/tmp": [],
+  "/output": [],
   "/config": [],
   "/temp": [],
   "/mnt": ["user"],
@@ -388,6 +416,8 @@ const libraries = new Map();
 const files = new Map();
 /** @type {Map<string, any>} */
 const jobs = new Map();
+/** Frames each running job's encode should give (mock bookkeeping, never sent). */
+const frameTotals = new Map();
 const activity = [];
 let activityId = 1;
 const savingsByDay = new Map();
@@ -420,8 +450,13 @@ function addActivity(level, message, extra = {}) {
   return entry;
 }
 
+/** A release name some groups write into every track's title. */
+const RELEASE_TITLE = "Demo.Movie.2017.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.7.1-DEMOGROUP";
+
 function makeProbe(file) {
   const [w, h] = RESOLUTIONS[file.resolution] ?? [1920, 1080];
+  // Some files carry their release name as the title of the tracks.
+  const released = file.relative_path.includes("Sintel") || file.relative_path.includes("Demo Show");
   const streams = [
     {
       index: 0, kind: "video", codec: file.video_codec, profile: file.video_codec === "hevc" ? "Main 10" : "High", language: null, title: null,
@@ -442,10 +477,11 @@ function makeProbe(file) {
       ...(file.dvNoBaseLayer ? { dolby_vision_without_base_layer: true } : {}),
     },
     {
-      index: 1, kind: "audio", codec: file.audio_codec, profile: null, language: "eng", title: "English 5.1", is_default: true,
+      index: 1, kind: "audio", codec: released ? "dts" : file.audio_codec, profile: released ? "DTS-HD MA" : null, language: "eng",
+      title: released ? RELEASE_TITLE : "English 5.1", is_default: true,
       is_forced: false, is_attached_pic: false, bit_rate: 640000, width: null, height: null, pix_fmt: null, bit_depth: null,
       frame_rate: null, color_primaries: null, color_transfer: null, color_space: null, color_range: null, hdr: null,
-      interlaced: false, channels: 6, channel_layout: "5.1(side)", sample_rate: 48000,
+      interlaced: false, channels: released ? 8 : 6, channel_layout: released ? "7.1" : "5.1(side)", sample_rate: 48000,
     },
   ];
   if (file.relative_path.includes("Sintel") || file.relative_path.includes("Demo Show")) {
@@ -456,7 +492,7 @@ function makeProbe(file) {
       interlaced: false, channels: 2, channel_layout: "stereo", sample_rate: 48000,
     });
     streams.push({
-      index: 3, kind: "subtitle", codec: "subrip", profile: null, language: "eng", title: null, is_default: false,
+      index: 3, kind: "subtitle", codec: "hdmv_pgs_subtitle", profile: null, language: "eng", title: RELEASE_TITLE, is_default: false,
       is_forced: false, is_attached_pic: false, bit_rate: null, width: null, height: null, pix_fmt: null, bit_depth: null,
       frame_rate: null, color_primaries: null, color_transfer: null, color_space: null, color_range: null, hdr: null,
       interlaced: false, channels: null, channel_layout: null, sample_rate: null,
@@ -513,7 +549,7 @@ function validationReport(ssimMin = between(0.955, 0.985)) {
 }
 
 function commandFor(file, encoder) {
-  const out = file.path.replace(/\.[^.]+$/, ".mkv").replace(/([^/]+)$/, ".$1.chrysopoeia-1a2b3c4d.tmp.mkv");
+  const out = file.path.replace(/\.[^.]+$/, ".mkv").replace(/([^/]+)$/, ".$1.szalinski-1a2b3c4d.tmp.mkv");
   const hwIn = encoder.endsWith("_nvenc") ? "-hwaccel cuda -hwaccel_output_format cuda " : "";
   return `ffmpeg -hide_banner -nostdin -y ${hwIn}-analyzeduration 100M -probesize 100M -i "${file.path}" -map 0:0 -map 0:1 -map 0:2? -c:v ${encoder} ${
     encoder.includes("nvenc") ? "-preset p5 -cq 28" : "-preset 6 -crf 30"
@@ -544,9 +580,13 @@ function makeJob(file, state, extra = {}) {
     fps: null,
     speed: null,
     eta_secs: null,
+    progress_basis: null,
+    frames: null,
+    elapsed_secs: null,
     encoder: state === "queued" ? null : encoder,
     hw_api: state === "queued" ? null : hw_api,
     attempt: 1,
+    attempts: [],
     input_size: file.original_size_bytes ?? file.size_bytes,
     output_size: null,
     freed_bytes: null,
@@ -789,6 +829,37 @@ function seedDemo() {
     finished_at: ago(3100),
   });
   jobA.created_at = ago(9000);
+  // Round 6: each way it was tried, with the check each one failed.
+  const visualFail = (n, encoder, hw_api, hwDecode, secs) => ({
+    attempt: n,
+    encoder,
+    hw_api,
+    device: null,
+    hw_decode: hwDecode,
+    elapsed_secs: secs,
+    result: "failed",
+    error: "The new file doesn't look like the original. At 1:12:40 the picture differs a lot",
+    problem: "verification",
+    failed_check: {
+      id: "visual",
+      label: "Looks the same as the original",
+      status: "fail",
+      detail: "At 1:12:40 the picture differs a lot. This usually means corrupted frames in the source.",
+      value: 0.6123,
+    },
+    command: commandFor(failedA, encoder),
+    log_tail: "[vist#0:0/h264 @ 0x55d0e] corrupt decoded frame",
+  });
+  Object.assign(jobA, {
+    attempt: 3,
+    encoder: "libx265",
+    hw_api: "software",
+    attempts: [
+      visualFail(1, "hevc_nvenc", "nvenc", true, 610),
+      visualFail(2, "hevc_nvenc", "nvenc", false, 702),
+      visualFail(3, "libx265", "software", false, 1890),
+    ],
+  });
   // A damaged original: the worker's own sentence for a file that stops early.
   const failedB = pendingMovies[1];
   failedB.status = "failed";
@@ -831,7 +902,7 @@ function seedDemo() {
   if (lockedEpisode) {
     const folder = lockedEpisode.path.slice(0, lockedEpisode.path.lastIndexOf("/"));
     lockedEpisode.status = "failed";
-    lockedEpisode.error = `Chrysopoeia doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
+    lockedEpisode.error = `Szalinski doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
     lockedEpisode.problem = "destination";
     makeJob(lockedEpisode, "failed", { stage: "finalizing", progress: 60, error: lockedEpisode.error, problem: "destination", started_at: ago(3300), finished_at: ago(3000) });
   }
@@ -961,7 +1032,52 @@ function seedDemo() {
     f.progress = stages[i].progress;
     const job = makeJob(f, "running", { ...stages[i], started_at: ago(between(300, 2400)), fps: between(90, 240), speed: between(3.5, 9.5) });
     job.eta_secs = Math.round(between(240, 1800));
+    if (job.stage === "transcoding") {
+      frameTotals.set(job.id, Math.round((f.duration_secs ?? 3600) * 24));
+      job.frames = Math.round((job.progress / 100) * frameTotals.get(job.id));
+      job.elapsed_secs = Math.round(between(200, 1200));
+      job.progress_basis = "time";
+    }
   });
+  // Round 6: the Atlas CPU fallback. The GPU's file failed a check twice (decoded on the
+  // GPU, then on the CPU), and the CPU's encode runs while ffmpeg 7 reports frames but no
+  // output time: no share is known, so the card shows the frames and the time spent.
+  const fallback = running[0] ? jobs.get(running[0].job_id) : null;
+  if (fallback) {
+    const failedCheck = (n, hwDecode, secs) => ({
+      attempt: n,
+      encoder: "hevc_nvenc",
+      hw_api: "nvenc",
+      device: null,
+      hw_decode: hwDecode,
+      elapsed_secs: secs,
+      result: "failed",
+      error: "The new file doesn't play start to finish. Playback stopped at 1:01 of 2:21:02",
+      problem: "verification",
+      failed_check: { id: "decode", label: "Plays start to finish", status: "fail", detail: "Playback stopped at 1:01 of 2:21:02", value: null },
+      command: commandFor(running[0], "hevc_nvenc"),
+      log_tail: "[matroska @ 0x55d0c] [warning] Invalid timestamps for stream 3 (DURATION-eng tag 02:21:02)",
+    });
+    Object.assign(fallback, {
+      encoder: "libx265",
+      hw_api: "software",
+      attempt: 3,
+      attempts: [failedCheck(1, true, 131), failedCheck(2, false, 164)],
+      command: commandFor(running[0], "libx265"),
+      progress: 0,
+      progress_basis: "unknown",
+      frames: 366,
+      elapsed_secs: 99,
+      fps: 3.7,
+      speed: null,
+      eta_secs: null,
+    });
+    frameTotals.set(fallback.id, 2400);
+    running[0].progress = 0;
+  }
+  // The second one estimates its share from frames (ffmpeg said no output time yet).
+  const estimated = running[1] ? jobs.get(running[1].job_id) : null;
+  if (estimated) Object.assign(estimated, { progress_basis: "frames" });
   const queued = candidates.filter((f) => f.status === "pending").slice(8, 38);
   queued.forEach((f, i) => {
     f.status = "queued";
@@ -1274,7 +1390,21 @@ function startJobs() {
       continue;
     }
     const { encoder, hw_api } = encoderFor(lib);
-    Object.assign(job, { state: "running", stage: "preparing", progress: 0, encoder, hw_api, started_at: iso(Date.now()), command: commandFor(file, encoder) });
+    Object.assign(job, {
+      state: "running",
+      stage: "preparing",
+      progress: 0,
+      encoder,
+      hw_api,
+      attempt: 1,
+      attempts: [],
+      progress_basis: null,
+      frames: null,
+      elapsed_secs: null,
+      started_at: iso(Date.now()),
+      command: commandFor(file, encoder),
+    });
+    frameTotals.set(job.id, Math.round((file.duration_secs ?? 3600) * 24));
     file.status = "processing";
     file.progress = 0;
     slots -= 1;
@@ -1291,6 +1421,27 @@ function finishJob(job) {
   const out = Math.round(job.input_size * ratio);
   // A hard-linked original's old data stays on disk through its other link: nothing is freed.
   const shared = Boolean(file?.hardLinked);
+  // The attempt that made the file joins the history, after any that failed.
+  const worked = {
+    attempt: job.attempt,
+    encoder: job.encoder,
+    hw_api: job.hw_api,
+    device: null,
+    hw_decode: job.hw_api !== "software",
+    elapsed_secs: Math.round((Date.now() - Date.parse(job.started_at ?? iso(Date.now()))) / 1000),
+    result: "succeeded",
+    error: null,
+    problem: null,
+    failed_check: null,
+    command: job.command,
+    log_tail: null,
+  };
+  const failedBefore = (job.attempts ?? []).at(-1);
+  const fallbackNote = failedBefore?.failed_check
+    ? [
+        `Converting on the ${failedBefore.hw_api === "nvenc" ? "NVIDIA GPU" : "GPU"} made a file that failed a check (${failedBefore.failed_check.label}: ${failedBefore.failed_check.detail.charAt(0).toLowerCase()}${failedBefore.failed_check.detail.slice(1)}), so it was converted on the CPU`,
+      ]
+    : [];
   Object.assign(job, {
     state: "done",
     stage: "finalizing",
@@ -1298,12 +1449,17 @@ function finishJob(job) {
     fps: null,
     speed: null,
     eta_secs: null,
+    progress_basis: null,
+    frames: null,
+    elapsed_secs: null,
+    attempts: [...(job.attempts ?? []), worked],
     output_size: out,
     freed_bytes: shared ? 0 : job.input_size - out,
     validation: validationReport(),
-    notes: file ? notesFor(file) : [],
+    notes: [...(file ? notesFor(file) : []), ...fallbackNote],
     finished_at: iso(Date.now()),
   });
+  frameTotals.delete(job.id);
   if (file) {
     // A second conversion saves against the first original, not the converted file.
     file.original_size_bytes = file.wasDone ? (file.original_size_bytes ?? job.input_size) : job.input_size;
@@ -1345,13 +1501,35 @@ function tick() {
     const speed = job.hw_api === "software" ? between(0.7, 1.6) : between(2.2, 4.4);
     if (job.stage === "preparing") {
       job.progress = Math.min(100, job.progress + 50);
-      if (job.progress >= 100) Object.assign(job, { stage: "transcoding", progress: 0 });
+      if (job.progress >= 100) Object.assign(job, { stage: "transcoding", progress: 0, progress_basis: "time", frames: 0, elapsed_secs: 0 });
     } else if (job.stage === "transcoding") {
-      job.progress = Math.min(100, job.progress + speed);
-      job.fps = job.hw_api === "software" ? between(24, 60) : between(140, 260);
-      job.speed = job.fps / 24;
-      job.eta_secs = Math.round(((100 - job.progress) / speed) * (TICK_MS / 1000) * 12);
-      if (job.progress >= 100) Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null });
+      const total = frameTotals.get(job.id) ?? 86_400;
+      job.elapsed_secs = (job.elapsed_secs ?? 0) + Math.round((TICK_MS / 1000) * 12);
+      if (job.progress_basis === "unknown" || job.progress_basis === "frames") {
+        // ffmpeg reports frames but no output time: a slow CPU encode.
+        job.fps = job.progress_basis === "unknown" ? between(3.5, 3.9) : between(24, 60);
+        job.speed = null;
+        job.frames = Math.min(total, (job.frames ?? 0) + Math.round(job.fps * (TICK_MS / 1000) * 12));
+        if (job.progress_basis === "unknown") {
+          job.progress = 0;
+          job.eta_secs = null;
+        } else {
+          job.progress = Math.min(99, (job.frames / total) * 100);
+          job.eta_secs = Math.round((total - job.frames) / job.fps);
+        }
+        if (job.frames >= total) {
+          Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null, progress_basis: null, frames: null, elapsed_secs: null });
+        }
+      } else {
+        job.progress = Math.min(100, job.progress + speed);
+        job.fps = job.hw_api === "software" ? between(24, 60) : between(140, 260);
+        job.speed = job.fps / 24;
+        job.frames = Math.round((job.progress / 100) * total);
+        job.eta_secs = Math.round(((100 - job.progress) / speed) * (TICK_MS / 1000) * 12);
+        if (job.progress >= 100) {
+          Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null, progress_basis: null, frames: null, elapsed_secs: null });
+        }
+      }
     } else if (job.stage === "verifying") {
       job.progress = Math.min(100, job.progress + 9);
       job.eta_secs = Math.round((100 - job.progress) / 9) * 3;
@@ -1374,6 +1552,9 @@ function tick() {
       fps: job.fps ? Number(job.fps.toFixed(1)) : null,
       speed: job.speed ? Number(job.speed.toFixed(2)) : null,
       eta_secs: job.eta_secs,
+      progress_basis: job.progress_basis ?? null,
+      frames: job.frames ?? null,
+      elapsed_secs: job.elapsed_secs ?? null,
       encoder: job.encoder,
       hw_api: job.hw_api,
       attempt: job.attempt,
@@ -1546,7 +1727,7 @@ const route = (method, pattern, handler) => {
   routes.push({ method, regex, keys, handler });
 };
 
-route("GET", "/api/health", () => ({ ok: true, version: "0.2.0-mock" }));
+route("GET", "/api/health", () => ({ ok: true, version: "0.3.0-mock" }));
 route("GET", "/api/overview", () => overview());
 route("GET", "/api/libraries", () => [...libraries.values()].map(libraryView));
 route("GET", "/api/libraries/:id", ({ id }) => libraryView(getLibrary(id)));
@@ -1560,10 +1741,10 @@ const libraryBlocked = (path) => {
   const instead = "Choose the folder that holds your videos.";
   const within = (dir) => path === dir || path.startsWith(`${dir}/`);
   if (path === "/")
-    return `The whole server can't be a library: it includes Chrysopoeia's own files and every share. ${instead}`;
+    return `The whole server can't be a library: it includes Szalinski's own files and every share. ${instead}`;
   for (const dir of ["/proc", "/sys", "/dev"]) if (within(dir)) return `${dir} is a system folder, not a place for videos. ${instead}`;
-  if (within("/config")) return `/config is where Chrysopoeia keeps its database and settings. ${instead}`;
-  if (within("/app")) return `/app holds the Chrysopoeia app itself, which is read-only. ${instead}`;
+  if (within("/config")) return `/config is where Szalinski keeps its database and settings. ${instead}`;
+  if (within("/app")) return `/app holds the Szalinski app itself, which is read-only. ${instead}`;
   return null;
 };
 
@@ -1585,7 +1766,7 @@ route("POST", "/api/libraries", async (_p, _q, req) => {
     throw new HttpError(
       400,
       "contains_output_folder",
-      "The output folder is inside this folder, so Chrysopoeia would convert its own results. Pick another folder, or change the output folder in Settings.",
+      "The output folder is inside this folder, so Szalinski would convert its own results. Pick another folder, or change the output folder in Settings.",
     );
   for (const lib of libraries.values()) {
     if (lib.path === path) throw new HttpError(409, "library_exists", `That folder is already the library ${lib.name}.`);
@@ -1728,7 +1909,7 @@ route("POST", "/api/files/:id/skip", ({ id }) => {
   // Like the server: a converting file is cancelled first, then skipped.
   for (const j of jobs.values()) {
     if (j.file_id === id && (j.state === "queued" || j.state === "running")) {
-      Object.assign(j, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
+      Object.assign(j, { state: "cancelled", fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, finished_at: iso(Date.now()) });
       broadcast({ type: "job.updated", job: j });
     }
   }
@@ -1793,7 +1974,7 @@ route("GET", "/api/jobs/:id", ({ id }) => getJob(id));
 route("POST", "/api/jobs/:id/cancel", ({ id }) => {
   const job = getJob(id);
   if (job.state !== "queued" && job.state !== "running") throw new HttpError(409, "job_finished", "This job has already finished.");
-  Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
+  Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, finished_at: iso(Date.now()) });
   const file = files.get(job.file_id);
   if (file) {
     // A converted file queued again stays converted.
@@ -1845,7 +2026,7 @@ route("POST", "/api/queue/resume", () => {
 route("POST", "/api/queue/stop", () => {
   for (const job of jobs.values()) {
     if (job.state !== "running") continue;
-    Object.assign(job, { state: "queued", stage: "waiting", progress: 0, fps: null, speed: null, eta_secs: null, started_at: null });
+    Object.assign(job, { state: "queued", stage: "waiting", progress: 0, fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, attempt: 0, attempts: [], started_at: null });
     const file = files.get(job.file_id);
     if (file) Object.assign(file, { status: "queued", progress: null });
     broadcast({ type: "job.updated", job });
@@ -1899,7 +2080,7 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
     for (const lib of libraries.values()) {
       if (next.output_folder === lib.path || next.output_folder.startsWith(`${lib.path}/`))
         throw invalid(
-          `The output folder can't be inside the library ${lib.name}, or Chrysopoeia would convert its own results.`,
+          `The output folder can't be inside the library ${lib.name}, or Szalinski would convert its own results.`,
           "output_folder",
         );
     }
@@ -1926,7 +2107,7 @@ function folderStatuses() {
       setting: "output_folder",
       path: settings.output_folder,
       problem: mount
-        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.`
+        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Szalinski to use the one there now.`
         : null,
       changed_mount: mount,
     });
@@ -1966,7 +2147,7 @@ route("POST", "/api/hardware/detect", async () => {
 route("GET", "/api/presets", () => presets);
 
 route("GET", "/api/system", () => ({
-  version: "0.2.0-mock",
+  version: "0.3.0-mock",
   build: "edge-mock",
   // The Docker image sets TEMP_DIR=/temp when that folder is mapped.
   default_temp_dir: "/temp",
@@ -1979,7 +2160,7 @@ route("GET", "/api/fs/browse", (_p, q) => {
   const path = (q.get("path")?.trim() || BROWSE_ROOTS[0]).replace(/(.)\/+$/, "$1");
   if (!path.startsWith("/")) throw new HttpError(400, "path_not_absolute", "Use a full folder path, starting with /.");
   if (!BROWSE_ROOTS.some((r) => r === "/" || path === r || path.startsWith(r + "/")))
-    throw new HttpError(403, "outside_roots", "That folder is outside the folders Chrysopoeia may show.");
+    throw new HttpError(403, "outside_roots", "That folder is outside the folders Szalinski may show.");
   if (!(path in FS)) throw new HttpError(404, "path_not_found", "That folder doesn't exist.");
   const parent = path === "/" ? null : path.slice(0, path.lastIndexOf("/")) || "/";
   return {
@@ -1988,12 +2169,21 @@ route("GET", "/api/fs/browse", (_p, q) => {
     roots: BROWSE_ROOTS,
     entries: FS[path].map((name) => {
       const full = path === "/" ? `/${name}` : `${path}/${name}`;
-      return { name, path: full, is_dir: true, ...mediaCount(full) };
+      const system = !PLAIN_FS && (full === `/${name}` ? SYSTEM_FOLDERS.includes(name) : false);
+      return { name, path: full, is_dir: true, ...mediaCount(full), ...(system ? { system: true } : {}) };
     }),
     // Round 4: the browsed folder's own count, by the same rules.
     ...mediaCount(path),
     // The picker disables "Use" for a library's folder with this.
     ...(libraryBlocked(path) ? { library_blocked: libraryBlocked(path) } : {}),
+    // The folders mounted into the container, offered first (none outside Docker).
+    user_folders: PLAIN_FS
+      ? []
+      : USER_FOLDERS.map((folder) => ({
+          name: folder.slice(1),
+          path: folder,
+          ...(libraryBlocked(folder) ? { library_blocked: libraryBlocked(folder) } : {}),
+        })),
   };
 });
 
@@ -2003,7 +2193,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return send(res, 204);
   if (HOST_DENY) {
     return send(res, 403, {
-      error: `Chrysopoeia doesn't answer to the address "${req.headers.host ?? ""}". Add it to ALLOWED_HOSTS.`,
+      error: `Szalinski doesn't answer to the address "${req.headers.host ?? ""}". Add it to ALLOWED_HOSTS.`,
       code: "host_not_allowed",
     });
   }
@@ -2050,6 +2240,6 @@ setInterval(() => {
 
 server.listen(PORT, () => {
   console.log(
-    `Chrysopoeia mock API (FAKE sample data, scenario "${SCENARIO}"${WS_ON ? "" : ", WebSocket off"}) on http://localhost:${PORT}/api`,
+    `Szalinski mock API (FAKE sample data, scenario "${SCENARIO}"${WS_ON ? "" : ", WebSocket off"}) on http://localhost:${PORT}/api`,
   );
 });

@@ -1,5 +1,5 @@
 /**
- * TypeScript mirror of `crates/chrysopoeia-core`. The serde JSON shape of the
+ * TypeScript mirror of `crates/szalinski-core`. The serde JSON shape of the
  * Rust types is the API contract, so this file follows it exactly:
  * snake_case fields, lowercase/snake_case enum strings, `Option<T>` as
  * `T | null`, `Uuid` and `DateTime<Utc>` as strings, integers as numbers.
@@ -174,6 +174,12 @@ export interface StreamInfo {
   /** MIME type of an attachment or MKV cover image (e.g. `image/jpeg`). Only sent when known. */
   mimetype?: string;
   bit_rate: number | null;
+  /**
+   * The track's Matroska statistics tags as the file names them
+   * (`DURATION-eng`, `BPS`, `_STATISTICS_WRITING_APP`, …); a conversion
+   * removes them. Only sent when there are some.
+   */
+  statistics_tags?: string[];
   width: number | null;
   height: number | null;
   pix_fmt: string | null;
@@ -229,6 +235,12 @@ export interface ProbeInfo {
   size_bytes: number;
   start_time: number | null;
   chapters: number;
+  /**
+   * Matroska statistics tags stored for the whole file rather than a track
+   * (`DURATION-eng`, …); a conversion to MKV or WebM removes them. Only sent
+   * when there are some.
+   */
+  statistics_tags?: string[];
   streams: StreamInfo[];
 }
 
@@ -439,6 +451,41 @@ export const PROBLEM_KINDS: readonly ProblemKind[] = [
 ];
 export type JobStage = "waiting" | "preparing" | "transcoding" | "verifying" | "finalizing";
 
+/**
+ * How a running job's `progress` was worked out while transcoding: `time`
+ * from how far into the file ffmpeg says it is; `frames` estimated from the
+ * frames encoded over the frames the original should have (ffmpeg didn't
+ * say how far it is); `unknown` neither, so `progress` is 0 and means
+ * nothing (show the frames and the time spent instead).
+ */
+export type ProgressBasis = "time" | "frames" | "unknown";
+
+export type AttemptResult = "succeeded" | "failed";
+
+/** One way of converting the file a job tried (core `JobAttempt`). */
+export interface JobAttempt {
+  /** 1-based, as `Job.attempt`. */
+  attempt: number;
+  /** ffmpeg encoder, e.g. `hevc_vaapi`. */
+  encoder: string;
+  hw_api: HwApi;
+  /** The GPU's render node (VA-API, Quick Sync), e.g. `/dev/dri/renderD128`. */
+  device?: string | null;
+  /** The GPU decoded the original; `false`: the CPU did. */
+  hw_decode: boolean;
+  /** How long it took, its checks included. */
+  elapsed_secs: number;
+  result: AttemptResult;
+  /** What went wrong, in plain words. */
+  error?: string | null;
+  problem?: ProblemKind | null;
+  /** The check the new file failed, with its plain reason. */
+  failed_check?: ValidationCheck | null;
+  command?: string | null;
+  /** The last lines ffmpeg printed (a failed attempt). */
+  log_tail?: string | null;
+}
+
 export interface Job {
   id: Uuid;
   file_id: Uuid;
@@ -452,9 +499,24 @@ export interface Job {
   fps: number | null;
   speed: number | null;
   eta_secs: number | null;
+  /**
+   * How `progress` was worked out while transcoding; `null` (or absent, from
+   * an older server) outside transcoding: `progress` is then as it says.
+   */
+  progress_basis?: ProgressBasis | null;
+  /** Video frames the current attempt has encoded (transcoding only). */
+  frames?: number | null;
+  /** Seconds since the current attempt started encoding (transcoding only). */
+  elapsed_secs?: number | null;
   encoder: string | null;
   hw_api: HwApi | null;
   attempt: number;
+  /**
+   * Every way of converting the file this job tried, in order, with how
+   * each ended; the attempt still running is left out. Empty (or absent,
+   * from an older server) when none ended yet or none were recorded.
+   */
+  attempts?: JobAttempt[];
   input_size: number;
   output_size: number | null;
   /**
@@ -498,6 +560,10 @@ export interface JobProgress {
   fps: number | null;
   speed: number | null;
   eta_secs: number | null;
+  /** See `Job.progress_basis`. */
+  progress_basis?: ProgressBasis | null;
+  frames?: number | null;
+  elapsed_secs?: number | null;
   encoder: string | null;
   hw_api: HwApi | null;
   attempt: number;
@@ -593,12 +659,12 @@ export interface Overview {
   queue: QueueState;
 }
 
-/** A setting that names a folder Chrysopoeia writes into. */
+/** A setting that names a folder Szalinski writes into. */
 export type FolderSetting = "output_folder" | "temp_dir";
 
 /**
  * `GET /settings/folders`: a folder in use (the output folder in folder
- * mode; the work folder, the one Chrysopoeia was started with while
+ * mode; the work folder, the one Szalinski was started with while
  * `temp_dir` is unset) and whether the drives and shares it sits on are
  * connected as they were.
  */
@@ -622,7 +688,7 @@ export interface FolderStatus {
 /** `GET /api/system`: facts about the server the settings screens explain. */
 export interface SystemInfo {
   version: string;
-  /** Image build label (`CHRYSOPOEIA_VERSION`, e.g. `edge-1a2b3c4`) when it differs from `version`. */
+  /** Image build label (`SZALINSKI_VERSION`, e.g. `edge-1a2b3c4`) when it differs from `version`. */
   build: string | null;
   /**
    * Scratch folder used when `Settings.temp_dir` is unset (`--temp-dir` /
@@ -697,6 +763,21 @@ export interface FsEntry {
   media_count?: number | null;
   /** True when counting stopped early, so `media_count` is a lower bound ("1,000+"). */
   media_count_capped?: boolean;
+  /**
+   * One of the container's own folders (`/bin`, `/etc`, `/proc`, `/usr`, the
+   * app), as opposed to a folder someone gave it. Only sent, as true, when
+   * the server runs in a container.
+   */
+  system?: boolean;
+}
+
+/** A folder mounted into the container: one of "your folders". */
+export interface UserFolder {
+  /** The last part of the path (`media`). */
+  name: string;
+  path: string;
+  /** Why it can't be a library (the settings folder, say). Absent when it can. */
+  library_blocked?: string | null;
 }
 
 export interface FsBrowse {
@@ -717,6 +798,12 @@ export interface FsBrowse {
    * can. The server refuses such a library too (`folder_not_allowed`).
    */
   library_blocked?: string | null;
+  /**
+   * The folders mounted into the container (Docker bind mounts, Unraid
+   * paths), which the picker offers first. Empty outside a container;
+   * absent from servers before it was added.
+   */
+  user_folders?: UserFolder[];
 }
 
 export type BulkAction = "queue" | "skip" | "retry_failed";

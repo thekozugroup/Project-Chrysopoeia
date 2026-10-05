@@ -2,7 +2,7 @@
 
 /**
  * "Use the drive that's there now": what the user is told before
- * Chrysopoeia takes another drive, mounted where a folder's drive or share
+ * Szalinski takes another drive, mounted where a folder's drive or share
  * was, as the usual one. Shared by the library page and Settings.
  */
 
@@ -46,7 +46,7 @@ export function UseDriveConfirm({
       onConfirm={onConfirm}
     >
       <p>
-        Chrysopoeia will take the drive mounted at <span className="font-mono text-[0.8125rem] text-fg">{mount}</span>{" "}
+        Szalinski will take the drive mounted at <span className="font-mono text-[0.8125rem] text-fg">{mount}</span>{" "}
         as the usual one from now on: it reads files from it and saves new files to it.
       </p>
       <p className="font-medium text-fg">

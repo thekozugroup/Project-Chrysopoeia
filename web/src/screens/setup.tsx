@@ -108,12 +108,12 @@ export function SetupScreen({ settings }: { settings: Settings }) {
               <StepHeading
                 level={1}
                 focusOnMount={moved}
-                className="font-display text-[2.75rem] leading-[1.05] text-fg outline-none sm:text-[3.5rem]"
+                className="font-display text-[2.75rem] leading-[1.08] text-fg outline-none sm:text-[3.5rem]"
               >
                 Make your video library smaller, safely.
               </StepHeading>
               <p className="mt-5 max-w-xl text-[0.9375rem] leading-relaxed text-muted">
-                Point Chrysopoeia at a folder and choose a goal. It converts files in the background, checks each
+                Point Szalinski at a folder and choose a goal. It converts files in the background, checks each
                 result against the original, and only then replaces it.
               </p>
               <ul className="mt-10 flex max-w-xl flex-col gap-5">

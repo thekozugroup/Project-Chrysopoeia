@@ -1,6 +1,6 @@
-# Chrysopoeia architecture
+# Szalinski architecture
 
-Chrysopoeia is a self-hosted media transcoder: point it at folders, pick a goal,
+Szalinski is a self-hosted media transcoder: point it at folders, pick a goal,
 and it converts the library in the background, verifies every result, and only
 then replaces the original. It is a Tdarr alternative that trades plugin stacks
 for sensible defaults, automatic hardware setup and verified output.
@@ -8,7 +8,7 @@ for sensible defaults, automatic hardware setup and verified output.
 This document is the contract between the backend crates, the web UI and the
 deployment files, and it describes what the code does. Field names and JSON
 shapes here are normative. The Rust source of truth for every shared type is
-`crates/chrysopoeia-core`; the TypeScript mirror is `web/src/lib/types.ts`.
+`crates/szalinski-core`; the TypeScript mirror is `web/src/lib/types.ts`.
 
 ## Runtime shape
 
@@ -22,11 +22,11 @@ shapes here are normative. The Rust source of truth for every shared type is
              │   │     plan ─► ffmpeg (HW ► HW-enc/SW-dec ► CPU) ─► verify   │
              │   │     ─► finalize (crash-safe replace) ─► DB + events       │
              │   └─ Hardware: hwdetect::detect at startup + on demand        │
-             │ SQLite (WAL) at $DATA_DIR/chrysopoeia.db                       │
+             │ SQLite (WAL) at $DATA_DIR/szalinski.db                       │
              └────────────────────────────────────────────────────────────────┘
 ```
 
-- Single static binary `chrysopoeia` (crate `chrysopoeia-server`) serves the
+- Single static binary `szalinski` (crate `szalinski-server`) serves the
   API, the WebSocket and the exported Next.js UI. No Node at runtime.
 - ffmpeg/ffprobe are external processes (jellyfin-ffmpeg in the Docker image,
   which bundles NVENC, QSV/oneVPL, VA-API (Intel iHD + AMD), AMF and Rockchip
@@ -39,11 +39,11 @@ shapes here are normative. The Rust source of truth for every shared type is
 
 | Crate | Owns | Public API |
 |---|---|---|
-| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, tying child processes to the server's life | Everything in `src/*.rs` |
-| `chrysopoeia-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
-| `chrysopoeia-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
-| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
-| `chrysopoeia-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `chrysopoeia` |
+| `szalinski-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, where a file really ends by its packets (`timeline`), tying child processes to the server's life | Everything in `src/*.rs` |
+| `szalinski-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
+| `szalinski-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
+| `szalinski-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
+| `szalinski-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `szalinski` |
 
 Existing public signatures are fixed; new public items may be added. The
 workspace's minimum Rust version (MSRV) is 1.88.
@@ -76,22 +76,22 @@ it is picked up or converted (the settle time); the database busy timeout is
 
 Start order: raise the soft limit on open files to the hard limit (at most
 65 536; Docker often starts with 1 024) → exclusive lock on
-`$DATA_DIR/chrysopoeia.lock` (a second
-Chrysopoeia on the same data folder exits with "Another Chrysopoeia is already
+`$DATA_DIR/szalinski.lock` (a second
+Szalinski on the same data folder exits with "Another Szalinski is already
 using the data folder …" and changes nothing, advising to stop the other one or
 give this one its own Config folder in a container (the image sets the data
 folder there), and `--data-dir` / `DATA_DIR` outside one; filesystems that
 can't lock only log a warning) → bind the port → open the database → recovery.
 
 A database file SQLite finds damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
-moved aside as `chrysopoeia.db.damaged-<UTC time>` (with its `-wal`/`-shm`
+moved aside as `szalinski.db.damaged-<UTC time>` (with its `-wal`/`-shm`
 files) and a new one is started; the feed says so at WARN ("The database was
-damaged, so Chrysopoeia moved it aside to … and started with a new one. Your
+damaged, so Szalinski moved it aside to … and started with a new one. Your
 media files were not touched. Add your libraries and settings again."), so a
 container set to restart doesn't loop. A data folder on a full disk stops
 the start with "The disk that holds the data folder (…) is full, so the
 database there couldn't be opened. Free some space on that disk, then start
-Chrysopoeia again" (`db::is_disk_full`: SQLite's `SQLITE_FULL` or the
+Szalinski again" (`db::is_disk_full`: SQLite's `SQLITE_FULL` or the
 system's "no space left", or any database error while less than 1 MiB is
 free there; a new database fails with the former, an existing one with a
 disk I/O error). This covers opening, migrating and the first writes of the
@@ -140,7 +140,8 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
      freed_bytes INT NULL, profile TEXT JSON NULL, placing INT DEFAULT 0,
-     placing_size INT NULL, placing_original_size INT NULL, final_mount TEXT JSON NULL)
+     placing_size INT NULL, placing_original_size INT NULL, final_mount TEXT JSON NULL,
+     attempts TEXT JSON NULL, progress_basis TEXT NULL, frames INT NULL, elapsed_secs INT NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs, partial INDEX(placing) of marked jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
@@ -210,6 +211,12 @@ onto itself (see "Drives and shares the folders sit on") is another drive,
 never noted. Another filesystem mounted there before that first look (a
 tmpfs, or a host folder bound into a container) can't be told from the
 share and is noted as it; the user then says which one to use as below.
+14 = `jobs.attempts` (JSON `JobAttempt[]`, every way of converting the
+file the job tried with how it ended; see Contract additions (round 6))
+and how a running job's progress was worked out while transcoding:
+`jobs.progress_basis` (`time`, `frames`, `unknown`), `jobs.frames` and
+`jobs.elapsed_secs`. Jobs recorded before have no attempts (`NULL`, read
+as none) and no basis.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -288,6 +295,29 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   it's back". It is forgotten once its folder has files without being a
   mount. (When the folder doesn't answer, every known mount counts as
   offline.)
+- "Your folders" in the folder picker (`services::user_folders`,
+  `GET /fs/browse`). In a container (`/.dockerenv` or
+  `/run/.containerenv`) the folders a person gave it (Unraid paths, Docker
+  mounts) are what they look for; the rest of `/` is the container's own
+  system. `user_folders` is read from `/proc/self/mountinfo` through
+  `slow_fs::mount_points` (a local list, no share is touched, no folder
+  is looked at): the mount points that are not `/`, not in `/proc`, `/sys`,
+  `/dev`, `/run`, `/etc`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/lost+found`, `/var`, `/boot`,
+  `/root` or `/app`, not the web UI's folder, not a pseudo filesystem
+  (`proc`, `sysfs`, `devpts`, `cgroup2`, `mqueue`, ...) wherever mounted,
+  and inside the browse roots (the picker would refuse the rest). Of a
+  mount and the ones inside it only the outer one is listed, sorted by
+  path. A `tmpfs` someone mounted for work files counts. The settings
+  folder (`/config`) is listed with `library_blocked` (the same sentence
+  as for browsing it), so the picker leaves it out while a library's
+  folder is chosen and offers it for the other folders. Outside a container
+  (a desktop's disks are all "yours") `user_folders` is `[]` and no entry
+  is marked `system`: folders are listed as they always were. The picker
+  shows the folders as quick choices on top, lists them first at `/`
+  (then the other folders, then the system folders folded under "System
+  folders"), keeps "Type a path" and the reasons a folder can't be a
+  library, and keeps a way to the whole server (`All folders`) when the
+  roots are more than these folders.
 - Drives and shares the folders sit on (`services::share_mounts`). An
   unmounted share leaves its mount point behind as an ordinary folder on
   the disk below: empty, or holding whatever was there before the share
@@ -327,7 +357,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   it, and its conversions continue."), and while something else is
   mounted there it is not connected either ("A different drive is mounted
   at /mnt/remotes/nas than before. Reconnect the usual one, or tell
-  Chrysopoeia to use the one there now."), whatever the folder holds: the
+  Szalinski to use the one there now."), whatever the folder holds: the
   library shows that as its `path_error` (with `changed_mount`, the place,
   for another drive), a scan of it stops there (an error entry, nothing
   taken for removed or added), its jobs and every job that uses the
@@ -410,7 +440,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   place after the job ended, whatever the stop recorded them as: back in
   the queue, cancelled) is settled from what is on the disk (see "Putting
   the new file in place on a share that stops answering"): its new file in
-  place → recorded `done` (note: "Chrysopoeia stopped just as the new file
+  place → recorded `done` (note: "Szalinski stopped just as the new file
   was being put in place. The new file was already complete, so it was
   kept") and the backup removed; not in place → the original put back and
   the job's temp files gone. Only an answer settles a job: a folder that
@@ -494,9 +524,9 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   is held across a watcher call.
 - A new or changed file is reported once no event arrived for it for the
   settle time and its size/mtime held still that long; removals (files and
-  folders) are reported at once, except renames to Chrysopoeia's backup names
+  folders) are reported at once, except renames to Szalinski's backup names
   and the loss of a whole root.
-- Chrysopoeia's own results are not copies in progress. A converted file put
+- Szalinski's own results are not copies in progress. A converted file put
   in place goes through the same settle wait as any new file, but it is
   complete, so the count of files still being copied
   (`LibraryStats.settling`, "Waiting for 1 file to finish copying") leaves
@@ -569,7 +599,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   queue while they waited for it). Cancel answers before the other
   `*.updated` events go out (they follow in the background), so a library
   on a hung share, which takes seconds to describe, doesn't slow it.
-- Folder checks that may hang (`chrysopoeia_worker::slow_fs`, used through
+- Folder checks that may hang (`szalinski_worker::slow_fs`, used through
   `services::fs_guard`): library checks, every check of a job (server and
   worker share them), leftover searches and the folder picker run on a
   blocking thread, one at a time per path, kind of check and mount (a
@@ -616,7 +646,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   check is busy shows no problem, an offline library stays as it was and
   is checked again 15 s later, a job waits (above), a failed job whose
   file can't be looked at is tried again rather than failed or taken for
-  deleted, the folder picker answers 503 `busy` ("Chrysopoeia is still
+  deleted, the folder picker answers 503 `busy` ("Szalinski is still
   waiting for other folders that stopped answering, so it couldn't open
   this one right now. Try again in a moment."), and the watch over a long
   step ignores such checks. A hung share therefore costs at most 8
@@ -645,7 +675,17 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   moment ago, or a stale row) is closed directly only while it is still
   `running`, so a result recorded in the meantime is never overwritten.
 - Progress: every update is broadcast as `job.progress`; the DB is written on
-  stage changes and at most every 2 s per job.
+  stage changes and at most every 2 s per job. The update that follows the
+  end of an attempt carries the attempts so far (`JobProgress.attempts`,
+  worker to server only): it is always written (`jobs.attempts`), and the
+  job goes out as `job.updated`, so the job's details say why an attempt
+  failed while the next one runs; the `job.progress` event never carries
+  them. The job's outcome carries the whole list again
+  (`JobOutcome::{Done, Skipped, Failed}.attempts`), written with the result
+  in the same transaction (an outcome without any, such as a job settled
+  from the disk after a restart, keeps those written while it ran). A job
+  that starts again (claimed, put back in the queue, recovered at start-up)
+  starts with none: they describe its latest run.
 - A result is never lost: recording it retries while the database is busy.
 - Encoder candidates come from `hwdetect::encoder_candidates(hw, profile.video_codec,
   settings.hardware, settings.cpu_fallback)`, else the codec's software encoder.
@@ -699,10 +739,13 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   so this file wasn't converted. …". When no such job is on record (a file
   someone else put there), the worker's message stays.
 - Stored probes of PQ video without HDR10 mastering data are refreshed at job
-  start (older versions didn't read it).
+  start (older versions didn't read it), and so are stored probes of
+  Matroska files that list no statistics tags on any track
+  (`StreamInfo.statistics_tags`, which older versions didn't record), so
+  the conversion can remove them.
 - A failure is logged once, at WARN, through its activity entry.
 - Logging: the start line names the version and, when set, the build
-  (`CHRYSOPOEIA_VERSION`); each hardware detection logs one INFO line
+  (`SZALINSKI_VERSION`); each hardware detection logs one INFO line
   ("hardware detection finished", with hwdetect's own summary at DEBUG);
   each finished job logs one plain INFO line, its activity entry ("Converted
   …", "Skipped …", "Cancelled …"; failures at WARN). Job starts, attempts
@@ -766,6 +809,26 @@ with `JobSpec.force` uses it when `decide` says skip.
   ignore cover images (they read back as attached pictures).
 - `-map_metadata 0 -map_chapters 0`, `-max_muxing_queue_size 9999`,
   `-analyzeduration 100M -probesize 100M` on input, `-f <muxer>`.
+- Matroska statistics tags (`core::tags`): mkvmerge stores `BPS`,
+  `DURATION`, `NUMBER_OF_FRAMES`, `NUMBER_OF_BYTES` and `_STATISTICS_*`
+  with each track, with the language appended when written with one
+  (`DURATION-eng`). ffmpeg copies a track's tags into its output whether it
+  copies or re-encodes the track, and its MKV writer adds only a fresh
+  plain `DURATION`, so a clip cut from a film keeps the film's
+  `DURATION-eng` (2:21:02 next to the clip's 1:01). The scanner records
+  each track's statistics tags as the file names them
+  (`StreamInfo.statistics_tags`), and for MKV and WebM every kept track
+  (video, audio copied or re-encoded, subtitles, attachments) gets
+  `-metadata:s:<v:0|a:N|s:N|t:N> <KEY>=` for each, which removes it and
+  leaves every other tag (title, language, dispositions, HDR metadata) as it
+  was; ffmpeg's MKV writer then adds its own `DURATION` for the new track.
+  Statistics tags stored for the whole file (`ProbeInfo.statistics_tags`:
+  an MP4's `DURATION-eng` kept with `use_metadata_tags`, an MKV's global
+  tags), which `-map_metadata 0` would copy, get `-metadata <KEY>=` the
+  same way; the file's title and other tags stay. (Probes stored before
+  this list existed have it empty, so such a file keeps its global tag
+  until it is probed again.) MP4 keeps no such tags (checked with ffmpeg
+  6.1 and 7.0), so it gets none of these options.
 - Audio per output stream: copy when the profile says copy (or source already in
   target codec) and the container can hold it; else encode with
   `AudioCodec::default_bitrate_kbps(channels)`, downmixing past
@@ -862,12 +925,77 @@ that a different drive is mounted there).
    time or bytes written moved, or a new stderr line. (ffmpeg 7, as in the
    Docker image, keeps printing identical blocks every half second while
    it is stuck; those don't count.)
+   Every attempt that ran is recorded as it ends (`JobAttempt`, see Contract
+   additions (round 6)): an ffmpeg failure, no file written, an original
+   that stops early, a failed check (the check, and its reason without the
+   job's advice), or a success (a size-rule skip included). Plan failures,
+   repeated commands and attempts cut short by Cancel, Stop or a share that
+   stops answering are not. A fallback's note names the check the attempt
+   before the one that worked failed, when one did: "Converting on the GPU
+   (VA-API) made a file that failed a check (Plays start to finish:
+   playback stopped at 1:01 of 2:21:02), so it was converted on the CPU"
+   ("Decoding on the GPU made a file that failed a check (…), so it was
+   decoded on the CPU"; "The first way of converting … made a file that
+   failed a check (…), so another one was used"); after an ffmpeg error the
+   notes stay as before ("Converting on the NVIDIA GPU didn't work for this
+   file, so it was converted on the CPU"). A similarity score stays out of
+   the note.
+   **Progress while encoding** (`ffmpeg::estimate_progress`): ffmpeg 7
+   reports as its output time that of the track furthest behind, and none
+   at all (`out_time=N/A`) while a track has had no packet yet (a subtitle
+   track without a line so far), sometimes for a whole encode; ffmpeg
+   before 6 printed "no time yet" as `-9223372036854775807`, read as none.
+   The share is the output time over the original's length (`time`); when
+   ffmpeg reports no output time, or the frames encoded are at least 2
+   points ahead of it, it is the frames over the frames the original should
+   have (`frames`: its stated length times its frame rate, both known and
+   plausible, 1 to 240 fps; at most 99 % before ffmpeg's final report, and
+   dropped once the frames pass that count by more than 5 %), with the time
+   left from the frames still to encode at ffmpeg's fps; with neither it is
+   `unknown`: progress 0 and no time left, never a figure that only looks
+   like one, while the frames and the time spent are reported. Where the
+   encode got (for "the original stops early") is likewise its frames over
+   the frame rate when no output time came.
 3. A cut-off original: when ffmpeg reported damaged input or verification
    found the result too short, and the encode ended clearly before the length
-   the container claims (> max(2 s, 5 %)), the job fails with "The original
+   the original claims (> max(2 s, 5 %)), the job fails with "The original
    file appears damaged or incomplete (it stops after 0.1 s). It was left
    unchanged." (With verification off, ending before half the length is
-   enough.) Only an attempt that decoded on the CPU (or the last attempt)
+   enough.) The claim is the scanned length, confirmed by reading the
+   original's length again the way verification does
+   (`validate::source_length`, below; the scanned one counts only when the
+   original can't be probed again): an out-of-date tag, a file with no
+   length but its tags or none at all, or timestamps that don't start at
+   zero never make a complete original look cut off (nor does a stored probe
+   made before lengths were read this way), while one that plays clearly
+   shorter than its container says, or than its tags say when it stops in
+   the middle of a packet, still does. Before the original is blamed, its
+   packets are listed near the end it states (the packets verification
+   listed when it measured the file that way, else the last 10 s, else all
+   of them; no decoding) and `run::early_end` decides:
+   - they reach its length within the length check's tolerance (max(1 s,
+     0.5 %)), whether or not ffprobe finds a cut packet at the very end:
+     the original is complete, and the new file is what's short. With
+     checks on, that is the failed length check, a `verification` problem,
+     and a hardware attempt moves on to the next one as for any failed
+     check (a wrapper that cuts every encode to 30 s fails with "The new
+     file is shorter than the original (30.0 s instead of 1:01). The
+     original was kept. Try again." after every attempt, never "damaged").
+     With checks off, the attempt fails as an `encoder` problem ("Converting
+     on the CPU made a file shorter than the original (30.0 s instead of
+     1:01), so the original was left unchanged. Try again; if it happens
+     again, the job's log has the details.") and the next attempt is tried;
+   - they stop short of it (a file cut off in the middle of a packet stops
+     where its packets do): damaged, as above;
+   - it states no length and ffprobe finds it cut off (a live-stream MKV
+     cut in half): nothing tells how much is missing, so evidence of the
+     cut (damaged input, a failed length check, or checks off) makes it
+     damaged;
+   - the packets can't be listed (ffprobe fails, or lists nothing new for
+     60 s): its length decides alone, as before. A share that stops
+     answering meanwhile ends the job as not responding.
+   When the scan found no length, damaged input (or checks off) is enough
+   to look. Only an attempt that decoded on the CPU (or the last attempt)
    concludes this; a GPU-decoding attempt that stops early moves on to the
    next attempt like any other hardware failure.
 4. **Size rule**: if `profile.min_savings_pct = Some(p)` and the output is not
@@ -896,6 +1024,77 @@ child is started with `core::process::end_with_parent` (Linux
 **validate_output** by level (checks stop at the first failure):
 - `quick`: ffprobe opens the output; stream counts match the plan; video codec
   is the target; duration (picture and sound streams) within max(1 s, 0.5 %).
+- How a length is read, for both files (`validate::probe_media`): a
+  stream's length is ffprobe's own stream duration (MP4 and most
+  containers), else its plain Matroska `DURATION` tag, else a localized
+  `DURATION-xx` tag only when the stream has nothing else; among several
+  tags of a kind the one with the first name counts, so the choice never
+  depends on the order ffprobe lists them in (the scanner reads tags by
+  the same rule, `core::tags`, and takes the container's length first).
+  Lengths count from where the file starts: a start time up to 0.5 s
+  counts as zero (`core::timeline`). What a file states is then checked
+  against where its packets really end when it can't be taken as it is:
+  - A tag the container contradicts: longer than the container by more
+    than the tolerance (no stream outlasts its container), or a picture or
+    sound track's shorter by more than it. ffprobe lists the packets of the
+    last 10 s (`-read_intervals <end-10>% -show_entries packet=… -of
+    compact=p=0`, no decoding): a stream with packets there takes the end
+    of its last packet; a picture or sound track with none keeps a shorter
+    tag that ends before that part (a subtitle that runs on past the video
+    keeps the container longer); anything else, or every contradicted tag
+    when the packets can't be listed, takes the container's length.
+  - No length but the tags (a Matroska file written as a live stream,
+    `-live 1`, or by a recorder that never filled it in), no length at all
+    in any container (neither the container nor a picture or sound stream
+    states one: the same live-stream file without tags, or written through
+    a pipe; a raw elementary stream such as `.h264`; a transport stream or
+    VOB ffprobe can't estimate), or a Matroska file whose timestamps don't
+    start at zero (ffmpeg's writer states where such a file ends, 11:01 for
+    a minute starting at 10:00, as its length and in every `DURATION`;
+    through a pipe ffmpeg 7 states its length instead): nothing it states
+    is taken as its length. The packets are listed from 10 s before the
+    longest it could be (each stated length read as a length from its
+    start; a seek past the end lands on the last keyframe, with Matroska
+    Cues or by reading through a file without them), and when that lists
+    nothing, or the file states no length to read back from, every packet
+    of the file (no decoding; about 5 s for a 1 GB, 45-minute file, and
+    only for these rare files). The file's length is where its last packet
+    ends minus its start, each picture and sound track's where its own
+    packets end; one with no packet in the part listed keeps a tag that
+    ends before it, read as a length, and is otherwise unknown. A raw
+    stream's packets have no times at all: in a listing where none has
+    one, each stream's packet durations are added up (a listing with times
+    ignores the packets without). When ffprobe says the file stops in the
+    middle of a packet ("File ended prematurely"), its packets show where
+    it stops, not how long it should be: what it states stands, read as a
+    length (a stated value past the start time is an end), so a cut-off
+    original is still found out; one that states nothing has no length
+    then. When the packets can't be listed, the length is unknown, except
+    a container length smaller than the start time, which can only be a
+    length. An original whose length is unknown this way leaves nothing to
+    tell a complete new file from one cut short, so the length check fails
+    ("The original's length couldn't be read (it states none that can be
+    trusted, and its contents couldn't be listed), so the new file
+    couldn't be checked against it"; cut off: "(it stops in the middle of
+    its data and doesn't say how long it should be)") and the original is
+    kept. So does one whose length can't be read for any other reason (it
+    can't be probed again and the scan found none): the length check is
+    never skipped. A listing that lists nothing new for 60 s is given up.
+  So an out-of-date tag, a file that states no length of its own or
+  timestamps that don't start at zero can neither make a new file look
+  "the same length" as a wrongly long original nor make a complete one
+  look cut short, and the pictures of a file that states no length are
+  compared like any other's (before, "The file is too short to compare
+  pictures"). The new file's own length is read the same way, so one that
+  states none is measured too. The length the full decode must reach is
+  the new file's picture and sound length read this way, else its
+  container's, else the original's; a conversion that stops early still
+  fails ("The new file is shorter than the original (…)" or "Playback
+  stopped at … of …"). The scanner's `probe_file` reads such files'
+  lengths the same way (`ProbeInfo.duration_secs`, within its 60 s), so
+  the library, progress and the cut-off check (step 3 above) agree with
+  verification; `parse_ffprobe_json` alone (no packets) gives the length
+  as stated.
 - `standard`: quick + full decode of every picture and sound track (error/fatal
   lines, "corrupt decoded frame" and concealment count as damage; damage the
   original already has only warns) + visual comparison at 4 segments of 2 s.
@@ -917,9 +1116,17 @@ child is started with `core::process::end_with_parent` (Linux
   file couldn't be compared with the original." A similarity score stays in
   the check's detail (the report) as a percentage, like the UI shows it
   ("Matches the original at 4 points (99.8% similar on average)"), never in
-  the error, and every error ends with what to do: "The original was kept.
-  Try again, or choose lighter checks in Settings › Output." Track counts
-  name each kind ("1 video track and 2 audio tracks").
+  the error, and every error ends with what to do, by the check that
+  failed (`run::verification_fix`): lighter checks only where they skip
+  it (`decode` and `visual` at Quick, `black_frames` and `frozen_frames`
+  at Standard): "The original was kept. Try again, or choose lighter
+  checks in Settings › Output."; `probe`, `streams` and `duration` run at
+  every level, and only Off skips them, which would put a broken or
+  cut-short file in place unchecked, so: "The original was kept. Try
+  again."; and when the original's length couldn't be read: "The original
+  was kept. Try again; if it happens again, check that the original plays
+  to the end, or replace it with a good copy." Track counts name each kind
+  ("1 video track and 2 audio tracks").
 
 **Putting the new file in place on a share that stops answering.** A
 rename that has started can't be called back, and abandoning it half way
@@ -973,7 +1180,7 @@ that finds its files. Replacements go by the backup
 under the final name (the original's own name, or the new name while the
 original's name is free) → in place; this is noted first (`placing` = 2,
 with both sizes), then the backup is removed (`finalize::remove_backup`)
-and the job recorded `done` with the note "Chrysopoeia stopped just as the
+and the job recorded `done` with the note "Szalinski stopped just as the
 new file was being put in place. The new file was already complete, so it
 was kept", its savings counted. (Noting it first means a removal that
 finishes after a share answered late can't make the job look as if its
@@ -1020,7 +1227,7 @@ drive or share known to be mounted in the library above the file is
 disconnected, and in folder mode the output folder answers and can be
 read. A job that settles itself
 then waits with its library offline, its reason the library's own
-problem or "Chrysopoeia can't read the folder … because the disk reported
+problem or "Szalinski can't read the folder … because the disk reported
 a read or write error. If it's on a drive or network share, check that
 it's connected."; the check every 15 s keeps it so while the share
 answers with errors. While a job is marked, its destination counts
@@ -1047,7 +1254,7 @@ group where allowed (the group alone when only that is), and, with
 `keep_file_dates`, its times; a new file that couldn't keep the owner or
 group gets a job note ("The new file couldn't keep the original's group
 (group 1001), so it is in group 100. If your media server can't open it,
-run Chrysopoeia as the owner of your media (PUID and PGID)"). MP4 and WebM
+run Szalinski as the owner of your media (PUID and PGID)"). MP4 and WebM
 can't hold attachments: the plan notes the fonts it leaves out ("Left out 2
 subtitle fonts because MP4 can't hold attachments"; "Left out 1 attached
 file because …" when not all are fonts). Every loss `replace_loss` counts
@@ -1096,7 +1303,7 @@ activity feed, setup hints, API errors) is one or two plain sentences: what
 happened, then what to do ("The work folder /temp can't be used because a
 file with that name is in the way. Fix it, or choose another work folder, in
 Settings › Output."). Messages never carry raw OS errors or error numbers
-(`chrysopoeia_core::plain::io_reason` turns an `io::Error` into a few words
+(`szalinski_core::plain::io_reason` turns an `io::Error` into a few words
 such as "the disk is full"), encoder names ("Converting on the NVIDIA GPU
 didn't work…", not `hevc_nvenc`), exit codes, or paths without saying what
 the folder is ("the work folder /temp", "the output folder /out/TV", "the
@@ -1107,7 +1314,7 @@ file's size, not the margin kept free. A size reads the same wherever it
 appears (the activity feed, a job's check lines, the web UI): decimal units,
 whole KB, then two decimals below 10, one below 100 and none above, rounded
 before moving up a unit ("3.13 MB", "572 KB", "1 GB"); one formatter,
-`chrysopoeia_core::format::bytes`, follows the web's `formatBytes`.
+`szalinski_core::format::bytes`, follows the web's `formatBytes`.
 An unfamiliar ffmpeg failure is described plainly and then quoted
 ("Converting on the CPU stopped with an error, so the original was left
 unchanged. ffmpeg said: "…""); the job's `log_tail` keeps the details.
@@ -1127,8 +1334,8 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 
 | Method & path | Body / query | Returns |
 |---|---|---|
-| `GET /health` | | `{"ok":true,"version":"0.2.0"}` |
-| `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `CHRYSOPOEIA_VERSION` when it differs from `version`, else null) |
+| `GET /health` | | `{"ok":true,"version":"0.3.0"}` |
+| `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `SZALINSKI_VERSION` when it differs from `version`, else null) |
 | `GET /overview` | | `Overview` (`totals` and `savings_history` cover the same libraries; `resolutions` has a "No video" bucket for files without a video stream, "Unknown" for pictures whose size couldn't be read) |
 | `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline, or on a drive or share seen mounted there that isn't now: "The drive or share mounted at … isn't connected. …", or has another drive in its place: "A different drive is mounted at … than before. …", with `changed_mount` the place, also when that is the output or work folder's or where an unsettled conversion's new file goes) |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`folder_not_allowed`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. `folder_not_allowed`: the folder (as the disk has it, links followed) is `/`, the data folder or inside it or above it, `/config`, `/app` or the web folder or inside them, or `/proc`, `/sys` or `/dev` or inside them; the `LIBRARIES` start-up list follows the same rule. Starts a scan. |
@@ -1144,7 +1351,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /files/{id}/skip` | | `MediaFile` status skipped, reason "Skipped by you"; cancels its job |
 | `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`), except files skipped by the size rule under that goal; the rest are counted in `left_out` (0 for other selections). |
 | `GET /jobs` | `state` (`active` = running+queued, `running`, `queued`, `history` = finished, `all`), `limit`, `offset` | `{"items": Job[], "total"}`; active sorted running-first then queue order; history newest first |
-| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`, `freed_bytes`, `output_name`) |
+| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`, `freed_bytes`, `output_name`, `attempts`, `progress_basis`, `frames`, `elapsed_secs`; the lists and `GET /files/{id}` carry the same) |
 | `POST /jobs/{id}/cancel` | | `Job` (409 `job_finished`) |
 | `POST /jobs/{id}/priority` | `{"priority": int}` or `{"move":"top"}` | `Job` |
 | `POST /jobs/clear` | `{"state":"history"}` | `{"affected": n}` deletes finished job rows (files keep status) |
@@ -1158,7 +1365,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
-| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots`, 503 `not_responding` (the folder didn't answer within 10 s, or its share already has as many stuck checks as it may) / `busy` (too many checks of other shares are stuck: try again) |
+| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"user_folders": [{"name","path","library_blocked"?: string}],"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool,"system"?: true}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. `user_folders`: the folders mounted into the container (Docker bind mounts, the paths of an Unraid template), the ones the picker offers first (see "Your folders" below); always present, empty outside a container. `system: true` on an entry marks one of the container's own folders (`/bin`, `/etc`, `/proc`, `/usr`, the app, links into them such as `/bin`); sent only in a container. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots`, 503 `not_responding` (the folder didn't answer within 10 s, or its share already has as many stuck checks as it may) / `busy` (too many checks of other shares are stuck: try again) |
 | `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first (`problem` on entries about a failed file) |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 
@@ -1240,6 +1447,47 @@ headers are sent (except with `--dev-cors`, which also skips the
   job; `null` otherwise. Derived from `jobs.final_path` (where the job put
   its result, stored when it started), so nothing more is stored.
 
+### Contract additions (round 6)
+
+Every new field may be absent in what an older server sends (read as
+`null`, or `[]` for `attempts`); the existing fields mean what they did.
+
+- **`Job.progress_basis`**, **`JobProgress.progress_basis`**
+  (`"time" | "frames" | "unknown" | null`, `jobs.progress_basis`): how
+  `progress` was worked out while transcoding (see "Progress while
+  encoding" under run_job). `time`: ffmpeg's output time over the
+  original's length (or 100 once ffmpeg reports the end); `frames`: an
+  estimate from the frames encoded over the frames the original should
+  have, shown as one; `unknown`: no share is known, `progress` is 0 and
+  means nothing and `eta_secs` is null: show the frames and the time spent
+  instead. `null` outside transcoding (`progress` is then as it says) and
+  for finished jobs.
+- **`Job.frames`**, **`JobProgress.frames`** (`integer | null`,
+  `jobs.frames`): video frames the current attempt has encoded, while
+  transcoding.
+- **`Job.elapsed_secs`**, **`JobProgress.elapsed_secs`** (`integer | null`,
+  `jobs.elapsed_secs`): seconds since the current attempt started
+  encoding, while transcoding. The UI shows "1,017 frames · 7 min elapsed"
+  from these two when the basis is `unknown`.
+- **`Job.attempts`** (`JobAttempt[]`, `jobs.attempts`): every way of
+  converting the file the job tried in its latest run, in order, each with
+  how it ended; the attempt still running is left out (`Job.attempt` and
+  `encoder` describe it). Stored as each attempt ends and sent as
+  `job.updated` then, and with the job's result. `JobAttempt`:
+  `{attempt, encoder, hw_api, device: string|null (render node), hw_decode:
+  bool (the GPU decoded the original; false: the CPU did), elapsed_secs:
+  number (the attempt with its checks), result: "succeeded"|"failed",
+  error: string|null (plain words; a failed check's is its reason without
+  the job's advice), problem: ProblemKind|null, failed_check:
+  ValidationCheck|null (the check that failed, with its plain detail),
+  command: string|null, log_tail: string|null (a failed attempt's last
+  ffmpeg lines: at most 12, without known noise, at most 2 000
+  characters)}`. The job's own `encoder`, `command`, `log_tail`,
+  `validation` and `error` are still those of its last attempt, as before.
+- **`JobProgress.attempts`** (`JobAttempt[]`, left out when absent): the
+  worker's update to the server after an attempt ends; never in the
+  `job.progress` event (see Dispatcher, Progress).
+
 ## Hardware detection (normative)
 
 - CPU: model from `/proc/cpuinfo` (fallback: "Unknown CPU"), logical cores via
@@ -1256,7 +1504,7 @@ headers are sent (except with `--dev-cors`, which also skips the
   encode with the same init flags `build_plan` uses (15 s each, 30 s in all,
   NVENC one at a time, a hung GPU is not tested again). Unverified encoders
   say why in `error` ("<sentence> Details: <ffmpeg tail>").
-- Busy NVIDIA GPU (every encoding session taken, e.g. by Chrysopoeia's own
+- Busy NVIDIA GPU (every encoding session taken, e.g. by Szalinski's own
   running jobs or by Plex): tested again once after 3 s. If it stays busy, an
   encoder the previous detection verified keeps that result (and the busy
   hint goes); otherwise the busy hint stays and detection runs again by itself
@@ -1277,7 +1525,7 @@ headers are sent (except with `--dev-cors`, which also skips the
   otherwise it gives the fix itself (NVIDIA: the Nvidia-Driver plugin and
   `--runtime=nvidia` settings; Intel/AMD: `--device=/dev/dri`; or choose
   Automatic). A busy GPU gets a warning saying files wait (or use the CPU)
-  until it is free and that Chrysopoeia checks again by itself.
+  until it is free and that Szalinski checks again by itself.
 - `recommend_jobs`: CPU jobs = clamp(floor(effective_cores / 4), 1, 8), further
   capped by memory (1.5 GB per job) — effective cores honor cgroup limits.
   GPU jobs: NVIDIA 3 per GPU (consumer NVENC session limits), Intel/AMD 2 per
@@ -1299,10 +1547,19 @@ Navigation: a sidebar on wide screens (Overview, Queue, each library, "Add
 library", Settings; appearance switch), a bottom tab bar on phones
 (Overview, Queue, Libraries, Settings). The queue link shows what is
 running. Details of a job or file open in a sheet over the current screen.
+A file's sheet lists its tracks with the language, codec and channels always
+in full; the optional title a release gave a track (often the whole release
+name) is a line of its own that is cut short, with the full text as its
+tooltip, so it never hides the codec.
+
+Typography: display type (page titles, the big savings number, the brand)
+is Newsreader, self-hosted (`@fontsource-variable/newsreader`, with its
+optical-size axis, which follows the font size on its own), DM Sans for the
+interface and JetBrains Mono for technical values.
 
 Screens:
 1. **Setup** (first run, when `settings.onboarded` is false and there are no
-   libraries): welcome (what Chrysopoeia does, three reassurances) → pick a
+   libraries): welcome (what Szalinski does, three reassurances) → pick a
    folder with the server-side folder picker, which shows how many videos
    each folder and the current one hold (`media_count`) → choose a goal
    (Save space / Balanced / Plays everywhere / Archive, each with its
@@ -1315,8 +1572,16 @@ Screens:
    attention** (setup hints from hardware detection, libraries that can't be
    reached, failed files grouped by `problem` with the fix for each);
    **Converting now** (live cards per running job: file, stage, progress,
-   speed, time left, where it runs); **Libraries** (each library's
-   progress, and "Add library"); the latest finished results. No codec
+   speed, time left, where it runs; while the share isn't known
+   (`progress_basis` `unknown`) a moving bar with "1,017 frames · 7 min
+   elapsed" instead of a percentage and no time left, and an estimate from
+   frames reads "About 37% · estimated from 1,017 frames"; a later attempt
+   says which check the last one failed); **Libraries** (each library's
+   progress, and "Add library"; a library is never "100% finished" or
+   "Everything is finished" while files are still being copied in
+   (`LibraryStats.settling`) or it is being scanned: it says "Waiting for N
+   files to finish copying" instead, as do the sidebar and the library page,
+   which says "N of M files finished so far"); the latest finished results. No codec
    breakdown and no activity feed. Without libraries it shows the welcome
    and "Choose a folder".
 3. **Queue**: tabs **Running** / **Up next** / **History** with counts.
@@ -1326,8 +1591,13 @@ Screens:
    they apply, and can be cleared. The activity **Log** (scans, warnings
    and problems) sits under History. Queue controls: pause, resume, stop
    now. A job's sheet
-   shows before → after, notes, the verification report, and the ffmpeg
-   command and log tail under a disclosure.
+   shows before → after, notes, the attempts when there was more than one
+   ("Attempt 1 · AMD GPU (VA-API) · decoded on the GPU · 2 min" over
+   "Failed: Plays start to finish: playback stopped at 1:01 of 2:21:02",
+   the one still running last; a VA-API attempt is named after the GPU
+   whose render node it used), the verification report, and under a
+   disclosure the ffmpeg command and log tail, each attempt's command and
+   log, and "Copy for a bug report" (all of it as plain text).
 4. **Library** (one per library, tabs **Files** and **Settings**): Files is
    the library's progress and the file table with search, status filters
    (with counts), sort, pages and bulk Convert / Skip, plus the
@@ -1335,7 +1605,7 @@ Screens:
    `path_error` (in a callout at the top; when that is another drive
    mounted in place of the usual one, `changed_mount`, the callout is
    "A different drive is mounted" with **Use the drive that's there now**,
-   which asks first: "Chrysopoeia will take the drive mounted at … as the
+   which asks first: "Szalinski will take the drive mounted at … as the
    usual one from now on: it reads files from it and saves new files to
    it. Only do this if you replaced the drive or share on purpose. If the
    usual one just isn't connected yet, reconnect it instead: files saved
@@ -1378,6 +1648,6 @@ every destructive action is reversible or confirmed.
   folder, put it on an SSD/cache pool). One port: 8080.
 - GPU: NVIDIA via `--runtime=nvidia` (Unraid Nvidia-Driver plugin) or compose
   `deploy.resources.reservations.devices`; Intel/AMD via `--device=/dev/dri`.
-- `unraid/chrysopoeia.xml`: Community Applications template with those fields.
+- `unraid/szalinski.xml`: Community Applications template with those fields.
 - `docker-compose.yml` (CPU), `docker-compose.nvidia.yml`,
   `docker-compose.intel-amd.yml` overlays.

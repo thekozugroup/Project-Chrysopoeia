@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { doneSavings, trackTitle } from "./files";
+import { doneSavings, trackCodec, trackDetails, trackName } from "./files";
 import { rootOf } from "./folder-picker";
 import { leftOutText, planBulkConvert, skipFollowsSettings } from "@/lib/convertible";
 import type { MediaFile, ProbeInfo, StreamInfo } from "@/lib/types";
@@ -137,13 +137,45 @@ describe("skipFollowsSettings", () => {
   });
 });
 
-describe("trackTitle", () => {
-  it("names the language, or just the kind of track when it has none", () => {
-    expect(trackTitle("audio", "eng", null)).toBe("English audio");
-    expect(trackTitle("audio", null, null)).toBe("Audio");
-    expect(trackTitle("audio", "und", "Commentary")).toBe("Audio · Commentary");
-    expect(trackTitle("subtitles", "jpn", "Signs")).toBe("Japanese subtitles · Signs");
-    expect(trackTitle("subtitles", null, null)).toBe("Subtitles");
+describe("track names", () => {
+  it("name the language, or just the kind of track when it has none", () => {
+    expect(trackName("audio", "eng")).toBe("English audio");
+    expect(trackName("audio", null)).toBe("Audio");
+    expect(trackName("audio", "und")).toBe("Audio");
+    expect(trackName("subtitles", "jpn")).toBe("Japanese subtitles");
+    expect(trackName("subtitles", null)).toBe("Subtitles");
+  });
+});
+
+describe("track details", () => {
+  it("lead with the codec, then the channels", () => {
+    expect(trackDetails(stream({ kind: "audio", codec: "eac3", channels: 6, channel_layout: "5.1(side)" }))).toBe(
+      "E-AC-3 · 5.1",
+    );
+    expect(trackDetails(stream({ kind: "audio", codec: "truehd", channels: 8, channel_layout: null }))).toBe(
+      "TrueHD · 7.1",
+    );
+    expect(trackDetails(stream({ kind: "audio", codec: "aac", channels: null, channel_layout: null }))).toBe("AAC");
+  });
+
+  it("say which kind of DTS it is", () => {
+    expect(trackCodec({ codec: "dts", profile: "DTS-HD MA" })).toBe("DTS-HD MA");
+    expect(trackCodec({ codec: "dts", profile: null })).toBe("DTS");
+    expect(trackCodec({ codec: "ac3", profile: "ignored" })).toBe("AC-3");
+  });
+
+  it("give the picture's codec, size and speed", () => {
+    expect(trackDetails(stream({ kind: "video", codec: "hevc", width: 3840, height: 2160, frame_rate: 23.976 }))).toBe(
+      "HEVC · 3840×2160 · 23.98 frames a second",
+    );
+    expect(trackDetails(stream({ kind: "video", codec: "h264", interlaced: true, frame_rate: null }))).toBe(
+      "H.264 · 1280×720 · interlaced",
+    );
+  });
+
+  it("name a subtitle's format", () => {
+    expect(trackDetails(stream({ kind: "subtitle", codec: "hdmv_pgs_subtitle" }))).toBe("PGS");
+    expect(trackDetails(stream({ kind: "subtitle", codec: "subrip" }))).toBe("SRT");
   });
 });
 

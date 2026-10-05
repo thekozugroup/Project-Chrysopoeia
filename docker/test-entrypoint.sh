@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Regression tests for docker/entrypoint.sh, run against a built image.
 #
-#   docker/test-entrypoint.sh <image>        e.g. docker/test-entrypoint.sh chrysopoeia:dev
+#   docker/test-entrypoint.sh <image>        e.g. docker/test-entrypoint.sh szalinski:dev
 #
 # Covers PUID/PGID (including a gid that already exists, such as Unraid's 100
 # "users"), GPU device groups (never the root group), UMASK, the /temp and
 # empty-variable rules, the startup banner, warnings about missing, read-only
-# or unwritable mounts, /config ownership (only Chrysopoeia's own files are
-# re-owned, never a shared folder's other contents), the privilege drop and
+# or unwritable mounts, /config ownership (only Szalinski's own files are
+# re-owned, never a shared folder's other contents; a folder from Chrysopoeia,
+# the name before the rename, counts as Szalinski's), the privilege drop and
 # argument pass-through. Fake GPU nodes are created inside the container with mknod
 # (Docker's default capabilities allow it), so no GPU and no sudo are needed.
 # Takes about 30 seconds; nothing is left behind.
@@ -26,10 +27,10 @@ command -v docker >/dev/null 2>&1 || {
     exit 2
 }
 
-VOLUME="chrysopoeia-entrypoint-test-$$"
-MEDIA_VOLUME="chrysopoeia-entrypoint-test-media-$$"
-SHARED_VOLUME="chrysopoeia-entrypoint-test-shared-$$"
-CONTAINER="chrysopoeia-entrypoint-test-$$"
+VOLUME="szalinski-entrypoint-test-$$"
+MEDIA_VOLUME="szalinski-entrypoint-test-media-$$"
+SHARED_VOLUME="szalinski-entrypoint-test-shared-$$"
+CONTAINER="szalinski-entrypoint-test-$$"
 FAILURES=0
 OUT=""
 STATUS=0
@@ -137,13 +138,13 @@ echo "Testing the entrypoint of $IMAGE"
 # --- Users and groups ---------------------------------------------------------
 
 run -- id
-expect "defaults to uid 1000 and gid 1000" '^uid=1000\(chrysopoeia\) gid=1000\(chrysopoeia\)'
+expect "defaults to uid 1000 and gid 1000" '^uid=1000\(szalinski\) gid=1000\(szalinski\)'
 
 run -e PUID=99 -e PGID=100 -- id
-expect "Unraid ids 99/100 reuse the existing users group" '^uid=99\(chrysopoeia\) gid=100\(users\)'
+expect "Unraid ids 99/100 reuse the existing users group" '^uid=99\(szalinski\) gid=100\(users\)'
 
 run -e PUID=4242 -e PGID=4343 -- id
-expect "new ids move the image's user and group" '^uid=4242\(chrysopoeia\) gid=4343\(chrysopoeia\)'
+expect "new ids move the image's user and group" '^uid=4242\(szalinski\) gid=4343\(szalinski\)'
 
 # 33 is www-data in Debian: `id` may print either account's name.
 run -e PUID=33 -e PGID=33 -- id
@@ -180,9 +181,9 @@ done
 docker rm -f -v "$CONTAINER" >/dev/null 2>&1 || true
 STATUS=0
 expect "the startup banner lists GPU devices" 'GPU devices +/dev/dri/renderD128 \(group gpu993\)'
-expect "the startup banner names the user" 'Runs as +uid 99 \(chrysopoeia\), gid 100 \(users\)'
+expect "the startup banner names the user" 'Runs as +uid 99 \(szalinski\), gid 100 \(users\)'
 # The server's own version (Cargo.toml), plus the build label when it differs.
-expect "the startup banner shows the server version" 'Chrysopoeia [0-9]+\.[0-9]+\.[0-9]+( \(build [^)]+\))?$'
+expect "the startup banner shows the server version" 'Szalinski [0-9]+\.[0-9]+\.[0-9]+( \(build [^)]+\))?$'
 
 # --- Mount warnings ---------------------------------------------------------------
 
@@ -205,10 +206,10 @@ expect "explains a read-only /media" '/media is mounted read-only'
 expect_not "does not blame PUID/PGID for a read-only /media" 'cannot write to /media'
 
 server_log -e PUID=99 -e PGID=100 -v "$VOLUME:/config" -v "$MEDIA_VOLUME:/media"
-expect "warns when PUID/PGID cannot write to /media" 'Chrysopoeia \(uid 99\) cannot write to /media.*PUID/PGID'
+expect "warns when PUID/PGID cannot write to /media" 'Szalinski \(uid 99\) cannot write to /media.*PUID/PGID'
 
 server_log --user 1234:1234 -v "$VOLUME:/config" -v "$MEDIA_VOLUME:/media"
-expect "with --user, warns that /media is not writable" 'Chrysopoeia \(uid 1234\) cannot write to /media'
+expect "with --user, warns that /media is not writable" 'Szalinski \(uid 1234\) cannot write to /media'
 
 # --- Environment rules ----------------------------------------------------------
 
@@ -234,7 +235,7 @@ run -v "$VOLUME:/config" -e PUID=99 -e PGID=100 -- stat -c '%u:%g' /config
 expect "gives /config to PUID/PGID" '^99:100$'
 
 # /config may be a folder shared with other apps (a template mistake such as
-# pointing Config at /mnt/user/appdata). Only Chrysopoeia's own files may change
+# pointing Config at /mnt/user/appdata). Only Szalinski's own files may change
 # owner; everything else in it must be left exactly as it is.
 
 # seed_shared <shell commands run as root in /config, which starts empty>
@@ -249,29 +250,29 @@ shared_owners() {
 }
 docker volume create "$SHARED_VOLUME" >/dev/null
 
-# Chrysopoeia's database and lock files left behind by another owner (for
+# Szalinski's database and lock files left behind by another owner (for
 # example by an earlier PUID) are fixed; a neighbour's files are not.
 seed_shared 'mkdir -p /config/otherapp/data
 echo x > /config/otherapp/data/file
 echo y > /config/notes.txt
-touch /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+touch /config/szalinski.db /config/szalinski.db-wal /config/szalinski.db-shm /config/szalinski.lock
 chown -R 1234:1234 /config/otherapp /config/notes.txt
-chown 555:555 /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+chown 555:555 /config/szalinski.db /config/szalinski.db-wal /config/szalinski.db-shm /config/szalinski.lock
 chown 555:555 /config'
 run -v "$SHARED_VOLUME:/config" -e PUID=99 -e PGID=100 -- id -u
-expect "starts with a Config folder that has Chrysopoeia's files and other data" '^99$'
-shared_owners /config /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock \
+expect "starts with a Config folder that has Szalinski's files and other data" '^99$'
+shared_owners /config /config/szalinski.db /config/szalinski.db-wal /config/szalinski.db-shm /config/szalinski.lock \
     /config/notes.txt /config/otherapp /config/otherapp/data /config/otherapp/data/file
-expect "gives the database to PUID/PGID" '^/config/chrysopoeia\.db 99:100$'
-expect "gives the database's write-ahead files to PUID/PGID" '^/config/chrysopoeia\.db-wal 99:100$'
-expect "gives the database's shared-memory file to PUID/PGID" '^/config/chrysopoeia\.db-shm 99:100$'
-expect "gives the lock file to PUID/PGID" '^/config/chrysopoeia\.lock 99:100$'
+expect "gives the database to PUID/PGID" '^/config/szalinski\.db 99:100$'
+expect "gives the database's write-ahead files to PUID/PGID" '^/config/szalinski\.db-wal 99:100$'
+expect "gives the database's shared-memory file to PUID/PGID" '^/config/szalinski\.db-shm 99:100$'
+expect "gives the lock file to PUID/PGID" '^/config/szalinski\.lock 99:100$'
 expect "gives a Config folder that holds the database to PUID/PGID" '^/config 99:100$'
 expect "leaves another app's folder alone" '^/config/otherapp 1234:1234$'
 expect "leaves files inside another app's folder alone" '^/config/otherapp/data/file 1234:1234$'
 expect "leaves other files in the Config folder alone" '^/config/notes\.txt 1234:1234$'
 
-# A folder that only holds other data is not Chrysopoeia's to take over: it
+# A folder that only holds other data is not Szalinski's to take over: it
 # is left as it is, and the container stops with a message if it cannot write.
 seed_shared 'mkdir -p /config/otherapp
 echo x > /config/otherapp/file
@@ -292,9 +293,32 @@ chown 1234:1234 /config/other.conf
 chown 99:100 /config
 chmod 775 /config'
 server_log -e PUID=99 -e PGID=100 -v "$SHARED_VOLUME:/config"
-expect "warns when the Config folder holds other files and no Chrysopoeia database" 'already holds other files but no Chrysopoeia database'
+expect "warns when the Config folder holds other files and no Szalinski database" 'already holds other files but no Szalinski database'
 shared_owners /config/other.conf
 expect "still leaves the other files alone" '^/config/other\.conf 1234:1234$'
+
+# A Config folder from Chrysopoeia (the name before the rename) holds its
+# database under the old name: that is Szalinski's database too, so the folder
+# and the old files are Szalinski's to fix, and there is nothing to warn about.
+seed_shared 'touch /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+echo y > /config/notes.txt
+chown 1234:1234 /config/notes.txt
+chown 555:555 /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+chown 555:555 /config
+chmod 755 /config'
+run -v "$SHARED_VOLUME:/config" -e PUID=99 -e PGID=100 -- id -u
+expect "starts with a Config folder from Chrysopoeia" '^99$'
+shared_owners /config /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock /config/notes.txt
+expect "gives a Config folder that holds Chrysopoeia's database to PUID/PGID" '^/config 99:100$'
+expect "gives Chrysopoeia's database to PUID/PGID" '^/config/chrysopoeia\.db 99:100$'
+expect "gives Chrysopoeia's write-ahead files to PUID/PGID" '^/config/chrysopoeia\.db-wal 99:100$'
+expect "gives Chrysopoeia's shared-memory file to PUID/PGID" '^/config/chrysopoeia\.db-shm 99:100$'
+expect "gives Chrysopoeia's lock file to PUID/PGID" '^/config/chrysopoeia\.lock 99:100$'
+expect "still leaves other files next to Chrysopoeia's alone" '^/config/notes\.txt 1234:1234$'
+seed_shared 'touch /config/chrysopoeia.db
+chown -R 99:100 /config'
+server_log -e PUID=99 -e PGID=100 -v "$SHARED_VOLUME:/config"
+expect_not "no shared-folder warning for a Config folder from Chrysopoeia" 'no Szalinski database'
 
 run -e PUID=99 -e PGID=100 -- sh -c 'grep -E "^(NoNewPrivs|CapEff)" /proc/self/status'
 expect "drops all capabilities" 'CapEff:[[:space:]]+0+$'

@@ -22,7 +22,7 @@ import {
 
 /**
  * Sentences the server uses when the original itself can't be read:
- * `chrysopoeia-scanner` probe errors ("This file can't be read as a video:
+ * `szalinski-scanner` probe errors ("This file can't be read as a video:
  * …", "The disk reported a read error…") and the worker's "The original
  * file appears damaged or incomplete (it stops after 0.1 s)." Only for an
  * activity entry that carries no `problem` code (one from a server older
@@ -170,19 +170,19 @@ export function setupFix(kind: SetupProblem, outputMode?: OutputMode): SetupFix 
     case "work_folder":
       return {
         title: "The work folder can't be used",
-        fix: "Make sure the work folder exists and Chrysopoeia can write to it (in Docker, the PUID/PGID user needs write access), or choose another one.",
+        fix: "Make sure the work folder exists and Szalinski can write to it (in Docker, the PUID/PGID user needs write access), or choose another one.",
         setting: { label: "Work folder settings", path: "/settings/output", focus: "temp_dir" },
       };
     case "destination":
       return outputMode === "folder"
         ? {
             title: "Finished files can't be saved",
-            fix: "Chrysopoeia can't write to the output folder. Make sure the PUID/PGID user can write to it, or choose another one.",
+            fix: "Szalinski can't write to the output folder. Make sure the PUID/PGID user can write to it, or choose another one.",
             setting: { label: "Output settings", path: "/settings/output", focus: "output_folder" },
           }
         : {
             title: "Finished files can't be saved",
-            fix: "Chrysopoeia can't write to the library folder. Map it into the container read-write (not read-only) and make sure the PUID/PGID user can write to it.",
+            fix: "Szalinski can't write to the library folder. Map it into the container read-write (not read-only) and make sure the PUID/PGID user can write to it.",
             setting: { label: "Output settings", path: "/settings/output" },
           };
     case "disk_full":

@@ -2,13 +2,13 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "chrysopoeia-api",
+      "name": "szalinski-api",
       "runtimeExecutable": "make",
       "runtimeArgs": ["dev-api"],
       "port": 8080
     },
     {
-      "name": "chrysopoeia-web",
+      "name": "szalinski-web",
       "runtimeExecutable": "make",
       "runtimeArgs": ["dev-web"],
       "port": 3000

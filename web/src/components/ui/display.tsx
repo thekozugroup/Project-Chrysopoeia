@@ -14,9 +14,14 @@ export function Skeleton({ className, ...props }: ComponentProps<"div">) {
 }
 
 interface MeterProps {
-  /** 0..100 */
-  value: number;
+  /**
+   * 0..100, or `null` while the share isn't known: an indeterminate bar (a
+   * band moving along it; standing still, striped, with reduced motion).
+   */
+  value: number | null;
   label: string;
+  /** What the bar stands for in words, for screen readers ("1,017 frames, 6 min elapsed"). */
+  valueText?: string;
   className?: string;
   /** Adds the travelling highlight that says "working". */
   live?: boolean;
@@ -25,7 +30,22 @@ interface MeterProps {
 }
 
 /** A progress bar with a proper progressbar role. */
-export function Meter({ value, label, className, live, tone = "accent", size = "sm" }: MeterProps) {
+export function Meter({ value, label, valueText, className, live, tone = "accent", size = "sm" }: MeterProps) {
+  const height = size === "xs" ? "h-1" : size === "sm" ? "h-1.5" : "h-2.5";
+  if (value === null) {
+    // No aria-valuenow: an indeterminate progressbar.
+    return (
+      <div
+        role="progressbar"
+        aria-label={label}
+        aria-valuetext={valueText}
+        data-indeterminate=""
+        className={cn("meter-indeterminate w-full rounded-full bg-raised", height, className)}
+      >
+        <div className="meter-indeterminate-band h-full rounded-full bg-meter" />
+      </div>
+    );
+  }
   const clamped = Math.max(0, Math.min(100, Number.isFinite(value) ? value : 0));
   return (
     <div
@@ -34,9 +54,10 @@ export function Meter({ value, label, className, live, tone = "accent", size = "
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={Math.round(clamped)}
+      aria-valuetext={valueText}
       className={cn(
         "w-full overflow-hidden rounded-full bg-raised",
-        size === "xs" ? "h-1" : size === "sm" ? "h-1.5" : "h-2.5",
+        height,
         className,
       )}
     >

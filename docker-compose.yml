@@ -1,4 +1,4 @@
-# Chrysopoeia with CPU encoding. Works on any Docker host.
+# Szalinski with CPU encoding. Works on any Docker host.
 #
 #   cp .env.example .env        # optional: adjust paths and ids
 #   docker compose up -d
@@ -7,16 +7,16 @@
 # Add a GPU with an overlay file:
 #   NVIDIA:     docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d
 #   Intel/AMD:  docker compose -f docker-compose.yml -f docker-compose.intel-amd.yml up -d
-name: chrysopoeia
+name: szalinski
 
 services:
-  chrysopoeia:
+  szalinski:
     # To run an image built from this checkout (`make docker`), set
-    # CHRYSOPOEIA_IMAGE=chrysopoeia:dev in .env.
-    image: ${CHRYSOPOEIA_IMAGE:-ghcr.io/thekozugroup/chrysopoeia:latest}
-    container_name: chrysopoeia
+    # SZALINSKI_IMAGE=szalinski:dev in .env.
+    image: ${SZALINSKI_IMAGE:-ghcr.io/thekozugroup/szalinski:latest}
+    container_name: szalinski
     restart: unless-stopped
-    # Chrysopoeia stops its running jobs and exits within about 10 seconds;
+    # Szalinski stops its running jobs and exits within about 10 seconds;
     # the extra margin keeps a slow disk from turning that into a hard kill.
     stop_grace_period: 20s
     ports:
@@ -24,7 +24,7 @@ services:
     volumes:
       # Database and settings. Back this folder up.
       - ./config:/config
-      # Your media. Chrysopoeia replaces files here once each result is verified.
+      # Your media. Szalinski replaces files here once each result is verified.
       - ${MEDIA_PATH:-./media}:/media
       # Optional: a fast disk (SSD) for in-progress files. Without it, work
       # files are written next to each original.
@@ -51,7 +51,7 @@ services:
       # "Save space" goal and begin converting at once; leave it empty to
       # choose folder and goal in the app instead.
       LIBRARIES: ${LIBRARIES:-}
-      # Behind a reverse proxy: the domain name(s) you open Chrysopoeia at,
+      # Behind a reverse proxy: the domain name(s) you open Szalinski at,
       # e.g. transcode.example.com. IP addresses and local names always work.
       ALLOWED_HOSTS: ${ALLOWED_HOSTS:-}
     logging:

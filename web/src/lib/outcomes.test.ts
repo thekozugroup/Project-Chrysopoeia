@@ -28,7 +28,7 @@ import {
 import { serverLeftOutText, settlingText } from "./convertible";
 import { PROBLEM_KINDS, type JobState, type MasteringDisplay, type ProblemKind } from "./types";
 
-// Sentences the real server writes (chrysopoeia-scanner probe.rs, chrysopoeia-worker run.rs).
+// Sentences the real server writes (szalinski-scanner probe.rs, szalinski-worker run.rs).
 const TRUNCATED = "The original file appears damaged or incomplete (it stops after 0.1 s). It was left unchanged.";
 const FAKE = "This file can't be read as a video: it has no MP4 index, so it's incomplete or not really a video.";
 const PROBE_SAID = "This file can't be read as a video (ffprobe said: Weird failure).";
@@ -45,7 +45,7 @@ describe("isUnreadableSource", () => {
 
   it("leaves conversion failures, missing files and empty errors alone", () => {
     expect(isUnreadableSource(VISUAL)).toBe(false);
-    expect(isUnreadableSource("Chrysopoeia doesn't have permission to read this file.")).toBe(false);
+    expect(isUnreadableSource("Szalinski doesn't have permission to read this file.")).toBe(false);
     expect(isUnreadableSource(null)).toBe(false);
     expect(isUnreadableSource("")).toBe(false);
   });

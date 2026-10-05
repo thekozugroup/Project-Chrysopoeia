@@ -11,9 +11,9 @@
 #     - "105"   # the number shown by: stat -c %g /dev/dri/renderD128
 #
 # Check it worked: Settings > Hardware in the app shows QSV or VA-API encoders
-# as Works under Details, and `docker exec chrysopoeia vainfo --display drm`
+# as Works under Details, and `docker exec szalinski vainfo --display drm`
 # prints your GPU's profiles.
 services:
-  chrysopoeia:
+  szalinski:
     devices:
       - /dev/dri:/dev/dri

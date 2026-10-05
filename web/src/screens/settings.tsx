@@ -847,7 +847,7 @@ function About() {
           About
         </h2>
         <p className="mt-0.5 text-[0.8125rem] text-muted">
-          Chrysopoeia <span className="font-mono text-fg">{info.version}</span>
+          Szalinski <span className="font-mono text-fg">{info.version}</span>
           {info.build ? (
             <>
               {" "}

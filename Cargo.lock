@@ -271,106 +271,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "chrysopoeia-core"
-version = "0.2.0"
-dependencies = [
- "chrono",
- "rustix",
- "serde",
- "serde_json",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "chrysopoeia-hwdetect"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrysopoeia-core",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "chrysopoeia-scanner"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrysopoeia-core",
- "globset",
- "inotify",
- "notify",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tracing",
- "uuid",
- "walkdir",
-]
-
-[[package]]
-name = "chrysopoeia-server"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "chrysopoeia-core",
- "chrysopoeia-hwdetect",
- "chrysopoeia-scanner",
- "chrysopoeia-worker",
- "clap",
- "futures",
- "globset",
- "hyper",
- "hyper-util",
- "rustix",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "sqlx",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "chrysopoeia-worker"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrysopoeia-core",
- "chrysopoeia-scanner",
- "chrysopoeia-worker",
- "filetime",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "clap"
 version = "4.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2164,6 +2064,106 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "szalinski-core"
+version = "0.3.0"
+dependencies = [
+ "chrono",
+ "rustix",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "szalinski-hwdetect"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "szalinski-core",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "szalinski-scanner"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "globset",
+ "inotify",
+ "notify",
+ "serde",
+ "serde_json",
+ "szalinski-core",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+ "walkdir",
+]
+
+[[package]]
+name = "szalinski-server"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "clap",
+ "futures",
+ "globset",
+ "hyper",
+ "hyper-util",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "sqlx",
+ "szalinski-core",
+ "szalinski-hwdetect",
+ "szalinski-scanner",
+ "szalinski-worker",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "szalinski-worker"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "filetime",
+ "rustix",
+ "serde",
+ "serde_json",
+ "szalinski-core",
+ "szalinski-scanner",
+ "szalinski-worker",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

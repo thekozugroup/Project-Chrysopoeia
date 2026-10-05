@@ -22,16 +22,17 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 
 | Path | What |
 |---|---|
-| `crates/chrysopoeia-core` | Shared types; their JSON shape is the API |
-| `crates/chrysopoeia-hwdetect` | CPU/memory/GPU detection, encoder test encodes, job-count recommendation |
-| `crates/chrysopoeia-scanner` | Folder walking, ffprobe, folder watching |
-| `crates/chrysopoeia-worker` | Transcode plans, ffmpeg runs, verification, safe replacement |
-| `crates/chrysopoeia-server` | The `chrysopoeia` binary: HTTP API, WebSocket, queue, UI hosting |
+| `crates/szalinski-core` | Shared types; their JSON shape is the API |
+| `crates/szalinski-hwdetect` | CPU/memory/GPU detection, encoder test encodes, job-count recommendation |
+| `crates/szalinski-scanner` | Folder walking, ffprobe, folder watching |
+| `crates/szalinski-worker` | Transcode plans, ffmpeg runs, verification, safe replacement |
+| `crates/szalinski-server` | The `szalinski` binary: HTTP API, WebSocket, queue, UI hosting |
 | `web/` | Next.js UI, exported as static files to `web/out` |
 | `docker/`, `Dockerfile`, `docker-compose*.yml` | Container image and examples |
 | `unraid/` | Community Applications template and icon |
-| `scripts/` | Test and demo media generators, the end-to-end smoke tests and the screenshot script |
+| `scripts/` | Test and demo media generators, the end-to-end smoke tests, the screenshot script, and the release rules (`release-channel.sh`, `release-notes.sh`, tested by `test-release-channel.sh`) |
 | `docs/` | Architecture, Unraid and hardware guides, and `screenshots/` |
+| `CHANGELOG.md` | What changed in each release; the source of the GitHub Release notes |
 | `.github/workflows/` | CI and the image release |
 
 ## Everyday commands
@@ -40,15 +41,16 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 
 | Command | Does |
 |---|---|
-| `make dev-api` | Runs the backend on :8080 (`cargo run -p chrysopoeia-server -- --data-dir ./data --dev-cors`) |
+| `make dev-api` | Runs the backend on :8080 (`cargo run -p szalinski-server -- --data-dir ./data --dev-cors`) |
 | `make dev-web` | Runs `next dev` on :3000 with `NEXT_PUBLIC_API_URL=http://localhost:8080` |
 | `make test` | `cargo test --workspace` and the web unit tests (`pnpm test`) |
 | `make lint` | `cargo fmt --check`, clippy with `-D warnings`, eslint, `tsc --noEmit` and shellcheck |
 | `make build` | Static UI in `web/out` plus the release binary |
-| `make run` | Builds, then serves UI and API together from `./target/release/chrysopoeia` on :8080 |
+| `make run` | Builds, then serves UI and API together from `./target/release/szalinski` on :8080 |
 | `make test-media` | Writes a synthetic library to `./media` |
-| `make docker` | Builds the image `chrysopoeia:dev` |
+| `make docker` | Builds the image `szalinski:dev` |
 | `make test-docker` | Builds the image and runs the entrypoint tests |
+| `make test-release` | Checks the release rules without Docker or GitHub: which tags a release moves (`stable` never moves backwards) and the release notes |
 | `make e2e` | Builds the image and runs the end-to-end smoke test (API) |
 | `make e2e-browser` | Builds the image and drives its first run in a real browser |
 
@@ -66,12 +68,12 @@ another port, so `make dev-web` sets `NEXT_PUBLIC_API_URL` and `make dev-api`
 passes `--dev-cors` to allow it. Without `make`:
 
 ```sh
-cargo run -p chrysopoeia-server -- --data-dir ./data --dev-cors
+cargo run -p szalinski-server -- --data-dir ./data --dev-cors
 cd web && pnpm install && NEXT_PUBLIC_API_URL=http://localhost:8080 pnpm dev
 ```
 
 Server options are flags with environment-variable fallbacks
-(`cargo run -p chrysopoeia-server -- --help`); the table is in
+(`cargo run -p szalinski-server -- --help`); the table is in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#configuration-server). To work on
 the UI alone, [web/README.md](web/README.md) describes a mock API with sample
 data and the phone layout check (`pnpm e2e:layout`).
@@ -89,15 +91,15 @@ dimensions, an audio-only FLAC, a truncated MKV and a text file named `.mp4`.
 Rust tests generate the same kind of media into temporary folders.
 
 Tests that make a folder stop answering, as a hung network share does, use the
-`test-hooks` feature of `chrysopoeia-worker` (`slow_fs::hang`,
+`test-hooks` feature of `szalinski-worker` (`slow_fs::hang`,
 `finalize::hold`). The crates' own tests turn it on, so `cargo test --workspace`
 needs nothing extra; it is never part of the release build or the image.
 
 ## Docker image
 
 ```sh
-make docker                                   # chrysopoeia:dev for linux/amd64
-docker buildx build --platform linux/amd64,linux/arm64 -t chrysopoeia:multi .
+make docker                                   # szalinski:dev for linux/amd64
+docker buildx build --platform linux/amd64,linux/arm64 -t szalinski:multi .
 ```
 
 The first build takes 10 to 15 minutes on four cores and about 8 GB of disk
@@ -107,7 +109,7 @@ to the web pages alone takes about two minutes.
 `make docker` does not pass `VERSION`, so the image's build label is `dev`; for
 a build that others will install (README, [Build it
 yourself](README.md#build-it-yourself)) use
-`docker build -t chrysopoeia:local --build-arg VERSION=local .`.
+`docker build -t szalinski:local --build-arg VERSION=local .`.
 
 The build compiles the UI and the Rust binary on the build machine's own
 architecture and cross-compiles the binary for arm64, so an arm64 image needs
@@ -117,9 +119,9 @@ machine, register QEMU once (the host needs `binfmt_misc` mounted), build with
 
 ```sh
 docker run --privileged --rm tonistiigi/binfmt --install arm64
-docker buildx build --platform linux/arm64 --load -t chrysopoeia:arm64 .
-docker run --rm --platform linux/arm64 chrysopoeia:arm64 --version
-scripts/e2e-smoke.sh chrysopoeia:arm64      # works, slowly, under emulation
+docker buildx build --platform linux/arm64 --load -t szalinski:arm64 .
+docker run --rm --platform linux/arm64 szalinski:arm64 --version
+scripts/e2e-smoke.sh szalinski:arm64      # works, slowly, under emulation
 ```
 
 Useful build arguments:
@@ -127,8 +129,8 @@ Useful build arguments:
 (pin ffmpeg), `VERSION`/`REVISION` (image metadata).
 
 The entrypoint (`docker/entrypoint.sh`) handles PUID/PGID/UMASK, GPU device
-groups and dropping privileges; `docker run --rm chrysopoeia:dev id` shows the
-result, and `docker run --rm chrysopoeia:dev --help` reaches the binary.
+groups and dropping privileges; `docker run --rm szalinski:dev id` shows the
+result, and `docker run --rm szalinski:dev --help` reaches the binary.
 `make test-docker` (or `docker/test-entrypoint.sh <image>`) runs its
 regression tests against an image, with fake GPU device nodes, in about 30
 seconds.
@@ -145,12 +147,12 @@ Two scripts test a built image the way it is used. Both start it with an empty
 exercised, and clean up after themselves.
 
 ```sh
-make e2e                                  # build, then test chrysopoeia:dev
-scripts/e2e-smoke.sh ghcr.io/thekozugroup/chrysopoeia:latest
+make e2e                                  # build, then test szalinski:dev
+scripts/e2e-smoke.sh ghcr.io/thekozugroup/szalinski:latest
 E2E_URL=http://127.0.0.1:8080 scripts/e2e-smoke.sh   # against a running dev server
 
 make e2e-browser                          # build, then drive the first run in Chromium
-scripts/e2e-browser.sh chrysopoeia:dev
+scripts/e2e-browser.sh szalinski:dev
 ```
 
 `scripts/e2e-smoke.sh` talks to the API. It adds the library with the *Plays
@@ -183,7 +185,7 @@ the demo library, not mock data. To retake them:
 ```sh
 scripts/make-demo-media.sh /srv/demo-media            # eleven files, about 175 MB
 docker run -d --name demo -p 8080:8080 -v /srv/demo-media:/media -v "$(mktemp -d)":/config \
-  -e PUID="$(id -u)" -e PGID="$(id -g)" chrysopoeia:dev
+  -e PUID="$(id -u)" -e PGID="$(id -g)" szalinski:dev
 node scripts/take-screenshots.mjs http://127.0.0.1:8080
 ```
 
@@ -203,48 +205,153 @@ whose screen has visibly changed since the last time.
 - `.github/workflows/ci.yml` runs on pull requests and on pushes to `main`:
   workflow, shell-script and template lint (actionlint via the
   `rhysd/actionlint` image, shellcheck, xmllint on the Unraid template,
-  `docker compose config` on the compose files), Rust (fmt, clippy, tests with
-  ffmpeg installed), web (lint, typecheck, unit tests, static build) and Docker
-  (amd64 image, entrypoint tests, `scripts/e2e-smoke.sh` and
-  `scripts/e2e-browser.sh` against the built image).
+  `docker compose config` on the compose files, and
+  `scripts/test-release-channel.sh`, the release rules below), Rust (fmt,
+  clippy, tests with ffmpeg installed), web (lint, typecheck, unit tests,
+  static build) and Docker (amd64 image, entrypoint tests,
+  `scripts/e2e-smoke.sh` and `scripts/e2e-browser.sh` against the built image).
 - `.github/workflows/release.yml` runs on pushes to `main`, on `v*` tags and
   by hand. It builds the amd64 image, runs the entrypoint tests and both
   end-to-end tests against it, and only then pushes a multi-arch (amd64 +
-  arm64) image to `ghcr.io/<owner>/chrysopoeia`: a push to `main` is tagged
-  `latest` and `sha-<short>`; a tag `v1.2.3` is tagged `1.2.3`, `1.2`, `1` and
-  `sha-<short>` (a `v0.*` tag gets no major-only tag: `v0.2.3` is tagged `0.2.3`,
-  `0.2` and `sha-<short>`). A version tag never moves `latest`, which always
-  follows `main`. The arm64 image is cross-compiled (only the final `apt-get` step runs
-  under emulation) and is not run in CI.
+  arm64) image to `ghcr.io/<owner>/szalinski`. Which tags a run publishes is
+  in [Update channels](#update-channels) below; a version tag also gets a GitHub
+  Release ([Cutting a release](#cutting-a-release)). The arm64 image is
+  cross-compiled (only the final `apt-get` step runs under emulation) and is not
+  run in CI.
 - There are two version numbers. The server reports the `version` in
   `Cargo.toml` (`[workspace.package]`) in `/api/health`, `/api/system` and its
   "is running" log line. The image version is `1.2.3` for a tag,
   `main-<short sha>` for a build from `main` and `<branch>-<short sha>` for a
   manual run (`dev` for a local build without `VERSION`); it is in the OCI
-  version label, the `CHRYSOPOEIA_VERSION` variable, the first line of the
+  version label, the `SZALINSKI_VERSION` variable, the first line of the
   container log and *About* at the bottom of Settings, where it is called the
-  *build*, next to the server's version: `Chrysopoeia 0.2.0 (build
-  main-1a2b3c4)` in the log, `Chrysopoeia 0.2.0 · build main-1a2b3c4` in
+  *build*, next to the server's version: `Szalinski 0.3.0 (build
+  main-1a2b3c4)` in the log, `Szalinski 0.3.0 · build main-1a2b3c4` in
   *About*. A bug report that quotes it names the exact commit. To release, set
   `version` in `Cargo.toml` to `1.2.3`, commit, then tag `v1.2.3`; the workflow
-  refuses a tag that does not match.
+  refuses a tag that does not match (see [Cutting a release](#cutting-a-release)).
 - To publish an image from a branch before merging it (for example to try it
   on an Unraid server), open **Actions > Release > Run workflow** and pick the
   branch. The same tests run, and the image is pushed as `edge` and
-  `sha-<short>` (image version `<branch>-<short sha>`); `latest` is not
-  touched. On Unraid, set the container's Repository to
-  `ghcr.io/<owner>/chrysopoeia:edge`. After the merge, `main`'s own release run
-  publishes `latest`; set Repository back to it.
+  `sha-<short>` (image version `<branch>-<short sha>`); `latest` and `stable`
+  are not touched. On Unraid, set the container's Repository to
+  `ghcr.io/<owner>/szalinski:edge`. Afterwards set Repository back to
+  `:stable`, or to `:latest` once the branch is merged and `main`'s own release
+  run has published it.
 - The Unraid template's `TemplateURL` and `Icon` point at the `main` branch
-  (`unraid/chrysopoeia.xml`, `unraid/chrysopoeia.png`), so a template or icon
+  (`unraid/szalinski.xml`, `unraid/szalinski.png`), so a template or icon
   change reaches users only once it is merged. A template tried from a branch
   must be downloaded from that branch's raw URL by hand.
 - The first image ever published, including a first `edge` from a branch,
   creates the package as **private** (GitHub copies the repository's access
   rules to a new package, but not its visibility). Make it public once:
-  GitHub > Packages > chrysopoeia > Package settings > Change visibility >
+  GitHub > Packages > szalinski > Package settings > Change visibility >
   Public. Until then Unraid and Docker are refused when pulling it. The
   workflow run's summary repeats this.
+
+### Update channels
+
+The image tag is the update channel: a container follows whatever its tag
+follows. `latest` follows every build of `main` and is not a release channel;
+`stable` is.
+
+| Trigger | Image tags pushed | GitHub Release |
+|---|---|---|
+| Push to `main` | `latest`, `sha-<short>` | none |
+| Tag `v1.2.3` | `1.2.3`, `sha-<short>`, then the moving tags below that this release is entitled to | yes, as the latest release if it moved `stable` |
+| Tag `v1.2.0-rc.1` (any tag with a `-` suffix, a prerelease) | `1.2.0-rc.1`, `sha-<short>`; no moving tag | yes, marked as a pre-release |
+| Manual run on another branch | `edge`, `sha-<short>` | none |
+| Manual run on a tag | as for that tag; never moves a moving tag backwards | only if it has none yet |
+
+The moving tags of a release (`scripts/release-channel.sh moving-tags`):
+
+- `stable` only if this is the newest release of all;
+- `1.2` only if it is the newest release of the 1.2 line, and `1` (from 1.0
+  on; `v0.x` has no major-only tag) only if it is the newest of the 1.x line.
+
+A "release" here is a tag that is a strict `vMAJOR.MINOR.PATCH` version
+without a prerelease suffix, and "newest" compares the numbers, not the text,
+so `v0.10.0` is newer than `v0.9.9`. Other tags (`v1`, `vfoo`) are ignored by
+the rules, and the workflow refuses to build a `v*` tag that is not a valid
+version. The tags `1.2.3` and `sha-<short>` are exact and never move.
+
+### Cutting a release
+
+A release is a version tag on `main`. Nothing else moves `stable`.
+
+1. Make sure the commit you want to ship is on `main` and green: CI, and the
+   **Release** run that `main` itself triggers.
+2. Prepare the release in a pull request:
+   - In `CHANGELOG.md`, move the entries of `## [Unreleased]` into a new
+     `## [X.Y.Z] - YYYY-MM-DD` section, leave an empty `## [Unreleased]` above
+     it and update the links at the bottom. The release workflow copies this
+     section into the GitHub Release; without it the notes list commits only and
+     the run says so.
+   - Set `version` in `Cargo.toml` (`[workspace.package]`) to `X.Y.Z` and
+     refresh the lock file with `cargo update --workspace`, which changes only
+     the five workspace crates' versions (CI builds with `--locked`).
+   - Merge it.
+3. Tag the merge commit and push the tag:
+
+   ```sh
+   git switch main && git pull
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   A prerelease works the same with a suffix: set `version = "X.Y.Z-rc.1"` in
+   `Cargo.toml` and push `vX.Y.Z-rc.1`. The final `vX.Y.Z` needs `X.Y.Z` there.
+4. Watch **Actions > Release**. For a version tag the workflow:
+   1. refuses a tag that is not a valid version, or that does not match
+      `version` in `Cargo.toml`, before building anything;
+   2. builds the amd64 image and runs the entrypoint tests and both end-to-end
+      tests against it;
+   3. pushes the multi-arch image as `X.Y.Z` and `sha-<short>`;
+   4. reads the tags that exist at that moment and, for a release (not a
+      prerelease), copies the image to `stable`, `X.Y` and `X` as far as this
+      release is the newest of each (the same image, by digest, checked after);
+   5. in a second job, the only one allowed to write repository contents,
+      creates the GitHub Release for the tag: the `CHANGELOG.md` section, the
+      commits since the previous release (merge commits left out, at most 100),
+      a link to the full comparison and the image tags. It is marked as a
+      pre-release for a prerelease, and as the latest release only if it moved
+      `stable`. A release that already exists is left as it is, so a re-run
+      cannot overwrite notes you edited.
+5. Run the checks under [Before announcing a release](#before-announcing-a-release).
+
+**The first release.** `stable` is created by the first version tag. Until a
+tag such as `v0.3.0` has been pushed and its Release run has finished,
+`ghcr.io/thekozugroup/szalinski:stable` does not exist, and pulling it fails
+with *manifest unknown*. The Unraid template's Repository is `:stable`, so push
+the first release (and make the package public) before the template reaches
+`main` and Community Applications, or the first install from it fails.
+`Cargo.toml` says `0.3.0` today, so the first tag is `v0.3.0` unless you change
+it.
+
+**How `stable` is protected from moving backwards.**
+
+- The rule is in one place, `scripts/release-channel.sh`, and compares versions
+  numerically (`v0.10.0` beats `v0.9.9`). `scripts/test-release-channel.sh`
+  tests it, with `v0.2.0`, `v0.3.0`, `v0.3.1-rc.1`, `v0.10.0` and `v0.9.9`
+  among others, and CI runs it (`make test-release` locally). Only the newest
+  of those, `v0.10.0`, takes `stable`: `v0.9.9` and the prerelease do not.
+- The decision is made after the build, right before the tags are moved, from
+  the tags that exist then (read from the GitHub API), not from those at the
+  start of the run. If `v0.3.1` is tagged while `v0.3.0` is still building,
+  `v0.3.0` leaves `stable` alone, whichever finishes first.
+- Re-running an older release (from the Actions page) republishes its exact
+  tag and cannot move `stable`, `X.Y` or `X` backwards. A prerelease never
+  moves any of them.
+- The cost: the newest *tag* decides, even if its own run failed. If the
+  newest version's run fails, `stable` stays where it was, and older tags cannot
+  move it. Re-run the failed run, or cut the next patch release with the fix.
+- Never re-tag or force-push a version that was published. Containers that
+  follow `stable` update by themselves, and the database of a newer version
+  cannot be read by an older one. Fix forward with a new patch release. To put
+  `stable` back on an older image after a bad release anyway, do it by hand
+  (`docker login ghcr.io`, then `docker buildx imagetools create -t
+  ghcr.io/<owner>/szalinski:stable ghcr.io/<owner>/szalinski:X.Y.Z`); the
+  workflow will not.
 
 ### Before announcing a release
 
@@ -254,34 +361,43 @@ shell) that is not logged in to GitHub or GHCR, because a private package
 and a logged-in session hide the problem:
 
 1. Merge to `main` (or push the version tag) and wait for the **Release** run
-   to finish green: it pushes `:latest` (or the version tags).
+   to finish green: it pushes `:latest` (or the version tags and `:stable`).
 2. The first time ever: set the package to **Public** (GitHub > Packages >
-   chrysopoeia > Package settings > Change visibility).
+   szalinski > Package settings > Change visibility).
 3. Check the image and the raw files the docs point at:
 
    ```sh
    docker logout ghcr.io
-   docker pull ghcr.io/thekozugroup/chrysopoeia:latest      # not "denied"
-   raw=https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main
-   for f in unraid/chrysopoeia.xml unraid/chrysopoeia.png docker-compose.yml .env.example; do
+   docker pull ghcr.io/thekozugroup/szalinski:latest      # not "denied"
+   docker pull ghcr.io/thekozugroup/szalinski:stable      # needs a version tag; not "manifest unknown"
+   for tag in stable X.Y.Z; do                              # the same digest twice
+     docker buildx imagetools inspect "ghcr.io/thekozugroup/szalinski:$tag" --format '{{json .Manifest}}' | jq -r .digest
+   done
+   raw=https://raw.githubusercontent.com/thekozugroup/Szalinski/main
+   for f in unraid/szalinski.xml unraid/szalinski.png docker-compose.yml .env.example; do
      curl -fsSL -o /dev/null -w "%{http_code}  $f\n" "$raw/$f" || echo "FAILED  $f"
    done
    ```
 
    All four must answer `200`. For a fresh Compose install, also run the
    README's Compose steps in an empty folder and confirm `docker compose up -d`
-   starts `ghcr.io/thekozugroup/chrysopoeia:latest` (`docker compose config`
+   starts `ghcr.io/thekozugroup/szalinski:latest` (`docker compose config`
    shows the image), and open the web UI.
-4. Only then announce it. Until it is done, the README and UNRAID.md callouts
+4. For a version tag, open the project's Releases page: the release has its
+   notes, a prerelease is marked as one, and only a release that moved
+   `stable` carries the *Latest* badge.
+5. Only then announce it. Until it is done, the README and UNRAID.md callouts
    tell people to use the branch's raw URLs and the `:edge` image, or to build
    the image themselves.
 
-Run the workflow checks locally before pushing a change to `.github/`:
+Run the workflow checks locally before pushing a change to `.github/` or
+`scripts/`:
 
 ```sh
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 shellcheck docker/*.sh scripts/*.sh
-xmllint --noout unraid/chrysopoeia.xml
+xmllint --noout unraid/szalinski.xml
+scripts/test-release-channel.sh       # make test-release
 ```
 
 ## Conventions
@@ -291,7 +407,7 @@ xmllint --noout unraid/chrysopoeia.xml
 - Rust: no `unwrap`/`expect` on runtime paths, no blocking work on the async
   runtime, `cargo fmt` and clippy clean. Errors shown to users are complete,
   plain-language sentences.
-- Changing a type in `chrysopoeia-core` changes the API: update
+- Changing a type in `szalinski-core` changes the API: update
   `web/src/lib/types.ts` and `docs/ARCHITECTURE.md` in the same change.
 
 ## License

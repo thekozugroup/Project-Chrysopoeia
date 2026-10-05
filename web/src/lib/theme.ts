@@ -7,7 +7,7 @@
  */
 
 import { useEffect, useSyncExternalStore } from "react";
-import { THEME_STORAGE_KEY } from "./theme-script";
+import { LEGACY_THEME_STORAGE_KEY, THEME_STORAGE_KEY } from "./theme-script";
 
 export type ThemeChoice = "system" | "light" | "dark";
 
@@ -15,7 +15,8 @@ const listeners = new Set<() => void>();
 
 function readChoice(): ThemeChoice {
   try {
-    const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+    const value =
+      window.localStorage.getItem(THEME_STORAGE_KEY) ?? window.localStorage.getItem(LEGACY_THEME_STORAGE_KEY);
     if (value === "light" || value === "dark") return value;
   } catch {
     // Storage blocked: fall back to the OS setting.
@@ -38,6 +39,7 @@ export function applyTheme(choice: ThemeChoice): void {
 /** Remember and apply a theme choice. */
 export function setTheme(choice: ThemeChoice): void {
   try {
+    window.localStorage.removeItem(LEGACY_THEME_STORAGE_KEY);
     if (choice === "system") window.localStorage.removeItem(THEME_STORAGE_KEY);
     else window.localStorage.setItem(THEME_STORAGE_KEY, choice);
   } catch {

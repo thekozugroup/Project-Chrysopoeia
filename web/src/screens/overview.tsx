@@ -26,7 +26,7 @@ import type { ReactNode } from "react";
 import { SavingsChart, worthCharting } from "@/components/charts";
 import { FileName, WasName } from "@/components/file-name";
 import { JobCard, JobCardSkeleton, historyNote } from "@/components/jobs";
-import { LibraryBar, LibraryLegend, finishedPercent, remainingCount } from "@/components/library-bar";
+import { LibraryBar, LibraryLegend, finishedText, remainingCount } from "@/components/library-bar";
 import { QueueControls } from "@/components/queue-controls";
 import { JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
@@ -34,7 +34,7 @@ import { Callout, SectionHeading, Skeleton } from "@/components/ui/display";
 import { useFileActions, useQueueActions } from "@/lib/actions";
 import { errorMessage } from "@/lib/api";
 import { settlingText } from "@/lib/convertible";
-import { formatBytes, formatCount, formatHour, formatPercent, formatRelative, plural, splitBytes } from "@/lib/format";
+import { formatBytes, formatCount, formatHour, formatRelative, plural, splitBytes } from "@/lib/format";
 import { SETUP_PROBLEMS, newFileName, reasonsFor, setupFix, type SetupProblem } from "@/lib/outcomes";
 import {
   useFailures,
@@ -86,6 +86,15 @@ function scanSentence(libraries: Library[], scans: Record<string, ScanProgress>)
   return found > 0 ? `Looking through ${where}: ${plural(found, "video")} found so far` : `Looking through ${where} for videos`;
 }
 
+/**
+ * Files being copied into the libraries that are watched right now
+ * (`LibraryStats.settling`); a paused library or one whose folder is
+ * missing isn't looking, so its last count doesn't hold anything up.
+ */
+export function copyingFiles(libraries: readonly Library[]): number {
+  return libraries.reduce((n, l) => n + (l.enabled && !l.path_error ? l.stats.settling : 0), 0);
+}
+
 interface Status {
   icon: ReactNode;
   text: string;
@@ -100,6 +109,8 @@ export interface Attention {
   failed: number;
   /** A setup problem (work folder, destination, disk space, hardware) is open. */
   blocked: boolean;
+  /** Files still being copied into watched libraries (`LibraryStats.settling`). */
+  settling?: number;
 }
 
 /**
@@ -138,6 +149,14 @@ export function overviewStatus(
   if (queue.queued) return { icon: <Clock aria-hidden />, text: `${plural(queue.queued, "file")} waiting to start` };
   // "Needs your attention" follows right below with the fix.
   if (attention.blocked) return { icon: <TriangleAlert className="text-warning" aria-hidden />, text: "Waiting for a fix" };
+  // Not "All caught up" while a file is still arriving.
+  if (attention.settling) {
+    return {
+      icon: <Hourglass aria-hidden />,
+      text: settlingText(attention.settling),
+      detail: attention.failed > 0 ? `${plural(attention.failed, "file")} to review` : undefined,
+    };
+  }
   return {
     icon: <CircleCheck className="text-success" aria-hidden />,
     text: "All caught up",
@@ -158,7 +177,11 @@ function StatusLine({ queue, failed }: { queue: QueueState; failed: number }) {
   const blocked = useSetupProblems().open;
   // While the server is away this is only what it last said: no live icon.
   const down = useServerDown();
-  const status = overviewStatus(queue, settings.data, scanSentence(libraries.data ?? [], scans), { failed, blocked });
+  const status = overviewStatus(queue, settings.data, scanSentence(libraries.data ?? [], scans), {
+    failed,
+    blocked,
+    settling: copyingFiles(libraries.data ?? []),
+  });
   return (
     <div className="mt-5 flex flex-wrap items-center gap-x-3 gap-y-2">
       <p
@@ -223,6 +246,8 @@ function SavedHero({ overview }: { overview: Overview }) {
     // Nothing to report yet: say what is happening instead of a giant "0 GB".
     const scanning = scanSentence(libraries.data ?? [], scans) !== null;
     const failed = totals.failed;
+    // Files still being copied in: nothing is "in good shape" until they're in.
+    const copying = copyingFiles(libraries.data ?? []);
     // Failed files are never "in good shape": say they're waiting on the user.
     const title = scanning
       ? "Getting to know your library"
@@ -233,7 +258,9 @@ function SavedHero({ overview }: { overview: Overview }) {
             ? "Nothing saved yet"
             : "Nothing converted yet"
           : totals.file_count > 0
-            ? "Nothing needs converting"
+            ? copying > 0
+              ? "Nothing to convert so far"
+              : "Nothing needs converting"
             : "Waiting for videos";
     const detail = scanning
       ? "Conversions start as soon as files are checked."
@@ -241,12 +268,15 @@ function SavedHero({ overview }: { overview: Overview }) {
         ? "The space you get back shows up here as soon as the first files are verified."
         : failed > 0
           ? `${plural(failed, "file")} ${failed === 1 ? "needs" : "need"} your attention below.`
-          : totals.file_count > 0
-            ? "Every file is already in good shape or was left as it is."
-            : "Once a library is scanned and files are converted, the space you get back shows up here.";
+          : copying > 0
+            ? // The status line below says how many; this says what happens next.
+              `${totals.file_count > 0 ? "Every file found so far is in good shape or was left as it is. " : ""}Files still being copied in are added once they stop changing.`
+            : totals.file_count > 0
+              ? "Every file is already in good shape or was left as it is."
+              : "Once a library is scanned and files are converted, the space you get back shows up here.";
     return (
       <div className="min-w-0">
-        <h1 className="font-display text-[2.5rem] leading-[1.05] text-fg sm:text-[3.25rem]">{title}</h1>
+        <h1 className="font-display text-[2.5rem] leading-[1.08] text-fg sm:text-[3.25rem]">{title}</h1>
         <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">{detail}</p>
         <StatusLine queue={overview.queue} failed={totals.failed} />
         {holdings}
@@ -258,7 +288,7 @@ function SavedHero({ overview }: { overview: Overview }) {
     <div className="min-w-0">
       <h1 className="sr-only">Overview</h1>
       <p className="flex flex-wrap items-baseline gap-x-3 text-fg">
-        <span className="font-display text-[4.25rem] leading-[0.95] tracking-[-0.02em] sm:text-[5.5rem]">
+        <span className="font-display text-[4.25rem] leading-[0.95] tracking-[-0.015em] sm:text-[5.5rem]">
           {value}
           <span className="ml-2 text-[0.5em] tracking-normal text-accent-ink">{unit}</span>
         </span>
@@ -462,7 +492,7 @@ export function problemsFrom(
         icon: <FileWarning aria-hidden />,
         tone: "warning",
         title: `${plural(n, "file")} can't be read`,
-        detail: `${n === 1 ? "It looks" : "They look"} damaged or ${n === 1 ? "isn't a video" : "aren't videos"}. Chrysopoeia left ${n === 1 ? "it" : "them"} alone.`,
+        detail: `${n === 1 ? "It looks" : "They look"} damaged or ${n === 1 ? "isn't a video" : "aren't videos"}. Szalinski left ${n === 1 ? "it" : "them"} alone.`,
       })),
       ...perLibrary("failed", libraries, count("conversion"), (n) => ({
         icon: <TriangleAlert aria-hidden />,
@@ -634,6 +664,8 @@ export function LibraryRow({ library }: { library: Library }) {
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   const scanning = library.scanning || (scan && scan.phase !== "done");
   const left = remainingCount(stats);
+  // "100% finished" only once nothing more is on its way (see `finishedText`).
+  const finished = finishedText(stats, unreadable, Boolean(scanning));
   let status: ReactNode;
   // Files being copied in get their own line, unless that's the whole story.
   let settling = copying > 0 && Boolean(library.enabled && !library.path_error);
@@ -654,7 +686,8 @@ export function LibraryRow({ library }: { library: Library }) {
     );
   } else if (left > 0) {
     status = `${plural(left, "file")} to go`;
-  } else if (copying > 0 && stats.failed === 0) {
+  } else if (copying > 0) {
+    // Not "everything is finished" while a file is still arriving.
     status = settlingText(copying);
     settling = false;
   } else if (stats.file_count === 0) {
@@ -697,9 +730,7 @@ export function LibraryRow({ library }: { library: Library }) {
             </>
           ) : null}
         </span>
-        {stats.file_count > 0 ? (
-          <span className="shrink-0 tabular">{formatPercent(finishedPercent(stats, unreadable))} finished</span>
-        ) : null}
+        {stats.file_count > 0 && finished ? <span className="shrink-0 tabular">{finished}</span> : null}
       </div>
       {settling ? (
         <p className="mt-0.5 flex items-center gap-1.5 text-[0.8125rem] text-muted">
@@ -849,7 +880,7 @@ function LiveUpdatesOff() {
   return (
     <Callout tone="info" title="Live updates aren't reaching this browser" className="mb-8">
       <p>
-        The page refreshes every 5 seconds instead, so progress moves in steps. If you open Chrysopoeia through a
+        The page refreshes every 5 seconds instead, so progress moves in steps. If you open Szalinski through a
         reverse proxy (Nginx Proxy Manager, SWAG, Traefik), turn on WebSocket support for it.
       </p>
     </Callout>
@@ -869,11 +900,11 @@ function Welcome() {
   const problems = problemsFrom(libraries.data ?? [], failures, hardware.hw, settings.data, kept);
   return (
     <div className="max-w-2xl">
-      <h1 className="font-display text-[2.75rem] leading-[1.05] text-fg sm:text-[3.5rem]">
+      <h1 className="font-display text-[2.75rem] leading-[1.08] text-fg sm:text-[3.5rem]">
         Make your video library smaller, safely.
       </h1>
       <p className="mt-5 max-w-xl text-sm leading-relaxed text-muted">
-        Point Chrysopoeia at a folder and choose a goal. It converts files in the background, checks each result
+        Point Szalinski at a folder and choose a goal. It converts files in the background, checks each result
         against the original, and only then replaces it.
       </p>
       <a href={href("/libraries/new")} className={cn(buttonVariants({ variant: "primary", size: "lg" }), "mt-8")}>

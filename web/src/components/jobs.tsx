@@ -13,8 +13,10 @@ import {
   Check,
   CircleMinus,
   CircleStop,
+  CircleX,
   FileVideo,
   Info,
+  LoaderCircle,
   Play,
   RotateCcw,
   Wrench,
@@ -24,9 +26,17 @@ import { FileName } from "@/components/file-name";
 import { useThrottledAnnouncement } from "@/components/providers";
 import { CheckIcon, EncoderBadge, JobStateBadge } from "@/components/status";
 import { Button, buttonVariants } from "@/components/ui/button";
-import { Callout, CodeBlock, Detail, Disclosure, Meter, Skeleton } from "@/components/ui/display";
+import { Callout, CodeBlock, CopyButton, Detail, Disclosure, Meter, Skeleton } from "@/components/ui/display";
 import { ConfirmDialog, Sheet } from "@/components/ui/overlays";
 import { useFileActions, useJobActions } from "@/lib/actions";
+import {
+  attemptHeading,
+  attemptOutcome,
+  attemptRows,
+  jobReportText,
+  lastFailedCheck,
+  lowerFirst,
+} from "@/lib/attempts";
 import { convertsAgain, skipFollowsSettings } from "@/lib/convertible";
 import {
   formatBytes,
@@ -58,11 +68,27 @@ import {
   type JobStanding,
   type SetupProblem,
 } from "@/lib/outcomes";
-import { overallProgress } from "@/lib/progress";
-import { useFile, useJob, useLibraries, useLibrary, useNewFileName, useSettings } from "@/lib/queries";
+import { framesElapsedText, framesText, overallProgress, readProgress } from "@/lib/progress";
+import {
+  useFile,
+  useHardwareInfo,
+  useJob,
+  useLibraries,
+  useLibrary,
+  useNewFileName,
+  useSettings,
+} from "@/lib/queries";
 import { href } from "@/lib/router";
 import { useLiveJob } from "@/lib/store";
-import type { Job, JobStage, MediaFile, TranscodeProfile, ValidationCheck, ValidationReport } from "@/lib/types";
+import type {
+  GpuDevice,
+  Job,
+  JobStage,
+  MediaFile,
+  TranscodeProfile,
+  ValidationCheck,
+  ValidationReport,
+} from "@/lib/types";
 import { cn, useRetained } from "@/lib/utils";
 
 /**
@@ -198,6 +224,68 @@ export function jobOverall(job: Pick<Job, "stage" | "progress">): number {
   return overallProgress(job.stage, job.progress);
 }
 
+/**
+ * A running job's progress in words, matching its bar: "37%", "About 37% ·
+ * estimated from 1,017 frames", or, while the share isn't known, "1,017
+ * frames · 7 min elapsed" (never a 0% that only looks like a number). The
+ * time left only goes with a share.
+ */
+export function progressWords(job: Pick<Job, "stage" | "progress" | "progress_basis" | "frames" | "elapsed_secs" | "eta_secs">): {
+  lead: string;
+  detail: string | null;
+  eta: string | null;
+} {
+  const reading = readProgress(job);
+  switch (reading.kind) {
+    case "unknown":
+      return {
+        lead: framesElapsedText(reading.frames, reading.elapsedSecs),
+        detail: "how far isn't known yet",
+        eta: null,
+      };
+    case "estimated":
+      return {
+        lead: `About ${Math.round(reading.overall)}%`,
+        detail: reading.frames !== null ? `estimated from ${framesText(reading.frames)}` : "estimated from the frames encoded",
+        eta: formatEta(job.eta_secs),
+      };
+    default:
+      return { lead: `${Math.round(reading.overall)}%`, detail: null, eta: formatEta(job.eta_secs) };
+  }
+}
+
+/** The bar and the line under it for a running job (see `progressWords`). */
+function JobProgressBlock({ job, label, lineClassName }: { job: Job; label: string; lineClassName?: string }) {
+  const reading = readProgress(job);
+  const words = progressWords(job);
+  const said = [words.lead, words.detail, words.eta].filter(Boolean).join(", ");
+  return (
+    <>
+      <Meter
+        value={reading.kind === "unknown" ? null : reading.overall}
+        valueText={reading.kind === "measured" ? undefined : said}
+        label={label}
+        live
+        size="md"
+      />
+      <p className={cn("text-[0.8125rem] text-fg", lineClassName)}>
+        <span className="font-semibold tabular">{words.lead}</span>
+        {words.detail ? <span className="text-muted"> · {words.detail}</span> : null}
+        {words.eta ? <span className="text-muted"> · {words.eta}</span> : null}
+      </p>
+    </>
+  );
+}
+
+/** "Attempt 2: …" on a running job's card, with the check the last try failed when it did. */
+function attemptLine(job: Job): string {
+  const check = lastFailedCheck(job);
+  if (check) {
+    return `Attempt ${job.attempt}: the last try made a file that failed a check (${check.label}), so Szalinski is trying another way.`;
+  }
+  return `Attempt ${job.attempt}: the first try didn't work, so Szalinski is trying another way.`;
+}
+
 /** Live card for a running job. */
 export function JobCard({
   job: baseJob,
@@ -212,12 +300,12 @@ export function JobCard({
   const job = useLiveJob(baseJob);
   const libraries = useLibraries();
   const libraryName = libraries.data?.find((l) => l.id === job.library_id)?.name;
-  const eta = formatEta(job.eta_secs);
   const stage = JOB_STAGE_LABEL[job.stage];
-  const overall = jobOverall(job);
+  const words = progressWords(job);
+  const done = readProgress(job).kind === "unknown" ? words.lead : `${words.lead} done`;
 
   useThrottledAnnouncement(
-    announce ? `${job.file_name}: ${Math.round(overall)}% done, ${stage.toLowerCase()}${eta ? `, ${eta}` : ""}.` : null,
+    announce ? `${job.file_name}: ${done}, ${stage.toLowerCase()}${words.eta ? `, ${words.eta}` : ""}.` : null,
     `${job.id}:${job.stage}`,
   );
 
@@ -249,16 +337,8 @@ export function JobCard({
       <StageSteps stage={job.stage} />
 
       <div>
-        <Meter value={overall} label={`${job.file_name}: whole file`} live size="md" />
-        <p className="mt-2 text-[0.8125rem] text-fg">
-          <span className="font-semibold tabular">{Math.round(overall)}%</span>
-          {eta ? <span className="text-muted"> · {eta}</span> : null}
-        </p>
-        {job.attempt > 1 ? (
-          <p className="mt-2 text-[0.8125rem] text-warning">
-            Attempt {job.attempt}: the first try didn&apos;t work, so Chrysopoeia is trying another way.
-          </p>
-        ) : null}
+        <JobProgressBlock job={job} label={`${job.file_name}: whole file`} lineClassName="mt-2" />
+        {job.attempt > 1 ? <p className="mt-2 text-[0.8125rem] text-warning">{attemptLine(job)}</p> : null}
       </div>
 
       {/* Named after the file: with several cards, "Stop" and "Details" alone would be ambiguous. */}
@@ -317,11 +397,7 @@ export function noSpaceFreed(job: Pick<Job, "input_size" | "output_size" | "free
   return job.freed_bytes === 0 && job.output_size !== null && job.output_size <= job.input_size;
 }
 
-/** "The disk is full" → "the disk is full", to follow a colon; "NVENC …" and "HEVC" stay as they are. */
-export function lowerFirst(text: string): string {
-  if (/^[A-Z]{2}/.test(text)) return text;
-  return text.charAt(0).toLowerCase() + text.slice(1);
-}
+export { lowerFirst };
 
 /**
  * The second line of a finished job in a list: what came of it, briefly,
@@ -495,7 +571,7 @@ export function CantBeReadCallout({ error }: { error: string | null }) {
     <Callout tone="warning" title="Can't be read">
       <p>
         This file looks damaged or isn&apos;t a video{detail ? ` (${detail})` : ""}.
-        Chrysopoeia left it alone.
+        Szalinski left it alone.
       </p>
       <p className="mt-1.5">
         Play it in Plex or Jellyfin to check. If it&apos;s broken, replace it; the new copy is picked up automatically.
@@ -661,11 +737,54 @@ function Outcome({ job, standing, renamed }: { job: Job; standing: JobStanding; 
   return null;
 }
 
-/** Encoder, similarity scores, command and log: everything an expert or a bug report needs. */
-function JobTechnical({ job }: { job: Job }) {
+/**
+ * Every way the job tried, in plain words: "Attempt 1 · AMD GPU (VA-API) ·
+ * decoded on the GPU · 2 min" and "Failed: Plays start to finish: playback
+ * stopped at 1:01 of 2:21:02", with the one still running last. Shown when
+ * there was more than one (see `attemptRows`).
+ */
+export function Attempts({ job, gpus }: { job: Job; gpus: readonly GpuDevice[] }) {
+  const rows = attemptRows(job, gpus);
+  if (!rows.length) return null;
+  return (
+    <SheetSection title="Attempts">
+      <ol aria-label="Attempts" className="divide-y divide-line overflow-hidden rounded-lg border border-line">
+        {rows.map(({ attempt, running }) =>
+          attempt ? (
+            <li key={attempt.attempt} className="flex gap-3 px-3.5 py-3">
+              {attempt.result === "succeeded" ? (
+                <Check className="mt-0.5 size-4 shrink-0 text-success" aria-hidden />
+              ) : (
+                <CircleX className="mt-0.5 size-4 shrink-0 text-danger" aria-hidden />
+              )}
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-fg">{attemptHeading(attempt, gpus)}</p>
+                <p className="mt-0.5 text-[0.8125rem] leading-snug break-words text-muted">{attemptOutcome(attempt)}</p>
+              </div>
+            </li>
+          ) : running ? (
+            <li key={`running-${running.attempt}`} className="flex gap-3 px-3.5 py-3">
+              <LoaderCircle className="spin mt-0.5 size-4 shrink-0 text-accent-ink" aria-hidden />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-fg">{`Attempt ${running.attempt} · ${running.device}`}</p>
+                <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">Converting now</p>
+              </div>
+            </li>
+          ) : null,
+        )}
+      </ol>
+    </SheetSection>
+  );
+}
+
+/** Encoder, similarity scores, every attempt's command and log: everything an expert or a bug report needs. */
+function JobTechnical({ job, gpus }: { job: Job; gpus: readonly GpuDevice[] }) {
   const report = job.validation;
   const log = job.log_tail ? errorLinesFirst(job.log_tail) : null;
   const speed = job.state === "running" ? speedText(job) : null;
+  // The final attempt's command and log are shown below as before; with
+  // more than one attempt, each one's own are shown too.
+  const attempts = (job.attempts ?? []).length > 1 ? (job.attempts ?? []) : [];
   const scores = [
     report?.ssim_min != null ? `lowest ${report.ssim_min.toFixed(3)}` : null,
     report?.ssim_avg != null ? `average ${report.ssim_avg.toFixed(3)}` : null,
@@ -697,13 +816,32 @@ function JobTechnical({ job }: { job: Job }) {
       </Detail>
     ) : null,
   ].filter(Boolean);
-  if (!rows.length && !job.command && !log) return null;
+  if (!rows.length && !job.command && !log && !attempts.length) return null;
   return (
     <Disclosure className="mt-7">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[0.8125rem] text-muted">Everything below, with every attempt, in one piece of text.</p>
+        <CopyButton text={jobReportText(job, gpus)} label="Copy for a bug report" />
+      </div>
       {rows.length ? <dl className="-my-2 divide-y divide-line">{rows}</dl> : null}
       {log?.errors ? <CodeBlock code={log.errors} label="What ffmpeg reported" /> : null}
       {job.command ? <CodeBlock code={job.command} label="ffmpeg command of the final attempt" /> : null}
       {log ? <CodeBlock code={log.rest} label="Last lines from ffmpeg" maxHeight="20rem" /> : null}
+      {attempts.map((attempt) => (
+        <section key={attempt.attempt} aria-label={`Attempt ${attempt.attempt}`} className="flex flex-col gap-2">
+          <p className="text-[0.8125rem] font-medium text-fg">
+            {attemptHeading(attempt, gpus)}
+            <span className="font-normal text-muted">
+              {" "}
+              · <span className="font-mono text-xs">{attempt.encoder}</span> · {attemptOutcome(attempt)}
+            </span>
+          </p>
+          {attempt.command ? <CodeBlock code={attempt.command} label={`Attempt ${attempt.attempt}: ffmpeg command`} /> : null}
+          {attempt.log_tail ? (
+            <CodeBlock code={attempt.log_tail} label={`Attempt ${attempt.attempt}: last lines from ffmpeg`} maxHeight="12rem" />
+          ) : null}
+        </section>
+      ))}
     </Disclosure>
   );
 }
@@ -723,8 +861,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
   const settings = useSettings();
   const file = useFile(job.file_id).data?.file;
   const renamed = newFileName(job, file, settings.data?.output_mode);
-  const eta = formatEta(job.eta_secs);
-  const overall = jobOverall(job);
+  const gpus = useHardwareInfo().hw?.gpus ?? [];
   return (
     <>
       <div className="mb-6 flex flex-wrap items-center gap-2">
@@ -741,15 +878,13 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
       {job.state === "running" ? (
         <div className="mb-6 flex flex-col gap-3">
           <StageSteps stage={job.stage} />
-          <Meter value={overall} label="Whole file" live size="md" />
-          <p className="text-[0.8125rem] text-muted">
-            <span className="font-semibold text-fg tabular">{Math.round(overall)}%</span>
-            {eta ? ` · ${eta}` : ""}
-          </p>
+          <JobProgressBlock job={job} label="Whole file" />
         </div>
       ) : null}
 
       <Outcome job={job} standing={standing} renamed={renamed} />
+
+      <Attempts job={job} gpus={gpus} />
 
       {job.notes && job.notes.length > 0 ? (
         <SheetSection title="What changed">
@@ -798,7 +933,7 @@ function JobSheetBody({ job: baseJob }: { job: Job }) {
         </dl>
       </SheetSection>
 
-      <JobTechnical job={job} />
+      <JobTechnical job={job} gpus={gpus} />
     </>
   );
 }

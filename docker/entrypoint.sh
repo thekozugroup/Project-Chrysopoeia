@@ -1,12 +1,12 @@
 #!/bin/sh
-# Chrysopoeia container entrypoint (POSIX sh; runs under tini).
+# Szalinski container entrypoint (POSIX sh; runs under tini).
 #
 # Started as root (the default), it:
-#   1. moves the "chrysopoeia" user and group to PUID/PGID (default 1000/1000;
+#   1. moves the "szalinski" user and group to PUID/PGID (default 1000/1000;
 #      Unraid uses 99/100) and applies UMASK (default 002),
 #   2. adds the user to the groups that own the GPU device nodes it can see
 #      (/dev/dri, /dev/nvidia*, and ARM video/codec nodes), except root,
-#   3. hands that user Chrysopoeia's own files in /config (the database and its
+#   3. hands that user Szalinski's own files in /config (the database and its
 #      lock), the top folder of /config when it is new, empty or already holds
 #      the database, and the top folder of /temp, without ever re-owning other
 #      files or folders (the folder may be shared),
@@ -19,22 +19,22 @@
 # ("docker run image id").
 set -eu
 
-APP_USER=chrysopoeia
+APP_USER=szalinski
 
-log() { printf '[chrysopoeia] %s\n' "$*"; }
-warn() { printf '[chrysopoeia] Warning: %s\n' "$*" >&2; }
+log() { printf '[szalinski] %s\n' "$*"; }
+warn() { printf '[szalinski] Warning: %s\n' "$*" >&2; }
 die() {
-    printf '[chrysopoeia] Error: %s\n' "$*" >&2
+    printf '[szalinski] Error: %s\n' "$*" >&2
     exit 1
 }
 
 if [ $# -eq 0 ] || [ "${1#-}" != "$1" ]; then
-    set -- chrysopoeia "$@"
+    set -- szalinski "$@"
 fi
 
 # Show the banner only when starting the server for real.
 show_banner=0
-if [ "$1" = chrysopoeia ]; then
+if [ "$1" = szalinski ]; then
     show_banner=1
     for arg in "$@"; do
         case $arg in -h | --help | -V | --version) show_banner=0 ;; esac
@@ -107,16 +107,27 @@ anonymous_volume() {
     mount_info "$1" | grep -Eq '^[^ ]+ [^ ]+ [^ ]+ [^ ]*/volumes/[0-9a-f]{64}/_data '
 }
 
-# Names of the files Chrysopoeia creates in the Config folder: the database (in
+# Names of the files Szalinski creates in the Config folder: the database (in
 # write-ahead mode, hence the extra files) and the lock that keeps a second
 # copy out.
-DB_FILE=chrysopoeia.db
-LOCK_FILE=chrysopoeia.lock
+DB_FILE=szalinski.db
+LOCK_FILE=szalinski.lock
+# The same files under the name before the rename (Chrysopoeia 0.2). The
+# server renames the old database to $DB_FILE on its first start and keeps
+# holding the old lock, so they are Szalinski's own files too.
+LEGACY_DB_FILE=chrysopoeia.db
+LEGACY_LOCK_FILE=chrysopoeia.lock
 
 # Whether the Config folder holds nothing yet (the "lost+found" of a freshly
 # formatted disk does not count).
 config_dir_is_empty() {
     [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ]
+}
+
+# Whether the Config folder holds a Szalinski database, under the current
+# name or the one from before the rename.
+config_has_database() {
+    [ -e "$DATA_DIR/$DB_FILE" ] || [ -e "$DATA_DIR/$LEGACY_DB_FILE" ]
 }
 
 # Warnings about missing or unusable mounts, printed when the server starts.
@@ -126,20 +137,20 @@ check_mounts() {
     if ! mountpoint -q "$DATA_DIR" 2>/dev/null || anonymous_volume "$DATA_DIR"; then
         warn "No host folder is mounted at $DATA_DIR, so libraries, settings and history are lost when the container is recreated (for example by an update). Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
     fi
-    if [ -d "$DATA_DIR" ] && [ ! -e "$DATA_DIR/$DB_FILE" ] && ! config_dir_is_empty; then
-        warn "$DATA_DIR already holds other files but no Chrysopoeia database. Chrysopoeia adds its own files there and leaves the rest alone, but if this folder is shared with other apps, give Chrysopoeia a folder of its own (Unraid: the Config path, for example /mnt/user/appdata/chrysopoeia)."
+    if [ -d "$DATA_DIR" ] && ! config_has_database && ! config_dir_is_empty; then
+        warn "$DATA_DIR already holds other files but no Szalinski database. Szalinski adds its own files there and leaves the rest alone, but if this folder is shared with other apps, give Szalinski a folder of its own (Unraid: the Config path, for example /mnt/user/appdata/szalinski)."
     fi
     if [ "$media_mounted" = 0 ]; then
         if [ -z "${BROWSE_ROOTS:-}" ] && [ -z "${LIBRARIES:-}" ]; then
             warn "No media folder is mounted at /media. Mount the folder with your videos there (Unraid: the Media path; docker: -v /path/to/media:/media), or the folder picker will only show the container's own files."
         fi
     elif mounted_read_only /media; then
-        warn "/media is mounted read-only, so Chrysopoeia cannot replace files there. That only works with an Output folder elsewhere (Settings > Output). To replace originals, make it writable: on Unraid set the Media path's Access Mode to Read/Write; with docker, remove :ro."
+        warn "/media is mounted read-only, so Szalinski cannot replace files there. That only works with an Output folder elsewhere (Settings > Output). To replace originals, make it writable: on Unraid set the Media path's Access Mode to Read/Write; with docker, remove :ro."
     elif ! "$@" test -w /media; then
         if [ "$(id -u)" -eq 0 ]; then
-            warn "Chrysopoeia (uid $PUID) cannot write to /media, so it cannot replace files there. Set PUID/PGID to the owner of your media (Unraid: 99/100), or choose Output folder in Settings > Output."
+            warn "Szalinski (uid $PUID) cannot write to /media, so it cannot replace files there. Set PUID/PGID to the owner of your media (Unraid: 99/100), or choose Output folder in Settings > Output."
         else
-            warn "Chrysopoeia (uid $(id -u)) cannot write to /media, so it cannot replace files there. Run the container as the owner of your media, or choose Output folder in Settings > Output."
+            warn "Szalinski (uid $(id -u)) cannot write to /media, so it cannot replace files there. Run the container as the owner of your media, or choose Output folder in Settings > Output."
         fi
     fi
 }
@@ -161,12 +172,12 @@ banner() {
     fi
     # The server reports its own version (Cargo.toml) in the log and API; the
     # build label (a release tag, or <branch>-<commit>) names the image.
-    image_version=${CHRYSOPOEIA_VERSION:-dev}
-    app_version=$(chrysopoeia --version 2>/dev/null | awk 'NR == 1 { print $NF }') || app_version=""
+    image_version=${SZALINSKI_VERSION:-${CHRYSOPOEIA_VERSION:-dev}}
+    app_version=$(szalinski --version 2>/dev/null | awk 'NR == 1 { print $NF }') || app_version=""
     if [ -z "$app_version" ] || [ "$app_version" = "$image_version" ]; then
-        title="Chrysopoeia $image_version"
+        title="Szalinski $image_version"
     else
-        title="Chrysopoeia $app_version (build $image_version)"
+        title="Szalinski $app_version (build $image_version)"
     fi
     log "------------------------------------------------------------"
     log "$title"
@@ -252,10 +263,10 @@ case $PGID in '' | *[!0-9]*) die "PGID must be a number such as 100 or 1000 (got
 readonly_hint="Could not update the container's user list. If the container runs with a read-only root filesystem, start it with --user $PUID:$PGID instead of PUID/PGID."
 
 if [ "$PUID" -eq 0 ]; then
-    warn "PUID is 0, so Chrysopoeia runs as root. Files it writes will be owned by root."
+    warn "PUID is 0, so Szalinski runs as root. Files it writes will be owned by root."
 else
     # Use an existing group with this gid (e.g. 100 "users" on Unraid);
-    # otherwise move the image's "chrysopoeia" group to it.
+    # otherwise move the image's "szalinski" group to it.
     if [ -z "$(getent group "$PGID")" ]; then
         groupmod -g "$PGID" "$APP_USER" || die "$readonly_hint"
     fi
@@ -283,10 +294,10 @@ for dev in $DEVICE_NODES; do
     dev_group=$(getent group "$dev_gid" | cut -d: -f1)
     if [ "$PUID" -ne 0 ] && [ $((other_bits & 6)) -ne 6 ]; then
         if [ "$dev_gid" -eq 0 ] && [ "$PGID" -ne 0 ]; then
-            warn "$dev belongs to the root group, which Chrysopoeia does not join, so it may not be able to use this device. On the host, give it a group of its own, for example: chgrp video $dev && chmod g+rw $dev (a udev rule makes this permanent)."
+            warn "$dev belongs to the root group, which Szalinski does not join, so it may not be able to use this device. On the host, give it a group of its own, for example: chgrp video $dev && chmod g+rw $dev (a udev rule makes this permanent)."
         else
             if [ $((group_bits & 6)) -ne 6 ]; then
-                warn "$dev is not readable and writable by its group, so Chrysopoeia may not be able to use it. On the host, run: chmod g+rw $dev"
+                warn "$dev is not readable and writable by its group, so Szalinski may not be able to use it. On the host, run: chmod g+rw $dev"
             fi
             if [ "$dev_gid" != "$PGID" ]; then
                 if [ -z "$dev_group" ]; then
@@ -308,11 +319,12 @@ check_nvidia_runtime
 
 # Never change the owner of a whole folder tree: the Config folder may be shared
 # (for example an Unraid appdata folder that also holds other apps' data), and
-# re-owning that would damage those apps. Only what Chrysopoeia itself creates
-# is fixed: its database and lock files, and the top folder when it is new or
-# empty (or already holds Chrysopoeia's database).
+# re-owning that would damage those apps. Only what Szalinski itself creates
+# is fixed: its database and lock files (also under the name before the
+# rename, Chrysopoeia), and the top folder when it is new or empty (or already
+# holds Szalinski's database).
 
-# Give $1, a file Chrysopoeia creates, to the app user. A symbolic link is
+# Give $1, a file Szalinski creates, to the app user. A symbolic link is
 # changed itself, never followed.
 own_file() {
     { [ -e "$1" ] || [ -L "$1" ]; } || return 0
@@ -325,13 +337,17 @@ if [ "$PUID" -ne 0 ]; then
     if [ ! -d "$DATA_DIR" ]; then
         mkdir -p "$DATA_DIR" || die "Could not create $DATA_DIR. Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
     fi
-    if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ] && { config_dir_is_empty || [ -e "$DATA_DIR/$DB_FILE" ]; }; then
+    if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ] && { config_dir_is_empty || config_has_database; }; then
         log "Giving $DATA_DIR to uid $PUID, gid $PGID"
         chown "$PUID:$PGID" "$DATA_DIR" || warn "Could not change the owner of $DATA_DIR."
     fi
-    for name in "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" "$DB_FILE-journal" "$LOCK_FILE"; do
-        own_file "$DATA_DIR/$name"
+    for db in "$DB_FILE" "$LEGACY_DB_FILE"; do
+        for name in "$db" "$db-wal" "$db-shm" "$db-journal"; do
+            own_file "$DATA_DIR/$name"
+        done
     done
+    own_file "$DATA_DIR/$LOCK_FILE"
+    own_file "$DATA_DIR/$LEGACY_LOCK_FILE"
     # The scratch folder may hold large files: fix only the folder itself.
     if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
         if [ "$(stat -c %u:%g "$TEMP_DIR")" != "$PUID:$PGID" ]; then
@@ -353,7 +369,7 @@ as_app() {
 }
 
 if ! as_app test -w "$DATA_DIR"; then
-    die "Chrysopoeia (uid $PUID) cannot write to $DATA_DIR. Make the folder writable for PUID/PGID $PUID/$PGID, or set PUID/PGID to the folder's owner. (Chrysopoeia only changes the owner of its own files there, never of anything else in the folder.)"
+    die "Szalinski (uid $PUID) cannot write to $DATA_DIR. Make the folder writable for PUID/PGID $PUID/$PGID, or set PUID/PGID to the folder's owner. (Szalinski only changes the owner of its own files there, never of anything else in the folder.)"
 fi
 check_mounts as_app
 
