@@ -31,7 +31,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { UseDriveButton, UseDriveConfirm } from "@/components/drive-change";
 import { FileName } from "@/components/file-name";
-import { LibraryBar, LibraryLegend, countedFiles } from "@/components/library-bar";
+import { LibraryBar, LibraryLegend, countedFiles, isWaiting } from "@/components/library-bar";
 import { ProfileEditor } from "@/components/profile-editor";
 import { SaveBar } from "@/components/save-bar";
 import { PageHeader } from "@/components/shell";
@@ -234,20 +234,7 @@ function Header({ library }: { library: Library }) {
           <span className="text-xs text-muted">Scanned {formatRelative(library.last_scan_at)}</span>
         ) : null}
       </div>
-      <SettlingLine library={library} />
     </PageHeader>
-  );
-}
-
-/** "Waiting for 3 files to finish copying": files copied in right now, added once they stop changing. */
-function SettlingLine({ library }: { library: Library }) {
-  const copying = library.stats.settling;
-  if (copying <= 0) return null;
-  return (
-    <p className="mt-2.5 flex items-center gap-2 text-[0.8125rem] text-muted">
-      <Hourglass className="size-4 shrink-0 text-accent-ink" aria-hidden />
-      {settlingText(copying)}
-    </p>
   );
 }
 
@@ -283,18 +270,23 @@ function RemoveLibraryDialog({
   );
 }
 
-function Summary({ library }: { library: Library }) {
+export function Summary({ library }: { library: Library }) {
   const stats = library.stats;
   const failures = useFailures();
+  const scan = useLive((s) => s.scans[library.id]);
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
   // Originals that can't be read are set aside, as in the bar below.
   const counted = countedFiles(stats, unreadable);
+  // Files still being copied in, or a scan still looking: everything counted
+  // may be finished while more is on its way.
+  const copying = stats.settling;
+  const waiting = isWaiting(stats, library.scanning || Boolean(scan && scan.phase !== "done"));
   return (
     <section aria-label="Progress" className="rounded-lg border border-line bg-surface p-4 sm:p-5">
       <div className="flex flex-wrap items-baseline justify-between gap-x-6 gap-y-1">
         <p className="text-sm text-fg">
           <span className="font-semibold tabular">{formatCount(stats.done + stats.skipped)}</span> of{" "}
-          <span className="tabular">{plural(counted, "file")}</span> finished
+          <span className="tabular">{plural(counted, "file")}</span> finished{waiting ? " so far" : ""}
           {stats.skipped > 0 ? (
             <span className="text-muted">
               {" "}
@@ -312,6 +304,13 @@ function Summary({ library }: { library: Library }) {
           {formatBytes(stats.total_bytes)} in total
         </p>
       </div>
+      {copying > 0 ? (
+        // Added once they stop changing, so they aren't in the counts yet.
+        <p className="mt-2 flex items-center gap-2 text-[0.8125rem] text-muted">
+          <Hourglass className="size-4 shrink-0 text-accent-ink" aria-hidden />
+          {settlingText(copying)}
+        </p>
+      ) : null}
       <LibraryBar stats={stats} unreadable={unreadable} className="mt-3" />
       <LibraryLegend stats={stats} unreadable={unreadable} className="mt-3 hidden sm:flex" />
     </section>
@@ -581,7 +580,7 @@ function NoFilesYet({ library }: { library: Library }) {
   const copying = library.stats.settling;
   const latest = activity.data?.items.find((e) => e.library_id === library.id);
   if (copying > 0) {
-    // The header already says how many; this says what happens next.
+    // The progress above already says how many; this says what happens next.
     return (
       <EmptyState icon={<Hourglass aria-hidden />} title="Files are on their way">
         {copying === 1 ? "A file in this folder is" : `${plural(copying, "file")} in this folder are`} still being

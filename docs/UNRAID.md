@@ -123,6 +123,10 @@ Click **Apply**. Unraid pulls the image and starts the container.
    you are in: **Use “Movies”**. You can add more libraries later. The picker
    won't take `/`, `/config` or the app's own and system folders: the button
    is disabled and the picker says why. Choose the folder that holds your videos.
+   The paths you gave the container (Media, Transcode cache, an output folder)
+   are listed first, under **Your folders** and as buttons above the list;
+   the container's own folders (`/bin`, `/etc`, `/usr` and so on) are folded
+   away under **System folders**.
 3. Choose a goal. *Balanced* (HEVC) is fast with a GPU and plays on most TVs;
    *Save space* (AV1) gives the smallest files; *Plays everywhere* (H.264)
    suits old devices; *Archive* keeps near-original quality. Audio follows the

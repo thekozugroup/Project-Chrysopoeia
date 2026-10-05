@@ -757,6 +757,21 @@ export interface FsEntry {
   media_count?: number | null;
   /** True when counting stopped early, so `media_count` is a lower bound ("1,000+"). */
   media_count_capped?: boolean;
+  /**
+   * One of the container's own folders (`/bin`, `/etc`, `/proc`, `/usr`, the
+   * app), as opposed to a folder someone gave it. Only sent, as true, when
+   * the server runs in a container.
+   */
+  system?: boolean;
+}
+
+/** A folder mounted into the container: one of "your folders". */
+export interface UserFolder {
+  /** The last part of the path (`media`). */
+  name: string;
+  path: string;
+  /** Why it can't be a library (the settings folder, say). Absent when it can. */
+  library_blocked?: string | null;
 }
 
 export interface FsBrowse {
@@ -777,6 +792,12 @@ export interface FsBrowse {
    * can. The server refuses such a library too (`folder_not_allowed`).
    */
   library_blocked?: string | null;
+  /**
+   * The folders mounted into the container (Docker bind mounts, Unraid
+   * paths), which the picker offers first. Empty outside a container;
+   * absent from servers before it was added.
+   */
+  user_folders?: UserFolder[];
 }
 
 export type BulkAction = "queue" | "skip" | "retry_failed";

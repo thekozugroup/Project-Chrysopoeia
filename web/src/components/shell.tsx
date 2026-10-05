@@ -25,9 +25,10 @@ import {
 } from "lucide-react";
 import { useEffect, useId, useRef, type ReactNode } from "react";
 import { Brand } from "@/components/brand";
-import { finishedPercent } from "@/components/library-bar";
+import { finishedText } from "@/components/library-bar";
 import { Tooltip } from "@/components/ui/overlays";
-import { formatHour, formatPercent, plural } from "@/lib/format";
+import { settlingBrief } from "@/lib/convertible";
+import { formatHour, plural } from "@/lib/format";
 import { useFailures, useLibraries, useQueueState, useSettings, useSetupProblems } from "@/lib/queries";
 import { href, type Route } from "@/lib/router";
 import { useLive, useServerDown, type ConnectionState } from "@/lib/store";
@@ -276,7 +277,7 @@ function NavLink({
   );
 }
 
-function LibraryLink({ library, active }: { library: Library; active: boolean }) {
+export function LibraryLink({ library, active }: { library: Library; active: boolean }) {
   const scan = useLive((s) => s.scans[library.id]);
   const failures = useFailures();
   const unreadable = failures.byLibrary[library.id]?.unreadable ?? 0;
@@ -299,9 +300,10 @@ function LibraryLink({ library, active }: { library: Library; active: boolean })
       </span>
     );
   } else if (library.stats.file_count === 0) {
-    detail = "No files yet";
+    detail = library.stats.settling > 0 ? settlingBrief(library.stats.settling) : "No files yet";
   } else {
-    detail = `${formatPercent(finishedPercent(library.stats, unreadable))} finished`;
+    // Not "100% finished" while a file is still arriving.
+    detail = finishedText(library.stats, unreadable) ?? settlingBrief(library.stats.settling);
   }
   return (
     <a
@@ -497,7 +499,7 @@ export function PageHeader({
       )}
     >
       <div className="min-w-0">
-        <h1 className="font-display text-[2rem] leading-[1.1] text-fg md:text-[2.5rem]">{title}</h1>
+        <h1 className="font-display text-[2rem] leading-[1.12] break-words text-fg md:text-[2.5rem]">{title}</h1>
         {description ? <div className="mt-2 max-w-2xl text-sm leading-relaxed text-muted">{description}</div> : null}
         {children}
       </div>

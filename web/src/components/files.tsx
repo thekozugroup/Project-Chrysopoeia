@@ -49,13 +49,37 @@ import { useFileLive, type FileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo, TranscodeProfile } from "@/lib/types";
 import { useRetained } from "@/lib/utils";
 
-function StreamRow({ icon, title, meta, tags }: { icon: ReactNode; title: ReactNode; meta?: ReactNode; tags?: ReactNode }) {
+/**
+ * One track. The name, the codec and the channels are always shown in full;
+ * the optional title a release gave the track (often the whole release name)
+ * is a line of its own that is cut short instead, so it can never push the
+ * codec out of sight. Its full text is the tooltip.
+ */
+function StreamRow({
+  icon,
+  title,
+  meta,
+  note,
+  tags,
+}: {
+  icon: ReactNode;
+  title: ReactNode;
+  meta?: ReactNode;
+  /** The track's own title, when it has one. */
+  note?: string | null;
+  tags?: ReactNode;
+}) {
   return (
     <li className="flex gap-3 px-3.5 py-3">
       <span className="mt-0.5 text-muted [&_svg]:size-4">{icon}</span>
       <div className="min-w-0 flex-1">
         <p className="text-sm text-fg">{title}</p>
         {meta ? <p className="mt-0.5 text-[0.8125rem] leading-snug text-muted">{meta}</p> : null}
+        {note ? (
+          <p className="mt-0.5 truncate text-[0.8125rem] leading-snug text-muted" title={note}>
+            {note}
+          </p>
+        ) : null}
       </div>
       {tags ? <div className="flex shrink-0 flex-wrap items-start justify-end gap-1">{tags}</div> : null}
     </li>
@@ -90,7 +114,6 @@ function audioMeta(s: StreamInfo): string {
     .join(" · ");
 }
 
-/** "English audio", or just "Audio" when the track has no language tag. */
 /**
  * The saving shown for a converted file. The server's own figure wins: it
  * records 0 when nothing was freed (a hard-linked file, whose other links
@@ -104,10 +127,31 @@ export function doneSavings(
   return savingsText(file.original_size_bytes, output);
 }
 
-export function trackTitle(kind: "audio" | "subtitles", language: string | null, title: string | null): string {
+/** "English audio", or just "Audio" when the track has no language tag. */
+export function trackName(kind: "audio" | "subtitles", language: string | null): string {
   const known = language && language.toLowerCase() !== "und" ? languageLabel(language) : null;
-  const noun = known ? `${known} ${kind}` : kind === "audio" ? "Audio" : "Subtitles";
-  return title ? `${noun} · ${title}` : noun;
+  return known ? `${known} ${kind}` : kind === "audio" ? "Audio" : "Subtitles";
+}
+
+/** The codec in plain words: "E-AC-3", "HEVC", "PGS"; DTS says which kind ("DTS-HD MA"). */
+export function trackCodec(s: Pick<StreamInfo, "codec" | "profile">): string {
+  if (s.codec.toLowerCase() === "dts" && s.profile) return s.profile;
+  return sourceCodecLabel(s.codec);
+}
+
+/** The line under a track's name: its codec first, then what else is worth knowing. */
+export function trackDetails(s: StreamInfo): string {
+  const parts: (string | null)[] = [trackCodec(s)];
+  if (s.kind === "video") {
+    parts.push(
+      s.width && s.height ? `${s.width}×${s.height}` : null,
+      s.frame_rate ? `${Math.round(s.frame_rate * 100) / 100} frames a second` : null,
+      s.interlaced ? "interlaced" : null,
+    );
+  } else if (s.kind === "audio") {
+    parts.push(channelsLabel(s.channels, s.channel_layout));
+  }
+  return parts.filter((p): p is string => Boolean(p) && p !== "—").join(" · ");
 }
 
 /** The picture in plain words: "4K · HDR10 · 1,000 nits peak". */
@@ -125,25 +169,15 @@ function Tracks({ detail }: { detail: FileDetail }) {
   return (
     <ul className="divide-y divide-line rounded-lg border border-line">
       {video.map((s) => (
-        <StreamRow
-          key={s.index}
-          icon={<Film aria-hidden />}
-          title="Video"
-          meta={[
-            s.width && s.height ? `${s.width}×${s.height}` : null,
-            s.frame_rate ? `${Math.round(s.frame_rate * 100) / 100} frames a second` : null,
-            s.interlaced ? "interlaced" : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        />
+        <StreamRow key={s.index} icon={<Film aria-hidden />} title="Video" meta={trackDetails(s)} note={s.title} />
       ))}
       {audio.map((s) => (
         <StreamRow
           key={s.index}
           icon={<AudioLines aria-hidden />}
-          title={trackTitle("audio", s.language, s.title)}
-          meta={channelsLabel(s.channels, s.channel_layout)}
+          title={trackName("audio", s.language)}
+          meta={trackDetails(s)}
+          note={s.title}
           tags={s.is_default ? <Badge>Default</Badge> : null}
         />
       ))}
@@ -151,7 +185,9 @@ function Tracks({ detail }: { detail: FileDetail }) {
         <StreamRow
           key={s.index}
           icon={<Captions aria-hidden />}
-          title={trackTitle("subtitles", s.language, s.title)}
+          title={trackName("subtitles", s.language)}
+          meta={trackDetails(s)}
+          note={s.title}
           tags={
             <>
               {s.is_forced ? <Badge>Forced</Badge> : null}

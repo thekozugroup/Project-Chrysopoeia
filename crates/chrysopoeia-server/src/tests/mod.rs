@@ -25,4 +25,5 @@ mod startup;
 mod stuck_checks;
 mod support;
 mod unmounted_shares;
+mod user_folders;
 mod web;

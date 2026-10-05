@@ -1,5 +1,5 @@
 import type { Metadata, Viewport } from "next";
-import "@fontsource/instrument-serif/400.css";
+import "@fontsource-variable/newsreader/opsz.css";
 import "@fontsource-variable/dm-sans/wght.css";
 import "@fontsource-variable/jetbrains-mono/wght.css";
 import "./globals.css";

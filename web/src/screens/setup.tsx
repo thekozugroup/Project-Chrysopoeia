@@ -108,7 +108,7 @@ export function SetupScreen({ settings }: { settings: Settings }) {
               <StepHeading
                 level={1}
                 focusOnMount={moved}
-                className="font-display text-[2.75rem] leading-[1.05] text-fg outline-none sm:text-[3.5rem]"
+                className="font-display text-[2.75rem] leading-[1.08] text-fg outline-none sm:text-[3.5rem]"
               >
                 Make your video library smaller, safely.
               </StepHeading>

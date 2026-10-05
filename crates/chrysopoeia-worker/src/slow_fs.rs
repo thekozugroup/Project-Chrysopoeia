@@ -731,6 +731,13 @@ pub async fn mount_points() -> Option<Vec<MountPoint>> {
     Some(points_of(fresh_mounts().await?))
 }
 
+/// The mount points `/proc/self/mountinfo`'s text lists, as
+/// [`mount_points`] lists them (the one on top at each place). For tests that
+/// need the lines of a real machine.
+pub fn parse_mount_points(text: &[u8]) -> Vec<MountPoint> {
+    points_of(parse_listed(text))
+}
+
 /// The mount points of the mounts `listed`: the one on top at each place,
 /// and the shares an automounter mounted (on an `autofs` mount), which come
 /// and go by themselves and hide nothing for good.

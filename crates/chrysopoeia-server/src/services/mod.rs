@@ -11,6 +11,8 @@
 //! - [`fs_guard`]: checks on folders that may hang (network shares).
 //! - [`share_mounts`]: the drives and shares the folders in use are
 //!   mounted from, and whether they still are.
+//! - [`user_folders`]: the folders mounted into the container, which the
+//!   folder picker offers first.
 
 pub mod dispatcher;
 pub mod fs_guard;
@@ -21,4 +23,5 @@ pub mod queue;
 pub mod rescan;
 pub mod settings;
 pub mod share_mounts;
+pub mod user_folders;
 pub mod watcher;

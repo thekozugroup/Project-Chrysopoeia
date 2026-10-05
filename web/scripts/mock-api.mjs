@@ -25,6 +25,8 @@
  *   MOCK_BULK_FAILED=0      add a "Demo Bulk" library with this many files that all
  *                           failed because the work folder can't be used (more than
  *                           one 500-file page: the UI must read them all)
+ *   MOCK_FS=container       "plain" lists "/" without the container's own folders and
+ *                           sends no `user_folders`, like a server outside Docker
  *
  * Error codes, messages and the `field` of validation errors follow the
  * real server (crates/chrysopoeia-server), so the UI's error handling is
@@ -87,6 +89,7 @@ const ENV_MAX_JOBS = Number(process.env.MOCK_MAX_JOBS ?? 0) || null;
 const HOST_DENY = process.env.MOCK_HOST === "deny";
 const SETTLE_MS = Number(process.env.MOCK_SETTLE_MS ?? 60_000);
 const BULK_FAILED = Number(process.env.MOCK_BULK_FAILED ?? 0);
+const PLAIN_FS = process.env.MOCK_FS === "plain";
 const FORCE = process.env.MOCK_FORCE ?? "on";
 /** The worker's sentence for a file with other hard links (SHARED_ORIGINAL), left alone when originals are replaced. */
 const HARD_LINK_SKIP =
@@ -331,8 +334,24 @@ const presets = {
 // ---------------------------------------------------------------------------
 
 const BROWSE_ROOTS = ["/"];
+/**
+ * What the server's mount list says was given to the container (Unraid
+ * paths): `user_folders` in the browse answer. The data folder can't be a
+ * library, which is said with `library_blocked`.
+ */
+const USER_FOLDERS = ["/config", "/media", "/output", "/temp"];
+/** The container's own folders: `system: true` on their entries. */
+const SYSTEM_FOLDERS = ["app", "bin", "boot", "dev", "etc", "lib", "lib64", "proc", "root", "run", "sbin", "sys", "usr", "var"];
 const FS = {
-  "/": ["config", "media", "mnt", "temp"],
+  "/": PLAIN_FS
+    ? ["config", "media", "mnt", "temp"]
+    : [...SYSTEM_FOLDERS, "config", "home", "media", "mnt", "opt", "output", "srv", "temp", "tmp"].sort(),
+  ...Object.fromEntries(SYSTEM_FOLDERS.map((name) => [`/${name}`, []])),
+  "/home": [],
+  "/opt": [],
+  "/srv": [],
+  "/tmp": [],
+  "/output": [],
   "/config": [],
   "/temp": [],
   "/mnt": ["user"],
@@ -431,8 +450,13 @@ function addActivity(level, message, extra = {}) {
   return entry;
 }
 
+/** A release name some groups write into every track's title. */
+const RELEASE_TITLE = "Demo.Movie.2017.2160p.UHD.BluRay.x265.10bit.HDR.DTS-HD.MA.7.1-DEMOGROUP";
+
 function makeProbe(file) {
   const [w, h] = RESOLUTIONS[file.resolution] ?? [1920, 1080];
+  // Some files carry their release name as the title of the tracks.
+  const released = file.relative_path.includes("Sintel") || file.relative_path.includes("Demo Show");
   const streams = [
     {
       index: 0, kind: "video", codec: file.video_codec, profile: file.video_codec === "hevc" ? "Main 10" : "High", language: null, title: null,
@@ -453,10 +477,11 @@ function makeProbe(file) {
       ...(file.dvNoBaseLayer ? { dolby_vision_without_base_layer: true } : {}),
     },
     {
-      index: 1, kind: "audio", codec: file.audio_codec, profile: null, language: "eng", title: "English 5.1", is_default: true,
+      index: 1, kind: "audio", codec: released ? "dts" : file.audio_codec, profile: released ? "DTS-HD MA" : null, language: "eng",
+      title: released ? RELEASE_TITLE : "English 5.1", is_default: true,
       is_forced: false, is_attached_pic: false, bit_rate: 640000, width: null, height: null, pix_fmt: null, bit_depth: null,
       frame_rate: null, color_primaries: null, color_transfer: null, color_space: null, color_range: null, hdr: null,
-      interlaced: false, channels: 6, channel_layout: "5.1(side)", sample_rate: 48000,
+      interlaced: false, channels: released ? 8 : 6, channel_layout: released ? "7.1" : "5.1(side)", sample_rate: 48000,
     },
   ];
   if (file.relative_path.includes("Sintel") || file.relative_path.includes("Demo Show")) {
@@ -467,7 +492,7 @@ function makeProbe(file) {
       interlaced: false, channels: 2, channel_layout: "stereo", sample_rate: 48000,
     });
     streams.push({
-      index: 3, kind: "subtitle", codec: "subrip", profile: null, language: "eng", title: null, is_default: false,
+      index: 3, kind: "subtitle", codec: "hdmv_pgs_subtitle", profile: null, language: "eng", title: RELEASE_TITLE, is_default: false,
       is_forced: false, is_attached_pic: false, bit_rate: null, width: null, height: null, pix_fmt: null, bit_depth: null,
       frame_rate: null, color_primaries: null, color_transfer: null, color_space: null, color_range: null, hdr: null,
       interlaced: false, channels: null, channel_layout: null, sample_rate: null,
@@ -2144,12 +2169,21 @@ route("GET", "/api/fs/browse", (_p, q) => {
     roots: BROWSE_ROOTS,
     entries: FS[path].map((name) => {
       const full = path === "/" ? `/${name}` : `${path}/${name}`;
-      return { name, path: full, is_dir: true, ...mediaCount(full) };
+      const system = !PLAIN_FS && (full === `/${name}` ? SYSTEM_FOLDERS.includes(name) : false);
+      return { name, path: full, is_dir: true, ...mediaCount(full), ...(system ? { system: true } : {}) };
     }),
     // Round 4: the browsed folder's own count, by the same rules.
     ...mediaCount(path),
     // The picker disables "Use" for a library's folder with this.
     ...(libraryBlocked(path) ? { library_blocked: libraryBlocked(path) } : {}),
+    // The folders mounted into the container, offered first (none outside Docker).
+    user_folders: PLAIN_FS
+      ? []
+      : USER_FOLDERS.map((folder) => ({
+          name: folder.slice(1),
+          path: folder,
+          ...(libraryBlocked(folder) ? { library_blocked: libraryBlocked(folder) } : {}),
+        })),
   };
 });
 

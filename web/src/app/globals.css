@@ -38,13 +38,13 @@
   /*
    * UI type scale: 15px for everything people read (text-sm), 13px for
    * secondary lines, 12px (text-xs) only for tabular meta and timestamps.
-   * Display sizes (Instrument Serif) are set where they're used.
+   * Display sizes (Newsreader) are set where they're used.
    */
   --text-sm: 0.9375rem;
   --text-sm--line-height: 1.4;
 
   --font-sans: "DM Sans Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-display: "Instrument Serif", ui-serif, Georgia, "Times New Roman", serif;
+  --font-display: "Newsreader Variable", ui-serif, Georgia, "Times New Roman", serif;
   --font-mono: "JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
   --radius-sm: 6px;
@@ -224,10 +224,24 @@
   font-variant-numeric: tabular-nums;
 }
 
+/*
+ * Display type is Newsreader, whose optical-size axis follows the font size
+ * on its own: big sizes are drawn tighter and finer, small ones sturdier, so
+ * letters get no extra negative tracking on top (a size may set its own),
+ * and word spaces get a little air back.
+ * Light text on a dark surface looks thinner than it is, so dark mode takes
+ * a little more weight.
+ */
 @utility font-display {
   font-family: var(--font-display);
   font-weight: 400;
-  letter-spacing: -0.01em;
+  font-optical-sizing: auto;
+  letter-spacing: 0;
+  /* The display cut sets word spaces tight ("your videos" nearly runs together). */
+  word-spacing: 0.05em;
+  :where(.dark) & {
+    font-weight: 430;
+  }
 }
 
 /* Visually hidden but read by screen readers. */
