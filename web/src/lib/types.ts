@@ -235,6 +235,12 @@ export interface ProbeInfo {
   size_bytes: number;
   start_time: number | null;
   chapters: number;
+  /**
+   * Matroska statistics tags stored for the whole file rather than a track
+   * (`DURATION-eng`, …); a conversion to MKV or WebM removes them. Only sent
+   * when there are some.
+   */
+  statistics_tags?: string[];
   streams: StreamInfo[];
 }
 

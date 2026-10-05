@@ -145,6 +145,12 @@ pub fn walk_library(root: &Path, opts: &ScanOptions) -> anyhow::Result<WalkResul
 }
 
 /// Probe one file with ffprobe. Kills ffprobe after `timeout`.
+///
+/// Beyond [`parse_ffprobe_json`], a length the file states that can't be
+/// taken as it is (only Matroska `DURATION` tags, or a Matroska file whose
+/// timestamps don't start at zero) is checked against where its packets
+/// end, and an HDR10 video's first frames are read for HDR10+ and
+/// mastering metadata.
 pub async fn probe_file(
     ffprobe: &Path,
     path: &Path,
@@ -154,7 +160,11 @@ pub async fn probe_file(
 }
 
 /// Parse `ffprobe -print_format json -show_format -show_streams -show_chapters`
-/// output. `size_bytes` is the file size from the filesystem.
+/// output. `size_bytes` is the file size from the filesystem. The length is
+/// the container's, else ffprobe's stream durations, else the `DURATION`
+/// tags, as the file states them ([`probe_file`] checks a length from tags
+/// alone, and one of a Matroska file that doesn't start at zero, against
+/// the packets).
 pub fn parse_ffprobe_json(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeError> {
     probe::parse(json, size_bytes)
 }

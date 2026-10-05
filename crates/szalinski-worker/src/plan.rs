@@ -569,9 +569,18 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
             );
         for (spec, source) in kept {
             if let Some(source) = source {
-                args.extend(clear_statistics_tags(&spec, source));
+                args.extend(clear_statistics_tags(
+                    &format!("-metadata:s:{spec}"),
+                    &source.statistics_tags,
+                ));
             }
         }
+        // And those stored for the whole file (an MP4's `DURATION-eng`
+        // copied into its global tags); the title and the rest stay.
+        args.extend(clear_statistics_tags(
+            "-metadata",
+            &req.probe.statistics_tags,
+        ));
     }
 
     args.extend(video_output_args);
@@ -2421,22 +2430,25 @@ fn is_matroska(container: Container) -> bool {
 
 /// Remove the Matroska statistics tags (`BPS`, `DURATION`,
 /// `NUMBER_OF_FRAMES`, `NUMBER_OF_BYTES`, `_STATISTICS_*`, plain or
-/// localized such as `DURATION-eng`) that `source`, a kept track of the
-/// original, has. ffmpeg copies a track's tags into the new file whether it
-/// copies or re-encodes the track, but they describe the old track: a clip
-/// cut from a film keeps the film's `DURATION-eng`, and players such as
-/// Jellyfin read a stale `BPS` as the new bitrate. ffmpeg's MKV writer adds
-/// its own `DURATION` for the new track. `spec` is the output stream
-/// specifier, like `v:0`, `a:1` or `s:0`; an empty value removes
-/// the tag and leaves every other one (title, language, ...) alone.
-fn clear_statistics_tags(spec: &str, source: &StreamInfo) -> Vec<String> {
+/// localized such as `DURATION-eng`) named in `keys`: a kept track's
+/// (`StreamInfo::statistics_tags`) or the whole original's
+/// (`ProbeInfo::statistics_tags`). ffmpeg copies a track's tags into the
+/// new file whether it copies or re-encodes the track, and `-map_metadata`
+/// copies the file's, but they describe the old file: a clip cut from a
+/// film keeps the film's `DURATION-eng`, and players such as Jellyfin read
+/// a stale `BPS` as the new bitrate. ffmpeg's MKV writer adds its own
+/// `DURATION` for each new track. `option` is `-metadata:s:<spec>` for an
+/// output track (`v:0`, `a:1`, `s:0`) or `-metadata` for the file; an empty
+/// value removes the tag and leaves every other one (title, language, ...)
+/// alone.
+fn clear_statistics_tags(option: &str, keys: &[String]) -> Vec<String> {
     let mut args = Vec::new();
-    for key in &source.statistics_tags {
+    for key in keys {
         // A name with `=` or a line break can't be written as `KEY=`.
         if key.is_empty() || key.contains(['=', '\n', '\r']) || !is_statistics_tag(key) {
             continue;
         }
-        args.push(format!("-metadata:s:{spec}"));
+        args.push(option.to_string());
         args.push(format!("{key}="));
     }
     args
