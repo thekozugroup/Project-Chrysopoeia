@@ -325,7 +325,7 @@ published as `ghcr.io/thekozugroup/chrysopoeia` for a while. Switch to the new
 name when convenient:
 
 1. Back up the Config folder first (see [Backing up](#backing-up)). The new
-   version updates the database, and an older version can't read it
+   version renames and updates the database, so Chrysopoeia can't use it
    afterwards.
 2. On the **Docker** tab, click the Chrysopoeia icon, then **Edit**.
 3. Change **Repository** from `ghcr.io/thekozugroup/chrysopoeia:<tag>` to
@@ -336,13 +336,20 @@ name when convenient:
    limits as they are: the Config path can stay
    `/mnt/user/appdata/chrysopoeia`.
 4. Click **Apply**. On the first start the database in the Config folder is
-   renamed from `chrysopoeia.db` to `szalinski.db`; libraries, settings and
-   history carry over. A conversion that was interrupted under the old name is
-   finished or undone as usual.
+   renamed from `chrysopoeia.db` to `szalinski.db` (the log says *carried over
+   the database of Chrysopoeia*); libraries, settings and history carry over.
+   A conversion that was interrupted under the old name is finished or undone
+   as usual.
 
 Never start the old and the new image on the same Config folder at the same
-time: whichever starts second refuses to. To go back to Chrysopoeia, restore
-the backup from step 1 with the container stopped.
+time: whichever starts second refuses to (*already using the data folder* in
+its log) and changes nothing. To go back to Chrysopoeia, restore the backup
+from step 1 with the container stopped. Chrysopoeia started on the folder
+afterwards without the backup finds no `chrysopoeia.db` and starts empty, like
+a new install, with the first-run screens and no libraries, settings or
+history. It leaves `szalinski.db` alone, so nothing is lost: Szalinski started
+on the folder again carries on with everything it had (the new, empty
+`chrysopoeia.db` can then be deleted).
 
 ### Switching an existing install from :latest to :stable
 

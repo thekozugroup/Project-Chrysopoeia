@@ -47,7 +47,9 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
   build label variable `SZALINSKI_VERSION`. An existing install keeps working:
   the database (`chrysopoeia.db`) is carried over to `szalinski.db` on the
   first start, backup and temporary files left by the old name are still found
-  and put back after an interrupted conversion, and the old image's lock is
+  and put back after an interrupted conversion, the container treats the old
+  database and lock as its own (no warning about a shared Config folder, and
+  their owner is fixed like the new files'), and the old image's lock is
   honoured so the two can never share a `/config` folder. Every release is
   also published under the old image name for a while, so an install that
   still pulls `ghcr.io/thekozugroup/chrysopoeia` keeps updating; switch its
