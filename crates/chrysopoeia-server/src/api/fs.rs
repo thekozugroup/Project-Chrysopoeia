@@ -12,12 +12,15 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use chrysopoeia_worker::slow_fs::{self, MountPoint};
 use serde::{Deserialize, Serialize};
 
 use super::extract::ApiQuery;
 use crate::error::{ApiError, ApiResult};
 use crate::services::fs_guard;
+use crate::services::hardware::in_container;
 use crate::services::library_admin::{OwnFolders, library_folder_refusal};
+use crate::services::user_folders::{SystemFolders, UserFolder, user_folders};
 use crate::state::AppState;
 use crate::toolkit::Toolkit;
 
@@ -55,6 +58,11 @@ pub struct BrowseEntry {
     /// (depth, entries or time), so the folder holds at least that many.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media_count_capped: Option<bool>,
+    /// One of the container's own folders (`/bin`, `/etc`, `/proc`, `/usr`,
+    /// the app), which the picker sets apart from folders someone gave it.
+    /// Only said in a container (see [`BrowseResponse::user_folders`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub system: bool,
 }
 
 /// Response of `GET /api/fs/browse`.
@@ -80,6 +88,12 @@ pub struct BrowseResponse {
     /// library whatever the picker does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub library_blocked: Option<String>,
+    /// The folders mounted into the container (Docker bind mounts, Unraid
+    /// paths), which the picker offers first: from `/proc/self/mountinfo`,
+    /// without touching any share, inside the browse roots, the container's
+    /// own system folders left out (see [`crate::services::user_folders`]).
+    /// Empty outside a container, where the picker lists folders as usual.
+    pub user_folders: Vec<UserFolder>,
 }
 
 fn outside_roots() -> ApiError {
@@ -207,7 +221,12 @@ struct Listing {
 
 /// List the visible, readable subfolders of `dir`, counting the video files
 /// in each and, from those, in `dir` itself.
-fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Result<Listing> {
+fn list_dirs(
+    dir: &Path,
+    roots: &[PathBuf],
+    toolkit: &Toolkit,
+    system: Option<&SystemFolders>,
+) -> std::io::Result<Listing> {
     let mut out = Vec::new();
     let mut counting = true;
     let started = Instant::now();
@@ -228,11 +247,16 @@ fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Resul
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        // Where a link leads (`/bin` is a link to `/usr/bin` in most images).
+        let target = if file_type.is_symlink() {
+            std::fs::canonicalize(&path).ok()
+        } else {
+            None
+        };
         let is_dir = if file_type.is_symlink() {
-            match std::fs::canonicalize(&path) {
-                Ok(target) => within(&target, roots) && target.is_dir(),
-                Err(_) => false,
-            }
+            target
+                .as_deref()
+                .is_some_and(|t| within(t, roots) && t.is_dir())
         } else {
             file_type.is_dir()
         };
@@ -273,12 +297,15 @@ fn list_dirs(dir: &Path, roots: &[PathBuf], toolkit: &Toolkit) -> std::io::Resul
                 None => c.capped = true,
             }
         }
+        let is_system = system
+            .is_some_and(|s| s.contains(&path) || target.as_deref().is_some_and(|t| s.contains(t)));
         out.push(BrowseEntry {
             name,
             path: path_str.to_string(),
             is_dir: true,
             media_count: counted.map(|c| c.videos),
             media_count_capped: counted.map(|c| c.capped),
+            system: is_system,
         });
     }
     out.sort_by(|a, b| {
@@ -324,8 +351,22 @@ pub async fn browse(
     let data_dir = state.config.data_dir.clone();
     let web_dir = state.config.web_dir.clone();
     let toolkit = state.toolkit.clone();
+    // What is mounted into the container (a local list, read without
+    // touching any share); `None` outside one: folders are listed as usual.
+    let mounts = if in_container_now() {
+        slow_fs::mount_points().await
+    } else {
+        None
+    };
     let listed = fs_guard::guarded("browse", &key, BROWSE_TIMEOUT, move || {
-        browse_blocking(requested, &config_roots, &toolkit, &data_dir, &web_dir)
+        browse_blocking(
+            requested,
+            &config_roots,
+            &toolkit,
+            &data_dir,
+            &web_dir,
+            mounts.as_deref(),
+        )
     })
     .await;
     match listed {
@@ -346,13 +387,21 @@ pub async fn browse(
     }
 }
 
-/// [`browse`]'s work, with blocking calls.
+/// Whether the picker splits the container's own folders from the ones it
+/// was given. Only in a container (tests stand in for one).
+fn in_container_now() -> bool {
+    cfg!(test) || in_container()
+}
+
+/// [`browse`]'s work, with blocking calls. `mounts`: what is mounted into
+/// the container, when that is known (see [`BrowseResponse::user_folders`]).
 fn browse_blocking(
     requested: Option<PathBuf>,
     config_roots: &[PathBuf],
     toolkit: &Toolkit,
     data_dir: &Path,
     web_dir: &Path,
+    mounts: Option<&[MountPoint]>,
 ) -> ApiResult<BrowseResponse> {
     let roots = canonical_roots(config_roots);
     let Some(first_root) = roots.first().cloned() else {
@@ -399,15 +448,23 @@ fn browse_blocking(
         .filter(|p| within(p, &roots))
         .and_then(|p| p.to_str())
         .map(str::to_string);
-    let Listing { entries, own } = list_dirs(&canonical, &roots, toolkit).map_err(|_| {
-        ApiError::bad_request(
-            "not_readable",
-            "Chrysopoeia can't read that folder. Check its permissions (in Docker, the \
+    let own_folders = OwnFolders::resolve(data_dir, web_dir);
+    let system = mounts.map(|_| SystemFolders::new(&own_folders));
+    let Listing { entries, own } = list_dirs(&canonical, &roots, toolkit, system.as_ref())
+        .map_err(|_| {
+            ApiError::bad_request(
+                "not_readable",
+                "Chrysopoeia can't read that folder. Check its permissions (in Docker, the \
              PUID/PGID user needs read access).",
-        )
-    })?;
-    let library_blocked =
-        library_folder_refusal(&canonical, &OwnFolders::resolve(data_dir, web_dir));
+            )
+        })?;
+    let library_blocked = library_folder_refusal(&canonical, &own_folders);
+    let user_folders = match (mounts, system.as_ref()) {
+        (Some(mounts), Some(system)) => user_folders(mounts, system, &own_folders, |p| {
+            within(p, &roots) || within(p, config_roots)
+        }),
+        _ => Vec::new(),
+    };
     Ok(BrowseResponse {
         path: canonical.to_string_lossy().into_owned(),
         parent,
@@ -419,6 +476,7 @@ fn browse_blocking(
         media_count: own.map(|c| c.videos),
         media_count_capped: own.map(|c| c.capped),
         library_blocked,
+        user_folders,
     })
 }
 
@@ -502,7 +560,7 @@ mod tests {
             "ffprobe",
         ))));
         let roots = [root.canonicalize().unwrap()];
-        let listing = list_dirs(&roots[0], &roots, &toolkit).unwrap();
+        let listing = list_dirs(&roots[0], &roots, &toolkit, None).unwrap();
         let count_of = |name: &str| {
             listing
                 .entries
@@ -523,13 +581,67 @@ mod tests {
         }
 
         // A small folder: exact.
-        let listing = list_dirs(&roots[0].join("lib"), &roots, &toolkit).unwrap();
+        let listing = list_dirs(&roots[0].join("lib"), &roots, &toolkit, None).unwrap();
         assert_eq!(
             listing.own,
             Some(VideoCount {
                 videos: 2,
                 capped: false
             })
+        );
+    }
+
+    /// Without a list of mounts (outside a container) folders are listed as
+    /// they always were: no "your folders", no system folders.
+    #[test]
+    fn without_a_list_of_mounts_nothing_is_split_off() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("usr/lib")).unwrap();
+        std::fs::create_dir_all(root.join("media")).unwrap();
+        let toolkit = Toolkit::new(Arc::new(crate::toolkit::RealToolkit::new(PathBuf::from(
+            "ffprobe",
+        ))));
+        let roots = [root.clone()];
+        let data = root.join("data");
+        let web = root.join("web");
+        let listed =
+            browse_blocking(Some(root.clone()), &roots, &toolkit, &data, &web, None).unwrap();
+        assert!(listed.user_folders.is_empty());
+        assert!(
+            listed.entries.iter().all(|e| !e.system),
+            "{:?}",
+            listed.entries
+        );
+        let json = serde_json::to_value(&listed.entries).unwrap();
+        assert!(!json.to_string().contains("\"system\""), "{json}");
+
+        // With one, the same listing says which folders are the system's.
+        let mounts = [chrysopoeia_worker::slow_fs::parse_mount_points(
+            format!(
+                "30 1 0:1 / {} rw - ext4 /dev/sda1 rw\n",
+                root.join("media").display()
+            )
+            .as_bytes(),
+        )]
+        .concat();
+        let listed = browse_blocking(
+            Some(root.clone()),
+            &roots,
+            &toolkit,
+            &data,
+            &web,
+            Some(&mounts),
+        )
+        .unwrap();
+        assert_eq!(listed.user_folders.len(), 1);
+        assert_eq!(listed.user_folders[0].name, "media");
+        // Not under /usr, so not a system folder, though it is named like one.
+        assert!(
+            listed.entries.iter().all(|e| !e.system),
+            "{:?}",
+            listed.entries
         );
     }
 

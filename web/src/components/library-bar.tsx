@@ -12,7 +12,7 @@
  * either. Every segment is also said in words.
  */
 
-import { formatCount, percentOf } from "@/lib/format";
+import { formatCount, formatPercent, percentOf } from "@/lib/format";
 import type { LibraryStats } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -59,6 +59,30 @@ export function countedFiles(stats: LibraryStats, unreadable = 0): number {
  */
 export function finishedPercent(stats: LibraryStats, unreadable = 0): number {
   return percentOf(stats.done + stats.skipped, countedFiles(stats, unreadable));
+}
+
+/**
+ * Whether more of the library is on its way: files still being copied in
+ * (`LibraryStats.settling`, added once they stop changing) or a scan that is
+ * still looking. The files counted so far can all be finished while that
+ * is so, but the library isn't.
+ */
+export function isWaiting(stats: Pick<LibraryStats, "settling">, scanning = false): boolean {
+  return stats.settling > 0 || scanning;
+}
+
+/**
+ * "60% finished" for the sidebar and the overview, or `null` when it would
+ * say too much: a library whose known files are all finished still has
+ * files on their way while `isWaiting`, so it isn't "100% finished" (the
+ * caller says what it waits for, see `settlingText`). Rounds down, so one
+ * file left of 300 is "99%", never "100%".
+ */
+export function finishedText(stats: LibraryStats, unreadable = 0, scanning = false): string | null {
+  const percent = finishedPercent(stats, unreadable);
+  const all = percent >= 100;
+  if (all && isWaiting(stats, scanning)) return null;
+  return `${formatPercent(all ? 100 : Math.min(99, Math.floor(percent)))} finished`;
 }
 
 /** Files still waiting for work. */

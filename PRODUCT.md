@@ -63,7 +63,7 @@ against the source) before anything is replaced.
 ## Brand Commitments
 
 - Name: Chrysopoeia (alchemical transmutation into gold). Existing identity:
-  warm near-black surfaces, gold accent, Instrument Serif display type with DM
+  warm near-black surfaces, gold accent, Newsreader display type with DM
   Sans for UI and JetBrains Mono for technical values. Keep this identity.
 - Voice: calm, precise, plain. Never cute about failures; never jargon first.
 

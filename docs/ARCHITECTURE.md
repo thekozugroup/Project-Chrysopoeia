@@ -288,6 +288,29 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   it's back". It is forgotten once its folder has files without being a
   mount. (When the folder doesn't answer, every known mount counts as
   offline.)
+- "Your folders" in the folder picker (`services::user_folders`,
+  `GET /fs/browse`). In a container (`/.dockerenv` or
+  `/run/.containerenv`) the folders a person gave it (Unraid paths, Docker
+  mounts) are what they look for; the rest of `/` is the container's own
+  system. `user_folders` is read from `/proc/self/mountinfo` through
+  `slow_fs::mount_points` (a local list, no share is touched, no folder
+  is looked at): the mount points that are not `/`, not in `/proc`, `/sys`,
+  `/dev`, `/run`, `/etc`, `/usr`, `/bin`, `/sbin`, `/lib*`, `/lost+found`, `/var`, `/boot`,
+  `/root` or `/app`, not the web UI's folder, not a pseudo filesystem
+  (`proc`, `sysfs`, `devpts`, `cgroup2`, `mqueue`, ...) wherever mounted,
+  and inside the browse roots (the picker would refuse the rest). Of a
+  mount and the ones inside it only the outer one is listed, sorted by
+  path. A `tmpfs` someone mounted for work files counts. The settings
+  folder (`/config`) is listed with `library_blocked` (the same sentence
+  as for browsing it), so the picker leaves it out while a library's
+  folder is chosen and offers it for the other folders. Outside a container
+  (a desktop's disks are all "yours") `user_folders` is `[]` and no entry
+  is marked `system`: folders are listed as they always were. The picker
+  shows the folders as quick choices on top, lists them first at `/`
+  (then the other folders, then the system folders folded under "System
+  folders"), keeps "Type a path" and the reasons a folder can't be a
+  library, and keeps a way to the whole server (`All folders`) when the
+  roots are more than these folders.
 - Drives and shares the folders sit on (`services::share_mounts`). An
   unmounted share leaves its mount point behind as an ordinary folder on
   the disk below: empty, or holding whatever was there before the share
@@ -1158,7 +1181,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `GET /hardware` | | `HardwareInfo` (`detecting: true` placeholder until the first detection ends) |
 | `POST /hardware/detect` | | `HardwareInfo` (re-runs detection, ~seconds) |
 | `GET /presets` | | `{"goals": [{"goal","title","summary","profile"}]` (`summary`: a plain one-line outcome, no codec names or speed claims; kept for compatibility, the UI has its own copy), "video_codecs": [{"codec","label","royalty_free","hw_accelerated", "encoders": [verified names]}], "audio_codecs": [{"codec","label"}], "containers": [{"container","label","video": [...], "audio": [...]}]}` — only codecs with a verified encoder (a listed CPU encoder when detection failed) and audio codecs whose encoder ffmpeg has (plus `copy`); everything while detection runs |
-| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots`, 503 `not_responding` (the folder didn't answer within 10 s, or its share already has as many stuck checks as it may) / `busy` (too many checks of other shares are stuck: try again) |
+| `GET /fs/browse` | `path` (default: first browse root) | `{"path","parent": string\|null,"roots": [string],"media_count"?: n,"media_count_capped"?: bool,"library_blocked"?: string,"user_folders": [{"name","path","library_blocked"?: string}],"entries":[{"name","path","is_dir":true,"media_count"?: n,"media_count_capped"?: bool,"system"?: true}]}` directories only, sorted, hidden dirs and links out of the roots excluded. `media_count`: video files (not audio-only ones) in the folder and up to 4 levels below, hidden entries skipped, links to folders not followed; counting stops after 2 000 entries or ~150 ms per folder (`media_count_capped: true`, "at least n"), and after ~2 s per listing, or 300 folders, later folders get no count. The top-level pair is the browsed folder itself, so the picker can say what choosing it brings: its own video files plus the entries' counts (linked folders left out, as a scan doesn't follow them), capped when any entry is capped or has no count, so it is never lower than a subfolder's; left out when a file can't be checked. `library_blocked`: why this folder can't be a library (the `folder_not_allowed` sentence), left out when it can; the picker shows it and disables "Use" while a library's folder is chosen, and stays free for the output and work folders. `user_folders`: the folders mounted into the container (Docker bind mounts, the paths of an Unraid template), the ones the picker offers first (see "Your folders" below); always present, empty outside a container. `system: true` on an entry marks one of the container's own folders (`/bin`, `/etc`, `/proc`, `/usr`, the app, links into them such as `/bin`); sent only in a container. 400 `path_not_absolute`/`not_a_directory`/`not_readable`, 403 `outside_roots`, 404 `path_not_found`/`no_browse_roots`, 503 `not_responding` (the folder didn't answer within 10 s, or its share already has as many stuck checks as it may) / `busy` (too many checks of other shares are stuck: try again) |
 | `GET /activity` | `limit` (≤500, default 100), `before` (id) | `{"items": ActivityEntry[]}` newest first (`problem` on entries about a failed file) |
 | `GET /ws` | WebSocket | `Event` JSON messages (see `core::event`) |
 
@@ -1299,6 +1322,15 @@ Navigation: a sidebar on wide screens (Overview, Queue, each library, "Add
 library", Settings; appearance switch), a bottom tab bar on phones
 (Overview, Queue, Libraries, Settings). The queue link shows what is
 running. Details of a job or file open in a sheet over the current screen.
+A file's sheet lists its tracks with the language, codec and channels always
+in full; the optional title a release gave a track (often the whole release
+name) is a line of its own that is cut short, with the full text as its
+tooltip, so it never hides the codec.
+
+Typography: display type (page titles, the big savings number, the brand)
+is Newsreader, self-hosted (`@fontsource-variable/newsreader`, with its
+optical-size axis, which follows the font size on its own), DM Sans for the
+interface and JetBrains Mono for technical values.
 
 Screens:
 1. **Setup** (first run, when `settings.onboarded` is false and there are no
@@ -1316,7 +1348,11 @@ Screens:
    reached, failed files grouped by `problem` with the fix for each);
    **Converting now** (live cards per running job: file, stage, progress,
    speed, time left, where it runs); **Libraries** (each library's
-   progress, and "Add library"); the latest finished results. No codec
+   progress, and "Add library"; a library is never "100% finished" or
+   "Everything is finished" while files are still being copied in
+   (`LibraryStats.settling`) or it is being scanned: it says "Waiting for N
+   files to finish copying" instead, as do the sidebar and the library page,
+   which says "N of M files finished so far"); the latest finished results. No codec
    breakdown and no activity feed. Without libraries it shows the welcome
    and "Choose a folder".
 3. **Queue**: tabs **Running** / **Up next** / **History** with counts.

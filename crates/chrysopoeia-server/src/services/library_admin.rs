@@ -79,6 +79,13 @@ impl OwnFolders {
     }
 }
 
+impl OwnFolders {
+    /// The folders of the app itself: the web UI and the image's app folder.
+    pub fn app_folders(&self) -> [&Path; 2] {
+        [&self.web, &self.image_app]
+    }
+}
+
 /// Why a folder (already resolved to its real path) can't be a library, in
 /// a sentence for the user, or `None` when it can. A library is scanned and
 /// its files are replaced, so these are refused: the whole server (`/`),

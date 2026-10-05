@@ -278,3 +278,8 @@ export function nothingToConvertText(plan: LeftOut): string {
 export function settlingText(copying: number): string {
   return `Waiting for ${plural(copying, "file")} to finish copying`;
 }
+
+/** The short form of `settlingText`, for the narrow sidebar: "Waiting for 3 files". */
+export function settlingBrief(copying: number): string {
+  return `Waiting for ${plural(copying, "file")}`;
+}

@@ -41,6 +41,7 @@ MOCK_MAX_JOBS=2 pnpm mock        # the job limit comes from the container's MAX_
 MOCK_HOST=deny pnpm mock         # every request answers 403 host_not_allowed
 MOCK_SETTLE_MS=0 pnpm mock       # files still being copied never settle (default: after 60 s)
 MOCK_FORCE=off pnpm mock         # ignores "Convert anyway", like a server older than it
+MOCK_FS=plain pnpm mock          # a server outside Docker: the folder picker has no "Your folders"
 NEXT_PUBLIC_API_URL=http://localhost:8787 pnpm dev
 ```
 
