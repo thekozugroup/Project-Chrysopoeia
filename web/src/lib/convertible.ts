@@ -1,6 +1,6 @@
 /**
  * Whether queueing a file would actually convert it. The worker decides
- * again when a job starts (`decide` in crates/chrysopoeia-worker/src/plan.rs)
+ * again when a job starts (`decide` in crates/szalinski-worker/src/plan.rs)
  * and skips files the library's settings leave alone, so the UI must not
  * offer "Convert" for them: the file would be skipped at once and the user
  * told it worked. These helpers mirror the worker's rules as far as a file's

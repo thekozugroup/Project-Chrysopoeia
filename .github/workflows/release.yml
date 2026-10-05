@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes ghcr.io/<owner>/chrysopoeia for linux/amd64 and linux/arm64.
+# Publishes ghcr.io/<owner>/szalinski for linux/amd64 and linux/arm64.
 #
 # Update channels: what an installed container follows depends on its tag.
 #   :stable      the newest non-prerelease version tag (vX.Y.Z), compared by
@@ -53,7 +53,7 @@ name: Release
 #
 # The first image ever published, including a first :edge from a manual run on
 # a branch, creates the package as private. Make it public once (GitHub ->
-# Packages -> chrysopoeia -> Package settings -> Change visibility) so Unraid
+# Packages -> szalinski -> Package settings -> Change visibility) so Unraid
 # and Docker can pull it without logging in. The run's summary repeats this.
 
 on:
@@ -98,14 +98,18 @@ jobs:
         id: registry
         # Registry paths must be lowercase.
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chrysopoeia"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/szalinski"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
           echo "name=$image" >> "$GITHUB_OUTPUT"
+          # The image's name before the rename from Chrysopoeia. Every tag is
+          # copied there too for a while, so installs that still pull it keep
+          # getting updates until their template is switched to the new name.
+          echo "LEGACY_IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chrysopoeia" >> "$GITHUB_ENV"
 
       - name: Channel and version
         # kind is "release" for a version tag (v1.2.3, v1.2.0-rc.1) and
         # "build" for everything else. The image version is shown in the first
-        # line of the container log ("Chrysopoeia 0.2.0 (build main-1a2b3c4)")
+        # line of the container log ("Szalinski 0.3.0 (build main-1a2b3c4)")
         # and in the OCI version label. Tags: v1.2.3 -> 1.2.3. Branches:
         # <branch>-<short sha>, so a bug report from a :latest image names the
         # exact commit. The server itself (API, "is running" log line) reports
@@ -175,12 +179,12 @@ jobs:
           # The version label overrides metadata-action's default, which is
           # "latest" for builds from main.
           labels: |
-            org.opencontainers.image.title=Chrysopoeia
+            org.opencontainers.image.title=Szalinski
             org.opencontainers.image.description=Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original.
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.version=${{ steps.channel.outputs.version }}
           annotations: |
-            org.opencontainers.image.title=Chrysopoeia
+            org.opencontainers.image.title=Szalinski
             org.opencontainers.image.description=Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original.
             org.opencontainers.image.licenses=Apache-2.0
             org.opencontainers.image.version=${{ steps.channel.outputs.version }}
@@ -191,7 +195,7 @@ jobs:
           context: .
           platforms: linux/amd64
           load: true
-          tags: chrysopoeia:release-test
+          tags: szalinski:release-test
           build-args: |
             VERSION=${{ steps.channel.outputs.version }}
             REVISION=${{ github.sha }}
@@ -202,10 +206,10 @@ jobs:
           cache-to: type=gha,mode=max,scope=amd64
 
       - name: Entrypoint tests
-        run: docker/test-entrypoint.sh chrysopoeia:release-test
+        run: docker/test-entrypoint.sh szalinski:release-test
 
       - name: End-to-end smoke test (API)
-        run: scripts/e2e-smoke.sh chrysopoeia:release-test
+        run: scripts/e2e-smoke.sh szalinski:release-test
 
       - name: Install Playwright and Chromium
         run: |
@@ -213,7 +217,7 @@ jobs:
           playwright install --with-deps chromium
 
       - name: End-to-end smoke test (first run in a browser)
-        run: scripts/e2e-browser.sh chrysopoeia:release-test
+        run: scripts/e2e-browser.sh szalinski:release-test
 
       - name: Build and push linux/amd64 + linux/arm64
         id: push
@@ -274,6 +278,30 @@ jobs:
             echo "moving_tags=${moving[*]}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Also publish under the name before the rename
+        # Copies of the pushed image's digest (no new build) under every tag
+        # this run published, including the moving ones set above.
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          MOVING: ${{ steps.moving.outputs.moving_tags }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::The push step reported no image digest, so nothing was copied to $LEGACY_IMAGE."
+            exit 1
+          fi
+          args=()
+          while read -r ref; do
+            [[ -n "$ref" ]] && args+=(-t "$LEGACY_IMAGE:${ref##*:}")
+          done <<<"$TAGS"
+          for t in $MOVING; do
+            args+=(-t "$LEGACY_IMAGE:$t")
+          done
+          if ((${#args[@]} > 0)); then
+            docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
+          fi
+
       - name: Summary
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
@@ -306,7 +334,7 @@ jobs:
               echo "\`:stable\` was **not** moved: a newer release exists, and the stable channel never moves backwards."
             fi
             echo
-            echo "If this is the first image ever published (including a first \`:edge\` from a branch), the package is private and Unraid and Docker are refused when pulling it. Make it public once: open https://github.com/${GITHUB_REPOSITORY}/pkgs/container/chrysopoeia, then **Package settings > Change visibility > Public**."
+            echo "If this is the first image ever published (including a first \`:edge\` from a branch), the package is private and Unraid and Docker are refused when pulling it. Make it public once: open https://github.com/${GITHUB_REPOSITORY}/pkgs/container/szalinski, then **Package settings > Change visibility > Public**."
           } >> "$GITHUB_STEP_SUMMARY"
 
   release:

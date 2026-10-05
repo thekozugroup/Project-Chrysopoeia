@@ -492,7 +492,7 @@ export function problemsFrom(
         icon: <FileWarning aria-hidden />,
         tone: "warning",
         title: `${plural(n, "file")} can't be read`,
-        detail: `${n === 1 ? "It looks" : "They look"} damaged or ${n === 1 ? "isn't a video" : "aren't videos"}. Chrysopoeia left ${n === 1 ? "it" : "them"} alone.`,
+        detail: `${n === 1 ? "It looks" : "They look"} damaged or ${n === 1 ? "isn't a video" : "aren't videos"}. Szalinski left ${n === 1 ? "it" : "them"} alone.`,
       })),
       ...perLibrary("failed", libraries, count("conversion"), (n) => ({
         icon: <TriangleAlert aria-hidden />,
@@ -880,7 +880,7 @@ function LiveUpdatesOff() {
   return (
     <Callout tone="info" title="Live updates aren't reaching this browser" className="mb-8">
       <p>
-        The page refreshes every 5 seconds instead, so progress moves in steps. If you open Chrysopoeia through a
+        The page refreshes every 5 seconds instead, so progress moves in steps. If you open Szalinski through a
         reverse proxy (Nginx Proxy Manager, SWAG, Traefik), turn on WebSocket support for it.
       </p>
     </Callout>
@@ -904,7 +904,7 @@ function Welcome() {
         Make your video library smaller, safely.
       </h1>
       <p className="mt-5 max-w-xl text-sm leading-relaxed text-muted">
-        Point Chrysopoeia at a folder and choose a goal. It converts files in the background, checks each result
+        Point Szalinski at a folder and choose a goal. It converts files in the background, checks each result
         against the original, and only then replaces it.
       </p>
       <a href={href("/libraries/new")} className={cn(buttonVariants({ variant: "primary", size: "lg" }), "mt-8")}>

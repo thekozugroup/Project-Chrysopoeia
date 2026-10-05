@@ -280,7 +280,7 @@ export function updateParams(
 }
 
 /** Marks history entries created by opening a detail sheet. */
-const SHEET_ENTRY = "chrysopoeiaSheet";
+const SHEET_ENTRY = "szalinskiSheet";
 
 function openedBySheet(): boolean {
   const current = window.history.state as Record<string, unknown> | null;

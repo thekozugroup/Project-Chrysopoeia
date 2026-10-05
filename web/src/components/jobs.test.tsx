@@ -327,7 +327,7 @@ describe("a running job's card", () => {
       />,
     );
     expect(screen.getByRole("article").textContent).toContain(
-      "Attempt 2: the last try made a file that failed a check (Plays start to finish), so Chrysopoeia is trying another way.",
+      "Attempt 2: the last try made a file that failed a check (Plays start to finish), so Szalinski is trying another way.",
     );
   });
 });

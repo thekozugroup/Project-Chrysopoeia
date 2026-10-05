@@ -281,9 +281,9 @@ function JobProgressBlock({ job, label, lineClassName }: { job: Job; label: stri
 function attemptLine(job: Job): string {
   const check = lastFailedCheck(job);
   if (check) {
-    return `Attempt ${job.attempt}: the last try made a file that failed a check (${check.label}), so Chrysopoeia is trying another way.`;
+    return `Attempt ${job.attempt}: the last try made a file that failed a check (${check.label}), so Szalinski is trying another way.`;
   }
-  return `Attempt ${job.attempt}: the first try didn't work, so Chrysopoeia is trying another way.`;
+  return `Attempt ${job.attempt}: the first try didn't work, so Szalinski is trying another way.`;
 }
 
 /** Live card for a running job. */
@@ -571,7 +571,7 @@ export function CantBeReadCallout({ error }: { error: string | null }) {
     <Callout tone="warning" title="Can't be read">
       <p>
         This file looks damaged or isn&apos;t a video{detail ? ` (${detail})` : ""}.
-        Chrysopoeia left it alone.
+        Szalinski left it alone.
       </p>
       <p className="mt-1.5">
         Play it in Plex or Jellyfin to check. If it&apos;s broken, replace it; the new copy is picked up automatically.

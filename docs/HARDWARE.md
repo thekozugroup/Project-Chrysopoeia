@@ -1,11 +1,11 @@
 # Hardware encoding
 
-Chrysopoeia works without a GPU. When one is available it can convert many
+Szalinski works without a GPU. When one is available it can convert many
 times faster, at the cost of somewhat larger files than the CPU encoders give
 at the same visual quality.
 
 You do not pick encoders by hand. At startup (and whenever you click **Check
-again** in Settings > Hardware, the page headed *This machine*) Chrysopoeia
+again** in Settings > Hardware, the page headed *This machine*) Szalinski
 lists the encoders its ffmpeg build has, runs a one-second test encode on each
 hardware encoder, and uses only the ones that succeed. Under **Details:
 encoders and ffmpeg** on that page, each format shows *Works* when its test
@@ -38,8 +38,8 @@ oneVPL and Media SDK runtimes, and the bundled `libva` looks there first, so
 `LIBVA_DRIVERS_PATH` does not need to be set. Settings > Hardware names GPUs
 with `lspci`, which the image includes. `ffmpeg`, `ffprobe` and `vainfo` are
 on the `PATH` for checks with `docker exec`. The commands in this guide call
-the container `chrysopoeia`, which is what `docker run` and Compose name it;
-on Unraid the template names it `Chrysopoeia` with a capital C, and Docker
+the container `szalinski`, which is what `docker run` and Compose name it;
+on Unraid the template names it `Szalinski` with a capital C, and Docker
 container names are case-sensitive, so use that name there (or open the
 container's **Console** from the Docker tab and leave out `docker exec`).
 
@@ -58,18 +58,18 @@ encode under Details on Settings > Hardware is the final word.
 | Apple (VideoToolbox) | Apple Silicon; Intel Macs with Quick Sync | Apple Silicon; 2016+ Intel Macs (likely; model-dependent) | no (M3/M4 decode AV1 only) | no |
 | Raspberry Pi 4 (V4L2) | yes, up to 1080p | no | no | no |
 | Raspberry Pi 5 | no hardware encoder | no | no | no |
-| Rockchip RK3588 (MPP) | yes (experimental in Chrysopoeia) | yes (experimental) | no | no |
+| Rockchip RK3588 (MPP) | yes (experimental in Szalinski) | yes (experimental) | no | no |
 
 Notes worth knowing:
 
 - **NVIDIA session limit.** GeForce cards limit how many encodes run at once
   (8 per system with Linux driver 550.54 or newer; 3 to 5 with older drivers).
-  Chrysopoeia runs at most 3 files per NVIDIA GPU at once by default
+  Szalinski runs at most 3 files per NVIDIA GPU at once by default
   (2 per Intel or AMD GPU). Professional (RTX A-series, Quadro) cards have no
   such limit; choose a higher number under *Files at once* in Settings >
   Processing if you like.
 - **No NVENC at all.** The GeForce GT 1030 and most GeForce MX laptop chips
-  have no video encoder, so Chrysopoeia encodes on the CPU with them. NVIDIA's
+  have no video encoder, so Szalinski encodes on the CPU with them. NVIDIA's
   [Video Encode and Decode support matrix](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new)
   lists every model.
 - **GTX 1650.** The original GTX 1650 (TU117) has the older Volta-generation
@@ -84,7 +84,7 @@ Notes worth knowing:
   i965 driver; Quick Sync proper needs 5th gen (Broadwell) or newer.
 - **Intel Arc and Core Ultra** need a recent kernel. On Unraid, use 7.x.
 - **Intel 12th to 14th gen desktop and mobile** decode AV1 but do not encode
-  it; for AV1 output on those, Chrysopoeia uses the CPU (SVT-AV1).
+  it; for AV1 output on those, Szalinski uses the CPU (SVT-AV1).
 
 ## NVIDIA
 
@@ -97,7 +97,7 @@ Notes worth knowing:
 
 The image already sets `NVIDIA_DRIVER_CAPABILITIES=compute,video,utility`;
 without `video` NVENC is not available. Check from the host with
-`docker exec chrysopoeia nvidia-smi` (Unraid: `docker exec Chrysopoeia nvidia-smi`).
+`docker exec szalinski nvidia-smi` (Unraid: `docker exec Szalinski nvidia-smi`).
 
 ## Intel
 
@@ -110,8 +110,8 @@ without `video` NVENC is not available. Check from the host with
 
 The container adds itself to the group that owns the render node, so no
 `group_add` is needed unless you start it with `--user`. Check with
-`docker exec chrysopoeia vainfo --display drm --device /dev/dri/renderD128`
-(Unraid: `Chrysopoeia`, with a capital C).
+`docker exec szalinski vainfo --display drm --device /dev/dri/renderD128`
+(Unraid: `Szalinski`, with a capital C).
 
 ## AMD
 
@@ -125,7 +125,7 @@ The container adds itself to the group that owns the render node, so no
 ## Apple Silicon (macOS)
 
 Docker on macOS runs Linux in a virtual machine that cannot reach the Apple
-GPU, so run Chrysopoeia natively instead:
+GPU, so run Szalinski natively instead:
 
 ```sh
 brew install ffmpeg rust node pnpm
@@ -146,7 +146,7 @@ with a 64-bit OS and on other ARM64 boards.
 - **Pi 5:** no hardware video encoder; everything is encoded on the CPU.
 - **Rockchip RK3588** boards: jellyfin-ffmpeg includes Rockchip MPP encoders.
   Pass `--device /dev/dri --device /dev/dma_heap --device /dev/mpp_service
-  --device /dev/rga`. Support in Chrysopoeia is experimental.
+  --device /dev/rga`. Support in Szalinski is experimental.
 
 `HW_ACCEL=auto` picks these encoders on its own once their test encode
 passes. To use only one, set `HW_ACCEL=v4l2m2m` (Pi 4) or `HW_ACCEL=rkmpp`
@@ -158,7 +158,7 @@ off.
 ## CPU only
 
 No setup needed. CPU encoders give the best quality per byte: SVT-AV1 for AV1,
-x265 for HEVC, x264 for H.264 and libvpx for VP9. Chrysopoeia runs one job per
+x265 for HEVC, x264 for H.264 and libvpx for VP9. Szalinski runs one job per
 four CPU cores (up to 8) and runs ffmpeg at low priority by default, so the
 rest of the server stays responsive.
 
@@ -168,7 +168,7 @@ Open Settings > Hardware. It lists the devices the container can see and a
 setup tip with the fix; under *Details: encoders and ffmpeg*, each encoder's
 test result shows *Works* or *Failed test* with the error.
 The container log also prints the GPU devices it found at startup
-(`docker logs chrysopoeia`; Unraid: the container's **Logs** on the Docker tab).
+(`docker logs szalinski`; Unraid: the container's **Logs** on the Docker tab).
 The common causes:
 
 | Symptom | Fix |

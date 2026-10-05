@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * End-to-end smoke test: drives the first-run flow in a real browser against
- * a running Chrysopoeia server, the way a new user would, and waits until a
+ * a running Szalinski server, the way a new user would, and waits until a
  * file has been converted, verified and shown on the overview without a
  * reload.
  *
@@ -17,7 +17,7 @@
  *   --headed              show the browser
  *
  * The server must start with an empty data directory (first run), e.g.
- *   chrysopoeia --port 8080 --data-dir "$(mktemp -d)" --browse-root /media
+ *   szalinski --port 8080 --data-dir "$(mktemp -d)" --browse-root /media
  *   scripts/make-test-media.sh /media 8
  *   node web/e2e/smoke.mjs http://127.0.0.1:8080 --folder /media
  *
@@ -93,7 +93,7 @@ async function main() {
     health = await api("/health").catch(() => null);
     if (!health) await sleep(500);
   }
-  if (!health?.ok) throw new StepError(`No Chrysopoeia server answered at ${opts.url}/api/health`);
+  if (!health?.ok) throw new StepError(`No Szalinski server answered at ${opts.url}/api/health`);
   log(`Server ${health.version} is up at ${opts.url}`);
   const [settings, libraries] = await Promise.all([api("/settings"), api("/libraries")]);
   if (settings.onboarded || libraries.length) {

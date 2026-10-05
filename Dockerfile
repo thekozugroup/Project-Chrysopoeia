@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# Chrysopoeia: one container, one port. Multi-arch (linux/amd64, linux/arm64).
+# Szalinski: one container, one port. Multi-arch (linux/amd64, linux/arm64).
 #
-#   docker build -t chrysopoeia .
-#   docker buildx build --platform linux/amd64,linux/arm64 -t chrysopoeia .
+#   docker build -t szalinski .
+#   docker buildx build --platform linux/amd64,linux/arm64 -t szalinski .
 #
 # The web UI and the Rust binary are built on the build machine's own platform
 # ($BUILDPLATFORM); the binary is cross-compiled for $TARGETPLATFORM, so an
@@ -32,7 +32,7 @@ WORKDIR /src/web
 RUN corepack enable pnpm && corepack install -g "pnpm@${PNPM_VERSION}"
 # Manifests first so dependency installs are cached until they change.
 COPY web/package.json web/pnpm-*.yaml ./
-RUN --mount=type=cache,id=chrysopoeia-pnpm,target=/pnpm/store \
+RUN --mount=type=cache,id=szalinski-pnpm,target=/pnpm/store \
     pnpm install --frozen-lockfile --store-dir /pnpm/store
 COPY web/ ./
 RUN pnpm build \
@@ -42,18 +42,18 @@ RUN pnpm build \
     fi
 
 # ---------------------------------------------------------------------------
-# Server binary: cross-compiled for the target platform -> /out/chrysopoeia
+# Server binary: cross-compiled for the target platform -> /out/szalinski
 #
 # Dependencies are compiled in a layer of their own (cargo-chef) that depends
 # only on the Cargo manifests and Cargo.lock, so a source change recompiles
-# just Chrysopoeia's crates. Unlike RUN cache mounts, layers are kept by CI's
+# just Szalinski's crates. Unlike RUN cache mounts, layers are kept by CI's
 # GitHub Actions cache (type=gha).
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS rust-chef
 ARG CARGO_CHEF_VERSION=0.1.78
 ARG CARGO_BUILD_JOBS
 ENV CARGO_TERM_COLOR=never
-RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=szalinski-cargo-registry,target=/usr/local/cargo/registry \
     set -eu; \
     jobs="${CARGO_BUILD_JOBS:-}"; \
     unset CARGO_BUILD_JOBS; \
@@ -64,7 +64,7 @@ WORKDIR /src
 FROM rust-chef AS rust-plan
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=szalinski-cargo-registry,target=/usr/local/cargo/registry \
     cargo chef prepare --recipe-path /recipe.json
 
 FROM rust-chef AS rust
@@ -96,25 +96,25 @@ RUN set -eu; \
 ARG CARGO_BUILD_JOBS
 # 1. Dependencies only (cached until Cargo.toml or Cargo.lock change).
 COPY --from=rust-plan /recipe.json /recipe.json
-RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=chrysopoeia-cargo-git,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=szalinski-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=szalinski-cargo-git,target=/usr/local/cargo/git \
     set -eu; \
     triple="$(cat /rust-target)"; \
     jobs="${CARGO_BUILD_JOBS:-}"; \
     unset CARGO_BUILD_JOBS; \
     cargo chef cook --release --locked --target "$triple" --recipe-path /recipe.json \
-        -p chrysopoeia-server --bin chrysopoeia ${jobs:+--jobs "$jobs"}
-# 2. Chrysopoeia itself.
+        -p szalinski-server --bin szalinski ${jobs:+--jobs "$jobs"}
+# 2. Szalinski itself.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
-RUN --mount=type=cache,id=chrysopoeia-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=chrysopoeia-cargo-git,target=/usr/local/cargo/git \
+RUN --mount=type=cache,id=szalinski-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=szalinski-cargo-git,target=/usr/local/cargo/git \
     set -eu; \
     triple="$(cat /rust-target)"; \
     jobs="${CARGO_BUILD_JOBS:-}"; \
     unset CARGO_BUILD_JOBS; \
-    cargo build --release --locked --target "$triple" -p chrysopoeia-server --bin chrysopoeia ${jobs:+--jobs "$jobs"}; \
-    install -D -m 0755 "target/$triple/release/chrysopoeia" /out/chrysopoeia
+    cargo build --release --locked --target "$triple" -p szalinski-server --bin szalinski ${jobs:+--jobs "$jobs"}; \
+    install -D -m 0755 "target/$triple/release/szalinski" /out/szalinski
 
 # ---------------------------------------------------------------------------
 # Runtime: Debian + jellyfin-ffmpeg (NVENC, QSV, VA-API with bundled Intel and
@@ -127,7 +127,7 @@ ARG REVISION=unknown
 ARG CREATED
 ARG DEBIAN_FRONTEND=noninteractive
 
-LABEL org.opencontainers.image.title="Chrysopoeia" \
+LABEL org.opencontainers.image.title="Szalinski" \
       org.opencontainers.image.description="Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original." \
       org.opencontainers.image.url="https://github.com/thekozugroup/Project-Chrysopoeia" \
       org.opencontainers.image.source="https://github.com/thekozugroup/Project-Chrysopoeia" \
@@ -138,7 +138,7 @@ LABEL org.opencontainers.image.title="Chrysopoeia" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
       net.unraid.docker.webui="http://[IP]:[PORT:8080]/" \
-      net.unraid.docker.icon="https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/chrysopoeia.png"
+      net.unraid.docker.icon="https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/szalinski.png"
 
 # jellyfin-ffmpeg7 ships its own VA-API drivers (Intel iHD and i965, AMD
 # radeonsi) and the Intel oneVPL/MSDK runtimes under /usr/lib/jellyfin-ffmpeg,
@@ -162,19 +162,19 @@ RUN set -eux; \
     ffprobe -hide_banner -version > /dev/null; \
     command -v setpriv; \
     # The entrypoint moves this user and group to PUID/PGID at startup.
-    groupadd --gid 1000 chrysopoeia; \
+    groupadd --gid 1000 szalinski; \
     useradd --uid 1000 --gid 1000 --no-create-home --home-dir /nonexistent \
-        --shell /usr/sbin/nologin chrysopoeia; \
+        --shell /usr/sbin/nologin szalinski; \
     # /temp is deliberately not created: scratch files must never land in the
     # container layer (on Unraid that fills docker.img). Mount it or leave it out.
     install -d -m 0775 -o 1000 -g 1000 /config
 
-COPY --from=rust /out/chrysopoeia /usr/local/bin/chrysopoeia
+COPY --from=rust /out/szalinski /usr/local/bin/szalinski
 COPY --from=web /src/web/out /app/web
 COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-COPY LICENSE /usr/share/doc/chrysopoeia/LICENSE
+COPY LICENSE /usr/share/doc/szalinski/LICENSE
 
-ENV CHRYSOPOEIA_VERSION=${VERSION} \
+ENV SZALINSKI_VERSION=${VERSION} \
     DATA_DIR=/config \
     WEB_DIR=/app/web \
     PORT=8080 \
@@ -191,4 +191,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD curl -fsS -o /dev/null "http://127.0.0.1:${PORT:-8080}/api/health" || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]
-CMD ["chrysopoeia"]
+CMD ["szalinski"]

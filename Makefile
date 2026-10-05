@@ -1,10 +1,10 @@
-# Chrysopoeia developer tasks. Run `make` for the list.
+# Szalinski developer tasks. Run `make` for the list.
 
 API_PORT ?= 8080
 WEB_PORT ?= 3000
 DATA_DIR ?= ./data
 MEDIA_DIR ?= ./media
-IMAGE ?= chrysopoeia:dev
+IMAGE ?= szalinski:dev
 PLATFORM ?= linux/amd64
 
 .DEFAULT_GOAL := help
@@ -14,7 +14,7 @@ help: ## Show this help
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z0-9_-]+:.*## / {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 dev-api: ## Run the backend on :8080 with CORS open for `make dev-web`
-	cargo run -p chrysopoeia-server -- --port $(API_PORT) --data-dir $(DATA_DIR) --web-dir web/out --dev-cors
+	cargo run -p szalinski-server -- --port $(API_PORT) --data-dir $(DATA_DIR) --web-dir web/out --dev-cors
 
 dev-web: web/node_modules ## Run the UI with hot reload on :3000, talking to `make dev-api`
 	cd web && NEXT_PUBLIC_API_URL=http://localhost:$(API_PORT) pnpm dev --port $(WEB_PORT)
@@ -27,10 +27,10 @@ web-install: web/node_modules ## Install web dependencies
 
 build: web/node_modules ## Build the static UI (web/out) and the release binary
 	cd web && pnpm build
-	cargo build --release -p chrysopoeia-server
+	cargo build --release -p szalinski-server
 
 run: build ## Build, then serve UI + API from the release binary on :8080
-	./target/release/chrysopoeia --port $(API_PORT) --data-dir $(DATA_DIR) --web-dir web/out
+	./target/release/szalinski --port $(API_PORT) --data-dir $(DATA_DIR) --web-dir web/out
 
 test: web/node_modules ## Run the Rust tests (those needing ffmpeg skip without it) and the web unit tests
 	cargo test --workspace
@@ -45,7 +45,7 @@ lint: web/node_modules ## Check formatting, clippy, eslint, TypeScript and shell
 fmt: ## Format Rust code
 	cargo fmt --all
 
-docker: ## Build the Docker image (IMAGE=chrysopoeia:dev, PLATFORM=linux/amd64)
+docker: ## Build the Docker image (IMAGE=szalinski:dev, PLATFORM=linux/amd64)
 	docker build --platform $(PLATFORM) -t $(IMAGE) .
 
 test-docker: docker ## Build the image, then test its entrypoint (PUID/PGID, GPU groups)

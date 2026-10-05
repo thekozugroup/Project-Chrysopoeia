@@ -3,7 +3,7 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /*
- * Chrysopoeia design tokens.
+ * Szalinski design tokens.
  * Warm near-black surfaces with a gold accent (dark), warm paper with an
  * inked gold (light). Gold marks primary actions, current selection and
  * progress only; status colours always come with an icon and a word.

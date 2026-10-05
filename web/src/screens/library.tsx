@@ -156,7 +156,7 @@ export function FolderProblem({ library }: { library: Library }) {
     <>
       <Callout
         tone="warning"
-        title={mount ? "A different drive is mounted" : "Chrysopoeia can't read this folder"}
+        title={mount ? "A different drive is mounted" : "Szalinski can't read this folder"}
         className="mb-6"
         action={mount ? <UseDriveButton onClick={() => setConfirming(true)} /> : null}
       >
@@ -262,7 +262,7 @@ function RemoveLibraryDialog({
       onConfirm={onConfirm}
     >
       <p>
-        Chrysopoeia stops watching <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span> and
+        Szalinski stops watching <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span> and
         forgets its files and history. Anything converting in it is cancelled.
       </p>
       <p className="font-medium text-fg">Your media files are not deleted or changed.</p>
@@ -592,7 +592,7 @@ function NoFilesYet({ library }: { library: Library }) {
   return (
     <EmptyState icon={<FolderSearch aria-hidden />} title="No videos found yet">
       <p>
-        Chrysopoeia looked in <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span>. Files that
+        Szalinski looked in <span className="font-mono text-[0.8125rem] text-fg">{library.path}</span>. Files that
         are still being copied are picked up once they stop changing. If nothing appears, check that the folder is
         mapped into the container, then scan again.
       </p>

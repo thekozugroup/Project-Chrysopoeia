@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/chrysopoeia-core",
-    "crates/chrysopoeia-server",
-    "crates/chrysopoeia-worker",
-    "crates/chrysopoeia-scanner",
-    "crates/chrysopoeia-hwdetect",
+    "crates/szalinski-core",
+    "crates/szalinski-server",
+    "crates/szalinski-worker",
+    "crates/szalinski-scanner",
+    "crates/szalinski-hwdetect",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -47,10 +47,10 @@ globset = "0.4"
 tempfile = "3"
 
 # Internal crates
-chrysopoeia-core = { path = "crates/chrysopoeia-core" }
-chrysopoeia-hwdetect = { path = "crates/chrysopoeia-hwdetect" }
-chrysopoeia-scanner = { path = "crates/chrysopoeia-scanner" }
-chrysopoeia-worker = { path = "crates/chrysopoeia-worker" }
+szalinski-core = { path = "crates/szalinski-core" }
+szalinski-hwdetect = { path = "crates/szalinski-hwdetect" }
+szalinski-scanner = { path = "crates/szalinski-scanner" }
+szalinski-worker = { path = "crates/szalinski-worker" }
 
 # Smaller, faster debug builds. Line tables keep backtraces useful.
 [profile.dev]

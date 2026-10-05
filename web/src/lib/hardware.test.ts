@@ -221,7 +221,7 @@ describe("bugReportText", () => {
       settings: { hardware: "auto" },
     });
     expect(text.split("\n")).toEqual([
-      "Chrysopoeia 0.2.0 (build edge-1a2b3c4), in a container",
+      "Szalinski 0.2.0 (build edge-1a2b3c4), in a container",
       "ffmpeg: 6.1",
       "CPU: Test CPU (8 threads)",
       "GPUs: NVIDIA GeForce RTX 3060 (550.54)",
@@ -232,7 +232,7 @@ describe("bugReportText", () => {
   });
 
   it("leaves out what hasn't loaded, and says when nothing was found", () => {
-    expect(bugReportText({ system: { version: "0.2.0", build: null, in_container: false } })).toBe("Chrysopoeia 0.2.0");
+    expect(bugReportText({ system: { version: "0.2.0", build: null, in_container: false } })).toBe("Szalinski 0.2.0");
     const bare = bugReportText({
       system: { version: "0.2.0", build: null, in_container: false },
       hw: hardware({ encoders: [] }),

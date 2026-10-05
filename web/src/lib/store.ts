@@ -75,7 +75,7 @@ export const useLive = create<LiveState>((set) => ({
 
 /**
  * Whether the server has been unreachable for a moment (the same signal as
- * the "Can't reach Chrysopoeia" banner). Actions that change something are
+ * the "Can't reach Szalinski" banner). Actions that change something are
  * disabled meanwhile, since they would fail.
  */
 export function useServerDown(): boolean {
@@ -85,7 +85,7 @@ export function useServerDown(): boolean {
 }
 
 /** Why a control is disabled while the server is away. */
-export const SERVER_DOWN_TITLE = "Available when Chrysopoeia is back";
+export const SERVER_DOWN_TITLE = "Available when Szalinski is back";
 
 /** A job with its latest live progress applied (only while it is running). */
 export function useLiveJob(job: Job): Job {

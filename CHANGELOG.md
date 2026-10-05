@@ -16,7 +16,7 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
 
 ### Added
 
-- A **stable update channel**. `ghcr.io/thekozugroup/chrysopoeia:stable`
+- A **stable update channel**. `ghcr.io/thekozugroup/szalinski:stable`
   follows the newest tagged release (not a prerelease) and only moves when a
   newer release is published, never backwards, so automatic updates (such as
   the Unraid Community Applications updater) install releases rather than every
@@ -41,7 +41,19 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
 
 ### Changed
 
-- The web UI's font changed.
+- **Renamed to Szalinski** (it was Chrysopoeia), after the inventor in *Honey,
+  I Shrunk the Kids*. The image is now `ghcr.io/thekozugroup/szalinski`, the
+  binary `szalinski`, the Unraid template `unraid/szalinski.xml`, and the
+  build label variable `SZALINSKI_VERSION`. An existing install keeps working:
+  the database (`chrysopoeia.db`) is carried over to `szalinski.db` on the
+  first start, backup and temporary files left by the old name are still found
+  and put back after an interrupted conversion, and the old image's lock is
+  honoured so the two can never share a `/config` folder. Every release is
+  also published under the old image name for a while, so an install that
+  still pulls `ghcr.io/thekozugroup/chrysopoeia` keeps updating; switch its
+  Repository to `ghcr.io/thekozugroup/szalinski:stable` when convenient (see
+  [docs/UNRAID.md](docs/UNRAID.md#moving-from-chrysopoeia)).
+- The display font is now **Newsreader** (it was Instrument Serif).
 - Web UI notes: the UI no longer says "100% finished" while another discovered
   file is still settling; the folder picker puts the mounted media and output
   folders first instead of listing the container's system folders beside them;
@@ -50,9 +62,6 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
 - Documentation: *Save space* converts audio to Opus (keeping channel layout,
   language and flags). It does not keep lossless or Atmos audio; *Balanced* and
   *Archive* copy the original audio instead.
-- The project is being **renamed** (image name, binary and documentation).
-  Because automatic updates follow `:stable`, the release that carries the
-  rename will say here exactly what to change in an existing install.
 
 ### Fixed
 
@@ -68,7 +77,7 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
 
 ## [0.2.0] - 2026-10-04
 
-The first release.
+The first release, published as Chrysopoeia (from `main`; it was not tagged).
 
 ### Added
 

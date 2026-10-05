@@ -10,7 +10,7 @@ import { FolderProblem } from "@/screens/library";
 const LIB = "44444444-4444-4444-4444-444444444444";
 
 const DIFFERENT =
-  "A different drive is mounted at /mnt/remotes/nas than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.";
+  "A different drive is mounted at /mnt/remotes/nas than before. Reconnect the usual one, or tell Szalinski to use the one there now.";
 
 function library(partial: Partial<Library> = {}): Library {
   return {
@@ -48,7 +48,7 @@ describe("a library whose drive was swapped", () => {
     fireEvent.click(screen.getByRole("button", { name: "Use the drive that's there now" }));
     const dialog = await screen.findByRole("alertdialog");
     expect(within(dialog).getByRole("heading", { name: "Use the drive that's there now?" })).toBeTruthy();
-    expect(dialog.textContent).toContain("Chrysopoeia will take the drive mounted at /mnt/remotes/nas as the usual one");
+    expect(dialog.textContent).toContain("Szalinski will take the drive mounted at /mnt/remotes/nas as the usual one");
     expect(dialog.textContent).toContain("saves new files to it");
     expect(dialog.textContent).toContain("Only do this if you replaced the drive or share on purpose");
     expect(dialog.textContent).toContain("reconnect it instead");
@@ -74,7 +74,7 @@ describe("other folder problems", () => {
     const notConnected =
       "The drive or share mounted at /mnt/remotes/nas isn't connected. Reconnect it, and its conversions continue.";
     renderWithClient(<FolderProblem library={library({ path_error: notConnected })} />);
-    expect(screen.getByText("Chrysopoeia can't read this folder")).toBeTruthy();
+    expect(screen.getByText("Szalinski can't read this folder")).toBeTruthy();
     expect(screen.getByText(notConnected)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Use the drive that's there now" })).toBeNull();
   });

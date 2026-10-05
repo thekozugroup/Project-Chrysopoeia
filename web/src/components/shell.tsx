@@ -202,7 +202,7 @@ function ServerDownBanner() {
         <div className="mb-6 flex items-start gap-3 rounded-lg border border-line bg-raised px-4 py-3 md:mb-8">
           <LoaderCircle className="spin mt-0.5 size-4 shrink-0 text-muted" aria-hidden />
           <div className="min-w-0 text-[0.8125rem] leading-relaxed">
-            <p className="font-semibold text-fg">Can&apos;t reach Chrysopoeia right now</p>
+            <p className="font-semibold text-fg">Can&apos;t reach Szalinski right now</p>
             <p className="text-muted">
               It may be restarting. You&apos;re seeing the last known state; actions come back when it does, and this
               page reconnects on its own.
@@ -332,7 +332,7 @@ function Sidebar({ route }: { route: Route }) {
       className="sticky top-0 hidden h-dvh w-60 shrink-0 flex-col border-r border-line bg-sunken md:flex"
     >
       <div className="px-5 pt-5 pb-4">
-        <a href={href("/")} className="no-underline" aria-label="Chrysopoeia overview">
+        <a href={href("/")} className="no-underline" aria-label="Szalinski overview">
           <Brand />
         </a>
       </div>
@@ -389,7 +389,7 @@ function Sidebar({ route }: { route: Route }) {
 function MobileTopBar() {
   return (
     <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-3 border-b border-line bg-bg/95 px-4 backdrop-blur-sm md:hidden">
-      <a href={href("/")} className="no-underline" aria-label="Chrysopoeia overview">
+      <a href={href("/")} className="no-underline" aria-label="Szalinski overview">
         <Brand className="[&_svg]:size-6 [&>span:last-child]:text-xl" />
       </a>
       <div className="flex min-w-0 items-center gap-2">

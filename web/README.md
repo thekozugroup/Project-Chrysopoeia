@@ -1,6 +1,6 @@
-# Chrysopoeia web UI
+# Szalinski web UI
 
-The browser interface for Chrysopoeia. It is a Next.js app exported as static
+The browser interface for Szalinski. It is a Next.js app exported as static
 files (`web/out`) that the Rust server hosts next to the API, so the container
 needs no Node at runtime. Everything talks to `/api` on the same origin; see
 `docs/ARCHITECTURE.md` ("REST API", "WebSocket", "Web UI") for the contract.
@@ -62,7 +62,7 @@ builds leave it unset so the UI uses the same origin.
 
 ```sh
 scripts/make-test-media.sh /tmp/media 8          # from the repository root
-target/release/chrysopoeia --port 8080 --data-dir "$(mktemp -d)" \
+target/release/szalinski --port 8080 --data-dir "$(mktemp -d)" \
   --web-dir web/out --browse-root /tmp/media &
 cd web && pnpm e2e http://127.0.0.1:8080 --folder /tmp/media --screenshots /tmp/smoke
 ```
@@ -80,7 +80,7 @@ page errors or server errors.
   …) to screens. Detail sheets open from `?job=<id>` and `?file=<id>`.
 - `src/screens` — one file per screen.
 - `src/components` — shared pieces; `ui/` holds the primitives.
-- `src/lib/types.ts` — mirror of `crates/chrysopoeia-core` (keep in sync).
+- `src/lib/types.ts` — mirror of `crates/szalinski-core` (keep in sync).
 - `src/lib/api.ts` — REST client and `ApiError`.
 - `src/lib/live.ts` — WebSocket client that patches the query cache.
 - `src/lib/format.ts`, `labels.ts` — plain-language wording and number formats.

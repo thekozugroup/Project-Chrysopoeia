@@ -7,10 +7,10 @@ import { Providers } from "@/components/providers";
 import { THEME_BOOT_SCRIPT } from "@/lib/theme-script";
 
 export const metadata: Metadata = {
-  title: "Chrysopoeia",
+  title: "Szalinski",
   description:
-    "Chrysopoeia converts your media library to efficient formats in the background, verifies every file, and only then replaces the original.",
-  applicationName: "Chrysopoeia",
+    "Szalinski converts your media library to efficient formats in the background, verifies every file, and only then replaces the original.",
+  applicationName: "Szalinski",
   robots: { index: false, follow: false },
 };
 

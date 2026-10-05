@@ -326,7 +326,7 @@ export function HardwareSection({
       {hw && !hw.ffmpeg.found ? (
         <Callout tone="danger" title="ffmpeg wasn't found">
           <p>Nothing can be converted until ffmpeg is available. The official image includes it.</p>
-          <CodeBlock className="mt-3" code={`FFMPEG_PATH=${hw.ffmpeg.ffmpeg_path}`} label="Path Chrysopoeia tried" />
+          <CodeBlock className="mt-3" code={`FFMPEG_PATH=${hw.ffmpeg.ffmpeg_path}`} label="Path Szalinski tried" />
         </Callout>
       ) : null}
 

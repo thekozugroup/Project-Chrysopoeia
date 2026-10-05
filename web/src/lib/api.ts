@@ -1,5 +1,5 @@
 /**
- * REST client for the Chrysopoeia server (`/api`, see docs/ARCHITECTURE.md).
+ * REST client for the Szalinski server (`/api`, see docs/ARCHITECTURE.md).
  *
  * The UI is served by the same binary, so requests go to the same origin by
  * default. `NEXT_PUBLIC_API_URL` (baked in at build time) points a dev build
@@ -113,7 +113,7 @@ function reportReachability(reachable: boolean): void {
 
 const FALLBACK_MESSAGES: Record<number, string> = {
   400: "The server didn't accept that request.",
-  403: "That folder is outside the folders Chrysopoeia is allowed to show.",
+  403: "That folder is outside the folders Szalinski is allowed to show.",
   404: "That item no longer exists. It may have been removed.",
   409: "That conflicts with something that's already happening.",
   413: "That request was too large for the server.",
@@ -186,7 +186,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   } catch (err) {
     if (err instanceof DOMException && err.name === "AbortError") throw err;
     reportReachability(false);
-    throw new ApiError(0, "network_error", "Can't reach the Chrysopoeia server.");
+    throw new ApiError(0, "network_error", "Can't reach the Szalinski server.");
   }
 
   const error = res.ok ? null : await parseError(res);

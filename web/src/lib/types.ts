@@ -1,5 +1,5 @@
 /**
- * TypeScript mirror of `crates/chrysopoeia-core`. The serde JSON shape of the
+ * TypeScript mirror of `crates/szalinski-core`. The serde JSON shape of the
  * Rust types is the API contract, so this file follows it exactly:
  * snake_case fields, lowercase/snake_case enum strings, `Option<T>` as
  * `T | null`, `Uuid` and `DateTime<Utc>` as strings, integers as numbers.
@@ -653,12 +653,12 @@ export interface Overview {
   queue: QueueState;
 }
 
-/** A setting that names a folder Chrysopoeia writes into. */
+/** A setting that names a folder Szalinski writes into. */
 export type FolderSetting = "output_folder" | "temp_dir";
 
 /**
  * `GET /settings/folders`: a folder in use (the output folder in folder
- * mode; the work folder, the one Chrysopoeia was started with while
+ * mode; the work folder, the one Szalinski was started with while
  * `temp_dir` is unset) and whether the drives and shares it sits on are
  * connected as they were.
  */
@@ -682,7 +682,7 @@ export interface FolderStatus {
 /** `GET /api/system`: facts about the server the settings screens explain. */
 export interface SystemInfo {
   version: string;
-  /** Image build label (`CHRYSOPOEIA_VERSION`, e.g. `edge-1a2b3c4`) when it differs from `version`. */
+  /** Image build label (`SZALINSKI_VERSION`, e.g. `edge-1a2b3c4`) when it differs from `version`. */
   build: string | null;
   /**
    * Scratch folder used when `Settings.temp_dir` is unset (`--temp-dir` /

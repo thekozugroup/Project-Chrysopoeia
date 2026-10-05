@@ -22,7 +22,7 @@ q -f lavfi -i "$VIDEO_SRC" -f lavfi -i "sine=frequency=440:duration=$DUR" \
   "$OUT/Movies/Big Test (2020)/Big Test (2020).mp4"
 
 # 2. H.264 1080p with 5.1(side) AC-3 and an SRT subtitle in MKV (typical Blu-ray rip)
-printf '1\n00:00:00,500 --> 00:00:02,500\nHello from Chrysopoeia\n\n2\n00:00:03,000 --> 00:00:05,000\nSecond line\n' > "$OUT/.subs.srt"
+printf '1\n00:00:00,500 --> 00:00:02,500\nHello from Szalinski\n\n2\n00:00:03,000 --> 00:00:05,000\nSecond line\n' > "$OUT/.subs.srt"
 q -f lavfi -i "testsrc2=size=1920x1080:rate=24:duration=$DUR" \
   -f lavfi -i "sine=frequency=220:duration=$DUR" -i "$OUT/.subs.srt" \
   -filter_complex "[1:a]pan=5.1(side)|FL=c0|FR=c0|FC=c0|LFE=c0|SL=c0|SR=c0[a]" \

@@ -1,6 +1,6 @@
-# Chrysopoeia architecture
+# Szalinski architecture
 
-Chrysopoeia is a self-hosted media transcoder: point it at folders, pick a goal,
+Szalinski is a self-hosted media transcoder: point it at folders, pick a goal,
 and it converts the library in the background, verifies every result, and only
 then replaces the original. It is a Tdarr alternative that trades plugin stacks
 for sensible defaults, automatic hardware setup and verified output.
@@ -8,7 +8,7 @@ for sensible defaults, automatic hardware setup and verified output.
 This document is the contract between the backend crates, the web UI and the
 deployment files, and it describes what the code does. Field names and JSON
 shapes here are normative. The Rust source of truth for every shared type is
-`crates/chrysopoeia-core`; the TypeScript mirror is `web/src/lib/types.ts`.
+`crates/szalinski-core`; the TypeScript mirror is `web/src/lib/types.ts`.
 
 ## Runtime shape
 
@@ -22,11 +22,11 @@ shapes here are normative. The Rust source of truth for every shared type is
              │   │     plan ─► ffmpeg (HW ► HW-enc/SW-dec ► CPU) ─► verify   │
              │   │     ─► finalize (crash-safe replace) ─► DB + events       │
              │   └─ Hardware: hwdetect::detect at startup + on demand        │
-             │ SQLite (WAL) at $DATA_DIR/chrysopoeia.db                       │
+             │ SQLite (WAL) at $DATA_DIR/szalinski.db                       │
              └────────────────────────────────────────────────────────────────┘
 ```
 
-- Single static binary `chrysopoeia` (crate `chrysopoeia-server`) serves the
+- Single static binary `szalinski` (crate `szalinski-server`) serves the
   API, the WebSocket and the exported Next.js UI. No Node at runtime.
 - ffmpeg/ffprobe are external processes (jellyfin-ffmpeg in the Docker image,
   which bundles NVENC, QSV/oneVPL, VA-API (Intel iHD + AMD), AMF and Rockchip
@@ -39,11 +39,11 @@ shapes here are normative. The Rust source of truth for every shared type is
 
 | Crate | Owns | Public API |
 |---|---|---|
-| `chrysopoeia-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, tying child processes to the server's life | Everything in `src/*.rs` |
-| `chrysopoeia-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
-| `chrysopoeia-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
-| `chrysopoeia-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
-| `chrysopoeia-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `chrysopoeia` |
+| `szalinski-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, tying child processes to the server's life | Everything in `src/*.rs` |
+| `szalinski-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
+| `szalinski-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
+| `szalinski-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
+| `szalinski-server` | Config (CLI/env), SQLite schema + migrations, REST + WS, LibraryService, Dispatcher, static UI hosting, filesystem browser | binary `szalinski` |
 
 Existing public signatures are fixed; new public items may be added. The
 workspace's minimum Rust version (MSRV) is 1.88.
@@ -76,22 +76,22 @@ it is picked up or converted (the settle time); the database busy timeout is
 
 Start order: raise the soft limit on open files to the hard limit (at most
 65 536; Docker often starts with 1 024) → exclusive lock on
-`$DATA_DIR/chrysopoeia.lock` (a second
-Chrysopoeia on the same data folder exits with "Another Chrysopoeia is already
+`$DATA_DIR/szalinski.lock` (a second
+Szalinski on the same data folder exits with "Another Szalinski is already
 using the data folder …" and changes nothing, advising to stop the other one or
 give this one its own Config folder in a container (the image sets the data
 folder there), and `--data-dir` / `DATA_DIR` outside one; filesystems that
 can't lock only log a warning) → bind the port → open the database → recovery.
 
 A database file SQLite finds damaged (`SQLITE_CORRUPT`, `SQLITE_NOTADB`) is
-moved aside as `chrysopoeia.db.damaged-<UTC time>` (with its `-wal`/`-shm`
+moved aside as `szalinski.db.damaged-<UTC time>` (with its `-wal`/`-shm`
 files) and a new one is started; the feed says so at WARN ("The database was
-damaged, so Chrysopoeia moved it aside to … and started with a new one. Your
+damaged, so Szalinski moved it aside to … and started with a new one. Your
 media files were not touched. Add your libraries and settings again."), so a
 container set to restart doesn't loop. A data folder on a full disk stops
 the start with "The disk that holds the data folder (…) is full, so the
 database there couldn't be opened. Free some space on that disk, then start
-Chrysopoeia again" (`db::is_disk_full`: SQLite's `SQLITE_FULL` or the
+Szalinski again" (`db::is_disk_full`: SQLite's `SQLITE_FULL` or the
 system's "no space left", or any database error while less than 1 MiB is
 free there; a new database fails with the former, an existing one with a
 disk I/O error). This covers opening, migrating and the first writes of the
@@ -357,7 +357,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   it, and its conversions continue."), and while something else is
   mounted there it is not connected either ("A different drive is mounted
   at /mnt/remotes/nas than before. Reconnect the usual one, or tell
-  Chrysopoeia to use the one there now."), whatever the folder holds: the
+  Szalinski to use the one there now."), whatever the folder holds: the
   library shows that as its `path_error` (with `changed_mount`, the place,
   for another drive), a scan of it stops there (an error entry, nothing
   taken for removed or added), its jobs and every job that uses the
@@ -440,7 +440,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   place after the job ended, whatever the stop recorded them as: back in
   the queue, cancelled) is settled from what is on the disk (see "Putting
   the new file in place on a share that stops answering"): its new file in
-  place → recorded `done` (note: "Chrysopoeia stopped just as the new file
+  place → recorded `done` (note: "Szalinski stopped just as the new file
   was being put in place. The new file was already complete, so it was
   kept") and the backup removed; not in place → the original put back and
   the job's temp files gone. Only an answer settles a job: a folder that
@@ -524,9 +524,9 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   is held across a watcher call.
 - A new or changed file is reported once no event arrived for it for the
   settle time and its size/mtime held still that long; removals (files and
-  folders) are reported at once, except renames to Chrysopoeia's backup names
+  folders) are reported at once, except renames to Szalinski's backup names
   and the loss of a whole root.
-- Chrysopoeia's own results are not copies in progress. A converted file put
+- Szalinski's own results are not copies in progress. A converted file put
   in place goes through the same settle wait as any new file, but it is
   complete, so the count of files still being copied
   (`LibraryStats.settling`, "Waiting for 1 file to finish copying") leaves
@@ -599,7 +599,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   queue while they waited for it). Cancel answers before the other
   `*.updated` events go out (they follow in the background), so a library
   on a hung share, which takes seconds to describe, doesn't slow it.
-- Folder checks that may hang (`chrysopoeia_worker::slow_fs`, used through
+- Folder checks that may hang (`szalinski_worker::slow_fs`, used through
   `services::fs_guard`): library checks, every check of a job (server and
   worker share them), leftover searches and the folder picker run on a
   blocking thread, one at a time per path, kind of check and mount (a
@@ -646,7 +646,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   check is busy shows no problem, an offline library stays as it was and
   is checked again 15 s later, a job waits (above), a failed job whose
   file can't be looked at is tried again rather than failed or taken for
-  deleted, the folder picker answers 503 `busy` ("Chrysopoeia is still
+  deleted, the folder picker answers 503 `busy` ("Szalinski is still
   waiting for other folders that stopped answering, so it couldn't open
   this one right now. Try again in a moment."), and the watch over a long
   step ignores such checks. A hung share therefore costs at most 8
@@ -745,7 +745,7 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   the conversion can remove them.
 - A failure is logged once, at WARN, through its activity entry.
 - Logging: the start line names the version and, when set, the build
-  (`CHRYSOPOEIA_VERSION`); each hardware detection logs one INFO line
+  (`SZALINSKI_VERSION`); each hardware detection logs one INFO line
   ("hardware detection finished", with hwdetect's own summary at DEBUG);
   each finished job logs one plain INFO line, its activity entry ("Converted
   …", "Skipped …", "Cancelled …"; failures at WARN). Job starts, attempts
@@ -1085,7 +1085,7 @@ that finds its files. Replacements go by the backup
 under the final name (the original's own name, or the new name while the
 original's name is free) → in place; this is noted first (`placing` = 2,
 with both sizes), then the backup is removed (`finalize::remove_backup`)
-and the job recorded `done` with the note "Chrysopoeia stopped just as the
+and the job recorded `done` with the note "Szalinski stopped just as the
 new file was being put in place. The new file was already complete, so it
 was kept", its savings counted. (Noting it first means a removal that
 finishes after a share answered late can't make the job look as if its
@@ -1132,7 +1132,7 @@ drive or share known to be mounted in the library above the file is
 disconnected, and in folder mode the output folder answers and can be
 read. A job that settles itself
 then waits with its library offline, its reason the library's own
-problem or "Chrysopoeia can't read the folder … because the disk reported
+problem or "Szalinski can't read the folder … because the disk reported
 a read or write error. If it's on a drive or network share, check that
 it's connected."; the check every 15 s keeps it so while the share
 answers with errors. While a job is marked, its destination counts
@@ -1159,7 +1159,7 @@ group where allowed (the group alone when only that is), and, with
 `keep_file_dates`, its times; a new file that couldn't keep the owner or
 group gets a job note ("The new file couldn't keep the original's group
 (group 1001), so it is in group 100. If your media server can't open it,
-run Chrysopoeia as the owner of your media (PUID and PGID)"). MP4 and WebM
+run Szalinski as the owner of your media (PUID and PGID)"). MP4 and WebM
 can't hold attachments: the plan notes the fonts it leaves out ("Left out 2
 subtitle fonts because MP4 can't hold attachments"; "Left out 1 attached
 file because …" when not all are fonts). Every loss `replace_loss` counts
@@ -1208,7 +1208,7 @@ activity feed, setup hints, API errors) is one or two plain sentences: what
 happened, then what to do ("The work folder /temp can't be used because a
 file with that name is in the way. Fix it, or choose another work folder, in
 Settings › Output."). Messages never carry raw OS errors or error numbers
-(`chrysopoeia_core::plain::io_reason` turns an `io::Error` into a few words
+(`szalinski_core::plain::io_reason` turns an `io::Error` into a few words
 such as "the disk is full"), encoder names ("Converting on the NVIDIA GPU
 didn't work…", not `hevc_nvenc`), exit codes, or paths without saying what
 the folder is ("the work folder /temp", "the output folder /out/TV", "the
@@ -1219,7 +1219,7 @@ file's size, not the margin kept free. A size reads the same wherever it
 appears (the activity feed, a job's check lines, the web UI): decimal units,
 whole KB, then two decimals below 10, one below 100 and none above, rounded
 before moving up a unit ("3.13 MB", "572 KB", "1 GB"); one formatter,
-`chrysopoeia_core::format::bytes`, follows the web's `formatBytes`.
+`szalinski_core::format::bytes`, follows the web's `formatBytes`.
 An unfamiliar ffmpeg failure is described plainly and then quoted
 ("Converting on the CPU stopped with an error, so the original was left
 unchanged. ffmpeg said: "…""); the job's `log_tail` keeps the details.
@@ -1239,8 +1239,8 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 
 | Method & path | Body / query | Returns |
 |---|---|---|
-| `GET /health` | | `{"ok":true,"version":"0.2.0"}` |
-| `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `CHRYSOPOEIA_VERSION` when it differs from `version`, else null) |
+| `GET /health` | | `{"ok":true,"version":"0.3.0"}` |
+| `GET /system` | | `SystemInfo {version, build, default_temp_dir, browse_roots, data_dir, in_container}` (`build` from `SZALINSKI_VERSION` when it differs from `version`, else null) |
 | `GET /overview` | | `Overview` (`totals` and `savings_history` cover the same libraries; `resolutions` has a "No video" bucket for files without a video stream, "Unknown" for pictures whose size couldn't be read) |
 | `GET /libraries` | | `Library[]` (`path_error` set when the folder is missing, unreadable or offline, or on a drive or share seen mounted there that isn't now: "The drive or share mounted at … isn't connected. …", or has another drive in its place: "A different drive is mounted at … than before. …", with `changed_mount` the place, also when that is the output or work folder's or where an unsettled conversion's new file goes) |
 | `POST /libraries` | `{"path", "name"?, "profile"?, "goal"?}` | `Library` (201). 400 `path_required`/`path_not_absolute`/`path_not_found`/`not_a_directory`/`not_readable`/`path_not_supported`/`folder_not_allowed`/`contains_output_folder`/`invalid_name`/`invalid_profile`, 409 `library_exists`/`library_overlaps`. `folder_not_allowed`: the folder (as the disk has it, links followed) is `/`, the data folder or inside it or above it, `/config`, `/app` or the web folder or inside them, or `/proc`, `/sys` or `/dev` or inside them; the `LIBRARIES` start-up list follows the same rule. Starts a scan. |
@@ -1409,7 +1409,7 @@ Every new field may be absent in what an older server sends (read as
   encode with the same init flags `build_plan` uses (15 s each, 30 s in all,
   NVENC one at a time, a hung GPU is not tested again). Unverified encoders
   say why in `error` ("<sentence> Details: <ffmpeg tail>").
-- Busy NVIDIA GPU (every encoding session taken, e.g. by Chrysopoeia's own
+- Busy NVIDIA GPU (every encoding session taken, e.g. by Szalinski's own
   running jobs or by Plex): tested again once after 3 s. If it stays busy, an
   encoder the previous detection verified keeps that result (and the busy
   hint goes); otherwise the busy hint stays and detection runs again by itself
@@ -1430,7 +1430,7 @@ Every new field may be absent in what an older server sends (read as
   otherwise it gives the fix itself (NVIDIA: the Nvidia-Driver plugin and
   `--runtime=nvidia` settings; Intel/AMD: `--device=/dev/dri`; or choose
   Automatic). A busy GPU gets a warning saying files wait (or use the CPU)
-  until it is free and that Chrysopoeia checks again by itself.
+  until it is free and that Szalinski checks again by itself.
 - `recommend_jobs`: CPU jobs = clamp(floor(effective_cores / 4), 1, 8), further
   capped by memory (1.5 GB per job) — effective cores honor cgroup limits.
   GPU jobs: NVIDIA 3 per GPU (consumer NVENC session limits), Intel/AMD 2 per
@@ -1464,7 +1464,7 @@ interface and JetBrains Mono for technical values.
 
 Screens:
 1. **Setup** (first run, when `settings.onboarded` is false and there are no
-   libraries): welcome (what Chrysopoeia does, three reassurances) → pick a
+   libraries): welcome (what Szalinski does, three reassurances) → pick a
    folder with the server-side folder picker, which shows how many videos
    each folder and the current one hold (`media_count`) → choose a goal
    (Save space / Balanced / Plays everywhere / Archive, each with its
@@ -1510,7 +1510,7 @@ Screens:
    `path_error` (in a callout at the top; when that is another drive
    mounted in place of the usual one, `changed_mount`, the callout is
    "A different drive is mounted" with **Use the drive that's there now**,
-   which asks first: "Chrysopoeia will take the drive mounted at … as the
+   which asks first: "Szalinski will take the drive mounted at … as the
    usual one from now on: it reads files from it and saves new files to
    it. Only do this if you replaced the drive or share on purpose. If the
    usual one just isn't connected yet, reconnect it instead: files saved
@@ -1553,6 +1553,6 @@ every destructive action is reversible or confirmed.
   folder, put it on an SSD/cache pool). One port: 8080.
 - GPU: NVIDIA via `--runtime=nvidia` (Unraid Nvidia-Driver plugin) or compose
   `deploy.resources.reservations.devices`; Intel/AMD via `--device=/dev/dri`.
-- `unraid/chrysopoeia.xml`: Community Applications template with those fields.
+- `unraid/szalinski.xml`: Community Applications template with those fields.
 - `docker-compose.yml` (CPU), `docker-compose.nvidia.yml`,
   `docker-compose.intel-amd.yml` overlays.

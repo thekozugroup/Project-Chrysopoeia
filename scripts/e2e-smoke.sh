@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end smoke test for a Chrysopoeia Docker image.
+# End-to-end smoke test for a Szalinski Docker image.
 #
-#   scripts/e2e-smoke.sh <image>          e.g. scripts/e2e-smoke.sh chrysopoeia:dev
+#   scripts/e2e-smoke.sh <image>          e.g. scripts/e2e-smoke.sh szalinski:dev
 #
 # Generates a small synthetic library (scripts/make-test-media.sh, run with the
 # image's own ffmpeg), starts the image with it mounted at /media and an empty
@@ -70,7 +70,7 @@ case $GOAL in
     *) fail "Unknown E2E_GOAL \"$GOAL\" (use save_space, balanced, compatible or archive)." ;;
 esac
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/chrysopoeia-e2e.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/szalinski-e2e.XXXXXX")
 MEDIA="$WORK/media"
 CONFIG="$WORK/config"
 CONTAINER=""
@@ -154,7 +154,7 @@ else
         RUN_UID=1000
         RUN_GID=1000
     fi
-    CONTAINER="chrysopoeia-e2e-$$"
+    CONTAINER="szalinski-e2e-$$"
     env_args=(-e "PUID=$RUN_UID" -e "PGID=$RUN_GID" -e TZ=UTC -e "HW_ACCEL=${E2E_HW_ACCEL:-auto}")
     if [ -n "${E2E_MAX_JOBS:-}" ]; then
         env_args+=(-e "MAX_JOBS=$E2E_MAX_JOBS")
@@ -320,7 +320,7 @@ output_stems = {stem(p) for p in outputs}
 for p in inputs:
     if not p.startswith("./Broken/") and stem(p) not in output_stems:
         problems.append(f"Original {p} is gone and no converted file replaced it.")
-leftovers = [p for p in outputs if ".chrysopoeia-" in os.path.basename(p)]
+leftovers = [p for p in outputs if ".szalinski-" in os.path.basename(p)]
 for p in leftovers:
     problems.append(f"Temporary or backup file left behind: {p}")
 

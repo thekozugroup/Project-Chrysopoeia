@@ -12,7 +12,7 @@ import { FolderDriveNotice } from "./settings";
  */
 
 const DIFFERENT =
-  "A different drive is mounted at /mnt/remotes/nas than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.";
+  "A different drive is mounted at /mnt/remotes/nas than before. Reconnect the usual one, or tell Szalinski to use the one there now.";
 const NOT_CONNECTED =
   "The drive or share mounted at /mnt/remotes/nas isn't connected. Reconnect it, and its conversions continue.";
 
@@ -45,7 +45,7 @@ describe("the output folder's drive swapped", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Use the drive that's there now" }));
     const dialog = await screen.findByRole("alertdialog");
-    expect(dialog.textContent).toContain("Chrysopoeia will take the drive mounted at /mnt/remotes/nas as the usual one");
+    expect(dialog.textContent).toContain("Szalinski will take the drive mounted at /mnt/remotes/nas as the usual one");
     expect(dialog.textContent).toContain("Only do this if you replaced the drive or share on purpose");
     expect(relearn).not.toHaveBeenCalled();
     fireEvent.click(within(dialog).getByRole("button", { name: "Use this drive" }));

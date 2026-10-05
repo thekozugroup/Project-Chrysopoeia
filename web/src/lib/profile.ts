@@ -1,6 +1,6 @@
 /**
  * Profile rules on the client. `GET /api/presets` is the source of truth;
- * the tables here mirror `chrysopoeia-core` (codec.rs, profile.rs) so the
+ * the tables here mirror `szalinski-core` (codec.rs, profile.rs) so the
  * editor still works, and stays valid, if presets have not loaded.
  */
 

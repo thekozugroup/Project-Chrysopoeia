@@ -6,8 +6,8 @@ import type { FsBrowse, FsEntry, UserFolder } from "@/lib/types";
 import { FolderPicker, folderRefusal, groupEntries, quickFolders } from "./folder-picker";
 
 const WHOLE_SERVER =
-  "The whole server can't be a library: it includes Chrysopoeia's own files and every share. Choose the folder that holds your videos.";
-const SETTINGS = "/config is where Chrysopoeia keeps its database and settings. Choose the folder that holds your videos.";
+  "The whole server can't be a library: it includes Szalinski's own files and every share. Choose the folder that holds your videos.";
+const SETTINGS = "/config is where Szalinski keeps its database and settings. Choose the folder that holds your videos.";
 
 function listing(path: string, partial: Partial<FsBrowse> = {}): FsBrowse {
   return {

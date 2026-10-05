@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * DEV-ONLY mock of the Chrysopoeia API, for UI work and screenshots.
+ * DEV-ONLY mock of the Szalinski API, for UI work and screenshots.
  * Every library, file and number here is FAKE sample data. The app never
  * imports this file; run it with `pnpm mock` and build or run the UI with
  * NEXT_PUBLIC_API_URL=http://localhost:8787.
@@ -29,7 +29,7 @@
  *                           sends no `user_folders`, like a server outside Docker
  *
  * Error codes, messages and the `field` of validation errors follow the
- * real server (crates/chrysopoeia-server), so the UI's error handling is
+ * real server (crates/szalinski-server), so the UI's error handling is
  * exercised the same way. Also served: `GET /api/system` (with `build`),
  * `Job.notes`, `HardwareInfo.detecting`, and the round-3 additions:
  * `QueueState.max_jobs_source`, `LibraryStats.settling`, HDR10 metadata on
@@ -99,9 +99,9 @@ const HARD_LINK_NOTE = "The original has another hard link (for example a seedin
 /** The worker's sentence when the goal's container can't hold some of a file's tracks (plan::replace_loss). */
 const lossSkip = (container, lost) =>
   `${container} can't hold this file's ${lost}, so it was left unchanged. To convert it, choose an MKV goal or save converted files to a separate folder; Convert anyway converts it without them`;
-/** The server's sentence when the work folder can't be created (chrysopoeia-worker run.rs). */
+/** The server's sentence when the work folder can't be created (szalinski-worker run.rs). */
 const WORK_FOLDER_ERROR =
-  "The work folder /temp can't be created because Chrysopoeia doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
+  "The work folder /temp can't be created because Szalinski doesn't have permission to write in the folder above it (in Docker, the PUID/PGID user needs write access). Fix it, or choose another work folder, in Settings > Output.";
 /** Jobs queued with "Convert anyway" (force). */
 const forcedJobs = new Set();
 const STARTED = Date.now();
@@ -124,7 +124,7 @@ const ago = (secs) => iso(NOW - secs * 1000);
 const uuid = () => randomUUID();
 
 // ---------------------------------------------------------------------------
-// Profiles, presets and settings (mirror crates/chrysopoeia-core)
+// Profiles, presets and settings (mirror crates/szalinski-core)
 // ---------------------------------------------------------------------------
 
 function profileForGoal(goal) {
@@ -280,7 +280,7 @@ function detectingPlaceholder() {
       {
         level: "info",
         title: "Checking your hardware…",
-        detail: "Chrysopoeia is testing which encoders work on this machine. This takes a few seconds; conversions start right after.",
+        detail: "Szalinski is testing which encoders work on this machine. This takes a few seconds; conversions start right after.",
         fix: null,
       },
     ],
@@ -549,7 +549,7 @@ function validationReport(ssimMin = between(0.955, 0.985)) {
 }
 
 function commandFor(file, encoder) {
-  const out = file.path.replace(/\.[^.]+$/, ".mkv").replace(/([^/]+)$/, ".$1.chrysopoeia-1a2b3c4d.tmp.mkv");
+  const out = file.path.replace(/\.[^.]+$/, ".mkv").replace(/([^/]+)$/, ".$1.szalinski-1a2b3c4d.tmp.mkv");
   const hwIn = encoder.endsWith("_nvenc") ? "-hwaccel cuda -hwaccel_output_format cuda " : "";
   return `ffmpeg -hide_banner -nostdin -y ${hwIn}-analyzeduration 100M -probesize 100M -i "${file.path}" -map 0:0 -map 0:1 -map 0:2? -c:v ${encoder} ${
     encoder.includes("nvenc") ? "-preset p5 -cq 28" : "-preset 6 -crf 30"
@@ -902,7 +902,7 @@ function seedDemo() {
   if (lockedEpisode) {
     const folder = lockedEpisode.path.slice(0, lockedEpisode.path.lastIndexOf("/"));
     lockedEpisode.status = "failed";
-    lockedEpisode.error = `Chrysopoeia doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
+    lockedEpisode.error = `Szalinski doesn't have permission to write in ${folder}, so the new file couldn't be put there and the original was kept. Check the folder's permissions (in Docker, the PUID/PGID user needs write access).`;
     lockedEpisode.problem = "destination";
     makeJob(lockedEpisode, "failed", { stage: "finalizing", progress: 60, error: lockedEpisode.error, problem: "destination", started_at: ago(3300), finished_at: ago(3000) });
   }
@@ -1727,7 +1727,7 @@ const route = (method, pattern, handler) => {
   routes.push({ method, regex, keys, handler });
 };
 
-route("GET", "/api/health", () => ({ ok: true, version: "0.2.0-mock" }));
+route("GET", "/api/health", () => ({ ok: true, version: "0.3.0-mock" }));
 route("GET", "/api/overview", () => overview());
 route("GET", "/api/libraries", () => [...libraries.values()].map(libraryView));
 route("GET", "/api/libraries/:id", ({ id }) => libraryView(getLibrary(id)));
@@ -1741,10 +1741,10 @@ const libraryBlocked = (path) => {
   const instead = "Choose the folder that holds your videos.";
   const within = (dir) => path === dir || path.startsWith(`${dir}/`);
   if (path === "/")
-    return `The whole server can't be a library: it includes Chrysopoeia's own files and every share. ${instead}`;
+    return `The whole server can't be a library: it includes Szalinski's own files and every share. ${instead}`;
   for (const dir of ["/proc", "/sys", "/dev"]) if (within(dir)) return `${dir} is a system folder, not a place for videos. ${instead}`;
-  if (within("/config")) return `/config is where Chrysopoeia keeps its database and settings. ${instead}`;
-  if (within("/app")) return `/app holds the Chrysopoeia app itself, which is read-only. ${instead}`;
+  if (within("/config")) return `/config is where Szalinski keeps its database and settings. ${instead}`;
+  if (within("/app")) return `/app holds the Szalinski app itself, which is read-only. ${instead}`;
   return null;
 };
 
@@ -1766,7 +1766,7 @@ route("POST", "/api/libraries", async (_p, _q, req) => {
     throw new HttpError(
       400,
       "contains_output_folder",
-      "The output folder is inside this folder, so Chrysopoeia would convert its own results. Pick another folder, or change the output folder in Settings.",
+      "The output folder is inside this folder, so Szalinski would convert its own results. Pick another folder, or change the output folder in Settings.",
     );
   for (const lib of libraries.values()) {
     if (lib.path === path) throw new HttpError(409, "library_exists", `That folder is already the library ${lib.name}.`);
@@ -2080,7 +2080,7 @@ route("PATCH", "/api/settings", async (_p, _q, req) => {
     for (const lib of libraries.values()) {
       if (next.output_folder === lib.path || next.output_folder.startsWith(`${lib.path}/`))
         throw invalid(
-          `The output folder can't be inside the library ${lib.name}, or Chrysopoeia would convert its own results.`,
+          `The output folder can't be inside the library ${lib.name}, or Szalinski would convert its own results.`,
           "output_folder",
         );
     }
@@ -2107,7 +2107,7 @@ function folderStatuses() {
       setting: "output_folder",
       path: settings.output_folder,
       problem: mount
-        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Chrysopoeia to use the one there now.`
+        ? `A different drive is mounted at ${mount} than before. Reconnect the usual one, or tell Szalinski to use the one there now.`
         : null,
       changed_mount: mount,
     });
@@ -2147,7 +2147,7 @@ route("POST", "/api/hardware/detect", async () => {
 route("GET", "/api/presets", () => presets);
 
 route("GET", "/api/system", () => ({
-  version: "0.2.0-mock",
+  version: "0.3.0-mock",
   build: "edge-mock",
   // The Docker image sets TEMP_DIR=/temp when that folder is mapped.
   default_temp_dir: "/temp",
@@ -2160,7 +2160,7 @@ route("GET", "/api/fs/browse", (_p, q) => {
   const path = (q.get("path")?.trim() || BROWSE_ROOTS[0]).replace(/(.)\/+$/, "$1");
   if (!path.startsWith("/")) throw new HttpError(400, "path_not_absolute", "Use a full folder path, starting with /.");
   if (!BROWSE_ROOTS.some((r) => r === "/" || path === r || path.startsWith(r + "/")))
-    throw new HttpError(403, "outside_roots", "That folder is outside the folders Chrysopoeia may show.");
+    throw new HttpError(403, "outside_roots", "That folder is outside the folders Szalinski may show.");
   if (!(path in FS)) throw new HttpError(404, "path_not_found", "That folder doesn't exist.");
   const parent = path === "/" ? null : path.slice(0, path.lastIndexOf("/")) || "/";
   return {
@@ -2193,7 +2193,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "OPTIONS") return send(res, 204);
   if (HOST_DENY) {
     return send(res, 403, {
-      error: `Chrysopoeia doesn't answer to the address "${req.headers.host ?? ""}". Add it to ALLOWED_HOSTS.`,
+      error: `Szalinski doesn't answer to the address "${req.headers.host ?? ""}". Add it to ALLOWED_HOSTS.`,
       code: "host_not_allowed",
     });
   }
@@ -2240,6 +2240,6 @@ setInterval(() => {
 
 server.listen(PORT, () => {
   console.log(
-    `Chrysopoeia mock API (FAKE sample data, scenario "${SCENARIO}"${WS_ON ? "" : ", WebSocket off"}) on http://localhost:${PORT}/api`,
+    `Szalinski mock API (FAKE sample data, scenario "${SCENARIO}"${WS_ON ? "" : ", WebSocket off"}) on http://localhost:${PORT}/api`,
   );
 });

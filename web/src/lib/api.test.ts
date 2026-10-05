@@ -12,12 +12,12 @@ function jsonResponse(status: number, body: unknown): Response {
 describe("errorFromBody", () => {
   it("keeps the server's sentence, code and field", () => {
     const err = errorFromBody(400, {
-      error: "Chrysopoeia can't write to the temporary folder /temp.",
+      error: "Szalinski can't write to the temporary folder /temp.",
       code: "invalid_settings",
       field: "temp_dir",
     });
     expect(err).toBeInstanceOf(ApiError);
-    expect(err.message).toBe("Chrysopoeia can't write to the temporary folder /temp.");
+    expect(err.message).toBe("Szalinski can't write to the temporary folder /temp.");
     expect(err.code).toBe("invalid_settings");
     expect(err.field).toBe("temp_dir");
     expect(err.status).toBe(400);
