@@ -1301,6 +1301,207 @@ async fn a_damaged_original_is_confirmed_with_cpu_decoding() {
     assert_eq!(std::fs::read(&input).unwrap(), before);
 }
 
+/// Like [`fake_plan`], but each encoder's command names it, so attempts
+/// with different encoders are never taken for the same command.
+fn named_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
+    let mut plan = fake_plan(req)?;
+    let at = plan.args.len() - 1;
+    plan.args.splice(
+        at..at,
+        [
+            "-metadata".to_string(),
+            format!("comment=Converted with {}", req.encoder.name),
+        ],
+    );
+    Ok(plan)
+}
+
+/// The tester's report: a healthy 61 s original whose conversion an ffmpeg
+/// wrapper cut to 30 s (`-t 30`). Before, a failed length check after an
+/// encode that stopped early was taken to mean the original stops there:
+/// the job failed with "The original file appears damaged or incomplete (it
+/// stops after 30.0 s)", a problem with the original, which also stopped it
+/// from trying the next encoder. The original's packets reach its end, so
+/// the new file is what's short: a failed check, the next way of converting
+/// is tried, and the original is kept byte for byte. With checks off, the
+/// half-length rule catches the cut, as the conversion's doing too.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_conversion_cut_short_is_not_blamed_on_a_healthy_original() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let cut_at_30 = support::cutting_ffmpeg(dir.path(), 30);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::small_clip(&library, "Healthy (2020).mkv", 61, &[]);
+    let before = std::fs::read(&input).unwrap();
+    let hardware = candidate("h264_qsv", HwApi::Qsv, false);
+    let shorter = "The new file is shorter than the original (30.0 s instead of 1:01). The \
+                   original was kept. Try again.";
+    let cut_on_the_cpu = "Converting on the CPU made a file shorter than the original (30.0 s \
+                          instead of 1:01), so the original was left unchanged. Try again; if it \
+                          happens again, the job's log has the details.";
+    let both_tried = "None of the 2 ways Szalinski tried could convert this file. ";
+    // (The last attempt's failed check is the job's error as it is.)
+    for (validation, candidates, kind, error_is) in [
+        (
+            ValidationLevel::Thorough,
+            vec![software()],
+            ProblemKind::Verification,
+            shorter.to_string(),
+        ),
+        (
+            ValidationLevel::Thorough,
+            vec![hardware.clone(), software()],
+            ProblemKind::Verification,
+            shorter.to_string(),
+        ),
+        (
+            ValidationLevel::Standard,
+            vec![hardware.clone(), software()],
+            ProblemKind::Verification,
+            shorter.to_string(),
+        ),
+        (
+            ValidationLevel::Off,
+            vec![hardware.clone(), software()],
+            ProblemKind::Encoder,
+            format!("{both_tried}{cut_on_the_cpu}"),
+        ),
+    ] {
+        let mut cfg = config(validation);
+        cfg.ffmpeg = cut_at_30.clone();
+        let mut spec = spec(&input, &library, profile());
+        spec.candidates = candidates.clone();
+        let (outcome, _) = run(&cfg, &spec, &named_plan).await;
+        let attempts = outcome.attempts().to_vec();
+        let JobOutcome::Failed {
+            error,
+            problem,
+            attempt,
+            ..
+        } = outcome
+        else {
+            panic!("{validation:?}: expected Failed, got {outcome:?}");
+        };
+        assert_eq!(problem, kind, "{validation:?}: {error}");
+        assert_eq!(error, error_is, "{validation:?}");
+        // Every way of converting was tried, each failing the same way.
+        assert_eq!(attempt as usize, candidates.len(), "{validation:?}");
+        assert_eq!(attempts.len(), candidates.len(), "{validation:?}");
+        for (tried, candidate) in attempts.iter().zip(&candidates) {
+            assert_eq!(tried.encoder, candidate.name);
+            assert_eq!(tried.result, AttemptResult::Failed);
+            assert_eq!(tried.problem, Some(kind), "{validation:?}");
+            if validation != ValidationLevel::Off {
+                let check = tried.failed_check.as_ref().expect("the failed check");
+                assert_eq!(check.id, "duration");
+            }
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), before, "{validation:?}");
+        assert!(support::artifacts_in(dir.path()).is_empty());
+    }
+}
+
+/// When the original's packets can't be listed to confirm where it ends
+/// (ffprobe fails on them), its length decides alone, as it did before:
+/// the truncated MKV from the test library is still reported as damaged.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_original_that_cant_be_listed_is_judged_by_its_length() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let ffprobe = support::unlisting_ffprobe(dir.path());
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media("Broken/Truncated.mkv", &library);
+    let before = std::fs::read(&input).unwrap();
+    let spec = spec(&input, &library, profile());
+    for validation in [ValidationLevel::Standard, ValidationLevel::Off] {
+        let mut cfg = config(validation);
+        cfg.ffprobe = ffprobe.clone();
+        let (outcome, _) = run(&cfg, &spec, &fake_plan).await;
+        match outcome {
+            JobOutcome::Failed { error, problem, .. } => {
+                assert_eq!(problem, ProblemKind::UnreadableSource, "{error}");
+                assert!(
+                    error.starts_with(
+                        "The original file appears damaged or incomplete (it stops after 0.1 s)"
+                    ),
+                    "{validation:?}: {error}"
+                );
+            }
+            other => panic!("{validation:?}: expected Failed, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&input).unwrap(), before);
+    }
+}
+
+/// Really cut-off originals are still reported as damaged, with checks on
+/// and off, and left as they were: a 61 s MKV cut in half (as `head -c`
+/// cuts it), the same written as a live stream without tags and cut in
+/// half (it states no length, so only the cut tells it is incomplete), one
+/// whose timestamps start at 10:00 cut in half, and the truncated MKV from
+/// the test library. Each is probed as the server's scanner probes it.
+#[tokio::test]
+async fn really_cut_off_originals_are_still_reported_as_damaged() {
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let made = dir.path().join("made");
+    std::fs::create_dir_all(&made).unwrap();
+    let whole = support::small_clip(&made, "whole.mkv", 61, &[]);
+    let live = support::small_clip(&made, "live.mkv", 61, &["-live", "1"]);
+    let offset = support::small_clip(&made, "offset.mkv", 61, &["-output_ts_offset", "600"]);
+    let originals = [
+        support::first_half(&whole, "Cut (2020).mkv"),
+        support::first_half(&live, "Live cut (2020).mkv"),
+        support::first_half(&offset, "Offset cut (2020).mkv"),
+        support::copy_media("Broken/Truncated.mkv", &made),
+    ];
+    for file in [whole, live, offset] {
+        std::fs::remove_file(file).ok();
+    }
+    for original in originals {
+        let name = original.file_name().unwrap().to_owned();
+        let library = dir.path().join(original.file_stem().unwrap());
+        std::fs::create_dir_all(&library).unwrap();
+        let input = library.join(&name);
+        std::fs::rename(&original, &input).unwrap();
+        let before = std::fs::read(&input).unwrap();
+        let mut spec = spec(&input, &library, profile());
+        spec.probe =
+            szalinski_scanner::probe_file(Path::new("ffprobe"), &input, Duration::from_secs(60))
+                .await
+                .expect("probe");
+        for validation in [ValidationLevel::Thorough, ValidationLevel::Off] {
+            let (outcome, _) = run(&config(validation), &spec, &fake_plan).await;
+            match outcome {
+                JobOutcome::Failed { error, problem, .. } => {
+                    assert_eq!(
+                        problem,
+                        ProblemKind::UnreadableSource,
+                        "{name:?} {validation:?}: {error}"
+                    );
+                    assert!(
+                        error.starts_with(
+                            "The original file appears damaged or incomplete (it stops after"
+                        ),
+                        "{name:?} {validation:?}: {error}"
+                    );
+                    assert!(error.ends_with("It was left unchanged."), "{error}");
+                }
+                other => panic!("{name:?} {validation:?}: expected Failed, got {other:?}"),
+            }
+            assert_eq!(std::fs::read(&input).unwrap(), before, "{name:?}");
+            assert_eq!(
+                support::walk(&library),
+                std::slice::from_ref(&input),
+                "{name:?}"
+            );
+        }
+    }
+}
+
 /// A work folder that can't be used fails the job before anything is
 /// encoded, with a plain reason and the `work_folder` kind: here a file is
 /// in the way of the folder's name.

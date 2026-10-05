@@ -965,11 +965,37 @@ that a different drive is mounted there).
    original's length again the way verification does
    (`validate::source_length`, below; the scanned one counts only when the
    original can't be probed again): an out-of-date tag, a file with no
-   length but its tags, or timestamps that don't start at zero never make a
-   complete original look cut off (nor does a stored probe made before
-   lengths were read this way), while one that plays clearly shorter than
-   its container says, or than its tags say when it stops in the middle of
-   a packet, still does. Only an attempt that decoded on the CPU (or the last attempt)
+   length but its tags or none at all, or timestamps that don't start at
+   zero never make a complete original look cut off (nor does a stored probe
+   made before lengths were read this way), while one that plays clearly
+   shorter than its container says, or than its tags say when it stops in
+   the middle of a packet, still does. Before the original is blamed, its
+   packets are listed near the end it states (the packets verification
+   listed when it measured the file that way, else the last 10 s, else all
+   of them; no decoding) and `run::early_end` decides:
+   - they reach its length within the length check's tolerance (max(1 s,
+     0.5 %)), whether or not ffprobe finds a cut packet at the very end:
+     the original is complete, and the new file is what's short. With
+     checks on, that is the failed length check, a `verification` problem,
+     and a hardware attempt moves on to the next one as for any failed
+     check (a wrapper that cuts every encode to 30 s fails with "The new
+     file is shorter than the original (30.0 s instead of 1:01). The
+     original was kept. Try again." after every attempt, never "damaged").
+     With checks off, the attempt fails as an `encoder` problem ("Converting
+     on the CPU made a file shorter than the original (30.0 s instead of
+     1:01), so the original was left unchanged. Try again; if it happens
+     again, the job's log has the details.") and the next attempt is tried;
+   - they stop short of it (a file cut off in the middle of a packet stops
+     where its packets do): damaged, as above;
+   - it states no length and ffprobe finds it cut off (a live-stream MKV
+     cut in half): nothing tells how much is missing, so evidence of the
+     cut (damaged input, a failed length check, or checks off) makes it
+     damaged;
+   - the packets can't be listed (ffprobe fails, or lists nothing new for
+     60 s): its length decides alone, as before. A share that stops
+     answering meanwhile ends the job as not responding.
+   When the scan found no length, damaged input (or checks off) is enough
+   to look. Only an attempt that decoded on the CPU (or the last attempt)
    concludes this; a GPU-decoding attempt that stops early moves on to the
    next attempt like any other hardware failure.
 4. **Size rule**: if `profile.min_savings_pct = Some(p)` and the output is not
@@ -1018,43 +1044,57 @@ child is started with `core::process::end_with_parent` (Linux
     keeps the container longer); anything else, or every contradicted tag
     when the packets can't be listed, takes the container's length.
   - No length but the tags (a Matroska file written as a live stream,
-    `-live 1`, or by a recorder that never filled it in), or a Matroska
-    file whose timestamps don't start at zero (ffmpeg's writer states
-    where such a file ends, 11:01 for a minute starting at 10:00, as its
-    length and in every `DURATION`; through a pipe ffmpeg 7 states its
-    length instead): nothing it states is taken as its length. The packets
-    are listed from 10 s before the longest it could be (each stated
-    length read as a length from its start; a seek past the end lands on
-    the last keyframe, with Matroska Cues or by reading through a file
-    without them), and when that lists nothing, every packet of the file
-    (no decoding; about 5 s for a 1 GB, 45-minute file, and only for these
-    rare files). The file's length is where its last packet ends minus its
-    start, each picture and sound track's where its own packets end; one
-    with no packet in the part listed keeps a tag that ends before it,
-    read as a length, and is otherwise unknown. When ffprobe says the file
-    stops in the middle of a packet ("File ended prematurely"), its
-    packets show where it stops, not how long it should be: what it states
-    stands, read as a length (a stated value past the start time is an
-    end), so a cut-off original is still found out. When the packets
-    can't be listed, the length is unknown, except a container length
-    smaller than the start time, which can only be a length. An original
-    whose length is unknown this way leaves nothing to tell a complete new
-    file from one cut short, so the length check fails ("The original's
-    length couldn't be read (the length it states can't be trusted and its
-    contents couldn't be listed), so the new file couldn't be checked
-    against it") and the original is kept, never called cut short. A
-    listing that lists nothing new for 60 s is given up.
+    `-live 1`, or by a recorder that never filled it in), no length at all
+    in any container (neither the container nor a picture or sound stream
+    states one: the same live-stream file without tags, or written through
+    a pipe; a raw elementary stream such as `.h264`; a transport stream or
+    VOB ffprobe can't estimate), or a Matroska file whose timestamps don't
+    start at zero (ffmpeg's writer states where such a file ends, 11:01 for
+    a minute starting at 10:00, as its length and in every `DURATION`;
+    through a pipe ffmpeg 7 states its length instead): nothing it states
+    is taken as its length. The packets are listed from 10 s before the
+    longest it could be (each stated length read as a length from its
+    start; a seek past the end lands on the last keyframe, with Matroska
+    Cues or by reading through a file without them), and when that lists
+    nothing, or the file states no length to read back from, every packet
+    of the file (no decoding; about 5 s for a 1 GB, 45-minute file, and
+    only for these rare files). The file's length is where its last packet
+    ends minus its start, each picture and sound track's where its own
+    packets end; one with no packet in the part listed keeps a tag that
+    ends before it, read as a length, and is otherwise unknown. A raw
+    stream's packets have no times at all: in a listing where none has
+    one, each stream's packet durations are added up (a listing with times
+    ignores the packets without). When ffprobe says the file stops in the
+    middle of a packet ("File ended prematurely"), its packets show where
+    it stops, not how long it should be: what it states stands, read as a
+    length (a stated value past the start time is an end), so a cut-off
+    original is still found out; one that states nothing has no length
+    then. When the packets can't be listed, the length is unknown, except
+    a container length smaller than the start time, which can only be a
+    length. An original whose length is unknown this way leaves nothing to
+    tell a complete new file from one cut short, so the length check fails
+    ("The original's length couldn't be read (it states none that can be
+    trusted, and its contents couldn't be listed), so the new file
+    couldn't be checked against it"; cut off: "(it stops in the middle of
+    its data and doesn't say how long it should be)") and the original is
+    kept. So does one whose length can't be read for any other reason (it
+    can't be probed again and the scan found none): the length check is
+    never skipped. A listing that lists nothing new for 60 s is given up.
   So an out-of-date tag, a file that states no length of its own or
   timestamps that don't start at zero can neither make a new file look
   "the same length" as a wrongly long original nor make a complete one
-  look cut short. The length the full decode must reach is the new file's
-  picture and sound length read this way, else its container's, else the
-  original's; a conversion that stops early still fails ("The new file is
-  shorter than the original (…)" or "Playback stopped at … of …"). The
-  scanner's `probe_file` reads such files' lengths the same way
-  (`ProbeInfo.duration_secs`, within its 60 s), so the library, progress
-  and the cut-off check (step 3 above) agree with verification;
-  `parse_ffprobe_json` alone (no packets) gives the length as stated.
+  look cut short, and the pictures of a file that states no length are
+  compared like any other's (before, "The file is too short to compare
+  pictures"). The new file's own length is read the same way, so one that
+  states none is measured too. The length the full decode must reach is
+  the new file's picture and sound length read this way, else its
+  container's, else the original's; a conversion that stops early still
+  fails ("The new file is shorter than the original (…)" or "Playback
+  stopped at … of …"). The scanner's `probe_file` reads such files'
+  lengths the same way (`ProbeInfo.duration_secs`, within its 60 s), so
+  the library, progress and the cut-off check (step 3 above) agree with
+  verification; `parse_ffprobe_json` alone (no packets) gives the length
+  as stated.
 - `standard`: quick + full decode of every picture and sound track (error/fatal
   lines, "corrupt decoded frame" and concealment count as damage; damage the
   original already has only warns) + visual comparison at 4 segments of 2 s.
@@ -1076,9 +1116,17 @@ child is started with `core::process::end_with_parent` (Linux
   file couldn't be compared with the original." A similarity score stays in
   the check's detail (the report) as a percentage, like the UI shows it
   ("Matches the original at 4 points (99.8% similar on average)"), never in
-  the error, and every error ends with what to do: "The original was kept.
-  Try again, or choose lighter checks in Settings › Output." Track counts
-  name each kind ("1 video track and 2 audio tracks").
+  the error, and every error ends with what to do, by the check that
+  failed (`run::verification_fix`): lighter checks only where they skip
+  it (`decode` and `visual` at Quick, `black_frames` and `frozen_frames`
+  at Standard): "The original was kept. Try again, or choose lighter
+  checks in Settings › Output."; `probe`, `streams` and `duration` run at
+  every level, and only Off skips them, which would put a broken or
+  cut-short file in place unchecked, so: "The original was kept. Try
+  again."; and when the original's length couldn't be read: "The original
+  was kept. Try again; if it happens again, check that the original plays
+  to the end, or replace it with a good copy." Track counts name each kind
+  ("1 video track and 2 audio tracks").
 
 **Putting the new file in place on a share that stops answering.** A
 rename that has started can't be called back, and abandoning it half way

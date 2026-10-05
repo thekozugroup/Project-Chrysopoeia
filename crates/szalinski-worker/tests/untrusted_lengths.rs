@@ -17,6 +17,11 @@
 //! short still fails, the live-stream clip really cut short is still
 //! reported as damaged, and statistics tags stored for the whole file are
 //! removed from the new MKV.
+//!
+//! Originals that state no length at all (a live-stream MKV without tags,
+//! a raw H.264 stream) are measured by their packets: a conversion cut to
+//! 30 s no longer replaces the 61 s original, a complete one passes with
+//! every check run, and one whose packets can't be listed is kept.
 
 mod support;
 
@@ -274,9 +279,10 @@ macro_rules! require_libx265 {
     };
 }
 
-/// The whole job, as the server runs it, with the original in `dir`.
-async fn convert(input: &Path, probe: ProbeInfo, validation: ValidationLevel) -> JobOutcome {
-    let cfg = RunConfig {
+/// How the server runs a job on `input`: new files go to a `converted`
+/// folder next to it.
+fn config(input: &Path, validation: ValidationLevel) -> RunConfig {
+    RunConfig {
         ffmpeg: PathBuf::from("ffmpeg"),
         ffprobe: PathBuf::from("ffprobe"),
         temp_dir: None,
@@ -285,7 +291,16 @@ async fn convert(input: &Path, probe: ProbeInfo, validation: ValidationLevel) ->
         output_folder: Some(input.with_file_name("converted")),
         keep_file_dates: true,
         low_priority: false,
-    };
+    }
+}
+
+/// The whole job, as the server runs it, with the original in `dir`.
+async fn convert(input: &Path, probe: ProbeInfo, validation: ValidationLevel) -> JobOutcome {
+    convert_with(&config(input, validation), input, probe).await
+}
+
+/// [`convert`], run with `cfg`.
+async fn convert_with(cfg: &RunConfig, input: &Path, probe: ProbeInfo) -> JobOutcome {
     let spec = JobSpec {
         job_id: Uuid::new_v4(),
         file_id: Uuid::new_v4(),
@@ -299,7 +314,7 @@ async fn convert(input: &Path, probe: ProbeInfo, validation: ValidationLevel) ->
     };
     let (tx, mut rx) = mpsc::channel(4096);
     let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-    let outcome = run_job(&cfg, &spec, tx, CancellationToken::new()).await;
+    let outcome = run_job(cfg, &spec, tx, CancellationToken::new()).await;
     drain.await.ok();
     outcome
 }
@@ -651,4 +666,202 @@ async fn statistics_in_an_mp4s_metadata_are_not_carried_into_the_mkv() {
     );
     assert!(!tags.contains_key("DURATION-eng"), "{out}");
     assert!(!out.to_string().contains(FILM), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Originals that state no length at all.
+
+/// The tester's original: 61 s, written so it states no length.
+const UNSTATED_SECS: u32 = 61;
+
+/// [`config`] replacing the original, as the tester's library did.
+fn replacing(input: &Path, validation: ValidationLevel) -> RunConfig {
+    RunConfig {
+        output_mode: OutputMode::Replace,
+        output_folder: None,
+        ..config(input, validation)
+    }
+}
+
+/// A job that the checks failed: its problem, its error and its checks.
+fn failed(outcome: JobOutcome) -> (ProblemKind, String, ValidationReport) {
+    match outcome {
+        JobOutcome::Failed {
+            problem,
+            error,
+            validation: Some(report),
+            ..
+        } => {
+            eprintln!("{error}\n{}", describe(&report));
+            (problem, error, report)
+        }
+        other => panic!("expected the checks to fail the job, got {other:?}"),
+    }
+}
+
+/// A finished job that replaced the original after thorough checks that
+/// all ran (none skipped), comparing the 1:01 on both sides.
+fn assert_replaced_after_every_check(name: &str, source: &Path, outcome: JobOutcome) {
+    let JobOutcome::Done {
+        output_path,
+        validation,
+        ..
+    } = outcome
+    else {
+        panic!("{name}: expected the job to finish, got {outcome:?}");
+    };
+    let report = validation.expect("verified");
+    eprintln!("{name}:\n{}", describe(&report));
+    assert!(report.passed, "{name}:\n{}", describe(&report));
+    assert_eq!(report.level, ValidationLevel::Thorough);
+    for c in &report.checks {
+        assert_ne!(
+            c.status,
+            CheckStatus::Skipped,
+            "{name}:\n{}",
+            describe(&report)
+        );
+    }
+    assert_eq!(
+        check(&report, "duration").detail,
+        "Matches the original (1:01 vs 1:01)",
+        "{name}"
+    );
+    assert_eq!(
+        check(&report, "decode").detail,
+        "Decoded all 1:01 without errors",
+        "{name}"
+    );
+    let visual = check(&report, "visual");
+    assert_eq!(visual.status, CheckStatus::Pass, "{name}");
+    assert!(
+        visual
+            .detail
+            .starts_with("Matches the original at 10 points"),
+        "{name}: {}",
+        visual.detail
+    );
+    for id in ["black_frames", "frozen_frames"] {
+        assert_eq!(check(&report, id).status, CheckStatus::Pass, "{name}: {id}");
+    }
+    assert_eq!(output_path, source.with_extension("mkv"), "{name}");
+    let stated = format_field(&ffprobe_json(&output_path), "duration").unwrap_or_default();
+    assert!(
+        (stated - 61.0).abs() < 0.5,
+        "{name}: the new file states {stated}"
+    );
+}
+
+/// The tester's report: a Matroska file written as a live stream without
+/// tags (`-live 1`; through a pipe it is the same) states no length at
+/// all. Before, the scanner listed none, the checks said "Same length as
+/// the original [skipped]" and "Looks like the original [skipped]: The
+/// file is too short to compare pictures", and a conversion cut to 30 s
+/// passed and replaced the 61 s original. Its packets are listed now (all
+/// of them: there is no end to read back from). The cut conversion fails
+/// and the original is kept byte for byte, whether the server stored its
+/// length as ffprobe states it (none) or measured; a complete conversion
+/// replaces it after thorough checks that all ran. The same holds for its
+/// picture as a raw H.264 stream, a file that states no length in any
+/// container.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_stream_mkv_with_no_length_at_all() {
+    require_libx265!();
+    let dir = tempfile::tempdir().unwrap();
+    let cut_at_30 = support::cutting_ffmpeg(dir.path(), 30);
+    let live = support::small_clip(
+        dir.path(),
+        "Live (2017).mkv",
+        UNSTATED_SECS,
+        &["-live", "1"],
+    );
+    let raw = dir.path().join("Raw (2017).h264");
+    support::ffmpeg(&["-i", s(&live), "-map", "0:v", "-c", "copy", s(&raw)]);
+
+    for source in [live, raw] {
+        let name = source.file_name().unwrap().to_string_lossy().into_owned();
+        let json = ffprobe_json(&source);
+        assert_eq!(format_field(&json, "duration"), None, "{name}: {json}");
+        assert!(!json.to_string().contains("DURATION"), "{name}: {json}");
+        let stated = support::probe(&source);
+        assert_eq!(stated.duration_secs, None, "{name}: as ffprobe states it");
+        let scanned = scan(&source).await;
+        let length = scanned.duration_secs.unwrap_or_default();
+        assert!((length - 61.0).abs() < 0.2, "{name}: listed as {length} s");
+
+        let before = std::fs::read(&source).unwrap();
+        for probe in [stated.clone(), scanned] {
+            let cfg = RunConfig {
+                ffmpeg: cut_at_30.clone(),
+                ..replacing(&source, ValidationLevel::Thorough)
+            };
+            let (problem, error, report) = failed(convert_with(&cfg, &source, probe).await);
+            assert_eq!(problem, ProblemKind::Verification, "{name}");
+            assert_eq!(
+                error,
+                "The new file is shorter than the original (30.0 s instead of 1:01). The \
+                 original was kept. Try again.",
+                "{name}"
+            );
+            assert_eq!(
+                report.first_failure().map(|c| c.id.as_str()),
+                Some("duration"),
+                "{name}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), before, "{name}: kept");
+            assert!(support::artifacts_in(dir.path()).is_empty(), "{name}");
+        }
+
+        let cfg = replacing(&source, ValidationLevel::Thorough);
+        let outcome = convert_with(&cfg, &source, stated).await;
+        assert_replaced_after_every_check(&name, &source, outcome);
+    }
+}
+
+/// The same kind of original when its packets can't be listed (ffprobe
+/// fails on them): its length can't be read, so nothing could tell a
+/// complete conversion from one cut short. The length check fails at
+/// every level that runs it (Quick too) instead of being skipped, and the
+/// original is kept byte for byte. The advice is about the original, not
+/// lighter checks, which fail the same way.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_original_with_no_length_whose_packets_cant_be_listed_is_kept() {
+    require_libx265!();
+    let dir = tempfile::tempdir().unwrap();
+    let ffprobe = support::unlisting_ffprobe(dir.path());
+    let cut_at_3 = support::cutting_ffmpeg(dir.path(), 3);
+    let source = support::small_clip(dir.path(), "Live (2017).mkv", 6, &["-live", "1"]);
+    // The scanner can't measure it either.
+    let probe = szalinski_scanner::probe_file(&ffprobe, &source, Duration::from_secs(60))
+        .await
+        .expect("probe");
+    assert_eq!(probe.duration_secs, None);
+
+    let before = std::fs::read(&source).unwrap();
+    for (validation, ffmpeg) in [
+        (ValidationLevel::Quick, PathBuf::from("ffmpeg")),
+        (ValidationLevel::Thorough, PathBuf::from("ffmpeg")),
+        (ValidationLevel::Thorough, cut_at_3.clone()),
+    ] {
+        let cfg = RunConfig {
+            ffmpeg,
+            ffprobe: ffprobe.clone(),
+            ..replacing(&source, validation)
+        };
+        let (problem, error, report) = failed(convert_with(&cfg, &source, probe.clone()).await);
+        assert_eq!(problem, ProblemKind::Verification, "{validation:?}");
+        assert_eq!(
+            error,
+            "The original's length couldn't be read (it states none that can be trusted, and \
+             its contents couldn't be listed), so the new file couldn't be checked against it. \
+             The original was kept. Try again; if it happens again, check that the original \
+             plays to the end, or replace it with a good copy.",
+            "{validation:?}"
+        );
+        assert_eq!(check(&report, "duration").status, CheckStatus::Fail);
+        assert_eq!(std::fs::read(&source).unwrap(), before, "{validation:?}");
+        assert!(support::artifacts_in(dir.path()).is_empty());
+    }
 }

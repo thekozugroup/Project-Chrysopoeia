@@ -1233,7 +1233,7 @@ impl Job<'_> {
             // that gives up early gets the next attempt (CPU decoding) first.
             let unverified = cfg.validation == ValidationLevel::Off;
             let conclusive = !(candidate.api.is_hardware() && candidate.hw_decode) || is_last;
-            let stops_early = match self
+            let early = match self
                 .original_stops_early(
                     &prepared.watched,
                     run.encoded_secs,
@@ -1242,10 +1242,31 @@ impl Job<'_> {
                 )
                 .await
             {
-                Ok(stop) => stop,
+                Ok(early) => early,
                 Err(outcome) => return outcome,
             };
-            if let Some(stop) = stops_early {
+            if let EarlyEnd::NewFile { stop, length } = early
+                && unverified
+            {
+                // The original is complete, so the new file is cut short,
+                // and nothing else checks it: like an encode that failed, it
+                // is never put in place, and the next way of converting may
+                // do better. (Verified, it fails its length check.)
+                let f = failure(
+                    ProblemKind::Encoder,
+                    cut_short_message(candidate.api, stop, length),
+                    exit.tail().map(str::to_string),
+                );
+                self.reporter
+                    .record_attempt(failed_attempt(record(), &f, f.error.clone(), None));
+                tracing::debug!(job = %spec.job_id, attempt, "{}", f.error);
+                last_failure = Some(f);
+                if let Err(e) = guard.clear().await {
+                    return e.into();
+                }
+                continue;
+            }
+            if let EarlyEnd::Original(stop) = early {
                 let f = failure(
                     ProblemKind::UnreadableSource,
                     damaged_source_message(stop),
@@ -1343,8 +1364,9 @@ impl Job<'_> {
                 {
                     return outcome;
                 }
-                // Too short, and the encoder saw the input end early: the
-                // original is what's incomplete, not the new file.
+                // Too short, and the original's packets confirm it ends
+                // early: the original is what's incomplete, not the new
+                // file. When they reach its length, the new file is.
                 let too_short =
                     conclusive && report.first_failure().is_some_and(|c| c.id == "duration");
                 let stops_early = if too_short {
@@ -1352,7 +1374,8 @@ impl Job<'_> {
                         .original_stops_early(&prepared.watched, run.encoded_secs, true, false)
                         .await
                     {
-                        Ok(stop) => stop,
+                        Ok(EarlyEnd::Original(stop)) => Some(stop),
+                        Ok(EarlyEnd::NewFile { .. } | EarlyEnd::Neither) => None,
                         Err(outcome) => return outcome,
                     }
                 } else {
@@ -1549,16 +1572,22 @@ impl Job<'_> {
         lock_unfinished().insert(job_id, unfinished);
     }
 
-    /// Where the original stops, when an encode shows it ends clearly
-    /// before its length (see [`source_stops_early`]). Before it is called
-    /// cut off, its length is read again the way verification reads it
-    /// (see [`crate::validate`]): an out-of-date Matroska tag, a file that
-    /// states no length but its tags, or timestamps that don't start at zero
-    /// then never make a complete original look cut short, while one that
-    /// plays clearly shorter than its container says (or than its tags say,
-    /// when it stops in the middle of a packet) still does. When it can't
-    /// be read again, the length found when it was scanned counts. `Err`
-    /// when the job is cancelled or a share stops answering meanwhile.
+    /// Whether the original or the new file ends early, when an encode
+    /// shows one of them does: it ended clearly before the original's
+    /// length (see [`source_stops_early`]), or ffmpeg found the input
+    /// damaged (or nothing else checks the result) when the scan found no
+    /// length. Before the original is called cut off, its length is read
+    /// again the way verification reads it (see [`crate::validate`]), and
+    /// its packets are listed near the end it states (see [`early_end`]):
+    /// an out-of-date Matroska tag, a file that states no length but its
+    /// tags or none at all, timestamps that don't start at zero, or a
+    /// conversion cut short then never make a complete original look cut
+    /// short, while one that plays clearly shorter than its container says
+    /// (or than its tags say, or that stops in the middle of a packet) still
+    /// does. When it can't be read again, the length found when it was
+    /// scanned counts, and when its packets can't be listed, its length
+    /// decides alone. `Err` when the job is cancelled or a share stops
+    /// answering meanwhile.
     #[allow(
         clippy::result_large_err,
         reason = "the error is the job's outcome, made once per job and returned at once"
@@ -1569,10 +1598,12 @@ impl Job<'_> {
         encoded_secs: Option<f64>,
         damage_seen: bool,
         unverified: bool,
-    ) -> Result<Option<f64>, JobOutcome> {
+    ) -> Result<EarlyEnd, JobOutcome> {
         let scanned = self.spec.probe.duration_secs;
-        if source_stops_early(scanned, encoded_secs, damage_seen, unverified).is_none() {
-            return Ok(None);
+        let suspect = source_stops_early(scanned, encoded_secs, damage_seen, unverified).is_some()
+            || (scanned.is_none() && (damage_seen || unverified));
+        if !suspect {
+            return Ok(EarlyEnd::Neither);
         }
         let measure = validate::source_length(&self.cfg.ffprobe, &self.spec.input, self.cancel);
         let measured = tokio::select! {
@@ -1581,31 +1612,43 @@ impl Job<'_> {
                 return Err(NotAnswering::at(&path).into());
             }
         };
-        let claimed = match measured {
-            Ok(length) => length,
+        let measured = match measured {
+            Ok(measured) => measured,
             Err(validate::ProbeError::Cancelled) => return Err(JobOutcome::Cancelled),
             Err(validate::ProbeError::Failed(why)) => {
                 tracing::debug!(
                     job = %self.spec.job_id,
                     "could not read the original's length again ({why}); using the scanned one"
                 );
-                scanned
+                validate::SourceLength {
+                    length: scanned,
+                    packets: validate::PacketsEnd::Unlisted,
+                }
             }
         };
-        if claimed != scanned {
+        if measured.length != scanned {
             tracing::debug!(
                 job = %self.spec.job_id,
                 ?scanned,
-                ?claimed,
+                claimed = ?measured.length,
                 "the original's length, read again, differs from the scanned one"
             );
         }
-        Ok(source_stops_early(
-            claimed,
+        let early = early_end(
+            measured.length,
+            measured.packets,
             encoded_secs,
             damage_seen,
             unverified,
-        ))
+        );
+        tracing::debug!(
+            job = %self.spec.job_id,
+            ?encoded_secs,
+            packets = ?measured.packets,
+            ?early,
+            "checked whether the original ends early"
+        );
+        Ok(early)
     }
 
     /// Run ffmpeg for one attempt, reporting transcoding progress. Stops it
@@ -1712,6 +1755,69 @@ pub(crate) fn source_stops_early(
     (clearly_short && evidence).then_some(encoded)
 }
 
+/// What an encode that may have ended early says, once the original's
+/// packets have been listed (see [`early_end`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum EarlyEnd {
+    /// Nothing ended early, or nothing shows it.
+    Neither,
+    /// The original stops here (seconds): it is damaged or incomplete.
+    Original(f64),
+    /// The original is complete (its packets reach its `length`), so the
+    /// new file stopping at `stop` is the conversion's doing.
+    NewFile { stop: f64, length: f64 },
+}
+
+/// Whether the original or the new file ends early, when an encode stopped
+/// at `encoded_secs` (see [`source_stops_early`] for `claimed`,
+/// `damage_seen` and `unverified`), going by where the original's
+/// `packets` end (see [`validate::source_length`]):
+///
+/// - They reach its length, within the length check's tolerance (or, when
+///   it states none, they were listed to the end in one piece): the
+///   original is complete, so the new file is what's short
+///   ([`EarlyEnd::NewFile`]). A healthy original is never called damaged
+///   for a conversion cut short.
+/// - They stop clearly before its length (a file cut off in the middle of
+///   a packet stops where its packets do): the original really ends early
+///   ([`EarlyEnd::Original`]). One cut off that states no length has
+///   nothing to measure a conversion against; evidence of the cut
+///   (`damage_seen`, or `unverified`: nothing else checks the result) is
+///   enough.
+/// - They couldn't be listed: its length decides alone, as before.
+pub(crate) fn early_end(
+    claimed: Option<f64>,
+    packets: validate::PacketsEnd,
+    encoded_secs: Option<f64>,
+    damage_seen: bool,
+    unverified: bool,
+) -> EarlyEnd {
+    let stops_early = |length| source_stops_early(length, encoded_secs, damage_seen, unverified);
+    let original = |length| stops_early(length).map_or(EarlyEnd::Neither, EarlyEnd::Original);
+    let (end, cut_off) = match packets {
+        validate::PacketsEnd::Unlisted => return original(claimed),
+        validate::PacketsEnd::CutOff { at } => (at, true),
+        validate::PacketsEnd::At(at) => (Some(at), false),
+    };
+    let claimed = claimed.filter(|d| d.is_finite() && *d > 0.0);
+    let Some(length) = claimed.or(end.filter(|_| !cut_off)) else {
+        let stop = encoded_secs.filter(|t| t.is_finite()).or(end);
+        return if damage_seen || unverified {
+            EarlyEnd::Original(stop.unwrap_or(0.0).max(0.0))
+        } else {
+            EarlyEnd::Neither
+        };
+    };
+    let complete = end.is_some_and(|end| end + validate::duration_tolerance(length) >= length);
+    if !complete {
+        return original(Some(length));
+    }
+    match stops_early(Some(length)) {
+        Some(stop) => EarlyEnd::NewFile { stop, length },
+        None => EarlyEnd::Neither,
+    }
+}
+
 /// "The original file appears damaged or incomplete (it stops after 0.1 s).
 /// It was left unchanged."
 pub(crate) fn damaged_source_message(stop_secs: f64) -> String {
@@ -1719,6 +1825,22 @@ pub(crate) fn damaged_source_message(stop_secs: f64) -> String {
         "The original file appears damaged or incomplete (it stops after {}). It was left \
          unchanged.",
         short_duration(stop_secs)
+    )
+}
+
+/// "Converting on the CPU made a file shorter than the original (30.0 s
+/// instead of 1:01), so the original was left unchanged. Try again; if it
+/// happens again, the job's log has the details." For a conversion that
+/// stopped at `stop_secs` of a complete original `length_secs` long, with
+/// checks off.
+pub(crate) fn cut_short_message(api: HwApi, stop_secs: f64, length_secs: f64) -> String {
+    format!(
+        "Converting {} made a file shorter than the original ({} instead of {}), so the \
+         original was left unchanged. Try again; if it happens again, the job's log has the \
+         details.",
+        where_encoded(api),
+        short_duration(stop_secs),
+        short_duration(length_secs)
     )
 }
 
@@ -2320,18 +2442,47 @@ fn clean_up_later(guard: TempGuard, created_dirs: Vec<PathBuf>) {
 /// before it is left to the background.
 const CLEANUP_WAIT: Duration = Duration::from_secs(2);
 
-/// What to do after a failed verification; the job's error ends with it.
-const VERIFICATION_FIX: &str =
+/// What to do after a failed check that lighter checks skip (the full
+/// decode and the picture comparison, skipped at Quick; the black and
+/// frozen frames, skipped at Standard).
+const LIGHTER_CHECKS_FIX: &str =
     "The original was kept. Try again, or choose lighter checks in Settings › Output.";
+
+/// What to do after a failed check that every level runs: opening the new
+/// file, its tracks and its length. Only turning checks off skips them, and
+/// that would put a broken or cut-short file in place unchecked.
+const EVERY_LEVEL_FIX: &str = "The original was kept. Try again.";
+
+/// What to do when the original's length couldn't be read (a share that
+/// stopped answering for a moment, or an original that is damaged).
+const UNREAD_LENGTH_FIX: &str = "The original was kept. Try again; if it happens again, check \
+    that the original plays to the end, or replace it with a good copy.";
+
+/// What to do after `report` failed; the job's error ends with it.
+fn verification_fix(report: &ValidationReport) -> &'static str {
+    let Some(check) = report.first_failure() else {
+        return LIGHTER_CHECKS_FIX;
+    };
+    match check.id.as_str() {
+        "duration" if check.detail.starts_with(validate::UNREAD_SOURCE_LENGTH) => UNREAD_LENGTH_FIX,
+        "probe" | "streams" | "duration" => EVERY_LEVEL_FIX,
+        _ => LIGHTER_CHECKS_FIX,
+    }
+}
 
 /// Why a result failed verification, and what to do, for the job's error
 /// and the activity feed. A check's label says what passing means ("Same
 /// length as the original"), so it is never used here: the failure is
 /// phrased per check, e.g. "The new file is shorter than the original (0.1 s
-/// instead of 8.0 s). The original was kept. Try again, or …".
+/// instead of 8.0 s). The original was kept. Try again." The advice names
+/// lighter checks only when they would skip the check that failed.
 pub(crate) fn verification_error(report: &ValidationReport) -> String {
     let what = failed_check_sentence(report);
-    format!("{}. {VERIFICATION_FIX}", what.trim_end_matches('.'))
+    format!(
+        "{}. {}",
+        what.trim_end_matches('.'),
+        verification_fix(report)
+    )
 }
 
 /// A check's detail without a trailing similarity score ("… (50.0%
@@ -3194,6 +3345,108 @@ mod tests {
         assert_eq!(short_duration(42.46), "42.5 s");
     }
 
+    /// The tester's job: a healthy 61 s original whose conversion an
+    /// ffmpeg wrapper cut to 30 s. Its packets reach its end, so the new
+    /// file is what's short, not the original. A really cut-off original
+    /// is still called damaged.
+    #[test]
+    fn an_original_is_only_blamed_when_its_packets_stop_early() {
+        use validate::PacketsEnd::{At, CutOff, Unlisted};
+        let healthy = At(61.022);
+        // After a failed length check (`damage_seen`), or unverified.
+        for (damage, unverified) in [(true, false), (false, true)] {
+            assert_eq!(
+                early_end(Some(61.0), healthy, Some(30.0), damage, unverified),
+                EarlyEnd::NewFile {
+                    stop: 30.0,
+                    length: 61.0
+                }
+            );
+        }
+        // Within the length check's tolerance (1 s) the packets reach it.
+        assert!(matches!(
+            early_end(Some(61.0), At(60.1), Some(30.0), true, false),
+            EarlyEnd::NewFile { .. }
+        ));
+        // Cut off: packets stop at 30.4 s of 61 (`head -c`, a live file cut
+        // in half, one starting at 10:00, the film's tags kept on a cut).
+        for packets in [CutOff { at: Some(30.4) }, CutOff { at: None }, At(30.4)] {
+            assert_eq!(
+                early_end(Some(61.0), packets, Some(30.4), true, false),
+                EarlyEnd::Original(30.4),
+                "{packets:?}"
+            );
+        }
+        assert_eq!(
+            early_end(
+                Some(8462.0),
+                CutOff { at: Some(3.1) },
+                Some(3.1),
+                true,
+                false
+            ),
+            EarlyEnd::Original(3.1)
+        );
+        // The truncated test MKV claims 4 s and holds a tenth of one.
+        assert_eq!(
+            early_end(Some(4.0), At(0.083), Some(0.0), true, false),
+            EarlyEnd::Original(0.0)
+        );
+        // Cut off with no length of its own: nothing to measure the new
+        // file against, and the cut is evidence enough.
+        assert_eq!(
+            early_end(None, CutOff { at: Some(30.4) }, Some(30.4), true, false),
+            EarlyEnd::Original(30.4)
+        );
+        assert_eq!(
+            early_end(None, CutOff { at: Some(30.4) }, None, false, true),
+            EarlyEnd::Original(30.4)
+        );
+        assert_eq!(
+            early_end(None, CutOff { at: Some(30.4) }, Some(30.4), false, false),
+            EarlyEnd::Neither
+        );
+        // No length of its own, listed whole: as long as its packets.
+        assert_eq!(
+            early_end(None, At(61.0), Some(30.0), true, false),
+            EarlyEnd::NewFile {
+                stop: 30.0,
+                length: 61.0
+            }
+        );
+        // A cut-off end that a complete conversion reached is no matter.
+        assert_eq!(
+            early_end(
+                Some(61.0),
+                CutOff { at: Some(61.0) },
+                Some(61.0),
+                true,
+                false
+            ),
+            EarlyEnd::Neither
+        );
+        // Nothing listed: its length decides, as before.
+        assert_eq!(
+            early_end(Some(61.0), Unlisted, Some(30.0), true, false),
+            EarlyEnd::Original(30.0)
+        );
+        assert_eq!(
+            early_end(None, Unlisted, Some(30.0), true, true),
+            EarlyEnd::Neither
+        );
+        // A conversion that reached the end blames no one.
+        assert_eq!(
+            early_end(Some(61.0), healthy, Some(60.9), true, false),
+            EarlyEnd::Neither
+        );
+        assert_eq!(
+            cut_short_message(HwApi::Software, 30.0, 61.0),
+            "Converting on the CPU made a file shorter than the original (30.0 s instead of \
+             1:01), so the original was left unchanged. Try again; if it happens again, the \
+             job's log has the details."
+        );
+    }
+
     #[test]
     fn verification_eta_follows_its_pace() {
         assert_eq!(verify_eta(1.0, Duration::from_secs(10)), None);
@@ -3480,10 +3733,68 @@ mod tests {
         ];
         for (id, label, detail, expected) in cases {
             let error = verification_error(&failing(id, label, detail));
-            assert_eq!(error, format!("{expected}. {VERIFICATION_FIX}"), "{id}");
+            let fix = match id {
+                "duration" | "probe" | "streams" => EVERY_LEVEL_FIX,
+                _ => LIGHTER_CHECKS_FIX,
+            };
+            assert_eq!(error, format!("{expected}. {fix}"), "{id}");
             assert!(!error.contains(label), "{id}: {error}");
             assert!(!error.contains("similar"), "{id}: {error}");
         }
+    }
+
+    /// The advice after a failed check only suggests lighter checks when
+    /// they skip it: opening the new file, its tracks and its length are
+    /// checked at Quick too (only Off skips them, which would let a new
+    /// file cut short replace the original). An original whose length
+    /// can't be read gets advice about the original instead.
+    #[test]
+    fn verification_advice_fits_the_check_that_failed() {
+        let advice = |id: &str, detail: &str| {
+            let error = verification_error(&failing(id, "label", detail));
+            error[error.find("The original was kept.").unwrap()..].to_string()
+        };
+        // Each check and the lightest level that runs it.
+        for (id, from) in [
+            ("probe", ValidationLevel::Quick),
+            ("streams", ValidationLevel::Quick),
+            ("duration", ValidationLevel::Quick),
+            ("decode", ValidationLevel::Standard),
+            ("visual", ValidationLevel::Standard),
+            ("black_frames", ValidationLevel::Thorough),
+            ("frozen_frames", ValidationLevel::Thorough),
+        ] {
+            let said = advice(id, "Something was wrong");
+            let lighter_skips_it = from != ValidationLevel::Quick;
+            assert_eq!(
+                said.contains("lighter checks"),
+                lighter_skips_it,
+                "{id}: {said}"
+            );
+            assert!(!said.to_lowercase().contains("off"), "{id}: {said}");
+        }
+        assert_eq!(
+            advice(
+                "duration",
+                "The new file is shorter than the original (30.0 s instead of 1:01)"
+            ),
+            "The original was kept. Try again."
+        );
+        for detail in [
+            "The original's length couldn't be read (it states none that can be trusted, and its \
+             contents couldn't be listed), so the new file couldn't be checked against it",
+            "The original's length couldn't be read, so the new file couldn't be checked against it",
+        ] {
+            assert_eq!(
+                verification_error(&failing("duration", "Same length as the original", detail)),
+                format!("{detail}. {UNREAD_LENGTH_FIX}")
+            );
+        }
+        assert_eq!(
+            UNREAD_LENGTH_FIX,
+            "The original was kept. Try again; if it happens again, check that the original \
+             plays to the end, or replace it with a good copy."
+        );
     }
 
     #[test]

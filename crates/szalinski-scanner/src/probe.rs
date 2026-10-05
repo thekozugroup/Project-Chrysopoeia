@@ -65,18 +65,19 @@ pub(crate) async fn probe(
     Ok(info)
 }
 
-/// When the length a file states can't be taken as it is (see
-/// [`StatedLength::needs_packets`]), find where it really ends: ffprobe
-/// lists the packets of its last seconds (no decoding; a seek past the end
-/// lands on the last keyframe), or all of them when that lists nothing.
-/// The length is then where the last packet ends, counted from where the
-/// file starts, as the worker's verification reads it. A file that stops
-/// in the middle of a packet keeps what it states (read as a length from
-/// its start): its packets show where it stops, not how long it should be,
-/// so a cut-off original is still found out. When the packets can't be
-/// listed before the deadline, the length is unknown (except a container
-/// length smaller than the start time, which can only be a length), never
-/// a tag that may be out of date.
+/// When the length a file states can't be taken as it is, or it states
+/// none (see [`StatedLength::needs_packets`]), find where it really ends:
+/// ffprobe lists the packets of its last seconds (no decoding; a seek past
+/// the end lands on the last keyframe), or all of them when that lists
+/// nothing or there is no length to read back from. The length is then
+/// where the last packet ends, counted from where the file starts, as the
+/// worker's verification reads it. A file that stops in the middle of a
+/// packet keeps what it states (read as a length from its start), and one
+/// that states nothing keeps no length: its packets show where it stops,
+/// not how long it should be, so a cut-off original is still found out.
+/// When the packets can't be listed before the deadline, the length is
+/// unknown (except a container length smaller than the start time, which
+/// can only be a length), never a tag that may be out of date.
 async fn refine_length(
     ffprobe: &Path,
     path: &Path,
@@ -597,28 +598,31 @@ pub(crate) fn parse(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeErro
 pub(crate) struct StatedLength {
     /// The container's own length (`format.duration`).
     container: Option<f64>,
-    /// ffprobe's own stream durations gave the length (they are lengths,
-    /// from each stream's start).
+    /// ffprobe's own durations of the picture and sound streams gave the
+    /// length (they are lengths, from each stream's start).
     from_streams: bool,
     /// The lengths the `DURATION` tags state (tracks', then the file's).
     tags: Vec<f64>,
 }
 
 impl StatedLength {
-    /// Whether the length found can't be taken as it is: it comes from
-    /// tags alone (a Matroska file written as a live stream states no
-    /// length of its own, and its tags may be left over from before a
-    /// cut), or from a Matroska file whose timestamps don't start at zero
-    /// (ffmpeg's writer states where such a file ends, not how long it is).
+    /// Whether the length found can't be taken as it is: neither the
+    /// container nor a picture or sound stream states one, so it comes
+    /// from tags alone (a Matroska file written as a live stream states no
+    /// length of its own, and its tags may be left over from before a cut)
+    /// or from nothing at all (the same file without tags, a raw elementary
+    /// stream, a transport stream ffprobe couldn't estimate); or it comes
+    /// from a Matroska file whose timestamps don't start at zero (ffmpeg's
+    /// writer states where such a file ends, not how long it is).
     fn needs_packets(&self, info: &ProbeInfo) -> bool {
         if self.from_streams {
             return false;
         }
-        let tags_only = self.container.is_none() && !self.tags.is_empty();
+        let unstated = self.container.is_none();
         let shifted = info.container == "matroska"
             && timeline::start_offset(info.start_time) > 0.0
             && (self.container.is_some() || !self.tags.is_empty());
-        tags_only || shifted
+        unstated || shifted
     }
 }
 
@@ -658,6 +662,12 @@ pub(crate) fn parse_stated(
     // checks them against the packets; see `refine_length`).
     let container_secs = format.and_then(|f| positive_f64(f.get("duration")));
     let stream_secs = max_positive(raw_streams.iter().map(|s| positive_f64(s.get("duration"))));
+    let av_stream_secs = max_positive(
+        raw_streams
+            .iter()
+            .filter(|s| is_picture_or_sound(s))
+            .map(|s| positive_f64(s.get("duration"))),
+    );
     let tags: Vec<f64> = raw_streams
         .iter()
         .map(tagged_duration)
@@ -670,7 +680,7 @@ pub(crate) fn parse_stated(
         .or_else(|| format.and_then(tagged_duration));
     let stated = StatedLength {
         container: container_secs,
-        from_streams: container_secs.is_none() && stream_secs.is_some(),
+        from_streams: container_secs.is_none() && av_stream_secs.is_some(),
         tags,
     };
 
@@ -1019,6 +1029,13 @@ fn statistics_tag_keys(raw: &Value) -> Vec<String> {
     keys.sort();
     keys.dedup();
     keys
+}
+
+/// Whether a raw stream is picture or sound (cover art is neither).
+fn is_picture_or_sound(raw: &Value) -> bool {
+    let av = str_field(raw, "codec_type")
+        .is_some_and(|t| t.eq_ignore_ascii_case("video") || t.eq_ignore_ascii_case("audio"));
+    av && !flag(raw.get("disposition"), "attached_pic")
 }
 
 /// A disposition flag (`1`, `true` or `"1"`).
@@ -1676,6 +1693,29 @@ mod tests {
             assert!(close(info.duration_secs, 61.0), "{json}");
             assert!(!length.needs_packets(&info), "{json}");
         }
+
+        // No length at all, in any container: a live-stream MKV without
+        // tags, a raw elementary stream, a transport stream ffprobe
+        // couldn't estimate (a subtitle's length doesn't count, nor does
+        // cover art's). Before, these were listed with no length.
+        for json in [
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264", "start_time": "0.023"},
+                            {"codec_type": "audio", "codec_name": "aac"}],
+                "format": {"format_name": "matroska,webm", "start_time": "0.000000"}}"#,
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264"}],
+                "format": {"format_name": "h264"}}"#,
+            r#"{"streams": [{"codec_type": "video", "codec_name": "mpeg2video"},
+                            {"codec_type": "subtitle", "codec_name": "dvb_subtitle",
+                             "duration": "61.0"},
+                            {"codec_type": "video", "codec_name": "mjpeg", "duration": "0.04",
+                             "disposition": {"attached_pic": 1}}],
+                "format": {"format_name": "mpegts", "start_time": "1.4"}}"#,
+        ] {
+            let (info, length) = stated(json);
+            assert_eq!(length.container, None, "{json}");
+            assert!(length.tags.is_empty(), "{json}");
+            assert!(length.needs_packets(&info), "{json}");
+        }
     }
 
     /// Statistics tags stored for the whole file are listed for removal,
@@ -1699,7 +1739,10 @@ mod tests {
     /// length and in its fresh `DURATION`), and both, through a pipe. The
     /// scanner lists each as the 1:01 it plays, like verification does.
     /// The live-stream file really cut in half keeps the length it states:
-    /// its packets show where it stops, not how long it should be.
+    /// its packets show where it stops, not how long it should be. The clip
+    /// written as a live stream without tags, and its picture as a raw
+    /// H.264 stream, state no length at all and are listed as the 1:01
+    /// they play too; the former cut in half has no length.
     #[tokio::test]
     async fn the_real_length_of_files_whose_stated_length_cannot_be_trusted() {
         if !tool_available("ffmpeg") || !tool_available("ffprobe") {
@@ -1720,6 +1763,22 @@ mod tests {
             );
         };
         let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        // What ffprobe states, without the packets.
+        let ffprobe_json = |file: &str| {
+            std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    "-show_streams",
+                ])
+                .arg(file)
+                .output()
+                .unwrap()
+                .stdout
+        };
         ffmpeg(&[
             "-f",
             "lavfi",
@@ -1763,9 +1822,43 @@ mod tests {
         );
         let live = std::fs::read(path("live.mkv")).unwrap();
         std::fs::write(path("cut.mkv"), &live[..live.len() / 2]).unwrap();
+        // No length at all: a live stream without tags, and the raw H.264.
+        let (input, bare) = (path("clip.mkv"), path("bare.mkv"));
+        ffmpeg(&[
+            "-i",
+            &input,
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            "-map_metadata",
+            "-1",
+            "-live",
+            "1",
+            &bare,
+        ]);
+        let raw = path("raw.h264");
+        ffmpeg(&["-i", &input, "-map", "0:v", "-c", "copy", &raw]);
+        let bare_bytes = std::fs::read(&bare).unwrap();
+        std::fs::write(path("bare_cut.mkv"), &bare_bytes[..bare_bytes.len() / 2]).unwrap();
 
         let ffprobe = Path::new("ffprobe");
         let timeout = Duration::from_secs(60);
+        for name in ["bare.mkv", "raw.h264"] {
+            let info = crate::probe_file(ffprobe, Path::new(&path(name)), timeout)
+                .await
+                .unwrap();
+            let length = info.duration_secs.unwrap_or_default();
+            assert!((length - 61.0).abs() < 0.2, "{name}: {length}");
+            let stated = parse(&ffprobe_json(&path(name)), 1).unwrap();
+            assert_eq!(stated.duration_secs, None, "{name} states no length");
+        }
+        // Cut in half, it states nothing to keep: its length is unknown,
+        // never where it happens to stop.
+        let bare_cut = crate::probe_file(ffprobe, Path::new(&path("bare_cut.mkv")), timeout)
+            .await
+            .unwrap();
+        assert_eq!(bare_cut.duration_secs, None);
         for name in ["live.mkv", "offset.mkv", "offset_live.mkv"] {
             let info = crate::probe_file(ffprobe, Path::new(&path(name)), timeout)
                 .await
@@ -1773,19 +1866,7 @@ mod tests {
             let length = info.duration_secs.unwrap_or_default();
             assert!((length - 61.0).abs() < 0.2, "{name}: {length}");
             // As the JSON alone states it: the film's tag, or the end.
-            let json = std::process::Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "error",
-                    "-print_format",
-                    "json",
-                    "-show_format",
-                    "-show_streams",
-                ])
-                .arg(path(name))
-                .output()
-                .unwrap();
-            let stated = parse(&json.stdout, 1)
+            let stated = parse(&ffprobe_json(&path(name)), 1)
                 .unwrap()
                 .duration_secs
                 .unwrap_or_default();
@@ -2176,6 +2257,56 @@ mod tests {
             "{:?}",
             probed.duration_secs
         );
+    }
+
+    /// ffprobe JSON for a live-stream MKV without tags: no length at all.
+    #[cfg(unix)]
+    const UNSTATED_JSON: &str = r#"{"format":{"format_name":"matroska,webm","start_time":"0.000000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]}"#;
+
+    /// A file with no length at all is measured by all of its packets
+    /// (there is no end to read back from); when they can't be listed, or
+    /// it stops in the middle of one, its length stays unknown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_with_no_length_at_all_is_measured_by_its_packets() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("live.mkv");
+        std::fs::write(&media, b"data").unwrap();
+        let listing = "echo 'stream_index=0|pts_time=60.977000|dts_time=N/A|duration_time=0.042000'\n\
+                       echo 'stream_index=1|pts_time=61.000000|dts_time=N/A|duration_time=0.022000'";
+        for (name, packets, expected) in [
+            // Only a whole listing (no `-read_intervals`) is answered.
+            (
+                "ffprobe-all-packets",
+                format!("*-read_intervals*) exit 1 ;;\n*-show_entries*) {listing} ;;"),
+                Some(61.022),
+            ),
+            (
+                "ffprobe-no-packets",
+                "*-show_entries*) exit 1 ;;".to_string(),
+                None,
+            ),
+            (
+                "ffprobe-cut-packets",
+                "*-show_entries*) echo 'stream_index=0|pts_time=30.4|duration_time=0.04'; \
+                 echo '[matroska,webm @ 0x1] File ended prematurely' >&2 ;;"
+                    .to_string(),
+                None,
+            ),
+        ] {
+            let script = fake_ffprobe(
+                dir.path(),
+                name,
+                &format!("case \"$*\" in\n{packets}\n*) echo '{UNSTATED_JSON}' ;;\nesac"),
+            );
+            let probed = probe_with(&script, &media, Duration::from_secs(10))
+                .await
+                .unwrap();
+            match expected {
+                Some(length) => assert!(close(probed.duration_secs, length), "{name}: {probed:?}"),
+                None => assert_eq!(probed.duration_secs, None, "{name}"),
+            }
+        }
     }
 
     /// A minimal HEVC SEI NAL unit carrying SMPTE 2094-40 (HDR10+) metadata,
