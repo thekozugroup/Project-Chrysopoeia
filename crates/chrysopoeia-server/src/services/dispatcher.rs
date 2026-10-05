@@ -1372,7 +1372,7 @@ async fn execute(
         f.saved_bytes = None;
     }
     let probe = match file.probe.clone() {
-        Some(p) if unchanged && !lacks_hdr10_metadata(&p) => p,
+        Some(p) if unchanged && !lacks_hdr10_metadata(&p) && !lacks_statistics_tags(&p) => p,
         _ => {
             // ffprobe reading a file whose share stopped answering would
             // only give up after its own timeout; the share is noticed
@@ -1958,6 +1958,16 @@ fn lacks_hdr10_metadata(probe: &chrysopoeia_core::ProbeInfo) -> bool {
             && v.mastering_display.is_none()
             && v.content_light.is_none()
     })
+}
+
+/// Whether a stored probe of a Matroska file lists no statistics tags
+/// (`DURATION`, `BPS-eng`, …) on any track: probes made by older versions
+/// never recorded them, so the file is probed again and the conversion
+/// removes the out-of-date ones. (Nearly every MKV has some; one that
+/// truly has none is simply probed again, which is quick.)
+fn lacks_statistics_tags(probe: &chrysopoeia_core::ProbeInfo) -> bool {
+    probe.container.eq_ignore_ascii_case("matroska")
+        && probe.streams.iter().all(|s| s.statistics_tags.is_empty())
 }
 
 /// Forward worker progress: every update to the WebSocket, and to the
@@ -3841,5 +3851,31 @@ mod tests {
             "a/b.mkv"
         );
         assert_eq!(relative_to(None, Path::new("/x/b.mkv")), "/x/b.mkv");
+    }
+
+    /// Probes stored before statistics tags were recorded are refreshed at
+    /// job start, so the conversion can remove a film's out-of-date
+    /// `DURATION-eng` from a clip cut from it.
+    #[test]
+    fn stored_matroska_probes_without_statistics_tags_are_refreshed() {
+        use chrysopoeia_core::{ProbeInfo, StreamInfo};
+        let stream = |tags: &[&str]| StreamInfo {
+            statistics_tags: tags.iter().map(|t| t.to_string()).collect(),
+            ..Default::default()
+        };
+        let probe = |container: &str, streams| ProbeInfo {
+            container: container.into(),
+            streams,
+            ..Default::default()
+        };
+        assert!(lacks_statistics_tags(&probe(
+            "matroska",
+            vec![stream(&[]), stream(&[])]
+        )));
+        assert!(!lacks_statistics_tags(&probe(
+            "matroska",
+            vec![stream(&[]), stream(&["DURATION", "DURATION-eng"])]
+        )));
+        assert!(!lacks_statistics_tags(&probe("mov", vec![stream(&[])])));
     }
 }

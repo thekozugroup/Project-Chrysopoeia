@@ -152,8 +152,9 @@ pub fn parse_speed(value: &str) -> Option<f32> {
         .filter(|s| s.is_finite() && *s > 0.0)
 }
 
-/// Parse `HH:MM:SS.fraction` (the `out_time` field, Matroska `DURATION`
-/// tags) into seconds. Negative values give 0.
+/// Parse `HH:MM:SS.fraction` (the `out_time` progress field) into seconds.
+/// Negative values give 0. (Matroska `DURATION` tags are read with
+/// `chrysopoeia_core::tags`.)
 pub(crate) fn parse_clock(value: &str) -> Option<f64> {
     let value = value.trim();
     let negative = value.starts_with('-');

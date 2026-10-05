@@ -616,3 +616,35 @@ async fn a_disk_filled_by_parallel_jobs_is_retried_once() {
     assert_eq!(failed.json["total"], 1, "{}", failed.json);
     assert_eq!(failed.json["items"][0]["problem"], "disk_full");
 }
+
+/// A stored probe of an MKV that lists no statistics tags (made by a
+/// version that didn't record them) is refreshed when its job starts, so
+/// the conversion can remove a film's out-of-date `DURATION-eng`; a stored
+/// probe that lists them is used as it is.
+#[tokio::test]
+async fn stored_mkv_probes_without_statistics_tags_are_refreshed_at_job_start() {
+    for (content, probes_at_start) in [
+        ("video=h264\naudio=aac\nstatistics=none\n", 2),
+        (
+            "video=h264\naudio=aac\nstatistics=DURATION,DURATION-eng\n",
+            1,
+        ),
+    ] {
+        let app = TestApp::new().await;
+        app.fake.set_default(Behavior::Hold);
+        app.write("Movies/clip.mkv", content);
+        app.add_library("Movies", json!({ "goal": "save_space" }))
+            .await;
+        wait_until("the conversion to start", || async {
+            app.fake.started() == ["clip.mkv"]
+        })
+        .await;
+        assert_eq!(
+            app.fake.probes.load(Ordering::SeqCst),
+            probes_at_start,
+            "{content}"
+        );
+        app.fake.release.add_permits(1);
+        app.wait_queue_idle().await;
+    }
+}

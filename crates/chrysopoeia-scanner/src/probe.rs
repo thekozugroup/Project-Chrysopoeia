@@ -27,7 +27,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use chrysopoeia_core::{
-    ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind,
+    ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind, tags,
 };
 use serde_json::{Map, Value};
 use tokio::process::Command;
@@ -484,19 +484,14 @@ pub(crate) fn parse(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeErro
         .unwrap_or("unknown")
         .to_string();
 
+    // The container's own length first: Matroska `DURATION` tags may be
+    // left over from before a cut (see `chrysopoeia_core::tags`), so they
+    // only count when nothing else gives a length.
     let duration_secs = format
         .and_then(|f| positive_f64(f.get("duration")))
         .or_else(|| max_positive(raw_streams.iter().map(|s| positive_f64(s.get("duration")))))
-        .or_else(|| {
-            max_positive(
-                raw_streams
-                    .iter()
-                    .map(|s| statistics_tag(s, "DURATION").and_then(parse_clock_duration)),
-            )
-        })
-        .or_else(|| {
-            format.and_then(|f| statistics_tag(f, "DURATION").and_then(parse_clock_duration))
-        });
+        .or_else(|| max_positive(raw_streams.iter().map(tagged_duration)))
+        .or_else(|| format.and_then(tagged_duration));
 
     let chapters = root
         .get("chapters")
@@ -551,8 +546,13 @@ fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
         mimetype: tag(raw, "mimetype").map(str::to_ascii_lowercase),
         bit_rate: u64_value(raw.get("bit_rate"))
             .filter(|b| *b > 0)
-            .or_else(|| statistics_tag(raw, "BPS").and_then(parse_u64_str))
-            .filter(|b| *b > 0),
+            .or_else(|| {
+                tags::statistic(tag_pairs(raw), "BPS", |v| {
+                    parse_u64_str(v).filter(|b| *b > 0)
+                })
+                .map(|s| s.value)
+            }),
+        statistics_tags: statistics_tag_keys(raw),
         ..StreamInfo::default()
     };
 
@@ -765,22 +765,6 @@ fn frame_rate(value: Option<&Value>) -> Option<f64> {
     (rate.is_finite() && rate > 0.0 && rate <= MAX_FRAME_RATE).then_some(rate)
 }
 
-/// Parse a clock duration such as mkvmerge's `01:23:45.678000000` (also
-/// `MM:SS.s` and plain seconds).
-fn parse_clock_duration(text: &str) -> Option<f64> {
-    let parts: Vec<&str> = text.trim().split(':').collect();
-    if parts.len() > 3 {
-        return None;
-    }
-    let (seconds, larger_units) = parts.split_last()?;
-    let mut total: f64 = seconds.trim().parse().ok()?;
-    for (part, unit_secs) in larger_units.iter().rev().zip([60.0, 3600.0]) {
-        let value: u64 = part.trim().parse().ok()?;
-        total += value as f64 * unit_secs;
-    }
-    (total.is_finite() && total > 0.0).then_some(total)
-}
-
 /// Whether a `codec_tag_string` is a real FourCC (ffprobe prints unprintable
 /// bytes as `[0]`).
 fn is_printable_tag(tag: &str) -> bool {
@@ -824,22 +808,34 @@ fn tag<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|s| !s.is_empty())
 }
 
-/// An mkvmerge statistics tag (`BPS`, `DURATION`, ...), which older mkvmerge
-/// versions write with a language suffix (`BPS-eng`).
-fn statistics_tag<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
-    tag(value, key).or_else(|| {
-        tags(value)?
-            .iter()
-            .find(|(k, _)| {
-                k.len() > key.len()
-                    && k.is_char_boundary(key.len())
-                    && k[..key.len()].eq_ignore_ascii_case(key)
-                    && k[key.len()..].starts_with('-')
-            })
-            .and_then(|(_, v)| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-    })
+/// The text tags of a stream or of the container, as key/value pairs.
+fn tag_pairs(value: &Value) -> impl Iterator<Item = (&str, &str)> {
+    tags(value)
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| Some((k.as_str(), v.as_str()?)))
+}
+
+/// Length from the Matroska `DURATION` tags, the plain tag before a
+/// localized one (`DURATION-eng`), by the rule the worker's verification
+/// uses too.
+fn tagged_duration(value: &Value) -> Option<f64> {
+    tags::tagged_duration(tag_pairs(value)).map(|s| s.value)
+}
+
+/// The Matroska statistics tags of a stream, sorted (a conversion removes
+/// them; see [`StreamInfo::statistics_tags`]).
+fn statistics_tag_keys(raw: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = tags(raw)
+        .into_iter()
+        .flatten()
+        .map(|(k, _)| k)
+        .filter(|k| tags::is_statistics_tag(k))
+        .cloned()
+        .collect();
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 /// A disposition flag (`1`, `true` or `"1"`).
@@ -1235,6 +1231,23 @@ mod tests {
         let font = &probe.streams[4];
         assert_eq!(font.kind, Some(StreamKind::Attachment));
         assert_eq!(font.codec, "ttf");
+
+        // Every statistics tag is recorded, so a conversion can remove it;
+        // titles, languages and attachment names are not statistics.
+        assert_eq!(
+            video.statistics_tags,
+            [
+                "BPS-eng",
+                "DURATION-eng",
+                "NUMBER_OF_BYTES-eng",
+                "NUMBER_OF_FRAMES-eng",
+                "_STATISTICS_TAGS-eng",
+                "_STATISTICS_WRITING_APP-eng",
+                "_STATISTICS_WRITING_DATE_UTC-eng",
+            ]
+        );
+        assert_eq!(commentary.statistics_tags, ["BPS", "DURATION"]);
+        assert!(font.statistics_tags.is_empty());
     }
 
     #[test]
@@ -1365,15 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn clock_durations_and_rates() {
-        assert!(close(parse_clock_duration("01:23:45.678000000"), 5025.678));
-        assert!(close(parse_clock_duration("00:00:02.000000000"), 2.0));
-        assert!(close(parse_clock_duration("2:03.5"), 123.5));
-        assert!(close(parse_clock_duration("42.1"), 42.1));
-        assert_eq!(parse_clock_duration("00:00:00.000000000"), None);
-        assert_eq!(parse_clock_duration("garbage"), None);
-        assert_eq!(parse_clock_duration("1:2:3:4:5"), None);
-
+    fn frame_rates() {
         let rate = |s: &str| frame_rate(Some(&Value::String(s.to_string())));
         assert!(close(rate("30000/1001"), 29.97));
         assert_eq!(rate("0/0"), None);
@@ -1383,13 +1388,63 @@ mod tests {
 
     #[test]
     fn statistics_tags_prefer_the_plain_key() {
-        let value: Value = serde_json::from_str(
-            r#"{"tags": {"BPS-eng": "1", "bps": "2", "BPSX": "3", "DURATION-fre": "00:00:01"}}"#,
-        )
-        .unwrap();
-        assert_eq!(statistics_tag(&value, "BPS"), Some("2"));
-        assert_eq!(statistics_tag(&value, "duration"), Some("00:00:01"));
-        assert_eq!(statistics_tag(&value, "NUMBER_OF_FRAMES"), None);
+        let json = br#"{"streams": [{"codec_type": "audio", "codec_name": "ac3",
+            "tags": {"BPS-eng": "1", "bps": "2", "BPSX": "3", "DURATION-fre": "00:00:01"}}]}"#;
+        let probe = parse(json, 1).unwrap();
+        let stream = &probe.streams[0];
+        assert_eq!(stream.bit_rate, Some(2));
+        assert_eq!(stream.statistics_tags, ["BPS-eng", "DURATION-fre", "bps"]);
+        assert!(close(probe.duration_secs, 1.0));
+    }
+
+    /// The owner's clip: cut from a film with ffmpeg, it keeps the film's
+    /// `DURATION-eng` (2:21:02) next to ffmpeg's own `DURATION` (1:01). The
+    /// container's length wins, and without one the plain tags do, in
+    /// whichever order the tags are listed.
+    #[test]
+    fn stale_localized_durations_never_win() {
+        let fresh = r#""DURATION": "00:01:01.061000000""#;
+        let stale = r#""DURATION-eng": "02:21:02.000000000""#;
+        for (first, second) in [(fresh, stale), (stale, fresh)] {
+            let streams = format!(
+                r#""streams": [
+                    {{"codec_type": "video", "codec_name": "hevc",
+                      "tags": {{{first}, "BPS-eng": "60000000", {second}}}}},
+                    {{"codec_type": "audio", "codec_name": "truehd",
+                      "tags": {{"language": "eng", {second}, {first}}}}}]"#
+            );
+            let with_format = format!(
+                r#"{{{streams}, "format": {{"format_name": "matroska,webm", "duration": "61.061000"}}}}"#
+            );
+            let probe = parse(with_format.as_bytes(), 1).unwrap();
+            assert!(
+                close(probe.duration_secs, 61.061),
+                "{:?}",
+                probe.duration_secs
+            );
+            assert_eq!(
+                probe.streams[0].statistics_tags,
+                ["BPS-eng", "DURATION", "DURATION-eng"]
+            );
+            assert_eq!(
+                probe.streams[1].statistics_tags,
+                ["DURATION", "DURATION-eng"]
+            );
+            assert_eq!(probe.streams[1].language.as_deref(), Some("eng"));
+
+            let without_format = format!("{{{streams}}}");
+            let probe = parse(without_format.as_bytes(), 1).unwrap();
+            assert!(
+                close(probe.duration_secs, 61.061),
+                "{:?}",
+                probe.duration_secs
+            );
+        }
+
+        // Only localized tags and no container length: they are all there is.
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "h264",
+            "tags": {"DURATION-eng": "00:00:42.000000000"}}]}"#;
+        assert!(close(parse(json, 1).unwrap().duration_secs, 42.0));
     }
 
     #[cfg(unix)]

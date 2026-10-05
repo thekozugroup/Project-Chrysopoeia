@@ -174,6 +174,12 @@ export interface StreamInfo {
   /** MIME type of an attachment or MKV cover image (e.g. `image/jpeg`). Only sent when known. */
   mimetype?: string;
   bit_rate: number | null;
+  /**
+   * The track's Matroska statistics tags as the file names them
+   * (`DURATION-eng`, `BPS`, `_STATISTICS_WRITING_APP`, …); a conversion
+   * removes them. Only sent when there are some.
+   */
+  statistics_tags?: string[];
   width: number | null;
   height: number | null;
   pix_fmt: string | null;

@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail};
 use chrysopoeia_core::codec::{is_image_subtitle, source_efficiency_rank};
+use chrysopoeia_core::tags::is_statistics_tag;
 use chrysopoeia_core::{
     AudioCodec, Container, EncoderCandidate, HdrFormat, HwApi, ProbeInfo, StreamInfo, StreamKind,
     SubtitleAction, SubtitlePolicy, TranscodeProfile, VideoCodec,
@@ -542,6 +543,36 @@ pub fn build_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
         args.push(path_arg(&cover.file.path)?);
     }
     push(&mut args, &["-map_metadata", "0", "-map_chapters", "0"]);
+    if is_matroska(container) {
+        // Out-of-date statistics would follow every kept track into the
+        // new file (MP4 keeps no such tags).
+        let stream = |index: u32| req.probe.streams.iter().find(|s| s.index == index);
+        let kept = std::iter::once(("v:0".to_string(), Some(video)))
+            .chain(
+                audio
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .map(|(n, t)| (format!("a:{n}"), stream(t.index))),
+            )
+            .chain(
+                subtitles
+                    .iter()
+                    .enumerate()
+                    .map(|(n, t)| (format!("s:{n}"), stream(t.index))),
+            )
+            .chain(
+                attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(n, index)| (format!("t:{n}"), stream(*index))),
+            );
+        for (spec, source) in kept {
+            if let Some(source) = source {
+                args.extend(clear_statistics_tags(&spec, source));
+            }
+        }
+    }
 
     args.extend(video_output_args);
     args.extend(audio.args);
@@ -851,9 +882,6 @@ fn plan_video(
     if profile.container == Container::Mp4 && codec == VideoCodec::Hevc {
         // Apple devices only play HEVC in MP4 when tagged hvc1.
         push(&mut out, &["-tag:v", "hvc1"]);
-    }
-    if is_matroska(profile.container) {
-        out.extend(clear_statistics_tags("v:0"));
     }
 
     VideoPlan {
@@ -1363,12 +1391,7 @@ fn plan_audio(
                 args.push(format!("-c:a:{n}"));
                 args.push("copy".into());
             }
-            Some(codec) => {
-                args.extend(encode_audio_args(n, stream, codec, notes));
-                if is_matroska(container) {
-                    args.extend(clear_statistics_tags(&format!("a:{n}")));
-                }
-            }
+            Some(codec) => args.extend(encode_audio_args(n, stream, codec, notes)),
         }
     }
 
@@ -2396,20 +2419,23 @@ fn is_matroska(container: Container) -> bool {
     matches!(container, Container::Mkv | Container::Webm)
 }
 
-/// Remove the per-track statistics tags mkvmerge writes (bitrate, frame and
-/// byte counts). They describe the old stream, and players such as Jellyfin
-/// read the stale bitrate as the new one. `spec` is an output stream
-/// specifier like `v:0` or `a:1`.
-fn clear_statistics_tags(spec: &str) -> Vec<String> {
-    let mut args = Vec::with_capacity(12);
-    for key in [
-        "BPS",
-        "BPS-eng",
-        "NUMBER_OF_BYTES",
-        "NUMBER_OF_BYTES-eng",
-        "NUMBER_OF_FRAMES",
-        "NUMBER_OF_FRAMES-eng",
-    ] {
+/// Remove the Matroska statistics tags (`BPS`, `DURATION`,
+/// `NUMBER_OF_FRAMES`, `NUMBER_OF_BYTES`, `_STATISTICS_*`, plain or
+/// localized such as `DURATION-eng`) that `source`, a kept track of the
+/// original, has. ffmpeg copies a track's tags into the new file whether it
+/// copies or re-encodes the track, but they describe the old track: a clip
+/// cut from a film keeps the film's `DURATION-eng`, and players such as
+/// Jellyfin read a stale `BPS` as the new bitrate. ffmpeg's MKV writer adds
+/// its own `DURATION` for the new track. `spec` is the output stream
+/// specifier, like `v:0`, `a:1` or `s:0`; an empty value removes
+/// the tag and leaves every other one (title, language, ...) alone.
+fn clear_statistics_tags(spec: &str, source: &StreamInfo) -> Vec<String> {
+    let mut args = Vec::new();
+    for key in &source.statistics_tags {
+        // A name with `=` or a line break can't be written as `KEY=`.
+        if key.is_empty() || key.contains(['=', '\n', '\r']) || !is_statistics_tag(key) {
+            continue;
+        }
         args.push(format!("-metadata:s:{spec}"));
         args.push(format!("{key}="));
     }

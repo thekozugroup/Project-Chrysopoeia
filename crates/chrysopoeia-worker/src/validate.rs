@@ -18,6 +18,14 @@
 //! checks are reported as skipped), so a broken hardware encode falls back
 //! quickly.
 //!
+//! **Same length as the original** compares the picture and sound lengths
+//! of both files. A stream's length is ffprobe's own, else its Matroska
+//! `DURATION` tag (the plain one before a localized `DURATION-eng`, which
+//! an ffmpeg cut leaves over from the film it came from), and a tag the
+//! container's own length contradicts is checked against where the
+//! stream's last packets end (see `probe_media`). The decode below must
+//! reach the new file's length read the same way.
+//!
 //! **Plays start to finish** decodes every picture and sound track. Any
 //! error, a "corrupt decoded frame" warning or an error-concealment notice
 //! counts as damage. Damage in a track that is the same codec in the
@@ -104,6 +112,9 @@ const SCAN_ANOMALY_SECS: f64 = 0.5;
 /// before they are subtracted from the new file's (boundaries jitter).
 const INTERVAL_SLACK_SECS: f64 = 0.25;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Seconds of a file read from its end to see where its streams really
+/// stop. Reading starts at the keyframe before, so a little more is read.
+const TAIL_SECS: f64 = 10.0;
 const DECODE_STALL: Duration = Duration::from_secs(600);
 const SEGMENT_STALL: Duration = Duration::from_secs(180);
 /// `blackdetect` options: at least 0.5 s where 90 % of the picture is near
@@ -485,10 +496,7 @@ impl<'a> Ctx<'_, 'a> {
         // the output claims for its picture and sound, so a file cut short
         // on disk fails even though its header looks fine.
         let thorough = req.level == ValidationLevel::Thorough;
-        let expected_len = output
-            .av_duration()
-            .or(output.best_duration())
-            .or(source_duration);
+        let expected_len = expected_play_length(&output, source_duration);
         let (decode_weight, recheck_weight) = split_weight(self.weights.decode, 0.85);
         let decode = self
             .decode_output(&output, expected_len, decode_weight)
@@ -1033,6 +1041,15 @@ fn comparable_durations(
         .filter(|d| d.is_finite() && *d > 0.0)
         .or_else(|| source.and_then(MediaProbe::best_duration));
     (src, output.best_duration())
+}
+
+/// How far a full decode of the new file must get: the length it claims
+/// for its picture and sound, else its container's, else the original's.
+fn expected_play_length(output: &MediaProbe, source_duration: Option<f64>) -> Option<f64> {
+    output
+        .av_duration()
+        .or(output.best_duration())
+        .or(source_duration)
 }
 
 /// Allowed duration difference: max(1 s, 0.5 %).
@@ -2239,6 +2256,60 @@ struct ProbedStream {
     frame_rate: Option<Rational>,
     start_time: Option<f64>,
     duration: Option<f64>,
+    /// Where `duration` came from.
+    duration_from: DurationFrom,
+}
+
+/// Where a stream's length came from, best first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DurationFrom {
+    /// No length known.
+    #[default]
+    Unknown,
+    /// ffprobe's own stream duration (MP4 and most containers).
+    Stream,
+    /// The plain Matroska `DURATION` tag, which ffmpeg's MKV writer adds.
+    Tag,
+    /// A localized `DURATION-xx` tag: the stream has no other length.
+    LocalizedTag,
+    /// A tag contradicted by the file's own timing, replaced by the end of
+    /// the stream's last packet.
+    Packets,
+    /// A tag contradicted by the file's own timing, replaced by the
+    /// container's length.
+    Container,
+}
+
+impl DurationFrom {
+    fn is_tag(self) -> bool {
+        matches!(self, Self::Tag | Self::LocalizedTag)
+    }
+}
+
+/// How a tag-derived stream length disagrees with the container's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TagDoubt {
+    /// Longer than the container by more than the duration tolerance: no
+    /// stream outlasts its container, so the tag is out of date.
+    Longer,
+    /// A picture or sound track shorter than the container by more than
+    /// the duration tolerance: out of date, or a track that really ends
+    /// early (the container holds a subtitle that runs on).
+    Shorter,
+}
+
+/// The end of each stream's last packet near the end of a file (see
+/// [`read_tail_packets`]). Times count from timestamp 0, as Matroska's
+/// own length and `DURATION` tags do (an audio track that starts a few
+/// milliseconds early doesn't make the file longer).
+#[derive(Debug, Clone, Default, PartialEq)]
+struct TailPackets {
+    /// Where reading started. A stream with no packet listed ended before
+    /// this.
+    from: f64,
+    /// Stream index → the latest packet end (presentation time plus
+    /// duration).
+    ends: BTreeMap<u32, f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2260,6 +2331,13 @@ impl Rational {
 
     fn expr(&self) -> String {
         format!("{}/{}", self.num, self.den)
+    }
+}
+
+impl ProbedStream {
+    /// A picture or sound track (cover art is neither).
+    fn is_av(&self) -> bool {
+        !self.attached_pic && matches!(self.kind, Some(StreamKind::Video | StreamKind::Audio))
     }
 }
 
@@ -2290,9 +2368,7 @@ impl MediaProbe {
     fn av_duration(&self) -> Option<f64> {
         self.streams
             .iter()
-            .filter(|s| {
-                !s.attached_pic && matches!(s.kind, Some(StreamKind::Video | StreamKind::Audio))
-            })
+            .filter(|s| s.is_av())
             .filter_map(|s| s.duration)
             .filter(|d| d.is_finite() && *d > 0.0)
             .reduce(f64::max)
@@ -2318,13 +2394,102 @@ impl MediaProbe {
 
     /// Container duration, else the longest stream.
     fn best_duration(&self) -> Option<f64> {
-        self.duration.filter(|d| *d > 0.0).or_else(|| {
+        self.container_duration().or_else(|| {
             self.streams
                 .iter()
                 .filter_map(|s| s.duration)
                 .filter(|d| d.is_finite() && *d > 0.0)
                 .reduce(f64::max)
         })
+    }
+
+    fn container_duration(&self) -> Option<f64> {
+        self.duration.filter(|d| d.is_finite() && *d > 0.0)
+    }
+
+    /// How `stream`'s tag-derived length disagrees with the container's,
+    /// if it does by more than the duration tolerance.
+    fn tag_doubt(&self, stream: &ProbedStream) -> Option<TagDoubt> {
+        if !stream.duration_from.is_tag() {
+            return None;
+        }
+        let container = self.container_duration()?;
+        let tag = stream.duration?;
+        let tolerance = duration_tolerance(container);
+        if tag > container + tolerance {
+            Some(TagDoubt::Longer)
+        } else if stream.is_av() && tag + tolerance < container {
+            Some(TagDoubt::Shorter)
+        } else {
+            None
+        }
+    }
+
+    /// Whether any stream's length comes from a Matroska tag that the
+    /// container's own length contradicts.
+    fn has_doubtful_tags(&self) -> bool {
+        self.streams.iter().any(|s| self.tag_doubt(s).is_some())
+    }
+
+    /// Replace tag-derived stream lengths the container contradicts with
+    /// the file's real timing. `tail` (when it could be read) tells where
+    /// each stream's last packet ends: a stream with packets there gets
+    /// that length. A picture or sound track with none ended before the
+    /// part read: its shorter tag stands when it says so (a subtitle that
+    /// runs on keeps the container longer), anything else takes the
+    /// container's length. Without `tail` every contradicted tag takes the
+    /// container's length. Nothing changes when the container has no
+    /// length to compare with.
+    fn settle_tagged_durations(&mut self, tail: Option<&TailPackets>) {
+        let Some(container) = self.container_duration() else {
+            return;
+        };
+        let tolerance = duration_tolerance(container);
+        let settled: Vec<(usize, Option<(f64, DurationFrom)>)> = self
+            .streams
+            .iter()
+            .enumerate()
+            .filter_map(|(i, stream)| {
+                let doubt = self.tag_doubt(stream)?;
+                let tag = stream.duration?;
+                let measured = tail.and_then(|t| {
+                    t.ends
+                        .get(&stream.index)
+                        .copied()
+                        .filter(|d| d.is_finite() && *d > 0.0)
+                });
+                let ended_before_tail = tail.is_some_and(|t| tag <= t.from + tolerance);
+                let replacement = match measured {
+                    Some(secs) => Some((secs, DurationFrom::Packets)),
+                    None if doubt == TagDoubt::Shorter && ended_before_tail => None,
+                    None => Some((container, DurationFrom::Container)),
+                };
+                Some((i, replacement))
+            })
+            .collect();
+        for (i, replacement) in settled {
+            let Some(stream) = self.streams.get_mut(i) else {
+                continue;
+            };
+            match replacement {
+                Some((secs, from)) => {
+                    tracing::debug!(
+                        stream = stream.index,
+                        tagged = ?stream.duration,
+                        container,
+                        "a stream's DURATION tag disagrees with the file; using {secs:.3} s ({from:?})"
+                    );
+                    stream.duration = Some(secs);
+                    stream.duration_from = from;
+                }
+                None => tracing::debug!(
+                    stream = stream.index,
+                    tagged = ?stream.duration,
+                    container,
+                    "a track ends before the container; its DURATION tag agrees with its packets"
+                ),
+            }
+        }
     }
 }
 
@@ -2348,19 +2513,26 @@ struct FfprobeStream {
     start_time: Option<String>,
     duration: Option<String>,
     disposition: Option<FfprobeDisposition>,
-    /// Matroska keeps per-stream durations in a `DURATION` tag.
+    /// Matroska keeps per-stream durations in `DURATION` tags.
     #[serde(default)]
-    tags: std::collections::HashMap<String, String>,
+    tags: BTreeMap<String, String>,
 }
 
 impl FfprobeStream {
-    fn duration_secs(&self) -> Option<f64> {
-        parse_seconds(self.duration.as_ref()).or_else(|| {
-            self.tags
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("duration") || k.starts_with("DURATION-"))
-                .and_then(|(_, v)| crate::ffmpeg::parse_clock(v))
-        })
+    /// ffprobe's own stream duration, else the Matroska `DURATION` tags:
+    /// the plain tag ffmpeg writes, and a localized one (`DURATION-eng`,
+    /// possibly left over from before a cut) only when there is no other
+    /// (see [`chrysopoeia_core::tags`]).
+    fn duration_secs(&self) -> (Option<f64>, DurationFrom) {
+        if let Some(secs) = parse_seconds(self.duration.as_ref()).filter(|d| *d > 0.0) {
+            return (Some(secs), DurationFrom::Stream);
+        }
+        let pairs = self.tags.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+        match chrysopoeia_core::tags::tagged_duration(pairs) {
+            Some(tag) if tag.localized => (Some(tag.value), DurationFrom::LocalizedTag),
+            Some(tag) => (Some(tag.value), DurationFrom::Tag),
+            None => (None, DurationFrom::Unknown),
+        }
     }
 }
 
@@ -2404,9 +2576,10 @@ fn parse_probe_json(json: &[u8]) -> Result<MediaProbe, String> {
                 .and_then(Rational::parse)
                 .filter(|r| sane_fps(r.value()))
                 .or_else(|| s.r_frame_rate.as_deref().and_then(Rational::parse));
-            let duration = s.duration_secs();
+            let (duration, duration_from) = s.duration_secs();
             ProbedStream {
                 duration,
+                duration_from,
                 index: s.index,
                 kind,
                 codec: s.codec_name.unwrap_or_default(),
@@ -2431,22 +2604,117 @@ fn parse_probe_json(json: &[u8]) -> Result<MediaProbe, String> {
     })
 }
 
-/// Run ffprobe on `path` (killed after [`PROBE_TIMEOUT`] or on cancel).
+/// Parse `ffprobe -show_entries packet=stream_index,pts_time,dts_time,
+/// duration_time -of compact=p=0` output (one `key=value|…` line per
+/// packet), read from `from` on.
+fn parse_tail_packets(text: &str, from: f64) -> TailPackets {
+    let mut tail = TailPackets {
+        from,
+        ends: BTreeMap::new(),
+    };
+    for line in text.lines() {
+        let mut index: Option<u32> = None;
+        let (mut pts, mut dts, mut length) = (None, None, None);
+        for field in line.trim().split('|') {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            let seconds = || value.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+            match key.trim() {
+                "stream_index" => index = value.trim().parse().ok(),
+                "pts_time" => pts = seconds(),
+                "dts_time" => dts = seconds(),
+                "duration_time" => length = seconds().filter(|d| *d >= 0.0),
+                _ => {}
+            }
+        }
+        let (Some(index), Some(at)) = (index, pts.or(dts)) else {
+            continue;
+        };
+        let end = at + length.unwrap_or(0.0);
+        tail.ends
+            .entry(index)
+            .and_modify(|e| *e = e.max(end))
+            .or_insert(end);
+    }
+    tail
+}
+
+/// Probe `path` for verification: ffprobe's description of it (killed
+/// after [`PROBE_TIMEOUT`] or on cancel), with every Matroska `DURATION`
+/// tag the container's own length contradicts checked against where the
+/// streams' last packets really end (see
+/// [`MediaProbe::settle_tagged_durations`]). An out-of-date tag can then
+/// neither make a new file look as long as an original it doesn't match,
+/// nor make a complete one look cut short.
 async fn probe_media(
     ffprobe: &Path,
     path: &Path,
     cancel: &CancellationToken,
 ) -> Result<MediaProbe, ProbeError> {
+    let args = [
+        "-v",
+        "error",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+    ];
+    let json = run_ffprobe(ffprobe, &args, path, cancel).await?;
+    let mut probe = parse_probe_json(&json).map_err(ProbeError::Failed)?;
+    if probe.has_doubtful_tags() {
+        let tail = match read_tail_packets(ffprobe, path, &probe, cancel).await {
+            Ok(tail) => Some(tail),
+            Err(ProbeError::Cancelled) => return Err(ProbeError::Cancelled),
+            Err(ProbeError::Failed(why)) => {
+                tracing::debug!(
+                    file = %path.display(),
+                    "could not read the last packets to check DURATION tags: {why}"
+                );
+                None
+            }
+        };
+        probe.settle_tagged_durations(tail.as_ref());
+    }
+    Ok(probe)
+}
+
+/// Where each stream's last packet ends: the packets of the last
+/// [`TAIL_SECS`] of the container are listed (no decoding).
+async fn read_tail_packets(
+    ffprobe: &Path,
+    path: &Path,
+    probe: &MediaProbe,
+    cancel: &CancellationToken,
+) -> Result<TailPackets, ProbeError> {
+    let length = probe.container_duration().unwrap_or(0.0);
+    let from = (length - TAIL_SECS).max(0.0);
+    let interval = format!("{from:.3}%");
+    let args = [
+        "-v",
+        "error",
+        "-read_intervals",
+        interval.as_str(),
+        "-show_entries",
+        "packet=stream_index,pts_time,dts_time,duration_time",
+        "-of",
+        "compact=p=0",
+    ];
+    let text = run_ffprobe(ffprobe, &args, path, cancel).await?;
+    Ok(parse_tail_packets(&String::from_utf8_lossy(&text), from))
+}
+
+/// Run ffprobe with `args` then `path` and return what it printed (killed
+/// after [`PROBE_TIMEOUT`] or on cancel).
+async fn run_ffprobe(
+    ffprobe: &Path,
+    args: &[&str],
+    path: &Path,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, ProbeError> {
     let mut command = tokio::process::Command::new(ffprobe);
     command
-        .args([
-            "-v",
-            "error",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-        ])
+        .args(args)
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2498,7 +2766,7 @@ async fn probe_media(
             .to_string();
         return Err(ProbeError::Failed(reason));
     }
-    parse_probe_json(&output.stdout).map_err(ProbeError::Failed)
+    Ok(output.stdout)
 }
 
 // ---------------------------------------------------------------------------
@@ -2973,6 +3241,320 @@ mod tests {
             comparable_durations(&info, None, &output),
             (Some(5.0), Some(4.03))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Out-of-date Matroska DURATION tags (a clip cut from a film keeps the
+    // film's `DURATION-eng` next to ffmpeg's own `DURATION`).
+
+    /// A Matroska probe: video and two audio tracks with `tags`, a subtitle
+    /// with `sub_tags`, and the container's length.
+    fn mkv_json(tags: &str, sub_tags: &str, container: &str) -> Vec<u8> {
+        format!(
+            r#"{{"streams":[
+            {{"index":0,"codec_type":"video","codec_name":"hevc","width":3840,"height":2160,
+             "avg_frame_rate":"24000/1001","start_time":"0.000000","tags":{{{tags}}}}},
+            {{"index":1,"codec_type":"audio","codec_name":"truehd","tags":{{{tags}}}}},
+            {{"index":2,"codec_type":"audio","codec_name":"ac3","tags":{{{tags}}}}},
+            {{"index":3,"codec_type":"subtitle","codec_name":"hdmv_pgs_subtitle",
+             "tags":{{{sub_tags}}}}}],
+            "format":{{"duration":"{container}","start_time":"0.000000"}}}}"#
+        )
+        .into_bytes()
+    }
+
+    const FRESH: &str = r#""DURATION":"00:01:01.061000000""#;
+    const STALE: &str = r#""DURATION-eng":"02:21:02.000000000""#;
+    const FILM_SECS: f64 = 8462.0;
+
+    fn close(a: Option<f64>, b: f64) -> bool {
+        a.is_some_and(|a| (a - b).abs() < 1e-3)
+    }
+
+    /// The owner's clip: whichever order the tags come in, every stream's
+    /// length is ffmpeg's plain `DURATION`, which the container confirms.
+    #[test]
+    fn the_plain_duration_tag_wins_over_a_stale_localized_one_in_either_order() {
+        for tags in [
+            format!(r#"{FRESH},"BPS-eng":"60000000",{STALE}"#),
+            format!(r#"{STALE},"BPS-eng":"60000000",{FRESH}"#),
+        ] {
+            for _ in 0..8 {
+                let probe = parse_probe_json(&mkv_json(&tags, &tags, "61.061000")).unwrap();
+                for stream in &probe.streams {
+                    assert!(close(stream.duration, 61.061), "{stream:?}");
+                    assert_eq!(stream.duration_from, DurationFrom::Tag);
+                }
+                assert!(!probe.has_doubtful_tags());
+                assert!(close(probe.av_duration(), 61.061));
+                assert!(close(probe.best_duration(), 61.061));
+            }
+        }
+    }
+
+    #[test]
+    fn localized_tags_count_when_there_is_nothing_else() {
+        let tags = r#""DURATION-eng":"00:01:01.000000000""#;
+        let probe = parse_probe_json(&mkv_json(tags, tags, "61.061000")).unwrap();
+        let video = probe.primary_video().unwrap();
+        assert!(close(video.duration, 61.0));
+        assert_eq!(video.duration_from, DurationFrom::LocalizedTag);
+        assert!(!probe.has_doubtful_tags(), "they agree with the container");
+
+        // ffprobe's own stream duration (MP4) always comes first.
+        let json = br#"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264",
+            "duration":"61.000000","tags":{"DURATION-eng":"02:21:02.000000000"}}],
+            "format":{"duration":"61.000000"}}"#;
+        let probe = parse_probe_json(json).unwrap();
+        assert!(close(probe.primary_video().unwrap().duration, 61.0));
+        assert_eq!(
+            probe.primary_video().unwrap().duration_from,
+            DurationFrom::Stream
+        );
+    }
+
+    /// Only the film's tags survived (no plain `DURATION`): they claim far
+    /// more than the container holds, so the file's own timing is used.
+    #[test]
+    fn a_tag_much_longer_than_the_container_is_not_trusted() {
+        let probe = parse_probe_json(&mkv_json(STALE, STALE, "61.061000")).unwrap();
+        assert!(close(probe.av_duration(), FILM_SECS), "as tagged");
+        assert!(probe.has_doubtful_tags());
+        assert_eq!(probe.tag_doubt(&probe.streams[0]), Some(TagDoubt::Longer));
+
+        // The last packets could not be read: the container's length.
+        let mut without_tail = probe.clone();
+        without_tail.settle_tagged_durations(None);
+        for stream in &without_tail.streams {
+            assert!(close(stream.duration, 61.061), "{stream:?}");
+            assert_eq!(stream.duration_from, DurationFrom::Container);
+        }
+        assert!(!without_tail.has_doubtful_tags());
+
+        // Where the streams' last packets end (the subtitle had none in
+        // the last seconds).
+        let tail = parse_tail_packets(
+            "stream_index=0|pts_time=60.977000|dts_time=N/A|duration_time=0.042000\n\
+             stream_index=1|pts_time=61.020000|dts_time=61.020000|duration_time=0.001000\n\
+             stream_index=2|pts_time=N/A|dts_time=61.000000|duration_time=0.032000\n\
+             stream_index=1|pts_time=60.000000|dts_time=60.000000|duration_time=0.001000\n",
+            51.061,
+        );
+        let mut with_tail = probe.clone();
+        with_tail.settle_tagged_durations(Some(&tail));
+        assert!(close(with_tail.streams[0].duration, 61.019));
+        assert!(close(with_tail.streams[1].duration, 61.021));
+        assert!(close(with_tail.streams[2].duration, 61.032));
+        assert_eq!(with_tail.streams[0].duration_from, DurationFrom::Packets);
+        assert!(close(with_tail.streams[3].duration, 61.061));
+        assert_eq!(with_tail.streams[3].duration_from, DurationFrom::Container);
+        assert!(close(with_tail.av_duration(), 61.032));
+    }
+
+    /// A picture or sound tag well short of the container: out of date when
+    /// the stream's packets run on to the end, true when the stream really
+    /// stops early (a subtitle keeps the container going).
+    #[test]
+    fn a_tag_much_shorter_than_the_container_is_checked_against_the_packets() {
+        let short = r#""DURATION-eng":"00:00:30.000000000""#;
+        let probe = parse_probe_json(&mkv_json(short, short, "61.061000")).unwrap();
+        assert_eq!(probe.tag_doubt(&probe.streams[0]), Some(TagDoubt::Shorter));
+        // A subtitle that ends early is normal.
+        assert_eq!(probe.tag_doubt(&probe.streams[3]), None);
+
+        // Packets to the end: the tag is out of date.
+        let tail = parse_tail_packets(
+            "stream_index=0|pts_time=61.019000|duration_time=0.042000\n\
+             stream_index=1|pts_time=61.000000|duration_time=0.050000\n\
+             stream_index=2|pts_time=61.000000|duration_time=0.050000\n",
+            51.061,
+        );
+        let mut stale = probe.clone();
+        stale.settle_tagged_durations(Some(&tail));
+        assert!(close(stale.av_duration(), 61.061));
+        assert!(
+            close(stale.streams[3].duration, 30.0),
+            "subtitle left alone"
+        );
+
+        // No picture or sound in the last seconds: they really stop at 30 s.
+        let tail = parse_tail_packets(
+            "stream_index=3|pts_time=60.000000|duration_time=1.0\n",
+            51.061,
+        );
+        let mut early = probe.clone();
+        early.settle_tagged_durations(Some(&tail));
+        assert!(close(early.av_duration(), 30.0));
+        assert_eq!(early.streams[0].duration_from, DurationFrom::LocalizedTag);
+
+        // Nothing to go on: the container's length.
+        let mut unknown = probe.clone();
+        unknown.settle_tagged_durations(None);
+        assert!(close(unknown.av_duration(), 61.061));
+
+        // No container length: nothing to compare with, the tags stand.
+        let mut no_container = probe.clone();
+        no_container.duration = None;
+        assert!(!no_container.has_doubtful_tags());
+        no_container.settle_tagged_durations(None);
+        assert!(close(no_container.av_duration(), 30.0));
+    }
+
+    /// The tail read with the real ffprobe: a 12 s video with 8 s of
+    /// sound, read from 10 s before the end, finds where each really
+    /// stops, and a stale tag gives way to it.
+    #[tokio::test]
+    async fn reads_where_the_streams_really_end_with_ffprobe() {
+        let have = |tool: &str| {
+            std::process::Command::new(tool)
+                .arg("-version")
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        if !have("ffmpeg") || !have("ffprobe") {
+            eprintln!("ffmpeg/ffprobe not found; skipping");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tail.mkv");
+        let made = tokio::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x90:rate=25:duration=12",
+            ])
+            .args(["-f", "lavfi", "-i", "sine=frequency=440:duration=8"])
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-g", "25"])
+            .args(["-c:a", "aac"])
+            .arg(&path)
+            .output()
+            .await
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+
+        let cancel = CancellationToken::new();
+        let ffprobe = Path::new("ffprobe");
+        let mut probe = probe_media(ffprobe, &path, &cancel).await.unwrap();
+        assert!(close(probe.container_duration(), 12.0), "{probe:?}");
+        assert!(!probe.has_doubtful_tags(), "ffmpeg's own tags are right");
+
+        let tail = read_tail_packets(ffprobe, &path, &probe, &cancel)
+            .await
+            .unwrap();
+        assert!((tail.from - 2.0).abs() < 0.1, "{tail:?}");
+        let video_end = tail.ends.get(&0).copied().unwrap_or_default();
+        let audio_end = tail.ends.get(&1).copied().unwrap_or_default();
+        assert!((video_end - 12.0).abs() < 0.1, "{tail:?}");
+        assert!((audio_end - 8.0).abs() < 0.1, "{tail:?}");
+
+        // Had the video carried a film's tag, the packets would win.
+        probe.streams[0].duration = Some(FILM_SECS);
+        probe.streams[0].duration_from = DurationFrom::LocalizedTag;
+        assert!(probe.has_doubtful_tags());
+        probe.settle_tagged_durations(Some(&tail));
+        assert!(close(probe.streams[0].duration, video_end));
+        assert_eq!(probe.streams[0].duration_from, DurationFrom::Packets);
+        assert!((probe.av_duration().unwrap_or_default() - 12.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn tail_packets_keep_the_latest_end_per_stream() {
+        let tail = parse_tail_packets(
+            "stream_index=0|pts_time=9.000000|dts_time=8.900000|duration_time=0.040000\n\
+             stream_index=0|pts_time=8.960000|dts_time=8.940000|duration_time=0.040000\n\
+             stream_index=1|pts_time=N/A|dts_time=9.500000|duration_time=N/A\n\
+             garbage\n\
+             stream_index=2|pts_time=N/A|dts_time=N/A|duration_time=0.1\n\
+             \n",
+            5.0,
+        );
+        assert_eq!(tail.from, 5.0);
+        assert_eq!(tail.ends.len(), 2);
+        assert!(close(tail.ends.get(&0).copied(), 9.04));
+        assert!(close(tail.ends.get(&1).copied(), 9.5));
+    }
+
+    /// The owner's job, measured as verification measures it: the clip and
+    /// its conversion both carry the film's `DURATION-eng`. Before, the
+    /// length check could read "2:21:02 vs 2:21:02" and the full decode
+    /// then fail with "Playback stopped at 1:01 of 2:21:02".
+    #[test]
+    fn stale_tags_on_both_files_compare_the_real_lengths() {
+        for (first, second) in [(FRESH, STALE), (STALE, FRESH)] {
+            let tags = format!("{first},{second}");
+            let source = parse_probe_json(&mkv_json(&tags, &tags, "61.061000")).unwrap();
+            let output = parse_probe_json(&mkv_json(&tags, &tags, "61.061000")).unwrap();
+            let info = ProbeInfo {
+                duration_secs: Some(61.061),
+                ..Default::default()
+            };
+            let (src, out) = comparable_durations(&info, Some(&source), &output);
+            assert!(close(src, 61.061) && close(out, 61.061), "{src:?} {out:?}");
+            let check = duration_check(src, out);
+            assert_eq!(check.status, CheckStatus::Pass);
+            assert_eq!(check.detail, "Matches the original (1:01 vs 1:01)");
+
+            let expected = expected_play_length(&output, src);
+            assert!(close(expected, 61.061));
+            let mut decode = decode_result(&[]);
+            decode.decoded_secs = Some(61.04);
+            let played = decode_check(&decode, expected, &Inherited::default());
+            assert_eq!(played.status, CheckStatus::Pass, "{}", played.detail);
+            assert_eq!(played.detail, "Decoded all 1:01 without errors");
+        }
+    }
+
+    /// A truncated conversion still fails, stale tags or not: the length
+    /// check when the new file says it is shorter, the full decode when it
+    /// claims the whole length but stops early.
+    #[test]
+    fn truncated_output_still_fails_with_stale_tags() {
+        let tags = format!("{FRESH},{STALE}");
+        let source = parse_probe_json(&mkv_json(&tags, &tags, "61.061000")).unwrap();
+        let info = ProbeInfo {
+            duration_secs: Some(61.061),
+            ..Default::default()
+        };
+
+        // Cut short at 30 s, the film's tag still on every track.
+        let short = format!(r#""DURATION":"00:00:30.000000000",{STALE}"#);
+        let output = parse_probe_json(&mkv_json(&short, &short, "30.000000")).unwrap();
+        let (src, out) = comparable_durations(&info, Some(&source), &output);
+        let check = duration_check(src, out);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(
+            check.detail,
+            "The new file is shorter than the original (30.0 s instead of 1:01)"
+        );
+
+        // Only the film's tag left on the cut file: it can't pass for the
+        // original's length either.
+        let mut output = parse_probe_json(&mkv_json(STALE, STALE, "30.000000")).unwrap();
+        output.settle_tagged_durations(None);
+        let (src, out) = comparable_durations(&info, Some(&source), &output);
+        assert!(close(out, 30.0), "{out:?}");
+        assert_eq!(duration_check(src, out).status, CheckStatus::Fail);
+
+        // The header claims the whole length (stale tag included) but the
+        // pictures stop at 30 s.
+        let output = parse_probe_json(&mkv_json(&tags, &tags, "61.061000")).unwrap();
+        let (src, out) = comparable_durations(&info, Some(&source), &output);
+        assert_eq!(duration_check(src, out).status, CheckStatus::Pass);
+        let expected = expected_play_length(&output, src);
+        assert!(close(expected, 61.061), "never the film's 2:21:02");
+        let mut decode = decode_result(&[]);
+        decode.decoded_secs = Some(30.0);
+        let played = decode_check(&decode, expected, &Inherited::default());
+        assert_eq!(played.status, CheckStatus::Fail);
+        assert_eq!(played.detail, "Playback stopped at 30.0 s of 1:01");
+
+        // Without the container's word, a stale tag can't stretch what a
+        // decode has to reach past the file's real end either.
+        let mut stale_only = parse_probe_json(&mkv_json(STALE, STALE, "61.061000")).unwrap();
+        stale_only.settle_tagged_durations(None);
+        assert!(close(expected_play_length(&stale_only, src), 61.061));
     }
 
     #[test]

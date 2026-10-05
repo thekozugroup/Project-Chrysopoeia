@@ -21,6 +21,7 @@ pub mod profile;
 pub mod settings;
 pub mod stats;
 pub mod system;
+pub mod tags;
 pub mod validation;
 
 pub use codec::{AudioCodec, Container, SubtitleAction, VideoCodec};
