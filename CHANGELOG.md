@@ -91,6 +91,27 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
   length, read again this way, shows it, so an original that really is cut
   short is still reported. Statistics tags stored for a whole file (an MP4's
   `DURATION-eng`) are also removed from converted MKV files.
+- **Files that state no length at all** are measured the same way. A Matroska
+  file written as a live stream or through a pipe without tags (or a raw
+  `.h264` stream, or a transport stream ffprobe can't estimate) showed no
+  length, its length check was skipped and its pictures were never compared,
+  so in Replace mode a conversion cut to 30 seconds replaced a 61-second
+  original. Its packets are now listed (all of them, no decoding), by the
+  scanner and by verification, the cut conversion fails and the original is
+  kept. When the packets can't be listed, the length check fails instead of
+  being skipped, at every level that runs it.
+- **A conversion that stops early no longer blames the original.** When an
+  encode was cut short (a wrapper that adds `-t 30`, say), the failed length
+  check was read as "The original file appears damaged or incomplete", which
+  also stopped the job from trying the next encoder. The original's packets
+  are now listed near its end first: when they reach its length, the
+  conversion is what failed the check, and the next encoder is tried. A really
+  cut-off original is still reported as damaged.
+- When the original's length can't be read, the advice no longer says to
+  choose lighter checks, which fail the same way (Quick checks the length
+  too). It says to try again and, if it happens again, to check that the
+  original plays to the end. Lighter checks are only suggested when they
+  would skip the check that failed.
 
 ## [0.2.0] - 2026-10-04
 

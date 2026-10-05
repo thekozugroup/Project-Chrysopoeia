@@ -97,6 +97,103 @@ pub fn copy_media(name: &str, dir: &Path) -> PathBuf {
     dst
 }
 
+/// A stand-in for ffmpeg, written to `dir`, that runs the real one with
+/// `-t <secs>` before the output: a conversion cut short, as the tester's
+/// wrapper made it. Runs that write nowhere (the checks' decodes and
+/// comparisons, whose output is `-`) are left as they are.
+#[cfg(unix)]
+pub fn cutting_ffmpeg(dir: &Path, secs: u32) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(format!("ffmpeg-cut-at-{secs}"));
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/bin/sh
+for last in "$@"; do :; done
+if [ "$last" = "-" ]; then exec ffmpeg "$@"; fi
+count=$#
+i=0
+for arg in "$@"; do
+  i=$((i + 1))
+  if [ "$i" -eq "$count" ]; then set -- "$@" -t {secs}; fi
+  set -- "$@" "$arg"
+done
+shift "$count"
+exec ffmpeg "$@"
+"#
+        ),
+    )
+    .expect("write the ffmpeg wrapper");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the wrapper executable");
+    path
+}
+
+/// A stand-in for ffprobe, written to `dir`, that describes files as the
+/// real one does but can't list their packets (a listing that fails, as
+/// on a file ffprobe can't read through, or a share that gives up).
+#[cfg(unix)]
+pub fn unlisting_ffprobe(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("ffprobe-no-packets");
+    std::fs::write(
+        &path,
+        "#!/bin/sh\ncase \"$*\" in\n*-show_entries*) echo 'Input/output error' >&2; exit 1 ;;\n\
+         *) exec ffprobe \"$@\" ;;\nesac\n",
+    )
+    .expect("write the ffprobe wrapper");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the wrapper executable");
+    path
+}
+
+/// A clip of `secs` seconds as ffmpeg encodes it (small picture, sound),
+/// written to `dir`/`name` with `extra` options before the output (`-live
+/// 1`, `-output_ts_offset 600`).
+pub fn small_clip(dir: &Path, name: &str, secs: u32, extra: &[&str]) -> PathBuf {
+    let out = dir.join(name);
+    let video = format!("testsrc2=size=320x180:rate=24:duration={secs}");
+    let audio = format!("sine=frequency=440:duration={secs}");
+    let mut args: Vec<&str> = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        &video,
+        "-f",
+        "lavfi",
+        "-i",
+        &audio,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "18",
+        "-g",
+        "48",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-map_metadata",
+        "-1",
+    ];
+    args.extend_from_slice(extra);
+    let out_str = out.to_str().expect("utf-8 path");
+    args.push(out_str);
+    ffmpeg(&args);
+    out
+}
+
+/// The first half of `path`, bytes as they are (a download or copy cut
+/// short, as `head -c` makes one), written next to it as `name`.
+pub fn first_half(path: &Path, name: &str) -> PathBuf {
+    let bytes = std::fs::read(path).expect("read the file to cut");
+    let out = path.with_file_name(name);
+    std::fs::write(&out, &bytes[..bytes.len() / 2]).expect("write the cut file");
+    out
+}
+
 /// Run ffmpeg quietly with `-y`; panics on failure.
 pub fn ffmpeg(args: &[&str]) {
     let output = Command::new("ffmpeg")

@@ -12,13 +12,19 @@
 //!   timestamps start at zero: a one-minute clip whose timestamps start at
 //!   10:00 states 11:01. Written through a pipe, the same clip states 1:01.
 //!
+//! And some files state no length at all, in any container: a Matroska
+//! file written as a live stream or through a pipe without tags, a raw
+//! elementary stream (`.h264`), a transport stream or VOB ffprobe can't
+//! estimate.
+//!
 //! When the stated lengths can't be trusted, ffprobe lists the packets near
 //! the end of the file (`-read_intervals <from>% -show_entries packet=…`,
-//! no decoding; when the file can't be read from near its end, all of its
-//! packets), and the length is where the last one ends, counted from where
-//! the file starts. A seek past the end lands on the last keyframe (with
-//! Matroska Cues, and without them by reading through the file), so the
-//! point to read from is worked out from the longest the file could be.
+//! no decoding; when the file can't be read from near its end, or states
+//! no length to read back from, all of its packets), and the length is
+//! where the last one ends, counted from where the file starts. A seek past
+//! the end lands on the last keyframe (with Matroska Cues, and without them
+//! by reading through the file), so the point to read from is worked out
+//! from the longest the file could be.
 
 use std::collections::BTreeMap;
 
@@ -79,7 +85,8 @@ pub fn stated_length(stated: f64, start: f64) -> f64 {
 /// from the container's stated length when it has one, else the longest of
 /// `tags` (the stream lengths its tags state). Each is taken as a length
 /// from the start, the longest it could mean; a point past the real end
-/// lands on the last keyframe. `None` when nothing gives a length.
+/// lands on the last keyframe. `None` when nothing gives a length: there is
+/// no end to read back from, so every packet is listed.
 pub fn tail_start(start: f64, container: Option<f64>, tags: &[f64]) -> Option<f64> {
     let positive = |d: &f64| d.is_finite() && *d > 0.0;
     let stated = container
@@ -110,13 +117,21 @@ pub struct PacketEnds {
     /// ffprobe said the file stops in the middle of a packet or element:
     /// it was cut short, so its packets don't show how long it should be.
     pub cut_off: bool,
+    /// Stream index → the durations of its packets added up, while no
+    /// packet listed has had a time (see [`PacketEnds::push_line`]).
+    pub untimed: BTreeMap<u32, f64>,
 }
 
 impl PacketEnds {
     /// Read one line of `-show_entries packet=stream_index,pts_time,
     /// dts_time,duration_time -of compact=p=0` output
     /// (`stream_index=0|pts_time=1.0|dts_time=N/A|duration_time=0.04`).
-    /// Lines without a stream and a time are ignored.
+    /// Lines without a stream are ignored, and so are lines without a time,
+    /// except in a listing where no packet has one (a raw elementary
+    /// stream such as `.h264` has none): there each stream's packets follow
+    /// one another from zero, so a stream ends where their durations add up
+    /// to (a listing of the whole file). Once a packet has a time, what was
+    /// added up without one is dropped.
     pub fn push_line(&mut self, line: &str) {
         let mut index: Option<u32> = None;
         let (mut pts, mut dts, mut length) = (None, None, None);
@@ -133,9 +148,23 @@ impl PacketEnds {
                 _ => {}
             }
         }
-        let (Some(index), Some(at)) = (index, pts.or(dts)) else {
+        let Some(index) = index else {
             return;
         };
+        let Some(at) = pts.or(dts) else {
+            if self.first.is_none()
+                && let Some(length) = length.filter(|d| *d > 0.0)
+            {
+                let total = self.untimed.entry(index).or_insert(0.0);
+                *total += length;
+                self.ends.insert(index, *total);
+            }
+            return;
+        };
+        if self.first.is_none() && !self.untimed.is_empty() {
+            self.untimed.clear();
+            self.ends.clear();
+        }
         self.first = Some(self.first.map_or(at, |f| f.min(at)));
         let end = at + length.unwrap_or(0.0);
         self.ends
@@ -249,6 +278,32 @@ mod tests {
             (empty.first, empty.end(), empty.length(0.0)),
             (None, None, None)
         );
+    }
+
+    /// A raw elementary stream (`.h264`) has no times at all: its packets
+    /// follow one another, so it is as long as their durations add up to.
+    /// A listing whose packets do have times ignores the ones without.
+    #[test]
+    fn packets_without_any_time_add_up() {
+        let mut listing = String::new();
+        for _ in 0..1525 {
+            listing.push_str("stream_index=0|pts_time=N/A|dts_time=N/A|duration_time=0.040000\n");
+        }
+        let ends = PacketEnds::parse(&listing, "");
+        assert_eq!(ends.first, None);
+        assert!(close(ends.end(), 61.0), "{:?}", ends.end());
+        assert!(close(ends.length(0.0), 61.0));
+
+        let ends = PacketEnds::parse(
+            "stream_index=0|pts_time=N/A|dts_time=N/A|duration_time=0.04\n\
+             stream_index=0|pts_time=10.0|dts_time=N/A|duration_time=0.04\n\
+             stream_index=0|pts_time=N/A|dts_time=N/A|duration_time=0.04\n\
+             stream_index=1|pts_time=N/A|dts_time=N/A|duration_time=0.5\n",
+            "",
+        );
+        assert_eq!(ends.ends.len(), 1, "{ends:?}");
+        assert!(close(ends.end(), 10.04));
+        assert!(close(ends.first, 10.0));
     }
 
     /// A one-minute clip whose timestamps start at 10:00: 1:01 long.
