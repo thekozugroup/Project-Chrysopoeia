@@ -128,6 +128,13 @@ pub struct ProbeInfo {
     pub size_bytes: u64,
     pub start_time: Option<f64>,
     pub chapters: u32,
+    /// Matroska statistics tags stored for the whole file rather than a
+    /// track (`DURATION-eng` carried over from an MP4's metadata, say; see
+    /// [`crate::tags`]), named as the file spells them. A conversion to
+    /// MKV or WebM removes them like the tracks' own. Probes stored by
+    /// older versions have none listed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub statistics_tags: Vec<String>,
     pub streams: Vec<StreamInfo>,
 }
 

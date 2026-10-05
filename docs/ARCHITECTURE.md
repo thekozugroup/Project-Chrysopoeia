@@ -39,7 +39,7 @@ shapes here are normative. The Rust source of truth for every shared type is
 
 | Crate | Owns | Public API |
 |---|---|---|
-| `szalinski-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, tying child processes to the server's life | Everything in `src/*.rs` |
+| `szalinski-core` | Shared types, codec/container rules, goals, settings, events, artifact naming, Matroska statistics tags, where a file really ends by its packets (`timeline`), tying child processes to the server's life | Everything in `src/*.rs` |
 | `szalinski-hwdetect` | CPU/memory/cgroup detection, GPU discovery, ffmpeg encoder listing and **test-encode verification**, job-count recommendation, setup hints | `detect`, `recommend_jobs`, `encoder_candidates`, `is_busy_failure`, `preference_problem`, `preference_hint` |
 | `szalinski-scanner` | Walking libraries, media extension list, ffprobe probing (async, timeout), folder watching with settle debounce | `walk_library`, `is_media_path`, `is_video_path`, `probe_file`, `parse_ffprobe_json`, `LibraryWatcher`, `ScanOptions::from_settings`, `IgnoreRules`, `validate_ignore_pattern` |
 | `szalinski-worker` | `plan`/`quality`: skip decision + ffmpeg args. `ffmpeg`/`run`/`validate`/`finalize`: process execution with fallback chain, verification, crash-safe replacement | `decide`, `decide_forced`, `build_plan`, `run_job`, `validate_output`, `finalize::*` (incl. `resume_replace`, `remove_backup`, `recover_artifact`), `slow_fs` |
@@ -822,8 +822,13 @@ with `JobSpec.force` uses it when `decide` says skip.
   `-metadata:s:<v:0|a:N|s:N|t:N> <KEY>=` for each, which removes it and
   leaves every other tag (title, language, dispositions, HDR metadata) as it
   was; ffmpeg's MKV writer then adds its own `DURATION` for the new track.
-  MP4 keeps no such tags (checked with ffmpeg 6.1 and 7.0), so it gets none
-  of these options.
+  Statistics tags stored for the whole file (`ProbeInfo.statistics_tags`:
+  an MP4's `DURATION-eng` kept with `use_metadata_tags`, an MKV's global
+  tags), which `-map_metadata 0` would copy, get `-metadata <KEY>=` the
+  same way; the file's title and other tags stay. (Probes stored before
+  this list existed have it empty, so such a file keeps its global tag
+  until it is probed again.) MP4 keeps no such tags (checked with ffmpeg
+  6.1 and 7.0), so it gets none of these options.
 - Audio per output stream: copy when the profile says copy (or source already in
   target codec) and the container can hold it; else encode with
   `AudioCodec::default_bitrate_kbps(channels)`, downmixing past
@@ -953,10 +958,18 @@ that a different drive is mounted there).
    the frame rate when no output time came.
 3. A cut-off original: when ffmpeg reported damaged input or verification
    found the result too short, and the encode ended clearly before the length
-   the container claims (> max(2 s, 5 %)), the job fails with "The original
+   the original claims (> max(2 s, 5 %)), the job fails with "The original
    file appears damaged or incomplete (it stops after 0.1 s). It was left
    unchanged." (With verification off, ending before half the length is
-   enough.) Only an attempt that decoded on the CPU (or the last attempt)
+   enough.) The claim is the scanned length, confirmed by reading the
+   original's length again the way verification does
+   (`validate::source_length`, below; the scanned one counts only when the
+   original can't be probed again): an out-of-date tag, a file with no
+   length but its tags, or timestamps that don't start at zero never make a
+   complete original look cut off (nor does a stored probe made before
+   lengths were read this way), while one that plays clearly shorter than
+   its container says, or than its tags say when it stops in the middle of
+   a packet, still does. Only an attempt that decoded on the CPU (or the last attempt)
    concludes this; a GPU-decoding attempt that stops early moves on to the
    next attempt like any other hardware failure.
 4. **Size rule**: if `profile.min_savings_pct = Some(p)` and the output is not
@@ -992,22 +1005,56 @@ child is started with `core::process::end_with_parent` (Linux
   tags of a kind the one with the first name counts, so the choice never
   depends on the order ffprobe lists them in (the scanner reads tags by
   the same rule, `core::tags`, and takes the container's length first).
-  A tag-derived length is then checked against the container's: one longer
-  than the container by more than the tolerance (no stream outlasts its
-  container), or a picture or sound track's shorter by more than it, is not
-  trusted as it is. ffprobe then lists the packets of the last 10 s of the
-  file (`-read_intervals <end-10>% -show_entries packet=…`, no decoding):
-  a stream with packets there takes the end of its last packet; a picture
-  or sound track with none keeps a shorter tag that ends before that part
-  (a subtitle that runs on past the video keeps the container longer);
-  anything else, or every contradicted tag when the packets can't be read,
-  takes the container's length. Without a container length the tags stand.
-  So an out-of-date tag can neither make a new file look "the same length"
-  as a wrongly long original nor make a complete one look cut short. The
-  length the full decode must reach is the new file's picture and sound
-  length read this way, else its container's, else the original's; a
-  conversion that stops early still fails ("The new file is shorter than
-  the original (…)" or "Playback stopped at … of …").
+  Lengths count from where the file starts: a start time up to 0.5 s
+  counts as zero (`core::timeline`). What a file states is then checked
+  against where its packets really end when it can't be taken as it is:
+  - A tag the container contradicts: longer than the container by more
+    than the tolerance (no stream outlasts its container), or a picture or
+    sound track's shorter by more than it. ffprobe lists the packets of the
+    last 10 s (`-read_intervals <end-10>% -show_entries packet=… -of
+    compact=p=0`, no decoding): a stream with packets there takes the end
+    of its last packet; a picture or sound track with none keeps a shorter
+    tag that ends before that part (a subtitle that runs on past the video
+    keeps the container longer); anything else, or every contradicted tag
+    when the packets can't be listed, takes the container's length.
+  - No length but the tags (a Matroska file written as a live stream,
+    `-live 1`, or by a recorder that never filled it in), or a Matroska
+    file whose timestamps don't start at zero (ffmpeg's writer states
+    where such a file ends, 11:01 for a minute starting at 10:00, as its
+    length and in every `DURATION`; through a pipe ffmpeg 7 states its
+    length instead): nothing it states is taken as its length. The packets
+    are listed from 10 s before the longest it could be (each stated
+    length read as a length from its start; a seek past the end lands on
+    the last keyframe, with Matroska Cues or by reading through a file
+    without them), and when that lists nothing, every packet of the file
+    (no decoding; about 5 s for a 1 GB, 45-minute file, and only for these
+    rare files). The file's length is where its last packet ends minus its
+    start, each picture and sound track's where its own packets end; one
+    with no packet in the part listed keeps a tag that ends before it,
+    read as a length, and is otherwise unknown. When ffprobe says the file
+    stops in the middle of a packet ("File ended prematurely"), its
+    packets show where it stops, not how long it should be: what it states
+    stands, read as a length (a stated value past the start time is an
+    end), so a cut-off original is still found out. When the packets
+    can't be listed, the length is unknown, except a container length
+    smaller than the start time, which can only be a length. An original
+    whose length is unknown this way leaves nothing to tell a complete new
+    file from one cut short, so the length check fails ("The original's
+    length couldn't be read (the length it states can't be trusted and its
+    contents couldn't be listed), so the new file couldn't be checked
+    against it") and the original is kept, never called cut short. A
+    listing that lists nothing new for 60 s is given up.
+  So an out-of-date tag, a file that states no length of its own or
+  timestamps that don't start at zero can neither make a new file look
+  "the same length" as a wrongly long original nor make a complete one
+  look cut short. The length the full decode must reach is the new file's
+  picture and sound length read this way, else its container's, else the
+  original's; a conversion that stops early still fails ("The new file is
+  shorter than the original (…)" or "Playback stopped at … of …"). The
+  scanner's `probe_file` reads such files' lengths the same way
+  (`ProbeInfo.duration_secs`, within its 60 s), so the library, progress
+  and the cut-off check (step 3 above) agree with verification;
+  `parse_ffprobe_json` alone (no packets) gives the length as stated.
 - `standard`: quick + full decode of every picture and sound track (error/fatal
   lines, "corrupt decoded frame" and concealment count as damage; damage the
   original already has only warns) + visual comparison at 4 segments of 2 s.

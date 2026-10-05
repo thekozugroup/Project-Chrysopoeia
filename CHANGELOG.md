@@ -76,6 +76,21 @@ What is coming after 0.2.0, from an evaluation on a real AMD Unraid server.
   checked against it, and obsolete localized duration and statistics tags are
   removed from converted files. A truncated output still fails, and the full
   decode and the visual comparison are unchanged.
+- **Files whose stated length can't be trusted** are measured by where their
+  packets end. A Matroska file written as a live stream states no length but
+  its tags, so an old `DURATION-eng` was believed: every attempt failed and
+  a healthy original was reported as "damaged or incomplete". A file whose
+  timestamps start later than zero (a clip starting at 10:00) states where it
+  ends rather than how long it is, so its one minute was read as eleven and
+  even a conversion with current tags failed. Both are now measured from
+  their start by their packets (without decoding; a whole-file listing, about
+  5 s per GB, only when the end can't be read directly), by the scanner as
+  well as verification, and the length is left unknown rather than guessed
+  when that fails (verification then keeps the original rather than pass a
+  new file it can't check). An original is only called cut off when its
+  length, read again this way, shows it, so an original that really is cut
+  short is still reported. Statistics tags stored for a whole file (an MP4's
+  `DURATION-eng`) are also removed from converted MKV files.
 
 ## [0.2.0] - 2026-10-04
 

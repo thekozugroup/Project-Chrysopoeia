@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use szalinski_core::{
-    ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind, tags,
+    ContentLight, HdrFormat, MasteringDisplay, ProbeInfo, StreamInfo, StreamKind, tags, timeline,
 };
 use tokio::process::Command;
 
@@ -57,11 +57,137 @@ pub(crate) async fn probe(
     timeout: Duration,
 ) -> Result<ProbeInfo, ProbeError> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut info = tokio::time::timeout_at(deadline, probe_streams(ffprobe, path))
+    let (mut info, stated) = tokio::time::timeout_at(deadline, probe_streams(ffprobe, path))
         .await
         .map_err(|_| ProbeError::Timeout(timeout))??;
+    refine_length(ffprobe, path, &mut info, &stated, deadline).await;
     refine_hdr(ffprobe, path, &mut info, deadline).await;
     Ok(info)
+}
+
+/// When the length a file states can't be taken as it is (see
+/// [`StatedLength::needs_packets`]), find where it really ends: ffprobe
+/// lists the packets of its last seconds (no decoding; a seek past the end
+/// lands on the last keyframe), or all of them when that lists nothing.
+/// The length is then where the last packet ends, counted from where the
+/// file starts, as the worker's verification reads it. A file that stops
+/// in the middle of a packet keeps what it states (read as a length from
+/// its start): its packets show where it stops, not how long it should be,
+/// so a cut-off original is still found out. When the packets can't be
+/// listed before the deadline, the length is unknown (except a container
+/// length smaller than the start time, which can only be a length), never
+/// a tag that may be out of date.
+async fn refine_length(
+    ffprobe: &Path,
+    path: &Path,
+    info: &mut ProbeInfo,
+    stated: &StatedLength,
+    deadline: tokio::time::Instant,
+) {
+    if !stated.needs_packets(info) {
+        return;
+    }
+    let start = timeline::start_offset(info.start_time);
+    let from = timeline::tail_start(start, stated.container, &stated.tags);
+    let list = async {
+        let tail = match from {
+            Some(from) => list_packets(ffprobe, path, Some(from)).await,
+            None => Err("no length to read back from".to_string()),
+        };
+        match tail {
+            Ok(ends) if ends.end().is_some() => Ok(ends),
+            Ok(_) | Err(_) => list_packets(ffprobe, path, None).await,
+        }
+    };
+    let listed = match tokio::time::timeout_at(deadline, list).await {
+        Ok(Ok(ends)) => Some(ends),
+        Ok(Err(why)) => {
+            tracing::debug!(path = %path.display(), "could not list the packets: {why}");
+            None
+        }
+        Err(_) => {
+            tracing::debug!(path = %path.display(), "ran out of time listing the packets");
+            None
+        }
+    };
+    let before = info.duration_secs;
+    info.duration_secs = match &listed {
+        Some(ends) if ends.cut_off => info
+            .duration_secs
+            .map(|d| timeline::stated_length(d, start)),
+        Some(ends) if ends.length(start).is_some() => ends.length(start),
+        _ => stated.container.filter(|d| start > 0.0 && *d < start),
+    };
+    tracing::debug!(
+        path = %path.display(),
+        stated = ?before,
+        length = ?info.duration_secs,
+        cut_off = listed.as_ref().is_some_and(|e| e.cut_off),
+        "checked the stated length against the packets"
+    );
+}
+
+/// List the packets of `path` (no decoding) from `from` seconds on, or all
+/// of them, keeping where each stream's last one ends. The listing is read
+/// line by line as ffprobe prints it, so even a whole film's is never held
+/// in memory (no timeout of its own: dropping the future kills ffprobe).
+async fn list_packets(
+    ffprobe: &Path,
+    path: &Path,
+    from: Option<f64>,
+) -> Result<timeline::PacketEnds, String> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut command = Command::new(ffprobe);
+    command.args(["-v", "error"]);
+    if let Some(from) = from {
+        command.args(["-read_intervals", &format!("{from:.3}%")]);
+    }
+    command
+        .args([
+            "-show_entries",
+            timeline::PACKET_ENTRIES,
+            "-of",
+            "compact=p=0",
+            "-i",
+        ])
+        .arg(input_argument(path))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    szalinski_core::process::end_with_parent(command.as_std_mut());
+    let mut child = command
+        .spawn()
+        .map_err(|error| describe_spawn_error(ffprobe, &error))?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+        return Err("ffprobe's output couldn't be read".to_string());
+    };
+    let mut ends = timeline::PacketEnds::default();
+    let listing = async {
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+            ends.push_line(&line);
+        }
+        Ok::<(), String>(())
+    };
+    let messages = async {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        let mut cut_off = false;
+        while let Ok(Some(line)) = lines.next_line().await {
+            cut_off |= timeline::is_cut_off_message(&line);
+        }
+        cut_off
+    };
+    let (listed, cut_off) = tokio::join!(listing, messages);
+    listed?;
+    ends.cut_off = cut_off;
+    let status = child.wait().await.map_err(|e| e.to_string())?;
+    if status.success() || (ends.cut_off && ends.end().is_some()) {
+        Ok(ends)
+    } else {
+        Err(format!("ffprobe stopped with {status}"))
+    }
 }
 
 /// ffprobe ships HDR10+ metadata per frame (HEVC SEI messages, Matroska
@@ -250,7 +376,10 @@ fn is_hdr10_plus_side_data(side_data_type: &str) -> bool {
 
 /// Stat the file and run ffprobe on it (no timeout of its own: dropping the
 /// future kills ffprobe).
-async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeError> {
+async fn probe_streams(
+    ffprobe: &Path,
+    path: &Path,
+) -> Result<(ProbeInfo, StatedLength), ProbeError> {
     let metadata = tokio::fs::metadata(path)
         .await
         .map_err(|error| ProbeError::Unreadable(describe_open_error(&error)))?;
@@ -327,7 +456,7 @@ async fn probe_streams(ffprobe: &Path, path: &Path) -> Result<ProbeInfo, ProbeEr
             "ffprobe reported problems but read the file"
         );
     }
-    parse(&output.stdout, size_bytes)
+    parse_stated(&output.stdout, size_bytes)
 }
 
 /// The path as an ffprobe input argument. Relative paths get a `./` prefix
@@ -459,6 +588,45 @@ fn clean_ffprobe_line<'a>(line: &'a str, input: &str) -> &'a str {
 
 /// Implementation of [`crate::parse_ffprobe_json`].
 pub(crate) fn parse(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeError> {
+    parse_stated(json, size_bytes).map(|(info, _)| info)
+}
+
+/// The lengths a file states, as [`parse_stated`] found them, for checking
+/// against its packets (see [`refine_length`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct StatedLength {
+    /// The container's own length (`format.duration`).
+    container: Option<f64>,
+    /// ffprobe's own stream durations gave the length (they are lengths,
+    /// from each stream's start).
+    from_streams: bool,
+    /// The lengths the `DURATION` tags state (tracks', then the file's).
+    tags: Vec<f64>,
+}
+
+impl StatedLength {
+    /// Whether the length found can't be taken as it is: it comes from
+    /// tags alone (a Matroska file written as a live stream states no
+    /// length of its own, and its tags may be left over from before a
+    /// cut), or from a Matroska file whose timestamps don't start at zero
+    /// (ffmpeg's writer states where such a file ends, not how long it is).
+    fn needs_packets(&self, info: &ProbeInfo) -> bool {
+        if self.from_streams {
+            return false;
+        }
+        let tags_only = self.container.is_none() && !self.tags.is_empty();
+        let shifted = info.container == "matroska"
+            && timeline::start_offset(info.start_time) > 0.0
+            && (self.container.is_some() || !self.tags.is_empty());
+        tags_only || shifted
+    }
+}
+
+/// [`parse`], also telling how the length was found.
+pub(crate) fn parse_stated(
+    json: &[u8],
+    size_bytes: u64,
+) -> Result<(ProbeInfo, StatedLength), ProbeError> {
     let root: Value = serde_json::from_slice(json)
         .map_err(|error| ProbeError::Parse(format!("the output is not valid JSON ({error})")))?;
     if !root.is_object() {
@@ -486,19 +654,32 @@ pub(crate) fn parse(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeErro
 
     // The container's own length first: Matroska `DURATION` tags may be
     // left over from before a cut (see `szalinski_core::tags`), so they
-    // only count when nothing else gives a length.
-    let duration_secs = format
-        .and_then(|f| positive_f64(f.get("duration")))
-        .or_else(|| max_positive(raw_streams.iter().map(|s| positive_f64(s.get("duration")))))
+    // only count when nothing else gives a length (and `probe_file` then
+    // checks them against the packets; see `refine_length`).
+    let container_secs = format.and_then(|f| positive_f64(f.get("duration")));
+    let stream_secs = max_positive(raw_streams.iter().map(|s| positive_f64(s.get("duration"))));
+    let tags: Vec<f64> = raw_streams
+        .iter()
+        .map(tagged_duration)
+        .chain(std::iter::once(format.and_then(tagged_duration)))
+        .flatten()
+        .collect();
+    let duration_secs = container_secs
+        .or(stream_secs)
         .or_else(|| max_positive(raw_streams.iter().map(tagged_duration)))
         .or_else(|| format.and_then(tagged_duration));
+    let stated = StatedLength {
+        container: container_secs,
+        from_streams: container_secs.is_none() && stream_secs.is_some(),
+        tags,
+    };
 
     let chapters = root
         .get("chapters")
         .and_then(Value::as_array)
         .map_or(0, |c| u32::try_from(c.len()).unwrap_or(u32::MAX));
 
-    Ok(ProbeInfo {
+    let info = ProbeInfo {
         container,
         format_long_name: format.and_then(|f| str_field(f, "format_long_name").map(String::from)),
         duration_secs,
@@ -508,8 +689,10 @@ pub(crate) fn parse(json: &[u8], size_bytes: u64) -> Result<ProbeInfo, ProbeErro
         size_bytes,
         start_time: format.and_then(|f| f64_value(f.get("start_time"))),
         chapters,
+        statistics_tags: format.map(statistics_tag_keys).unwrap_or_default(),
         streams,
-    })
+    };
+    Ok((info, stated))
 }
 
 fn parse_stream(position: usize, raw: &Value) -> Option<StreamInfo> {
@@ -1441,10 +1624,182 @@ mod tests {
             );
         }
 
-        // Only localized tags and no container length: they are all there is.
+        // Only localized tags and no container length: they are all the
+        // JSON has (`probe_file` checks them against the packets).
         let json = br#"{"streams": [{"codec_type": "video", "codec_name": "h264",
             "tags": {"DURATION-eng": "00:00:42.000000000"}}]}"#;
         assert!(close(parse(json, 1).unwrap().duration_secs, 42.0));
+    }
+
+    /// Which stated lengths `probe_file` checks against the packets.
+    #[test]
+    fn lengths_from_tags_alone_or_a_shifted_matroska_file_are_checked() {
+        let stated = |json: &str| parse_stated(json.as_bytes(), 1).unwrap();
+        let stale = r#""tags": {"DURATION-eng": "02:21:02.000000000"}"#;
+
+        // A live-stream MKV: no length but the film's tag.
+        let (info, length) = stated(&format!(
+            r#"{{"streams": [{{"codec_type": "video", "codec_name": "h264", {stale}}}],
+               "format": {{"format_name": "matroska,webm", "start_time": "0.000000"}}}}"#
+        ));
+        assert!(close(info.duration_secs, 8462.0), "as the JSON states");
+        assert_eq!(length.container, None);
+        assert_eq!(length.tags, [8462.0]);
+        assert!(length.needs_packets(&info));
+
+        // The container states a length starting at zero: as before.
+        let (info, length) = stated(&format!(
+            r#"{{"streams": [{{"codec_type": "video", "codec_name": "h264", {stale}}}],
+               "format": {{"format_name": "matroska,webm", "duration": "61.061",
+                           "start_time": "0.007000"}}}}"#
+        ));
+        assert!(close(info.duration_secs, 61.061));
+        assert!(!length.needs_packets(&info));
+
+        // Timestamps from 10:00: ffmpeg's writer states the end, 11:01.
+        let (info, length) = stated(
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264", "start_time": "600.023"}],
+               "format": {"format_name": "matroska,webm", "duration": "661.068",
+                          "start_time": "600.000000"}}"#,
+        );
+        assert!(length.needs_packets(&info));
+        assert!(close(length.container, 661.068));
+
+        // Other containers state lengths, never ends.
+        for json in [
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264", "duration": "61.0"}],
+                "format": {"format_name": "mpegts", "duration": "61.0", "start_time": "601.4"}}"#,
+            r#"{"streams": [{"codec_type": "video", "codec_name": "h264", "duration": "61.0"}],
+                "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "start_time": "600.0"}}"#,
+        ] {
+            let (info, length) = stated(json);
+            assert!(close(info.duration_secs, 61.0), "{json}");
+            assert!(!length.needs_packets(&info), "{json}");
+        }
+    }
+
+    /// Statistics tags stored for the whole file are listed for removal,
+    /// other tags are not.
+    #[test]
+    fn container_statistics_tags_are_recorded() {
+        let json = br#"{"streams": [{"codec_type": "video", "codec_name": "h264"}],
+            "format": {"format_name": "matroska,webm", "duration": "61.0",
+              "tags": {"title": "Film", "DURATION-eng": "02:21:02.000000000",
+                       "BPS-eng": "12345", "ENCODER": "Lavf60.16.100"}}}"#;
+        let info = parse(json, 1).unwrap();
+        assert_eq!(info.statistics_tags, ["BPS-eng", "DURATION-eng"]);
+        assert!(close(info.duration_secs, 61.0), "the container's length");
+        let none = parse(br#"{"format": {"tags": {"title": "Film"}}}"#, 1).unwrap();
+        assert!(none.statistics_tags.is_empty());
+    }
+
+    /// ffmpeg cuts with the film's `DURATION-eng` on every track, made
+    /// three ways: written as a live stream (no length of its own), with
+    /// timestamps from 10:00 (ffmpeg states where it ends, 11:01, as its
+    /// length and in its fresh `DURATION`), and both, through a pipe. The
+    /// scanner lists each as the 1:01 it plays, like verification does.
+    /// The live-stream file really cut in half keeps the length it states:
+    /// its packets show where it stops, not how long it should be.
+    #[tokio::test]
+    async fn the_real_length_of_files_whose_stated_length_cannot_be_trusted() {
+        if !tool_available("ffmpeg") || !tool_available("ffprobe") {
+            eprintln!("skipping: ffmpeg/ffprobe not found on PATH");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ffmpeg = |args: &[&str]| {
+            let out = std::process::Command::new("ffmpeg")
+                .args(["-hide_banner", "-nostdin", "-loglevel", "error", "-y"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let path = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x90:rate=24:duration=61",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=61",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "48",
+            "-c:a",
+            "aac",
+            &path("clip.mkv"),
+        ]);
+        let stale = [
+            "-map_metadata",
+            "-1",
+            "-metadata:s:v:0",
+            "DURATION-eng=02:21:02.000000000",
+            "-metadata:s:a:0",
+            "DURATION-eng=02:21:02.000000000",
+        ];
+        let copy = |extra: &[&str], out: &str| {
+            let (input, output) = (path("clip.mkv"), path(out));
+            let mut args: Vec<&str> = vec!["-i", &input, "-map", "0", "-c", "copy"];
+            args.extend_from_slice(&stale);
+            args.extend_from_slice(extra);
+            args.push(&output);
+            ffmpeg(&args);
+        };
+        copy(&["-live", "1"], "live.mkv");
+        copy(&["-output_ts_offset", "600"], "offset.mkv");
+        copy(
+            &["-output_ts_offset", "600", "-live", "1"],
+            "offset_live.mkv",
+        );
+        let live = std::fs::read(path("live.mkv")).unwrap();
+        std::fs::write(path("cut.mkv"), &live[..live.len() / 2]).unwrap();
+
+        let ffprobe = Path::new("ffprobe");
+        let timeout = Duration::from_secs(60);
+        for name in ["live.mkv", "offset.mkv", "offset_live.mkv"] {
+            let info = crate::probe_file(ffprobe, Path::new(&path(name)), timeout)
+                .await
+                .unwrap();
+            let length = info.duration_secs.unwrap_or_default();
+            assert!((length - 61.0).abs() < 0.2, "{name}: {length}");
+            // As the JSON alone states it: the film's tag, or the end.
+            let json = std::process::Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-print_format",
+                    "json",
+                    "-show_format",
+                    "-show_streams",
+                ])
+                .arg(path(name))
+                .output()
+                .unwrap();
+            let stated = parse(&json.stdout, 1)
+                .unwrap()
+                .duration_secs
+                .unwrap_or_default();
+            assert!(stated > 600.0, "{name}: {stated}");
+        }
+        let cut = crate::probe_file(ffprobe, Path::new(&path("cut.mkv")), timeout)
+            .await
+            .unwrap();
+        assert!(close(cut.duration_secs, 8462.0), "{:?}", cut.duration_secs);
+        // A file that starts at zero and states its length is left alone.
+        let clip = crate::probe_file(ffprobe, Path::new(&path("clip.mkv")), timeout)
+            .await
+            .unwrap();
+        assert!(clip.duration_secs.is_some_and(|d| (d - 61.0).abs() < 0.2));
     }
 
     #[cfg(unix)]
@@ -1770,6 +2125,57 @@ mod tests {
         // result, reported as plain HDR10.
         assert_eq!(probed.hdr(), Some(HdrFormat::Hdr10));
         assert!(started.elapsed() < timeout + Duration::from_secs(3));
+    }
+
+    /// ffprobe JSON for a live-stream MKV: no length but the film's tag.
+    #[cfg(unix)]
+    const LIVE_JSON: &str = r#"{"format":{"format_name":"matroska,webm","start_time":"0.000000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264","tags":{"DURATION-eng":"02:21:02.000000000"}}]}"#;
+
+    /// When the packets can't be listed (ffprobe fails, or the listing
+    /// outlasts the timeout), a length from the film's tag alone is
+    /// unknown rather than taken as it is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_length_from_tags_alone_that_cant_be_checked_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("live.mkv");
+        std::fs::write(&media, b"data").unwrap();
+        for (name, listing) in [
+            ("ffprobe-no-packets", "exit 1"),
+            ("ffprobe-slow-packets", "exec sleep 30"),
+        ] {
+            let script = fake_ffprobe(
+                dir.path(),
+                name,
+                &format!(
+                    "case \"$*\" in\n*-show_entries*) {listing} ;;\n*) echo '{LIVE_JSON}' ;;\nesac"
+                ),
+            );
+            let started = std::time::Instant::now();
+            let timeout = Duration::from_millis(1500);
+            let probed = probe_with(&script, &media, timeout).await.unwrap();
+            assert_eq!(probed.duration_secs, None, "{name}");
+            assert!(started.elapsed() < timeout + Duration::from_secs(3));
+        }
+
+        // Listed: where the last packet ends.
+        let script = fake_ffprobe(
+            dir.path(),
+            "ffprobe-packets",
+            &format!(
+                "case \"$*\" in\n*-show_entries*) \
+                 echo 'stream_index=0|pts_time=60.977000|dts_time=N/A|duration_time=0.042000' ;;\n\
+                 *) echo '{LIVE_JSON}' ;;\nesac"
+            ),
+        );
+        let probed = probe_with(&script, &media, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(
+            close(probed.duration_secs, 61.019),
+            "{:?}",
+            probed.duration_secs
+        );
     }
 
     /// A minimal HEVC SEI NAL unit carrying SMPTE 2094-40 (HDR10+) metadata,

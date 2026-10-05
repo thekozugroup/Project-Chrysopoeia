@@ -59,7 +59,7 @@ use crate::finalize::{
 };
 use crate::plan::{CoverFile, Decision, FfmpegPlan, PlanRequest, where_encoded};
 use crate::slow_fs::{self, FOLDER_CHECK_TIMEOUT, NotAnswering, WATCH_INTERVAL};
-use crate::validate::{ValidateRequest, human_bytes, validate_output_at};
+use crate::validate::{self, ValidateRequest, human_bytes, validate_output_at};
 
 /// Settings that apply to every job.
 #[derive(Debug, Clone)]
@@ -1231,15 +1231,21 @@ impl Job<'_> {
             // original). Checked before the size rule: a stub is always small.
             // Only a CPU decode tells about the file itself: a GPU decoder
             // that gives up early gets the next attempt (CPU decoding) first.
-            let expected = self.spec.probe.duration_secs;
             let unverified = cfg.validation == ValidationLevel::Off;
             let conclusive = !(candidate.api.is_hardware() && candidate.hw_decode) || is_last;
-            if let Some(stop) = source_stops_early(
-                expected,
-                run.encoded_secs,
-                run.input_damage.is_some(),
-                unverified,
-            ) {
+            let stops_early = match self
+                .original_stops_early(
+                    &prepared.watched,
+                    run.encoded_secs,
+                    run.input_damage.is_some(),
+                    unverified,
+                )
+                .await
+            {
+                Ok(stop) => stop,
+                Err(outcome) => return outcome,
+            };
+            if let Some(stop) = stops_early {
                 let f = failure(
                     ProblemKind::UnreadableSource,
                     damaged_source_message(stop),
@@ -1341,10 +1347,18 @@ impl Job<'_> {
                 // original is what's incomplete, not the new file.
                 let too_short =
                     conclusive && report.first_failure().is_some_and(|c| c.id == "duration");
-                if let Some(stop) = too_short
-                    .then(|| source_stops_early(expected, run.encoded_secs, true, false))
-                    .flatten()
-                {
+                let stops_early = if too_short {
+                    match self
+                        .original_stops_early(&prepared.watched, run.encoded_secs, true, false)
+                        .await
+                    {
+                        Ok(stop) => stop,
+                        Err(outcome) => return outcome,
+                    }
+                } else {
+                    None
+                };
+                if let Some(stop) = stops_early {
                     let mut f = failure(
                         ProblemKind::UnreadableSource,
                         damaged_source_message(stop),
@@ -1535,6 +1549,65 @@ impl Job<'_> {
         lock_unfinished().insert(job_id, unfinished);
     }
 
+    /// Where the original stops, when an encode shows it ends clearly
+    /// before its length (see [`source_stops_early`]). Before it is called
+    /// cut off, its length is read again the way verification reads it
+    /// (see [`crate::validate`]): an out-of-date Matroska tag, a file that
+    /// states no length but its tags, or timestamps that don't start at zero
+    /// then never make a complete original look cut short, while one that
+    /// plays clearly shorter than its container says (or than its tags say,
+    /// when it stops in the middle of a packet) still does. When it can't
+    /// be read again, the length found when it was scanned counts. `Err`
+    /// when the job is cancelled or a share stops answering meanwhile.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the error is the job's outcome, made once per job and returned at once"
+    )]
+    async fn original_stops_early(
+        &self,
+        watched: &[PathBuf],
+        encoded_secs: Option<f64>,
+        damage_seen: bool,
+        unverified: bool,
+    ) -> Result<Option<f64>, JobOutcome> {
+        let scanned = self.spec.probe.duration_secs;
+        if source_stops_early(scanned, encoded_secs, damage_seen, unverified).is_none() {
+            return Ok(None);
+        }
+        let measure = validate::source_length(&self.cfg.ffprobe, &self.spec.input, self.cancel);
+        let measured = tokio::select! {
+            measured = measure => measured,
+            path = slow_fs::first_unanswered(watched, WATCH_INTERVAL, FOLDER_CHECK_TIMEOUT) => {
+                return Err(NotAnswering::at(&path).into());
+            }
+        };
+        let claimed = match measured {
+            Ok(length) => length,
+            Err(validate::ProbeError::Cancelled) => return Err(JobOutcome::Cancelled),
+            Err(validate::ProbeError::Failed(why)) => {
+                tracing::debug!(
+                    job = %self.spec.job_id,
+                    "could not read the original's length again ({why}); using the scanned one"
+                );
+                scanned
+            }
+        };
+        if claimed != scanned {
+            tracing::debug!(
+                job = %self.spec.job_id,
+                ?scanned,
+                ?claimed,
+                "the original's length, read again, differs from the scanned one"
+            );
+        }
+        Ok(source_stops_early(
+            claimed,
+            encoded_secs,
+            damage_seen,
+            unverified,
+        ))
+    }
+
     /// Run ffmpeg for one attempt, reporting transcoding progress. Stops it
     /// when one of `watched` stops answering.
     async fn encode(
@@ -1618,7 +1691,8 @@ struct EncodeRun {
 }
 
 /// Where the original stops, when an encode shows it ends clearly before
-/// the length its container claims (a cut-off download or copy). Needs
+/// the length it claims (a cut-off download or copy; see
+/// `Job::original_stops_early` for where the claim comes from). Needs
 /// evidence (`damage_seen`: ffmpeg reported the input damaged, or
 /// verification found the result too short), except that a result under
 /// half the claimed length is enough on its own when nothing verifies it.

@@ -1304,10 +1304,50 @@ fn statistics_tags_of_every_kept_track_are_cleared_in_matroska() {
         &software(VideoCodec::Av1),
     );
     assert!(
-        !mkv.args.iter().any(|a| a.starts_with("-metadata:s:")),
+        !mkv.args.iter().any(|a| a.starts_with("-metadata")),
         "{:?}",
         mkv.args
     );
+}
+
+/// Statistics tags stored for the whole original (an MP4's `DURATION-eng`
+/// in its metadata, carried over by `-map_metadata`) are removed from a
+/// Matroska result too; the title and other tags stay.
+#[test]
+fn statistics_tags_of_the_whole_file_are_cleared_in_matroska() {
+    let mut p = probe_of(
+        "mov",
+        vec![
+            video(0, "h264", 1280, 720),
+            audio(1, "aac", 2, 48_000, None),
+        ],
+    );
+    p.statistics_tags = ["BPS-eng", "DURATION-eng", "title", "BPS=1"]
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+    let mkv = plan(
+        &p,
+        &profile(VideoCodec::Av1, AudioCodec::Opus, Container::Mkv),
+        &software(VideoCodec::Av1),
+    );
+    assert_eq!(
+        values(&mkv.args, "-metadata"),
+        ["BPS-eng=", "DURATION-eng="],
+        "{:?}",
+        mkv.args
+    );
+    let copied_at = pair_pos(&mkv.args, "-map_metadata", "0").unwrap();
+    let cleared_at = pair_pos(&mkv.args, "-metadata", "DURATION-eng=").unwrap();
+    assert!(copied_at < cleared_at && cleared_at < mkv.args.len() - 1);
+
+    // MP4 keeps no such tags.
+    let mp4 = plan(
+        &p,
+        &profile(VideoCodec::Av1, AudioCodec::Copy, Container::Mp4),
+        &software(VideoCodec::Av1),
+    );
+    assert_absent(&mp4.args, "-metadata");
 }
 
 // ---------------------------------------------------------------------------
