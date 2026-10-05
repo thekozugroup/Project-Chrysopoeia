@@ -429,7 +429,9 @@ history live in `/config` and are kept.
 are also published as `ghcr.io/thekozugroup/chrysopoeia` for a while, so an
 existing install keeps updating. To switch, back up `/config`, then change the
 image to `ghcr.io/thekozugroup/szalinski` and keep the same `/config`: the
-database is carried over on the first start. Step by step for Unraid:
+database is carried over on the first start. To go back, restore that backup:
+Chrysopoeia does not find the carried-over database and would start empty.
+Step by step for Unraid:
 [Moving from Chrysopoeia](docs/UNRAID.md#moving-from-chrysopoeia).
 
 - **Unraid:** Docker tab › *Check for Updates* › *apply update*.

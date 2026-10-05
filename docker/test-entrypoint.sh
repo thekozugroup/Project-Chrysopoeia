@@ -7,7 +7,8 @@
 # "users"), GPU device groups (never the root group), UMASK, the /temp and
 # empty-variable rules, the startup banner, warnings about missing, read-only
 # or unwritable mounts, /config ownership (only Szalinski's own files are
-# re-owned, never a shared folder's other contents), the privilege drop and
+# re-owned, never a shared folder's other contents; a folder from Chrysopoeia,
+# the name before the rename, counts as Szalinski's), the privilege drop and
 # argument pass-through. Fake GPU nodes are created inside the container with mknod
 # (Docker's default capabilities allow it), so no GPU and no sudo are needed.
 # Takes about 30 seconds; nothing is left behind.
@@ -295,6 +296,29 @@ server_log -e PUID=99 -e PGID=100 -v "$SHARED_VOLUME:/config"
 expect "warns when the Config folder holds other files and no Szalinski database" 'already holds other files but no Szalinski database'
 shared_owners /config/other.conf
 expect "still leaves the other files alone" '^/config/other\.conf 1234:1234$'
+
+# A Config folder from Chrysopoeia (the name before the rename) holds its
+# database under the old name: that is Szalinski's database too, so the folder
+# and the old files are Szalinski's to fix, and there is nothing to warn about.
+seed_shared 'touch /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+echo y > /config/notes.txt
+chown 1234:1234 /config/notes.txt
+chown 555:555 /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock
+chown 555:555 /config
+chmod 755 /config'
+run -v "$SHARED_VOLUME:/config" -e PUID=99 -e PGID=100 -- id -u
+expect "starts with a Config folder from Chrysopoeia" '^99$'
+shared_owners /config /config/chrysopoeia.db /config/chrysopoeia.db-wal /config/chrysopoeia.db-shm /config/chrysopoeia.lock /config/notes.txt
+expect "gives a Config folder that holds Chrysopoeia's database to PUID/PGID" '^/config 99:100$'
+expect "gives Chrysopoeia's database to PUID/PGID" '^/config/chrysopoeia\.db 99:100$'
+expect "gives Chrysopoeia's write-ahead files to PUID/PGID" '^/config/chrysopoeia\.db-wal 99:100$'
+expect "gives Chrysopoeia's shared-memory file to PUID/PGID" '^/config/chrysopoeia\.db-shm 99:100$'
+expect "gives Chrysopoeia's lock file to PUID/PGID" '^/config/chrysopoeia\.lock 99:100$'
+expect "still leaves other files next to Chrysopoeia's alone" '^/config/notes\.txt 1234:1234$'
+seed_shared 'touch /config/chrysopoeia.db
+chown -R 99:100 /config'
+server_log -e PUID=99 -e PGID=100 -v "$SHARED_VOLUME:/config"
+expect_not "no shared-folder warning for a Config folder from Chrysopoeia" 'no Szalinski database'
 
 run -e PUID=99 -e PGID=100 -- sh -c 'grep -E "^(NoNewPrivs|CapEff)" /proc/self/status'
 expect "drops all capabilities" 'CapEff:[[:space:]]+0+$'

@@ -112,11 +112,22 @@ anonymous_volume() {
 # copy out.
 DB_FILE=szalinski.db
 LOCK_FILE=szalinski.lock
+# The same files under the name before the rename (Chrysopoeia 0.2). The
+# server renames the old database to $DB_FILE on its first start and keeps
+# holding the old lock, so they are Szalinski's own files too.
+LEGACY_DB_FILE=chrysopoeia.db
+LEGACY_LOCK_FILE=chrysopoeia.lock
 
 # Whether the Config folder holds nothing yet (the "lost+found" of a freshly
 # formatted disk does not count).
 config_dir_is_empty() {
     [ -z "$(find "$DATA_DIR" -mindepth 1 -maxdepth 1 ! -name lost+found -print -quit 2>/dev/null)" ]
+}
+
+# Whether the Config folder holds a Szalinski database, under the current
+# name or the one from before the rename.
+config_has_database() {
+    [ -e "$DATA_DIR/$DB_FILE" ] || [ -e "$DATA_DIR/$LEGACY_DB_FILE" ]
 }
 
 # Warnings about missing or unusable mounts, printed when the server starts.
@@ -126,7 +137,7 @@ check_mounts() {
     if ! mountpoint -q "$DATA_DIR" 2>/dev/null || anonymous_volume "$DATA_DIR"; then
         warn "No host folder is mounted at $DATA_DIR, so libraries, settings and history are lost when the container is recreated (for example by an update). Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
     fi
-    if [ -d "$DATA_DIR" ] && [ ! -e "$DATA_DIR/$DB_FILE" ] && ! config_dir_is_empty; then
+    if [ -d "$DATA_DIR" ] && ! config_has_database && ! config_dir_is_empty; then
         warn "$DATA_DIR already holds other files but no Szalinski database. Szalinski adds its own files there and leaves the rest alone, but if this folder is shared with other apps, give Szalinski a folder of its own (Unraid: the Config path, for example /mnt/user/appdata/szalinski)."
     fi
     if [ "$media_mounted" = 0 ]; then
@@ -309,8 +320,9 @@ check_nvidia_runtime
 # Never change the owner of a whole folder tree: the Config folder may be shared
 # (for example an Unraid appdata folder that also holds other apps' data), and
 # re-owning that would damage those apps. Only what Szalinski itself creates
-# is fixed: its database and lock files, and the top folder when it is new or
-# empty (or already holds Szalinski's database).
+# is fixed: its database and lock files (also under the name before the
+# rename, Chrysopoeia), and the top folder when it is new or empty (or already
+# holds Szalinski's database).
 
 # Give $1, a file Szalinski creates, to the app user. A symbolic link is
 # changed itself, never followed.
@@ -325,13 +337,17 @@ if [ "$PUID" -ne 0 ]; then
     if [ ! -d "$DATA_DIR" ]; then
         mkdir -p "$DATA_DIR" || die "Could not create $DATA_DIR. Mount a folder there (Unraid: the Config path; docker: -v /path/on/host:$DATA_DIR)."
     fi
-    if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ] && { config_dir_is_empty || [ -e "$DATA_DIR/$DB_FILE" ]; }; then
+    if [ "$(stat -c %u:%g "$DATA_DIR")" != "$PUID:$PGID" ] && { config_dir_is_empty || config_has_database; }; then
         log "Giving $DATA_DIR to uid $PUID, gid $PGID"
         chown "$PUID:$PGID" "$DATA_DIR" || warn "Could not change the owner of $DATA_DIR."
     fi
-    for name in "$DB_FILE" "$DB_FILE-wal" "$DB_FILE-shm" "$DB_FILE-journal" "$LOCK_FILE"; do
-        own_file "$DATA_DIR/$name"
+    for db in "$DB_FILE" "$LEGACY_DB_FILE"; do
+        for name in "$db" "$db-wal" "$db-shm" "$db-journal"; do
+            own_file "$DATA_DIR/$name"
+        done
     done
+    own_file "$DATA_DIR/$LOCK_FILE"
+    own_file "$DATA_DIR/$LEGACY_LOCK_FILE"
     # The scratch folder may hold large files: fix only the folder itself.
     if [ -n "${TEMP_DIR:-}" ] && [ -d "$TEMP_DIR" ]; then
         if [ "$(stat -c %u:%g "$TEMP_DIR")" != "$PUID:$PGID" ]; then
