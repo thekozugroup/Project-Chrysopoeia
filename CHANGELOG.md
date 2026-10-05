@@ -158,5 +158,5 @@ The first release, published as Chrysopoeia (from `main`; it was not tagged).
   through `ALLOWED_HOSTS`, and the published images `:latest` (every build of
   `main`) and `:edge` (a test build of a branch).
 
-[Unreleased]: https://github.com/thekozugroup/Project-Chrysopoeia/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/thekozugroup/Project-Chrysopoeia/releases/tag/v0.2.0
+[Unreleased]: https://github.com/thekozugroup/Szalinski/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/thekozugroup/Szalinski/releases/tag/v0.2.0

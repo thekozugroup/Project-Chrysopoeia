@@ -141,7 +141,7 @@ attachments MP4 can't hold, instead of trimming it (see the [FAQ](#faq)).
 
    ```sh
    wget -O /boot/config/plugins/dockerMan/templates-user/my-Szalinski.xml \
-     https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/szalinski.xml
+     https://raw.githubusercontent.com/thekozugroup/Szalinski/main/unraid/szalinski.xml
    ```
 
    then open **Docker › Add Container** and pick *Szalinski* from the
@@ -196,8 +196,8 @@ Then open `http://<server>:8080`.
 ### Docker Compose
 
 ```sh
-curl -O https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/.env.example
+curl -O https://raw.githubusercontent.com/thekozugroup/Szalinski/main/docker-compose.yml
+curl -o .env https://raw.githubusercontent.com/thekozugroup/Szalinski/main/.env.example
 # edit .env: MEDIA_PATH, PUID, PGID, TZ
 docker compose up -d
 ```
@@ -255,7 +255,7 @@ came from, read its *build* (*About* at the bottom of Settings, or the first
 line of the container log): `0.3.0` for a release (reached through `stable`,
 `0.3` or `0.3.0`), `main-<commit>` for `latest`, `<branch>-<commit>` for
 `edge`. Every release is listed, with notes, on the project's
-[Releases page](https://github.com/thekozugroup/Project-Chrysopoeia/releases)
+[Releases page](https://github.com/thekozugroup/Szalinski/releases)
 and in [CHANGELOG.md](CHANGELOG.md).
 
 `stable` does not exist until the first release tag has been pushed. Before
@@ -284,8 +284,8 @@ about 600 MB (150 MB compressed). Later builds reuse the cached steps: a change
 to the web pages alone takes a couple of minutes.
 
 ```sh
-git clone https://github.com/thekozugroup/Project-Chrysopoeia.git
-cd Project-Chrysopoeia          # for a branch that is not merged yet: git checkout <branch>
+git clone https://github.com/thekozugroup/Szalinski.git
+cd Szalinski          # for a branch that is not merged yet: git checkout <branch>
 docker build -t szalinski:local --build-arg VERSION=local .
 ```
 
@@ -293,8 +293,8 @@ No `git`? Download the branch as an archive instead (replace `main` with the
 branch name):
 
 ```sh
-curl -L https://github.com/thekozugroup/Project-Chrysopoeia/archive/refs/heads/main.tar.gz | tar xz
-cd Project-Chrysopoeia-*
+curl -L https://github.com/thekozugroup/Szalinski/archive/refs/heads/main.tar.gz | tar xz
+cd Szalinski-*
 docker build -t szalinski:local --build-arg VERSION=local .
 ```
 

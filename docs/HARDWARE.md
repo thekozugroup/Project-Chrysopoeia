@@ -129,7 +129,7 @@ GPU, so run Szalinski natively instead:
 
 ```sh
 brew install ffmpeg rust node pnpm
-git clone https://github.com/thekozugroup/Project-Chrysopoeia && cd Project-Chrysopoeia
+git clone https://github.com/thekozugroup/Szalinski && cd Szalinski
 make run        # builds the UI and the server, then serves http://localhost:8080
 ```
 

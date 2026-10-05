@@ -373,7 +373,7 @@ and a logged-in session hide the problem:
    for tag in stable X.Y.Z; do                              # the same digest twice
      docker buildx imagetools inspect "ghcr.io/thekozugroup/szalinski:$tag" --format '{{json .Manifest}}' | jq -r .digest
    done
-   raw=https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main
+   raw=https://raw.githubusercontent.com/thekozugroup/Szalinski/main
    for f in unraid/szalinski.xml unraid/szalinski.png docker-compose.yml .env.example; do
      curl -fsSL -o /dev/null -w "%{http_code}  $f\n" "$raw/$f" || echo "FAILED  $f"
    done

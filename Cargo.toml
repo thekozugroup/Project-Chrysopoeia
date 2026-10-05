@@ -13,7 +13,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/thekozugroup/Project-Chrysopoeia"
+repository = "https://github.com/thekozugroup/Szalinski"
 
 [workspace.dependencies]
 # Async runtime

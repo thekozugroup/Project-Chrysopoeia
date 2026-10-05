@@ -53,7 +53,7 @@ If it is not listed yet, add the template by hand. In the Unraid terminal:
 
 ```sh
 wget -O /boot/config/plugins/dockerMan/templates-user/my-Szalinski.xml \
-  https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/szalinski.xml
+  https://raw.githubusercontent.com/thekozugroup/Szalinski/main/unraid/szalinski.xml
 ```
 
 Then **Docker > Add Container**, and choose **Szalinski** in the *Template*
@@ -365,7 +365,7 @@ change **Repository** once by hand.
 1. Check the version first. Open **Settings** in Szalinski and read the
    *build* under *About*: `main-<commit>` means the container follows `latest`.
    Compare it with the newest release on the project's
-   [Releases page](https://github.com/thekozugroup/Project-Chrysopoeia/releases)
+   [Releases page](https://github.com/thekozugroup/Szalinski/releases)
    or in the [changelog](../CHANGELOG.md). `:stable` is the newest *release*,
    so it can be older than the `main` build you run. Going to an older build
    works only if it can still read your database: an older build refuses a
@@ -421,7 +421,7 @@ a branch shows no icon and cannot refresh itself; the container works the same.
 Before the very first release there is also no `stable` (and no `latest` until
 `main` has been built): install the template from the branch instead (replace
 `main` in the `wget` address of step 2 with the branch name, e.g.
-`.../Project-Chrysopoeia/my-branch/unraid/szalinski.xml`) and set
+`.../Szalinski/my-branch/unraid/szalinski.xml`) and set
 **Repository** to the `edge` image before clicking **Apply**.
 
 Without waiting for either, you can

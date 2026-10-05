@@ -129,16 +129,16 @@ ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.title="Szalinski" \
       org.opencontainers.image.description="Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original." \
-      org.opencontainers.image.url="https://github.com/thekozugroup/Project-Chrysopoeia" \
-      org.opencontainers.image.source="https://github.com/thekozugroup/Project-Chrysopoeia" \
-      org.opencontainers.image.documentation="https://github.com/thekozugroup/Project-Chrysopoeia#readme" \
+      org.opencontainers.image.url="https://github.com/thekozugroup/Szalinski" \
+      org.opencontainers.image.source="https://github.com/thekozugroup/Szalinski" \
+      org.opencontainers.image.documentation="https://github.com/thekozugroup/Szalinski#readme" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.vendor="thekozugroup" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.created="${CREATED}" \
       net.unraid.docker.webui="http://[IP]:[PORT:8080]/" \
-      net.unraid.docker.icon="https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main/unraid/szalinski.png"
+      net.unraid.docker.icon="https://raw.githubusercontent.com/thekozugroup/Szalinski/main/unraid/szalinski.png"
 
 # jellyfin-ffmpeg7 ships its own VA-API drivers (Intel iHD and i965, AMD
 # radeonsi) and the Intel oneVPL/MSDK runtimes under /usr/lib/jellyfin-ffmpeg,
