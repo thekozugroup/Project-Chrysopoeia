@@ -139,14 +139,32 @@ mod tests {
             fps: Some(120.0),
             speed: Some(4.8),
             eta_secs: Some(90),
+            progress_basis: Some(crate::job::ProgressBasis::Frames),
+            frames: Some(1017),
+            elapsed_secs: Some(8),
             encoder: Some("hevc_nvenc".into()),
             hw_api: Some(crate::encoder::HwApi::Nvenc),
             attempt: 1,
+            attempts: None,
         });
         let v: serde_json::Value = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["type"], "job.progress");
         assert_eq!(v["stage"], "transcoding");
         assert_eq!(v["hw_api"], "nvenc");
+        assert_eq!(v["progress_basis"], "frames");
+        assert_eq!(v["frames"], 1017);
+        assert_eq!(v["elapsed_secs"], 8);
+        // Only the worker's message to the server carries the attempts.
+        assert!(v.get("attempts").is_none(), "{v}");
+
+        // A message from a server without the new fields still reads.
+        let old = serde_json::json!({
+            "job_id": Uuid::nil(), "file_id": Uuid::nil(), "stage": "transcoding",
+            "progress": 3.0, "fps": null, "speed": null, "eta_secs": null,
+            "encoder": null, "hw_api": null, "attempt": 1
+        });
+        let p: JobProgress = serde_json::from_value(old).unwrap();
+        assert_eq!((p.progress_basis, p.frames, p.attempts), (None, None, None));
 
         let ev = Event::QueueState(QueueState {
             paused: true,

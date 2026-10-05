@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
-import type { Job, ValidationCheck, ValidationReport } from "@/lib/types";
+import type { HardwareInfo, Job, JobAttempt, Settings, ValidationCheck, ValidationReport } from "@/lib/types";
 import {
   JobCard,
+  JobSheet,
   StopJobButton,
   checkValueText,
   checksLead,
@@ -259,5 +260,189 @@ describe("a running job's card", () => {
     renderWithClient(<StopJobButton job={job({ state: "queued", file_name: name })} named />);
     // Voice control says what's on the button; the file name follows.
     expect(screen.getByRole("button", { name: `Remove from queue: ${name}` }).textContent).toContain("Remove from queue");
+  });
+
+  // The Atlas CPU fallback: frames were encoded for minutes while the card said 0%.
+  it("shows the frames and the time spent, with a moving bar, while how far it is isn't known", () => {
+    renderWithClient(
+      <JobCard
+        job={job({
+          state: "running",
+          stage: "transcoding",
+          progress: 0,
+          progress_basis: "unknown",
+          frames: 1017,
+          elapsed_secs: 400,
+          eta_secs: null,
+          attempt: 3,
+        })}
+        onOpen={() => {}}
+      />,
+    );
+    const bar = screen.getByRole("progressbar");
+    // An indeterminate bar has no value, but says what it stands for.
+    expect(bar.getAttribute("aria-valuenow")).toBeNull();
+    expect(bar.getAttribute("aria-valuetext")).toBe("1,017 frames · 7 min elapsed, how far isn't known yet");
+    const card = screen.getByRole("article");
+    expect(card.textContent).toContain("1,017 frames · 7 min elapsed");
+    expect(card.textContent).toContain("how far isn't known yet");
+    // Never a percentage it doesn't have, nor a time left.
+    expect(card.textContent).not.toMatch(/\d+%/);
+    expect(card.textContent).not.toMatch(/left/);
+  });
+
+  it("labels a share estimated from frames as an estimate", () => {
+    renderWithClient(
+      <JobCard
+        job={job({
+          state: "running",
+          stage: "transcoding",
+          progress: 50,
+          progress_basis: "frames",
+          frames: 732,
+          elapsed_secs: 200,
+          eta_secs: 200,
+        })}
+        onOpen={() => {}}
+      />,
+    );
+    const card = screen.getByRole("article");
+    expect(card.textContent).toContain("About 44% · estimated from 732 frames · about 3 min left");
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("44");
+  });
+
+  it("reads as before when the server measured it (or doesn't say)", () => {
+    renderWithClient(
+      <JobCard job={job({ state: "running", stage: "transcoding", progress: 50, eta_secs: 200 })} onOpen={() => {}} />,
+    );
+    expect(screen.getByRole("article").textContent).toContain("44% · about 3 min left");
+    expect(screen.getByRole("article").textContent).not.toContain("estimated");
+  });
+
+  it("says which check the last try failed while another way runs", () => {
+    renderWithClient(
+      <JobCard
+        job={job({ state: "running", stage: "transcoding", progress: 0, attempt: 2, attempts: [gpuFailed] })}
+        onOpen={() => {}}
+      />,
+    );
+    expect(screen.getByRole("article").textContent).toContain(
+      "Attempt 2: the last try made a file that failed a check (Plays start to finish), so Chrysopoeia is trying another way.",
+    );
+  });
+});
+
+/** The AMD GPU's file stopped playing early (the Atlas report). */
+const gpuFailed: JobAttempt = {
+  attempt: 1,
+  encoder: "hevc_vaapi",
+  hw_api: "vaapi",
+  device: "/dev/dri/renderD128",
+  hw_decode: true,
+  elapsed_secs: 128,
+  result: "failed",
+  error: "The new file doesn't play start to finish. Playback stopped at 1:01 of 2:21:02",
+  problem: "verification",
+  failed_check: { id: "decode", label: "Plays start to finish", status: "fail", detail: "Playback stopped at 1:01 of 2:21:02", value: null },
+  command: "ffmpeg -hwaccel vaapi -i Kingsman.mkv -c:v hevc_vaapi out.mkv",
+  log_tail: "[warning] Invalid timestamps",
+};
+
+const cpuWorked: JobAttempt = {
+  attempt: 2,
+  encoder: "libx265",
+  hw_api: "software",
+  device: null,
+  hw_decode: false,
+  elapsed_secs: 401,
+  result: "succeeded",
+  error: null,
+  problem: null,
+  failed_check: null,
+  command: "ffmpeg -i Kingsman.mkv -c:v libx265 out.mkv",
+  log_tail: null,
+};
+
+describe("a job's sheet", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  function showSheet(shown: Job) {
+    vi.spyOn(api, "job").mockResolvedValue(shown);
+    vi.spyOn(api, "libraries").mockResolvedValue([]);
+    vi.spyOn(api, "settings").mockResolvedValue({ output_mode: "replace" } as Settings);
+    vi.spyOn(api, "file").mockRejectedValue(new Error("not needed"));
+    vi.spyOn(api, "hardware").mockResolvedValue({
+      detecting: false,
+      gpus: [{ vendor: "amd", name: "AMD Renoir", render_node: "/dev/dri/renderD128", driver: "amdgpu" }],
+    } as unknown as HardwareInfo);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    return render(
+      <QueryClientProvider client={client}>
+        <JobSheet jobId={shown.id} onClose={() => {}} />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("lists every attempt in plain words, with the check that failed", async () => {
+    showSheet(
+      job({
+        encoder: "libx265",
+        hw_api: "software",
+        attempt: 2,
+        command: cpuWorked.command ?? null,
+        attempts: [gpuFailed, cpuWorked],
+        notes: ["Converting on the GPU (VA-API) made a file that failed a check (Plays start to finish: playback stopped at 1:01 of 2:21:02), so it was converted on the CPU"],
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    const list = await within(dialog).findByRole("list", { name: "Attempts" });
+    await waitFor(() => expect(within(list).getByText("Attempt 1 · AMD GPU (VA-API) · decoded on the GPU · 2 min")).toBeTruthy());
+    const rows = within(list).getAllByRole("listitem").map((li) => li.textContent);
+    expect(rows).toEqual([
+      "Attempt 1 · AMD GPU (VA-API) · decoded on the GPU · 2 minFailed: Plays start to finish: playback stopped at 1:01 of 2:21:02",
+      "Attempt 2 · CPU · 7 minWorked",
+    ]);
+    // The technical details keep each attempt's command and log, and copy them all for a bug report.
+    expect(within(dialog).getByText("Attempt 1: ffmpeg command")).toBeTruthy();
+    expect(within(dialog).getByText("Attempt 1: last lines from ffmpeg")).toBeTruthy();
+    expect(within(dialog).getByText(gpuFailed.command ?? "")).toBeTruthy();
+    expect(within(dialog).getByRole("button", { name: /Copy for a bug report/ })).toBeTruthy();
+  });
+
+  it("shows the attempt that failed and the one running now, with its frames while how far isn't known", async () => {
+    showSheet(
+      job({
+        state: "running",
+        stage: "transcoding",
+        progress: 0,
+        progress_basis: "unknown",
+        frames: 366,
+        elapsed_secs: 99,
+        encoder: "libx265",
+        hw_api: "software",
+        attempt: 2,
+        output_size: null,
+        freed_bytes: null,
+        attempts: [gpuFailed],
+      }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    const list = await within(dialog).findByRole("list", { name: "Attempts" });
+    await waitFor(() => expect(within(list).getByText("Attempt 2 · CPU")).toBeTruthy());
+    expect(within(list).getByText("Converting now")).toBeTruthy();
+    expect(within(list).getByText("Failed: Plays start to finish: playback stopped at 1:01 of 2:21:02")).toBeTruthy();
+    expect(dialog.textContent).toContain("366 frames · 2 min elapsed · how far isn't known yet");
+    expect(dialog.textContent).not.toMatch(/\b0%/);
+    expect(within(dialog).getByRole("progressbar", { name: "Whole file" }).getAttribute("aria-valuenow")).toBeNull();
+  });
+
+  it("has no attempts section for a job that worked the first time", async () => {
+    showSheet(job({ encoder: "libx265", hw_api: "software", attempts: [{ ...cpuWorked, attempt: 1 }] }));
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(within(dialog).getByText("Details")).toBeTruthy());
+    expect(within(dialog).queryByText("Attempts")).toBeNull();
   });
 });

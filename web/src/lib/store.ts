@@ -7,7 +7,7 @@
  */
 
 import { create } from "zustand";
-import { overallProgress } from "./progress";
+import { knownOverall, readProgress, type ProgressReading } from "./progress";
 import type { Job, JobProgress, JobStage, ScanProgress } from "./types";
 import { useSustained } from "./utils";
 
@@ -98,6 +98,10 @@ export function useLiveJob(job: Job): Job {
     fps: live.fps,
     speed: live.speed,
     eta_secs: live.eta_secs,
+    // An older server's events don't say: then the share is as it says.
+    progress_basis: live.progress_basis ?? null,
+    frames: live.frames ?? null,
+    elapsed_secs: live.elapsed_secs ?? null,
     encoder: live.encoder ?? job.encoder,
     hw_api: live.hw_api ?? job.hw_api,
     attempt: live.attempt,
@@ -107,8 +111,10 @@ export function useLiveJob(job: Job): Job {
 /** Live stage and whole-file progress of the running job for a file. */
 export interface FileLive {
   stage: JobStage;
-  /** Progress through the whole job, 0..100. */
-  overall: number;
+  /** Progress through the whole job, 0..100; `null` while it isn't known. */
+  overall: number | null;
+  /** How the share was worked out (see `readProgress`). */
+  reading: ProgressReading;
 }
 
 /** Live progress of whichever running job belongs to a file, or `null`. */
@@ -120,5 +126,5 @@ export function useFileLive(fileId: string): FileLive | null {
     return null;
   });
   if (!live) return null;
-  return { stage: live.stage, overall: overallProgress(live.stage, live.progress) };
+  return { stage: live.stage, overall: knownOverall(live), reading: readProgress(live) };
 }

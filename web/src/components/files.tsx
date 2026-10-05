@@ -42,9 +42,10 @@ import {
   skippedUnreadable,
   skipSummary,
 } from "@/lib/outcomes";
+import { framesElapsedText } from "@/lib/progress";
 import { useFile, useLibrary, useSettings } from "@/lib/queries";
 import { openSheet } from "@/lib/router";
-import { useFileLive } from "@/lib/store";
+import { useFileLive, type FileLive } from "@/lib/store";
 import type { FileDetail, Job, MediaFile, StreamInfo, TranscodeProfile } from "@/lib/types";
 import { useRetained } from "@/lib/utils";
 
@@ -209,6 +210,19 @@ function FileTechnical({ file }: { file: MediaFile }) {
   );
 }
 
+/** "37%", "About 37% (estimated)", or "1,017 frames · 7 min elapsed" while the share isn't known. */
+export function fileProgressText(live: Pick<FileLive, "reading">): string {
+  const reading = live.reading;
+  switch (reading.kind) {
+    case "unknown":
+      return framesElapsedText(reading.frames, reading.elapsedSecs);
+    case "estimated":
+      return `About ${Math.round(reading.overall)}% (estimated)`;
+    default:
+      return `${Math.round(reading.overall)}%`;
+  }
+}
+
 function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
   const live = useFileLive(file.id);
   const { library } = useLibrary(file.library_id);
@@ -241,9 +255,15 @@ function StatusExplanation({ file, jobs }: { file: MediaFile; jobs: Job[] }) {
         <p className="text-sm font-medium text-fg">Converting now</p>
         {live ? (
           <>
-            <Meter className="mt-2.5" value={live.overall} label="Conversion progress, whole file" live />
+            <Meter
+              className="mt-2.5"
+              value={live.overall}
+              valueText={live.reading.kind === "unknown" ? fileProgressText(live) : undefined}
+              label="Conversion progress, whole file"
+              live
+            />
             <p className="mt-1.5 text-[0.8125rem] text-muted tabular">
-              {Math.round(live.overall)}% · {JOB_STAGE_LABEL[live.stage]}
+              {fileProgressText(live)} · {JOB_STAGE_LABEL[live.stage]}
             </p>
           </>
         ) : (

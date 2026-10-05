@@ -16,10 +16,10 @@ use axum::http::{Method, Request, StatusCode};
 use chrono::{DateTime, Utc};
 use chrysopoeia_core::paths::{ARTIFACT_MARKER, is_backup, original_name_from_backup};
 use chrysopoeia_core::{
-    CheckStatus, CpuInfo, EncoderCandidate, EncoderStatus, FfmpegInfo, HardwareInfo, HwApi,
-    HwPreference, JobProgress, JobRecommendation, JobStage, MemoryInfo, OutputMode, ProbeInfo,
-    ProblemKind, StreamInfo, StreamKind, TranscodeProfile, ValidationCheck, ValidationLevel,
-    ValidationReport, VideoCodec,
+    AttemptResult, CheckStatus, CpuInfo, EncoderCandidate, EncoderStatus, FfmpegInfo, HardwareInfo,
+    HwApi, HwPreference, JobAttempt, JobProgress, JobRecommendation, JobStage, MemoryInfo,
+    OutputMode, ProbeInfo, ProblemKind, ProgressBasis, StreamInfo, StreamKind, TranscodeProfile,
+    ValidationCheck, ValidationLevel, ValidationReport, VideoCodec,
 };
 use chrysopoeia_hwdetect::DetectOptions;
 use chrysopoeia_scanner::{DiscoveredFile, ProbeError, ScanOptions, WalkResult, WatchEvent};
@@ -77,6 +77,40 @@ pub enum Behavior {
     /// end within a moment, the job ends `Cancelled` and leaves it to go
     /// on (see `chrysopoeia_worker::run::take_unfinished`).
     RealPlacing,
+    /// The first attempt (the GPU) made a file that failed a check: report
+    /// it as the worker does when the next attempt (the CPU) starts, with
+    /// that attempt's progress not known yet, then wait until cancelled or
+    /// released (then behave like `Done`, with both attempts).
+    FallBack,
+}
+
+/// The first attempt of [`Behavior::FallBack`]: the AMD GPU's file stopped
+/// playing early (the Atlas report).
+pub fn gpu_attempt_that_failed_a_check() -> JobAttempt {
+    JobAttempt {
+        attempt: 1,
+        encoder: "hevc_vaapi".into(),
+        hw_api: HwApi::Vaapi,
+        device: Some("/dev/dri/renderD128".into()),
+        hw_decode: true,
+        elapsed_secs: 128.4,
+        result: AttemptResult::Failed,
+        error: Some(
+            "The new file doesn't play start to finish. Playback stopped at 1:01 of 2:21:02".into(),
+        ),
+        problem: Some(ProblemKind::Verification),
+        failed_check: Some(ValidationCheck {
+            id: "decode".into(),
+            label: "Plays start to finish".into(),
+            status: CheckStatus::Fail,
+            detail: "Playback stopped at 1:01 of 2:21:02".into(),
+            value: None,
+        }),
+        command: Some(
+            "ffmpeg -init_hw_device vaapi=va:/dev/dri/renderD128 -hwaccel vaapi …".into(),
+        ),
+        log_tail: Some("[warning] Invalid timestamps".into()),
+    }
 }
 
 /// Holds library walks after they have listed the files, so a test can
@@ -491,6 +525,7 @@ async fn real_placing(
             encoder: None,
             attempt: 1,
             validation: None,
+            attempts: Vec::new(),
         };
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -522,6 +557,7 @@ async fn real_placing(
             validation: Some(passed_report()),
             command: "ffmpeg -i in out".into(),
             notes: placed.notes,
+            attempts: Vec::new(),
         },
         Err(e) if e.is::<Undone>() => JobOutcome::Cancelled,
         Err(e) => JobOutcome::Failed {
@@ -532,6 +568,7 @@ async fn real_placing(
             encoder: None,
             attempt: 1,
             validation: None,
+            attempts: Vec::new(),
         },
     };
     tokio::select! {
@@ -575,6 +612,7 @@ async fn fake_done(cfg: &RunConfig, spec: &JobSpec, ratio: f64) -> JobOutcome {
             encoder: None,
             attempt: 1,
             validation: None,
+            attempts: Vec::new(),
         };
     }
     if cfg.output_mode == OutputMode::Replace && out != spec.input {
@@ -591,6 +629,7 @@ async fn fake_done(cfg: &RunConfig, spec: &JobSpec, ratio: f64) -> JobOutcome {
         validation: Some(passed_report()),
         command: format!("ffmpeg -i {}", spec.input.display()),
         notes: vec![],
+        attempts: Vec::new(),
     }
 }
 
@@ -772,9 +811,13 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     fps: Some(100.0),
                     speed: Some(4.0),
                     eta_secs: Some(10),
+                    progress_basis: Some(ProgressBasis::Time),
+                    frames: Some(1200),
+                    elapsed_secs: Some(12),
                     encoder: spec.candidates.first().map(|c| c.name.clone()),
                     hw_api: Some(HwApi::Software),
                     attempt: 1,
+                    attempts: None,
                 })
                 .await;
             let notes = me.done_notes.lock().unwrap().clone();
@@ -788,6 +831,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     attempt,
                     validation,
                     command,
+                    attempts,
                     ..
                 } => JobOutcome::Done {
                     output_path,
@@ -799,6 +843,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     validation,
                     command,
                     notes: notes.clone(),
+                    attempts,
                 },
                 other => other,
             };
@@ -825,6 +870,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     encoder: None,
                     attempt: 0,
                     validation: None,
+                    attempts: Vec::new(),
                 })
             };
             if let Some(refused) = taken().await {
@@ -850,6 +896,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     reason,
                     encoder: Some("libx265".into()),
                     output_size: Some(10),
+                    attempts: Vec::new(),
                 },
                 Behavior::Fail(error) => JobOutcome::Failed {
                     error,
@@ -859,6 +906,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     encoder: Some("libx265".into()),
                     attempt: 2,
                     validation: None,
+                    attempts: Vec::new(),
                 },
                 Behavior::FailWith(problem, error) => JobOutcome::Failed {
                     error,
@@ -868,6 +916,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                     encoder: Some("libx265".into()),
                     attempt: 2,
                     validation: None,
+                    attempts: Vec::new(),
                 },
                 Behavior::HoldFail(error) => {
                     tokio::select! {
@@ -882,6 +931,7 @@ impl MediaToolkit for Arc<FakeToolkit> {
                                 encoder: None,
                                 attempt: 0,
                                 validation: None,
+                                attempts: Vec::new(),
                             }
                         }
                     }
@@ -892,6 +942,54 @@ impl MediaToolkit for Arc<FakeToolkit> {
                         permit = me.release.acquire() => {
                             if let Ok(p) = permit { p.forget(); }
                             fake_done(&cfg, &spec, 0.5).await
+                        }
+                    }
+                }
+                Behavior::FallBack => {
+                    // The GPU's file failed a check; the CPU starts and
+                    // can't say how far it is yet, as the worker reports it.
+                    let failed = gpu_attempt_that_failed_a_check();
+                    let _ = progress
+                        .send(JobProgress {
+                            job_id: spec.job_id,
+                            file_id: spec.file_id,
+                            stage: JobStage::Transcoding,
+                            progress: 0.0,
+                            fps: Some(3.7),
+                            speed: None,
+                            eta_secs: None,
+                            progress_basis: Some(ProgressBasis::Unknown),
+                            frames: Some(366),
+                            elapsed_secs: Some(99),
+                            encoder: Some("libx265".into()),
+                            hw_api: Some(HwApi::Software),
+                            attempt: 2,
+                            attempts: Some(vec![failed.clone()]),
+                        })
+                        .await;
+                    tokio::select! {
+                        () = cancel.cancelled() => JobOutcome::Cancelled,
+                        permit = me.release.acquire() => {
+                            if let Ok(p) = permit { p.forget(); }
+                            let done = fake_done(&cfg, &spec, 0.5).await;
+                            let worked = JobAttempt {
+                                attempt: 2,
+                                encoder: spec
+                                    .candidates
+                                    .first()
+                                    .map_or_else(|| "libx265".into(), |c| c.name.clone()),
+                                hw_api: HwApi::Software,
+                                device: None,
+                                hw_decode: false,
+                                elapsed_secs: 401.0,
+                                result: AttemptResult::Succeeded,
+                                error: None,
+                                problem: None,
+                                failed_check: None,
+                                command: Some(format!("ffmpeg -i {}", spec.input.display())),
+                                log_tail: None,
+                            };
+                            done.with_attempts(vec![failed, worked])
                         }
                     }
                 }

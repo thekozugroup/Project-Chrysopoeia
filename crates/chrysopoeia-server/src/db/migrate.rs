@@ -10,7 +10,7 @@ use anyhow::{Context, bail};
 use sqlx::{Row, SqlitePool};
 
 /// Schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA_V1: &[&str] = &[
     "CREATE TABLE settings (
@@ -332,6 +332,21 @@ const MIGRATION_V13: &[&str] = &[
     "ALTER TABLE jobs ADD COLUMN final_mount TEXT",
 ];
 
+/// Version 14: `jobs.attempts`, every way of converting the file a job
+/// tried with how each ended (JSON `JobAttempt[]`: encoder, decoding path,
+/// time taken, command, the failed check or ffmpeg's error and a short log
+/// tail), written as each attempt ends; and how a running job's progress
+/// was worked out while transcoding (`jobs.progress_basis`: `time`,
+/// `frames` or `unknown`), with the frames encoded so far and the seconds
+/// the attempt has run (`jobs.frames`, `jobs.elapsed_secs`). Jobs from
+/// before have no attempts recorded (`NULL`, read as none).
+const MIGRATION_V14: &[&str] = &[
+    "ALTER TABLE jobs ADD COLUMN attempts TEXT",
+    "ALTER TABLE jobs ADD COLUMN progress_basis TEXT",
+    "ALTER TABLE jobs ADD COLUMN frames INTEGER",
+    "ALTER TABLE jobs ADD COLUMN elapsed_secs INTEGER",
+];
+
 /// Steps applied on top of version 1, in order: (version reached, statements).
 const MIGRATIONS: &[(i64, &[&str])] = &[
     (2, MIGRATION_V2),
@@ -346,6 +361,7 @@ const MIGRATIONS: &[(i64, &[&str])] = &[
     (11, MIGRATION_V11),
     (12, MIGRATION_V12),
     (13, MIGRATION_V13),
+    (14, MIGRATION_V14),
 ];
 
 /// Bring the database to [`SCHEMA_VERSION`]. Safe to run on every start.
@@ -1351,6 +1367,163 @@ mod tests {
                 .unwrap()
                 .flatten();
         assert_eq!(final_mount, None);
+    }
+
+    /// Version 14 keeps the jobs recorded before, with no attempts (they
+    /// weren't recorded) and no way of working out progress noted; a job
+    /// finished afterwards keeps its attempts, and a running one says how
+    /// its progress was worked out.
+    #[tokio::test]
+    async fn version_14_adds_attempt_history_and_progress_basis() {
+        use chrysopoeia_core::{
+            AttemptResult, HwApi, JobAttempt, JobProgress, JobStage, JobState, ProblemKind,
+            ProgressBasis,
+        };
+        const LIB: &str = "00000000-0000-0000-0000-00000000000a";
+        const FILE: &str = "00000000-0000-0000-0000-00000000000b";
+        const OLD: &str = "00000000-0000-0000-0000-0000000000f1";
+        const RUNNING: &str = "00000000-0000-0000-0000-0000000000f2";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v13.db");
+        {
+            let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+                .await
+                .unwrap();
+            migrate_to(&pool, 13).await.unwrap();
+            for sql in [
+                format!(
+                    "INSERT INTO libraries (id, name, path, profile, created_at) \
+                     VALUES ('{LIB}', 'Movies', '/m', '{{}}', '2026-01-01T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO files (id, library_id, path, relative_path, file_name, \
+                     size_bytes, modified_at, status, scanned_at, updated_at) VALUES \
+                     ('{FILE}', '{LIB}', '/m/a.mkv', 'a.mkv', 'a.mkv', 1, 'x', 'failed', 'x', 'x')"
+                ),
+                format!(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, error, problem, attempt, created_at) VALUES ('{OLD}', '{FILE}', \
+                     '{LIB}', 'a.mkv', '/m/a.mkv', 'failed', 'verifying', 'None of the 3 ways', \
+                     'verification', 3, '2026-01-03T00:00:00.000Z')"
+                ),
+                format!(
+                    "INSERT INTO jobs (id, file_id, library_id, file_name, file_path, state, \
+                     stage, attempt, created_at, started_at) VALUES ('{RUNNING}', '{FILE}', \
+                     '{LIB}', 'a.mkv', '/m/a.mkv', 'running', 'transcoding', 3, \
+                     '2026-01-04T00:00:00.000Z', '2026-01-04T00:00:00.000Z')"
+                ),
+            ] {
+                sqlx::query(&sql).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let v: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(v, 14);
+        let old = crate::db::jobs::get(db.pool(), OLD.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(old.attempts.is_empty());
+        assert_eq!(
+            (old.progress_basis, old.frames, old.elapsed_secs),
+            (None, None, None)
+        );
+        assert_eq!(old.attempt, 3);
+
+        // A running job notes how its progress was worked out, and the
+        // attempts that ended so far.
+        let running: uuid::Uuid = RUNNING.parse().unwrap();
+        let failed = JobAttempt {
+            attempt: 1,
+            encoder: "hevc_vaapi".into(),
+            hw_api: HwApi::Vaapi,
+            device: Some("/dev/dri/renderD128".into()),
+            hw_decode: true,
+            elapsed_secs: 121.5,
+            result: AttemptResult::Failed,
+            error: Some("The new file doesn't play start to finish".into()),
+            problem: Some(ProblemKind::Verification),
+            failed_check: None,
+            command: Some("ffmpeg -hwaccel vaapi …".into()),
+            log_tail: None,
+        };
+        let progress = JobProgress {
+            job_id: running,
+            file_id: FILE.parse().unwrap(),
+            stage: JobStage::Transcoding,
+            progress: 0.0,
+            fps: Some(3.7),
+            speed: None,
+            eta_secs: None,
+            progress_basis: Some(ProgressBasis::Unknown),
+            frames: Some(366),
+            elapsed_secs: Some(99),
+            encoder: Some("libx265".into()),
+            hw_api: Some(HwApi::Software),
+            attempt: 3,
+            attempts: Some(vec![failed.clone()]),
+        };
+        crate::db::jobs::update_progress(db.pool(), &progress)
+            .await
+            .unwrap();
+        // A later update without them keeps them.
+        let later = JobProgress {
+            attempts: None,
+            frames: Some(400),
+            ..progress
+        };
+        crate::db::jobs::update_progress(db.pool(), &later)
+            .await
+            .unwrap();
+        let job = crate::db::jobs::get(db.pool(), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.progress_basis, Some(ProgressBasis::Unknown));
+        assert_eq!((job.frames, job.elapsed_secs), (Some(400), Some(99)));
+        assert_eq!(job.attempts, std::slice::from_ref(&failed));
+
+        // Finished: the outcome's attempts are kept, the live fields go.
+        let worked = JobAttempt {
+            attempt: 3,
+            encoder: "libx265".into(),
+            hw_api: HwApi::Software,
+            device: None,
+            hw_decode: false,
+            elapsed_secs: 400.0,
+            result: AttemptResult::Succeeded,
+            error: None,
+            problem: None,
+            failed_check: None,
+            command: Some("ffmpeg …".into()),
+            log_tail: None,
+        };
+        let mut tx = db.write_tx().await.unwrap();
+        crate::db::jobs::finish(
+            &mut tx,
+            running,
+            JobState::Done,
+            &crate::db::jobs::JobFinish {
+                attempts: Some(vec![failed.clone(), worked.clone()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let job = crate::db::jobs::get(db.pool(), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.attempts, [failed, worked]);
+        assert_eq!(
+            (job.progress_basis, job.frames, job.elapsed_secs),
+            (None, None, None)
+        );
     }
 
     #[tokio::test]

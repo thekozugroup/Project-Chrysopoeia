@@ -63,6 +63,15 @@
  * with the worker's sentence ("MP4 can't hold this file's …, so it was left
  * unchanged. …; Convert anyway converts it without them") until converted
  * anyway.
+ *
+ * Round 6: `Job.attempts` (every way a job tried, each with its decoding,
+ * time, command, the check it failed or ffmpeg's error, and a log tail) and
+ * how a running job's share was worked out (`progress_basis` with `frames`
+ * and `elapsed_secs`, on jobs and `job.progress` events). The first running
+ * job is the Atlas CPU fallback: two NVIDIA attempts failed "Plays start to
+ * finish", and the CPU's encode reports frames but no share (`unknown`);
+ * the second estimates its share from frames; the failed-check file in
+ * Movies failed its check on all three attempts.
  */
 
 import { randomUUID } from "node:crypto";
@@ -388,6 +397,8 @@ const libraries = new Map();
 const files = new Map();
 /** @type {Map<string, any>} */
 const jobs = new Map();
+/** Frames each running job's encode should give (mock bookkeeping, never sent). */
+const frameTotals = new Map();
 const activity = [];
 let activityId = 1;
 const savingsByDay = new Map();
@@ -544,9 +555,13 @@ function makeJob(file, state, extra = {}) {
     fps: null,
     speed: null,
     eta_secs: null,
+    progress_basis: null,
+    frames: null,
+    elapsed_secs: null,
     encoder: state === "queued" ? null : encoder,
     hw_api: state === "queued" ? null : hw_api,
     attempt: 1,
+    attempts: [],
     input_size: file.original_size_bytes ?? file.size_bytes,
     output_size: null,
     freed_bytes: null,
@@ -789,6 +804,37 @@ function seedDemo() {
     finished_at: ago(3100),
   });
   jobA.created_at = ago(9000);
+  // Round 6: each way it was tried, with the check each one failed.
+  const visualFail = (n, encoder, hw_api, hwDecode, secs) => ({
+    attempt: n,
+    encoder,
+    hw_api,
+    device: null,
+    hw_decode: hwDecode,
+    elapsed_secs: secs,
+    result: "failed",
+    error: "The new file doesn't look like the original. At 1:12:40 the picture differs a lot",
+    problem: "verification",
+    failed_check: {
+      id: "visual",
+      label: "Looks the same as the original",
+      status: "fail",
+      detail: "At 1:12:40 the picture differs a lot. This usually means corrupted frames in the source.",
+      value: 0.6123,
+    },
+    command: commandFor(failedA, encoder),
+    log_tail: "[vist#0:0/h264 @ 0x55d0e] corrupt decoded frame",
+  });
+  Object.assign(jobA, {
+    attempt: 3,
+    encoder: "libx265",
+    hw_api: "software",
+    attempts: [
+      visualFail(1, "hevc_nvenc", "nvenc", true, 610),
+      visualFail(2, "hevc_nvenc", "nvenc", false, 702),
+      visualFail(3, "libx265", "software", false, 1890),
+    ],
+  });
   // A damaged original: the worker's own sentence for a file that stops early.
   const failedB = pendingMovies[1];
   failedB.status = "failed";
@@ -961,7 +1007,52 @@ function seedDemo() {
     f.progress = stages[i].progress;
     const job = makeJob(f, "running", { ...stages[i], started_at: ago(between(300, 2400)), fps: between(90, 240), speed: between(3.5, 9.5) });
     job.eta_secs = Math.round(between(240, 1800));
+    if (job.stage === "transcoding") {
+      frameTotals.set(job.id, Math.round((f.duration_secs ?? 3600) * 24));
+      job.frames = Math.round((job.progress / 100) * frameTotals.get(job.id));
+      job.elapsed_secs = Math.round(between(200, 1200));
+      job.progress_basis = "time";
+    }
   });
+  // Round 6: the Atlas CPU fallback. The GPU's file failed a check twice (decoded on the
+  // GPU, then on the CPU), and the CPU's encode runs while ffmpeg 7 reports frames but no
+  // output time: no share is known, so the card shows the frames and the time spent.
+  const fallback = running[0] ? jobs.get(running[0].job_id) : null;
+  if (fallback) {
+    const failedCheck = (n, hwDecode, secs) => ({
+      attempt: n,
+      encoder: "hevc_nvenc",
+      hw_api: "nvenc",
+      device: null,
+      hw_decode: hwDecode,
+      elapsed_secs: secs,
+      result: "failed",
+      error: "The new file doesn't play start to finish. Playback stopped at 1:01 of 2:21:02",
+      problem: "verification",
+      failed_check: { id: "decode", label: "Plays start to finish", status: "fail", detail: "Playback stopped at 1:01 of 2:21:02", value: null },
+      command: commandFor(running[0], "hevc_nvenc"),
+      log_tail: "[matroska @ 0x55d0c] [warning] Invalid timestamps for stream 3 (DURATION-eng tag 02:21:02)",
+    });
+    Object.assign(fallback, {
+      encoder: "libx265",
+      hw_api: "software",
+      attempt: 3,
+      attempts: [failedCheck(1, true, 131), failedCheck(2, false, 164)],
+      command: commandFor(running[0], "libx265"),
+      progress: 0,
+      progress_basis: "unknown",
+      frames: 366,
+      elapsed_secs: 99,
+      fps: 3.7,
+      speed: null,
+      eta_secs: null,
+    });
+    frameTotals.set(fallback.id, 2400);
+    running[0].progress = 0;
+  }
+  // The second one estimates its share from frames (ffmpeg said no output time yet).
+  const estimated = running[1] ? jobs.get(running[1].job_id) : null;
+  if (estimated) Object.assign(estimated, { progress_basis: "frames" });
   const queued = candidates.filter((f) => f.status === "pending").slice(8, 38);
   queued.forEach((f, i) => {
     f.status = "queued";
@@ -1274,7 +1365,21 @@ function startJobs() {
       continue;
     }
     const { encoder, hw_api } = encoderFor(lib);
-    Object.assign(job, { state: "running", stage: "preparing", progress: 0, encoder, hw_api, started_at: iso(Date.now()), command: commandFor(file, encoder) });
+    Object.assign(job, {
+      state: "running",
+      stage: "preparing",
+      progress: 0,
+      encoder,
+      hw_api,
+      attempt: 1,
+      attempts: [],
+      progress_basis: null,
+      frames: null,
+      elapsed_secs: null,
+      started_at: iso(Date.now()),
+      command: commandFor(file, encoder),
+    });
+    frameTotals.set(job.id, Math.round((file.duration_secs ?? 3600) * 24));
     file.status = "processing";
     file.progress = 0;
     slots -= 1;
@@ -1291,6 +1396,27 @@ function finishJob(job) {
   const out = Math.round(job.input_size * ratio);
   // A hard-linked original's old data stays on disk through its other link: nothing is freed.
   const shared = Boolean(file?.hardLinked);
+  // The attempt that made the file joins the history, after any that failed.
+  const worked = {
+    attempt: job.attempt,
+    encoder: job.encoder,
+    hw_api: job.hw_api,
+    device: null,
+    hw_decode: job.hw_api !== "software",
+    elapsed_secs: Math.round((Date.now() - Date.parse(job.started_at ?? iso(Date.now()))) / 1000),
+    result: "succeeded",
+    error: null,
+    problem: null,
+    failed_check: null,
+    command: job.command,
+    log_tail: null,
+  };
+  const failedBefore = (job.attempts ?? []).at(-1);
+  const fallbackNote = failedBefore?.failed_check
+    ? [
+        `Converting on the ${failedBefore.hw_api === "nvenc" ? "NVIDIA GPU" : "GPU"} made a file that failed a check (${failedBefore.failed_check.label}: ${failedBefore.failed_check.detail.charAt(0).toLowerCase()}${failedBefore.failed_check.detail.slice(1)}), so it was converted on the CPU`,
+      ]
+    : [];
   Object.assign(job, {
     state: "done",
     stage: "finalizing",
@@ -1298,12 +1424,17 @@ function finishJob(job) {
     fps: null,
     speed: null,
     eta_secs: null,
+    progress_basis: null,
+    frames: null,
+    elapsed_secs: null,
+    attempts: [...(job.attempts ?? []), worked],
     output_size: out,
     freed_bytes: shared ? 0 : job.input_size - out,
     validation: validationReport(),
-    notes: file ? notesFor(file) : [],
+    notes: [...(file ? notesFor(file) : []), ...fallbackNote],
     finished_at: iso(Date.now()),
   });
+  frameTotals.delete(job.id);
   if (file) {
     // A second conversion saves against the first original, not the converted file.
     file.original_size_bytes = file.wasDone ? (file.original_size_bytes ?? job.input_size) : job.input_size;
@@ -1345,13 +1476,35 @@ function tick() {
     const speed = job.hw_api === "software" ? between(0.7, 1.6) : between(2.2, 4.4);
     if (job.stage === "preparing") {
       job.progress = Math.min(100, job.progress + 50);
-      if (job.progress >= 100) Object.assign(job, { stage: "transcoding", progress: 0 });
+      if (job.progress >= 100) Object.assign(job, { stage: "transcoding", progress: 0, progress_basis: "time", frames: 0, elapsed_secs: 0 });
     } else if (job.stage === "transcoding") {
-      job.progress = Math.min(100, job.progress + speed);
-      job.fps = job.hw_api === "software" ? between(24, 60) : between(140, 260);
-      job.speed = job.fps / 24;
-      job.eta_secs = Math.round(((100 - job.progress) / speed) * (TICK_MS / 1000) * 12);
-      if (job.progress >= 100) Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null });
+      const total = frameTotals.get(job.id) ?? 86_400;
+      job.elapsed_secs = (job.elapsed_secs ?? 0) + Math.round((TICK_MS / 1000) * 12);
+      if (job.progress_basis === "unknown" || job.progress_basis === "frames") {
+        // ffmpeg reports frames but no output time: a slow CPU encode.
+        job.fps = job.progress_basis === "unknown" ? between(3.5, 3.9) : between(24, 60);
+        job.speed = null;
+        job.frames = Math.min(total, (job.frames ?? 0) + Math.round(job.fps * (TICK_MS / 1000) * 12));
+        if (job.progress_basis === "unknown") {
+          job.progress = 0;
+          job.eta_secs = null;
+        } else {
+          job.progress = Math.min(99, (job.frames / total) * 100);
+          job.eta_secs = Math.round((total - job.frames) / job.fps);
+        }
+        if (job.frames >= total) {
+          Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null, progress_basis: null, frames: null, elapsed_secs: null });
+        }
+      } else {
+        job.progress = Math.min(100, job.progress + speed);
+        job.fps = job.hw_api === "software" ? between(24, 60) : between(140, 260);
+        job.speed = job.fps / 24;
+        job.frames = Math.round((job.progress / 100) * total);
+        job.eta_secs = Math.round(((100 - job.progress) / speed) * (TICK_MS / 1000) * 12);
+        if (job.progress >= 100) {
+          Object.assign(job, { stage: "verifying", progress: 0, fps: null, speed: null, progress_basis: null, frames: null, elapsed_secs: null });
+        }
+      }
     } else if (job.stage === "verifying") {
       job.progress = Math.min(100, job.progress + 9);
       job.eta_secs = Math.round((100 - job.progress) / 9) * 3;
@@ -1374,6 +1527,9 @@ function tick() {
       fps: job.fps ? Number(job.fps.toFixed(1)) : null,
       speed: job.speed ? Number(job.speed.toFixed(2)) : null,
       eta_secs: job.eta_secs,
+      progress_basis: job.progress_basis ?? null,
+      frames: job.frames ?? null,
+      elapsed_secs: job.elapsed_secs ?? null,
       encoder: job.encoder,
       hw_api: job.hw_api,
       attempt: job.attempt,
@@ -1728,7 +1884,7 @@ route("POST", "/api/files/:id/skip", ({ id }) => {
   // Like the server: a converting file is cancelled first, then skipped.
   for (const j of jobs.values()) {
     if (j.file_id === id && (j.state === "queued" || j.state === "running")) {
-      Object.assign(j, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
+      Object.assign(j, { state: "cancelled", fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, finished_at: iso(Date.now()) });
       broadcast({ type: "job.updated", job: j });
     }
   }
@@ -1793,7 +1949,7 @@ route("GET", "/api/jobs/:id", ({ id }) => getJob(id));
 route("POST", "/api/jobs/:id/cancel", ({ id }) => {
   const job = getJob(id);
   if (job.state !== "queued" && job.state !== "running") throw new HttpError(409, "job_finished", "This job has already finished.");
-  Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, finished_at: iso(Date.now()) });
+  Object.assign(job, { state: "cancelled", fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, finished_at: iso(Date.now()) });
   const file = files.get(job.file_id);
   if (file) {
     // A converted file queued again stays converted.
@@ -1845,7 +2001,7 @@ route("POST", "/api/queue/resume", () => {
 route("POST", "/api/queue/stop", () => {
   for (const job of jobs.values()) {
     if (job.state !== "running") continue;
-    Object.assign(job, { state: "queued", stage: "waiting", progress: 0, fps: null, speed: null, eta_secs: null, started_at: null });
+    Object.assign(job, { state: "queued", stage: "waiting", progress: 0, fps: null, speed: null, eta_secs: null, progress_basis: null, frames: null, elapsed_secs: null, attempt: 0, attempts: [], started_at: null });
     const file = files.get(job.file_id);
     if (file) Object.assign(file, { status: "queued", progress: null });
     broadcast({ type: "job.updated", job });

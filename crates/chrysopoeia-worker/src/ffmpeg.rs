@@ -16,6 +16,7 @@ use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use chrysopoeia_core::ProgressBasis;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader, Split};
 use tokio::process::{Child, Command};
 use tokio::time::Instant;
@@ -118,7 +119,7 @@ impl ProgressParser {
             }
             "out_time" => {
                 if self.current.out_time_secs.is_none() {
-                    self.current.out_time_secs = parse_clock(value);
+                    self.current.out_time_secs = parse_out_time_clock(value);
                 }
             }
             "fps" => self.current.fps = value.parse::<f32>().ok().filter(|f| f.is_finite()),
@@ -137,9 +138,31 @@ impl ProgressParser {
 
 /// Parse an `out_time_us`/`out_time_ms` value (microseconds) into seconds.
 /// `N/A` gives `None`; negative values (before the first frame) give 0.
+/// ffmpeg before 6 printed "no time yet" as the lowest number it has
+/// (`-9223372036854775807`); that, like any time more than a day before the
+/// start, gives `None` too.
 pub fn parse_out_time_us(value: &str) -> Option<f64> {
     let micros: i64 = value.trim().parse().ok()?;
+    if micros < -NO_TIME_YET_SECS * 1_000_000 {
+        return None;
+    }
     Some(micros.max(0) as f64 / 1_000_000.0)
+}
+
+/// An output time further before the start than this is ffmpeg's "no time
+/// yet" (see [`parse_out_time_us`]).
+const NO_TIME_YET_SECS: i64 = 86_400;
+
+/// Parse the `out_time` field (`HH:MM:SS.fraction`, see [`parse_clock`]),
+/// with ffmpeg's old "no time yet" (`-2562047:47:16.854775`) as `None`.
+fn parse_out_time_clock(value: &str) -> Option<f64> {
+    match value.trim().strip_prefix('-') {
+        Some(magnitude) => {
+            let secs = parse_clock(magnitude)?;
+            (secs <= NO_TIME_YET_SECS as f64).then_some(0.0)
+        }
+        None => parse_clock(value),
+    }
 }
 
 /// Parse an ffmpeg speed value such as `2.31x` or ` 0.5x`. `N/A` and
@@ -172,56 +195,162 @@ pub(crate) fn parse_clock(value: &str) -> Option<f64> {
 /// duration.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Progress {
-    /// 0..=100.
+    /// 0..=100. Means nothing when `basis` is [`ProgressBasis::Unknown`]
+    /// (it is 0 then).
     pub percent: f32,
     /// Encoding frames per second.
     pub fps: Option<f32>,
     /// Realtime multiple.
     pub speed: Option<f32>,
-    /// Estimated seconds left.
+    /// Estimated seconds left. `None` whenever `percent` is unknown.
     pub eta_secs: Option<u64>,
+    /// Video frames encoded so far, when ffmpeg says.
+    pub frames: Option<u64>,
+    /// How `percent` was worked out.
+    pub basis: ProgressBasis,
 }
+
+/// What an encode's progress is measured against.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Timeline {
+    /// The source's length in seconds.
+    pub duration_secs: Option<f64>,
+    /// How many video frames the encode should give (the source's length
+    /// times its frame rate), when that can be trusted.
+    pub expected_frames: Option<f64>,
+}
+
+/// How far ahead (in percentage points) the frame count must be of the
+/// output time before the frames are taken as the better measure. ffmpeg 7
+/// reports the output time of the track that is furthest behind, so a
+/// subtitle track whose next line is minutes away holds it back while the
+/// video moves on.
+const FRAMES_LEAD_POINTS: f64 = 2.0;
+
+/// The highest share an estimate from frames shows before ffmpeg says it
+/// has finished: frames can't tell that the end has been reached.
+const FRAMES_PERCENT_CAP: f64 = 99.0;
+
+/// More frames than the source should have, by this share (plus a couple
+/// of frames), means the expected count was wrong: the estimate is dropped.
+const FRAMES_OVERSHOOT: f64 = 0.05;
 
 /// Turn a progress block into percent/ETA.
 ///
-/// `duration_secs` is the source duration (unknown durations give 0 % until
-/// the final block). `elapsed_secs` is the wall-clock time since the encode
-/// started; it estimates the ETA when ffmpeg reports no speed.
+/// `duration_secs` is the source duration (an unknown duration gives an
+/// unknown percentage until the final block). `elapsed_secs` is the
+/// wall-clock time since the encode started; it estimates the ETA when
+/// ffmpeg reports no speed. This knows no frame count to estimate from; see
+/// [`estimate_progress`].
 pub fn compute_progress(
     block: &ProgressBlock,
     duration_secs: Option<f64>,
     elapsed_secs: f64,
 ) -> Progress {
-    let duration = duration_secs.filter(|d| d.is_finite() && *d > 0.0);
-    let done = block.out_time_secs.unwrap_or(0.0).max(0.0);
-    let percent = if block.end {
-        100.0
-    } else {
-        match duration {
-            Some(d) => ((done / d) * 100.0).clamp(0.0, 100.0) as f32,
-            None => 0.0,
-        }
+    estimate_progress(
+        block,
+        Timeline {
+            duration_secs,
+            expected_frames: None,
+        },
+        elapsed_secs,
+    )
+}
+
+/// Turn a progress block into percent/ETA, from ffmpeg's output time over
+/// the source's length, or, when ffmpeg doesn't report an output time yet
+/// (or one that is behind the video), from the frames encoded over the
+/// frames the source should have ([`Timeline::expected_frames`], an
+/// estimate: never 100 % before the final block). With neither, the
+/// percentage is [`ProgressBasis::Unknown`]: 0 and no ETA, never a figure
+/// that only looks like one.
+pub fn estimate_progress(block: &ProgressBlock, timeline: Timeline, elapsed_secs: f64) -> Progress {
+    let duration = timeline.duration_secs.filter(|d| d.is_finite() && *d > 0.0);
+    let base = Progress {
+        percent: 0.0,
+        fps: block.fps,
+        speed: block.speed,
+        eta_secs: None,
+        frames: block.frame,
+        basis: ProgressBasis::Unknown,
     };
-    let eta_secs = if block.end {
-        Some(0)
-    } else {
-        duration.and_then(|d| {
-            let remaining = (d - done).max(0.0);
+    if block.end {
+        return Progress {
+            percent: 100.0,
+            eta_secs: Some(0),
+            basis: ProgressBasis::Time,
+            ..base
+        };
+    }
+    let done = block.out_time_secs.map(|t| t.max(0.0));
+    let by_time = done
+        .zip(duration)
+        .map(|(done, d)| ((done / d) * 100.0).clamp(0.0, 100.0));
+    let by_frames = frames_percent(block.frame, timeline.expected_frames);
+    match (by_time, by_frames) {
+        (Some(t), Some(f)) if f >= t + FRAMES_LEAD_POINTS => {
+            frames_progress(base, f, timeline, elapsed_secs)
+        }
+        (Some(t), _) => {
+            let (done, d) = (done.unwrap_or(0.0), duration.unwrap_or(0.0));
             let rate = match block.speed {
                 Some(speed) if speed > 0.01 => Some(f64::from(speed)),
                 _ if elapsed_secs > 1.0 && done > 0.0 => Some(done / elapsed_secs),
                 _ => None,
-            }?;
-            let eta = remaining / rate;
-            (eta.is_finite() && eta >= 0.0).then(|| eta.round() as u64)
-        })
-    };
-    Progress {
-        percent,
-        fps: block.fps,
-        speed: block.speed,
-        eta_secs,
+            };
+            Progress {
+                percent: t as f32,
+                eta_secs: rate.and_then(|rate| eta((d - done).max(0.0) / rate)),
+                basis: ProgressBasis::Time,
+                ..base
+            }
+        }
+        (None, Some(f)) => frames_progress(base, f, timeline, elapsed_secs),
+        (None, None) => base,
     }
+}
+
+/// The share of the source `frames` stand for, when the expected count is
+/// known and the frames haven't outrun it (then it was wrong).
+fn frames_percent(frames: Option<u64>, expected: Option<f64>) -> Option<f64> {
+    let expected = expected.filter(|e| e.is_finite() && *e >= 1.0)?;
+    let frames = frames? as f64;
+    if frames > expected * (1.0 + FRAMES_OVERSHOOT) + 2.0 {
+        return None;
+    }
+    Some((frames / expected * 100.0).clamp(0.0, FRAMES_PERCENT_CAP))
+}
+
+/// Progress estimated from frames: `percent` of the source, the time left
+/// from the frames still to encode at the pace so far.
+fn frames_progress(
+    base: Progress,
+    percent: f64,
+    timeline: Timeline,
+    elapsed_secs: f64,
+) -> Progress {
+    let frames = base.frames.unwrap_or(0) as f64;
+    // No pace before the first frame.
+    let rate = match base.fps {
+        _ if frames < 1.0 => None,
+        Some(fps) if fps > 0.01 => Some(f64::from(fps)),
+        _ if elapsed_secs > 1.0 => Some(frames / elapsed_secs),
+        _ => None,
+    };
+    let left = timeline
+        .expected_frames
+        .map(|expected| (expected - frames).max(0.0));
+    Progress {
+        percent: percent as f32,
+        eta_secs: rate.zip(left).and_then(|(rate, left)| eta(left / rate)),
+        basis: ProgressBasis::Frames,
+        ..base
+    }
+}
+
+/// Whole seconds left, when the estimate is a usable number.
+fn eta(secs: f64) -> Option<u64> {
+    (secs.is_finite() && secs >= 0.0).then(|| secs.round() as u64)
 }
 
 /// Ring buffer of the most recent stderr lines.
@@ -1110,10 +1239,11 @@ out_time=N/A\ntotal_size=N/A\nspeed=N/A\nprogress=continue\n";
             Some(180)
         );
 
-        // Unknown duration: no percent, no ETA.
+        // Unknown duration: no percent, no ETA, and it says so.
         let p = compute_progress(&block, None, 15.0);
         assert_eq!(p.percent, 0.0);
         assert_eq!(p.eta_secs, None);
+        assert_eq!(p.basis, ProgressBasis::Unknown);
 
         // Overshoot is clamped; the end block is always 100 %.
         let over = ProgressBlock {
@@ -1128,6 +1258,144 @@ out_time=N/A\ntotal_size=N/A\nspeed=N/A\nprogress=continue\n";
         let p = compute_progress(&end, Some(120.0), 1.0);
         assert_eq!(p.percent, 100.0);
         assert_eq!(p.eta_secs, Some(0));
+        assert_eq!(p.basis, ProgressBasis::Time);
+    }
+
+    /// With the output time reported, progress is the time over the length,
+    /// as before, and says so.
+    #[test]
+    fn progress_from_output_time_is_measured() {
+        let block = ProgressBlock {
+            frame: Some(720),
+            out_time_secs: Some(30.0),
+            speed: Some(2.0),
+            fps: Some(48.0),
+            ..Default::default()
+        };
+        let timeline = Timeline {
+            duration_secs: Some(120.0),
+            expected_frames: Some(2880.0),
+        };
+        let p = estimate_progress(&block, timeline, 15.0);
+        assert_eq!(p.basis, ProgressBasis::Time);
+        assert!((p.percent - 25.0).abs() < 1e-4);
+        assert_eq!(p.eta_secs, Some(45));
+        assert_eq!(p.frames, Some(720));
+    }
+
+    /// The Atlas CPU fallback: ffmpeg 7 printed frames and fps for minutes
+    /// but no output time (`out_time=N/A`), and progress sat at 0 % with no
+    /// time left. Frames over the frames the source should have give an
+    /// estimate instead, labelled as one, with the time left at that pace.
+    #[test]
+    fn progress_without_output_time_is_estimated_from_frames() {
+        let text = "frame=366\nfps=3.66\nstream_0_0_q=28.0\nbitrate=N/A\ntotal_size=4096\n\
+out_time_us=N/A\nout_time_ms=N/A\nout_time=N/A\ndup_frames=0\ndrop_frames=0\nspeed=N/A\n\
+progress=continue\n";
+        let block = parse_all(text).remove(0);
+        assert_eq!(block.out_time_secs, None);
+        // 61.1 s at 23.976 fps: 1465 frames.
+        let timeline = Timeline {
+            duration_secs: Some(61.1),
+            expected_frames: Some(61.1 * 24000.0 / 1001.0),
+        };
+        let p = estimate_progress(&block, timeline, 100.0);
+        assert_eq!(p.basis, ProgressBasis::Frames);
+        assert!((p.percent - 24.98).abs() < 0.05, "{}", p.percent);
+        assert_eq!(p.frames, Some(366));
+        assert_eq!(p.fps, Some(3.66));
+        // 1099 frames left at 3.66 fps.
+        assert_eq!(p.eta_secs, Some(300));
+
+        // Without a usable frame count to compare with, it is unknown: no
+        // percentage that only looks like one, and no time left.
+        for expected in [None, Some(0.0), Some(f64::NAN)] {
+            let timeline = Timeline {
+                expected_frames: expected,
+                ..timeline
+            };
+            let p = estimate_progress(&block, timeline, 100.0);
+            assert_eq!(p.basis, ProgressBasis::Unknown, "{expected:?}");
+            assert_eq!((p.percent, p.eta_secs), (0.0, None));
+            assert_eq!(p.frames, Some(366), "the frames are still reported");
+        }
+        // The old function has no frame count to go by.
+        let p = compute_progress(&block, Some(61.1), 100.0);
+        assert_eq!(
+            (p.basis, p.percent, p.eta_secs),
+            (ProgressBasis::Unknown, 0.0, None)
+        );
+        assert_eq!(p.frames, Some(366));
+    }
+
+    /// Frames can't tell that the end is reached: an estimate stays below
+    /// 100 % until ffmpeg's final block, and more frames than the source
+    /// should have mean the expected count was wrong, so it is dropped.
+    #[test]
+    fn frame_estimate_is_capped_and_dropped_when_wrong() {
+        let timeline = Timeline {
+            duration_secs: Some(10.0),
+            expected_frames: Some(240.0),
+        };
+        let at = |frame: u64| {
+            let block = ProgressBlock {
+                frame: Some(frame),
+                fps: Some(24.0),
+                ..Default::default()
+            };
+            estimate_progress(&block, timeline, 10.0)
+        };
+        assert_eq!(at(240).basis, ProgressBasis::Frames);
+        assert_eq!(at(240).percent, 99.0);
+        assert_eq!(at(250).percent, 99.0, "a few frames over is rounding");
+        assert_eq!(at(300).basis, ProgressBasis::Unknown);
+        assert_eq!((at(300).percent, at(300).eta_secs), (0.0, None));
+        // No frames yet: 0 %, honestly, with no time left to guess.
+        let start = at(0);
+        assert_eq!((start.basis, start.percent), (ProgressBasis::Frames, 0.0));
+        assert_eq!(start.eta_secs, None);
+    }
+
+    /// ffmpeg 7 reports the output time of the track furthest behind: a
+    /// subtitle track whose last line was at 0:05 holds it there while the
+    /// video is at 0:44. The frames, well ahead, are the better measure.
+    #[test]
+    fn output_time_held_back_by_a_sparse_track_gives_way_to_frames() {
+        let timeline = Timeline {
+            duration_secs: Some(100.0),
+            expected_frames: Some(2400.0),
+        };
+        let block = ProgressBlock {
+            frame: Some(1056),
+            out_time_secs: Some(5.0),
+            fps: Some(48.0),
+            speed: Some(0.2),
+            ..Default::default()
+        };
+        let p = estimate_progress(&block, timeline, 22.0);
+        assert_eq!(p.basis, ProgressBasis::Frames);
+        assert!((p.percent - 44.0).abs() < 1e-3, "{}", p.percent);
+        assert_eq!(p.eta_secs, Some(28));
+        // Close to each other, the output time stays the measure.
+        let block = ProgressBlock {
+            out_time_secs: Some(43.0),
+            ..block
+        };
+        assert_eq!(
+            estimate_progress(&block, timeline, 22.0).basis,
+            ProgressBasis::Time
+        );
+    }
+
+    /// ffmpeg before 6 printed "no time yet" as its lowest number; that is
+    /// no output time, not the start of the file.
+    #[test]
+    fn old_ffmpeg_no_time_yet_is_no_output_time() {
+        let text = "frame=12\nout_time_us=-9223372036854775807\n\
+out_time_ms=-9223372036854775807\nout_time=-2562047:47:16.854775\nprogress=continue\n";
+        assert_eq!(parse_all(text)[0].out_time_secs, None);
+        let blocks = parse_all("out_time=-00:00:00.023000\nprogress=continue\n");
+        assert_eq!(blocks[0].out_time_secs, Some(0.0));
     }
 
     #[test]

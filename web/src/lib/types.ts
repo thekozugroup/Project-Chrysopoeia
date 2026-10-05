@@ -439,6 +439,41 @@ export const PROBLEM_KINDS: readonly ProblemKind[] = [
 ];
 export type JobStage = "waiting" | "preparing" | "transcoding" | "verifying" | "finalizing";
 
+/**
+ * How a running job's `progress` was worked out while transcoding: `time`
+ * from how far into the file ffmpeg says it is; `frames` estimated from the
+ * frames encoded over the frames the original should have (ffmpeg didn't
+ * say how far it is); `unknown` neither, so `progress` is 0 and means
+ * nothing (show the frames and the time spent instead).
+ */
+export type ProgressBasis = "time" | "frames" | "unknown";
+
+export type AttemptResult = "succeeded" | "failed";
+
+/** One way of converting the file a job tried (core `JobAttempt`). */
+export interface JobAttempt {
+  /** 1-based, as `Job.attempt`. */
+  attempt: number;
+  /** ffmpeg encoder, e.g. `hevc_vaapi`. */
+  encoder: string;
+  hw_api: HwApi;
+  /** The GPU's render node (VA-API, Quick Sync), e.g. `/dev/dri/renderD128`. */
+  device?: string | null;
+  /** The GPU decoded the original; `false`: the CPU did. */
+  hw_decode: boolean;
+  /** How long it took, its checks included. */
+  elapsed_secs: number;
+  result: AttemptResult;
+  /** What went wrong, in plain words. */
+  error?: string | null;
+  problem?: ProblemKind | null;
+  /** The check the new file failed, with its plain reason. */
+  failed_check?: ValidationCheck | null;
+  command?: string | null;
+  /** The last lines ffmpeg printed (a failed attempt). */
+  log_tail?: string | null;
+}
+
 export interface Job {
   id: Uuid;
   file_id: Uuid;
@@ -452,9 +487,24 @@ export interface Job {
   fps: number | null;
   speed: number | null;
   eta_secs: number | null;
+  /**
+   * How `progress` was worked out while transcoding; `null` (or absent, from
+   * an older server) outside transcoding: `progress` is then as it says.
+   */
+  progress_basis?: ProgressBasis | null;
+  /** Video frames the current attempt has encoded (transcoding only). */
+  frames?: number | null;
+  /** Seconds since the current attempt started encoding (transcoding only). */
+  elapsed_secs?: number | null;
   encoder: string | null;
   hw_api: HwApi | null;
   attempt: number;
+  /**
+   * Every way of converting the file this job tried, in order, with how
+   * each ended; the attempt still running is left out. Empty (or absent,
+   * from an older server) when none ended yet or none were recorded.
+   */
+  attempts?: JobAttempt[];
   input_size: number;
   output_size: number | null;
   /**
@@ -498,6 +548,10 @@ export interface JobProgress {
   fps: number | null;
   speed: number | null;
   eta_secs: number | null;
+  /** See `Job.progress_basis`. */
+  progress_basis?: ProgressBasis | null;
+  frames?: number | null;
+  elapsed_secs?: number | null;
   encoder: string | null;
   hw_api: HwApi | null;
   attempt: number;

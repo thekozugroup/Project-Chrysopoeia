@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrysopoeia_core::{
-    CheckStatus, Container, EncoderCandidate, Goal, HwApi, JobProgress, JobStage, OutputMode,
-    ProbeInfo, ProblemKind, TranscodeProfile, ValidationLevel, VideoCodec,
+    AttemptResult, CheckStatus, Container, EncoderCandidate, Goal, HwApi, JobProgress, JobStage,
+    OutputMode, ProbeInfo, ProblemKind, ProgressBasis, TranscodeProfile, ValidationLevel,
+    VideoCodec,
 };
 use chrysopoeia_worker::run::{JobOutcome, JobSpec, RunConfig, run_job_with};
 use chrysopoeia_worker::{Decision, FfmpegPlan, PlanRequest};
@@ -79,8 +80,10 @@ fn fake_plan(req: &PlanRequest<'_>) -> anyhow::Result<FfmpegPlan> {
     let output = req.output.to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["-y".into()];
     if req.encoder.hw_decode {
-        // Differs from the CPU-decode retry so the retry is not deduplicated.
-        args.extend(["-threads".into(), "0".into()]);
+        // Differs from the CPU-decode retry so the retry is not deduplicated,
+        // and names a decoder as a real GPU-decoding plan does (`none`
+        // decodes on the CPU all the same).
+        args.extend(["-hwaccel".into(), "none".into()]);
     }
     args.extend(["-i".into(), input]);
     let mut video_map = "0:v:0".to_string();
@@ -206,11 +209,31 @@ async fn success_replaces_the_original_and_keeps_its_date() {
         validation,
         command,
         notes,
+        attempts,
     } = outcome
     else {
         panic!("expected Done, got {outcome:?}");
     };
     assert_eq!(output_path, input, "same container: replaced in place");
+    // One attempt, which worked, with the command that made the file.
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    let only = &attempts[0];
+    assert_eq!(
+        (
+            only.attempt,
+            only.encoder.as_str(),
+            only.hw_api,
+            only.hw_decode
+        ),
+        (1, "libx264", HwApi::Software, false)
+    );
+    assert_eq!(only.result, AttemptResult::Succeeded);
+    assert_eq!(only.command.as_deref(), Some(command.as_str()));
+    assert_eq!(
+        (&only.error, &only.failed_check, &only.log_tail),
+        (&None, &None, &None)
+    );
+    assert!(only.elapsed_secs > 0.0);
     assert_eq!(original_size, original.len() as u64);
     assert_eq!(output_size, std::fs::metadata(&input).unwrap().len());
     assert_ne!(
@@ -261,6 +284,21 @@ async fn success_replaces_the_original_and_keeps_its_date() {
         transcoding
             .iter()
             .all(|p| p.encoder.as_deref() == Some("libx264") && p.attempt == 1)
+    );
+    // While ffmpeg encodes, each update says how its share was worked out,
+    // with the frames so far and the time spent; the other stages don't.
+    assert!(
+        transcoding
+            .iter()
+            .any(|p| p.progress_basis.is_some() && p.frames.is_some() && p.elapsed_secs.is_some()),
+        "{transcoding:?}"
+    );
+    assert!(
+        updates
+            .iter()
+            .filter(|p| p.stage != JobStage::Transcoding)
+            .all(|p| p.progress_basis.is_none() && p.frames.is_none()),
+        "{updates:?}"
     );
 }
 
@@ -329,11 +367,15 @@ async fn size_rule_skips_and_keeps_the_original() {
         reason,
         encoder,
         output_size,
+        attempts,
     } = outcome
     else {
         panic!("expected Skipped, got {outcome:?}");
     };
     assert!(reason.ends_with("— kept the original"), "{reason}");
+    // The attempt worked; its file just wasn't small enough.
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].result, AttemptResult::Succeeded);
     assert_eq!(encoder.as_deref(), Some("libx264"));
     assert!(output_size.is_some_and(|s| s > 0));
     assert_eq!(std::fs::read(&input).unwrap(), original);
@@ -399,6 +441,8 @@ async fn failing_first_candidate_falls_back_to_the_next() {
         encoder,
         attempt,
         notes,
+        command,
+        attempts: history,
         ..
     } = outcome
     else {
@@ -412,6 +456,81 @@ async fn failing_first_candidate_falls_back_to_the_next() {
             .any(|n| n == "Converting on the NVIDIA GPU didn't work for this file, so it was converted on the CPU"),
         "{notes:?}"
     );
+    // Every attempt is kept, with what each one was and why it failed: the
+    // GPU decoding and encoding, the GPU encoding the CPU's frames, then
+    // the CPU.
+    let tried: Vec<_> = history
+        .iter()
+        .map(|a| {
+            (
+                a.attempt,
+                a.encoder.as_str(),
+                a.hw_api,
+                a.hw_decode,
+                a.result,
+            )
+        })
+        .collect();
+    assert_eq!(
+        tried,
+        [
+            (1, BROKEN_HW, HwApi::Nvenc, true, AttemptResult::Failed),
+            (2, BROKEN_HW, HwApi::Nvenc, false, AttemptResult::Failed),
+            (
+                3,
+                "libx264",
+                HwApi::Software,
+                false,
+                AttemptResult::Succeeded
+            ),
+        ]
+    );
+    for failed in &history[..2] {
+        let error = failed.error.as_deref().unwrap_or_default();
+        assert!(
+            error.starts_with("Converting on the NVIDIA GPU stopped with an error")
+                && error.contains("Unknown encoder 'chrysopoeia_no_such_encoder'"),
+            "{error}"
+        );
+        assert_eq!(failed.problem, Some(ProblemKind::Encoder));
+        assert_eq!(failed.failed_check, None);
+        assert!(
+            failed
+                .command
+                .as_deref()
+                .is_some_and(|c| c.contains("chrysopoeia_no_such_encoder")),
+            "{failed:?}"
+        );
+        let tail = failed.log_tail.as_deref().unwrap_or_default();
+        assert!(tail.contains("chrysopoeia_no_such_encoder"), "{tail}");
+        assert!(tail.lines().count() <= 12, "{tail}");
+    }
+    assert_eq!(
+        history[0]
+            .command
+            .as_deref()
+            .map(|c| c.contains("-hwaccel")),
+        Some(true)
+    );
+    assert_eq!(history[2].command.as_deref(), Some(command.as_str()));
+    assert_eq!(history[2].error, None);
+    // The history went out as the job ran: the update that starts each
+    // later attempt carries the attempts so far (the server stores them,
+    // so the job shows why the GPU wasn't used while the CPU still works).
+    let sent: Vec<usize> = updates
+        .iter()
+        .filter_map(|p| p.attempts.as_ref().map(Vec::len))
+        .collect();
+    assert_eq!(&sent[..2], [1, 2], "{sent:?}");
+    let second_start = updates
+        .iter()
+        .find(|p| p.attempts.as_ref().is_some_and(|a| a.len() == 2))
+        .unwrap();
+    assert_eq!(
+        (second_start.stage, second_start.attempt),
+        (JobStage::Transcoding, 3)
+    );
+    assert_eq!(second_start.attempts.as_deref(), Some(&history[..2]));
     let attempts: Vec<_> = updates
         .iter()
         .filter(|p| p.stage == JobStage::Transcoding && p.progress == 0.0)
@@ -447,10 +566,16 @@ async fn all_candidates_failing_reports_the_last_error() {
         encoder,
         attempt,
         validation,
+        attempts,
     } = outcome
     else {
         panic!("expected Failed, got {outcome:?}");
     };
+    // The one attempt, failed, as the job's error says.
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(attempts[0].result, AttemptResult::Failed);
+    assert_eq!(attempts[0].error.as_deref(), Some(error.as_str()));
+    assert_eq!(attempts[0].command, command);
     // Plain words first, no encoder name.
     assert!(
         error.starts_with(
@@ -490,6 +615,8 @@ async fn corrupt_hardware_output_falls_back_after_verification() {
         encoder,
         attempt,
         validation,
+        notes,
+        attempts,
         ..
     } = outcome
     else {
@@ -497,6 +624,41 @@ async fn corrupt_hardware_output_falls_back_after_verification() {
     };
     assert_eq!((encoder.as_str(), attempt), ("libx264", 2));
     assert!(validation.is_some_and(|r| r.passed));
+    // The failed check is kept with the first attempt, in plain words, and
+    // the note on the fallback names it.
+    let first = &attempts[0];
+    assert_eq!(
+        (first.encoder.as_str(), first.result),
+        (CORRUPT_HW, AttemptResult::Failed)
+    );
+    assert_eq!(first.problem, Some(ProblemKind::Verification));
+    let check = first.failed_check.as_ref().expect("the failed check");
+    assert_eq!(
+        (check.id.as_str(), check.status),
+        ("visual", CheckStatus::Fail)
+    );
+    let error = first.error.as_deref().unwrap_or_default();
+    assert!(
+        error.starts_with("The new file doesn't look like the original. "),
+        "{error}"
+    );
+    assert!(
+        !error.contains("Try again"),
+        "the job's advice isn't the attempt's: {error}"
+    );
+    assert_eq!(attempts[1].result, AttemptResult::Succeeded);
+    let note = notes
+        .iter()
+        .find(|n| n.starts_with("Converting with Intel Quick Sync"))
+        .unwrap_or_else(|| panic!("{notes:?}"));
+    assert!(
+        note.starts_with(&format!(
+            "Converting with Intel Quick Sync made a file that failed a check ({}: ",
+            check.label
+        )) && note.ends_with("), so it was converted on the CPU"),
+        "{note}"
+    );
+    assert!(!note.contains("% similar"), "{note}");
     // Verification ran twice: once failing (hardware), once passing.
     let verifying_starts = updates
         .iter()
@@ -642,7 +804,8 @@ async fn replacing_never_silently_loses_picture_subtitles_or_fonts() {
             reason,
             encoder: None,
             output_size: None,
-        } => assert!(
+            attempts,
+        } if attempts.is_empty() => assert!(
             reason.starts_with(
                 "MP4 can't hold this file's 1 picture-based subtitle and 1 subtitle font, so it \
                  was left unchanged."
@@ -700,7 +863,8 @@ async fn preparing_checks_fail_fast() {
         JobOutcome::Skipped {
             reason: "Already H.264".into(),
             encoder: None,
-            output_size: None
+            output_size: None,
+            attempts: Vec::new(),
         }
     );
 
@@ -764,7 +928,8 @@ async fn preparing_checks_fail_fast() {
             command: None,
             encoder: None,
             attempt: 0,
-            validation: None
+            validation: None,
+            attempts: Vec::new(),
         }
     );
     assert!(support::walk(dir.path()).is_empty());
@@ -1267,6 +1432,87 @@ async fn a_full_disk_stops_the_job_instead_of_trying_the_next_encoder() {
     assert_eq!(started, 1, "only one encode was started");
     assert_eq!(std::fs::read(&input).unwrap(), before);
     assert!(support::artifacts_in(dir.path()).is_empty());
+}
+
+/// A stand-in for ffmpeg 7 writing a file with a track that has had no
+/// packet yet (a subtitle track without a line so far): its progress blocks
+/// give frames and fps but no output time, to the end. It copies the input
+/// to the output.
+#[cfg(unix)]
+const FRAMES_ONLY_FFMPEG: &str = r#"#!/bin/sh
+input=""; prev=""; out=""
+for arg in "$@"; do
+  if [ "$prev" = "-i" ] && [ -z "$input" ]; then input="$arg"; fi
+  prev="$arg"; out="$arg"
+done
+for frame in 0 24 48 72; do
+  printf 'frame=%s\nfps=24.00\nout_time_us=N/A\nout_time_ms=N/A\nout_time=N/A\nspeed=N/A\nprogress=continue\n' "$frame"
+  sleep 0.6
+done
+cp "$input" "$out"
+printf 'frame=96\nfps=24.00\nout_time_us=N/A\nout_time=N/A\nspeed=N/A\nprogress=end\n'
+"#;
+
+/// The Atlas CPU fallback sat at 0 % with no time left for minutes while
+/// ffmpeg 7 encoded frames without reporting an output time. Progress now
+/// comes from the frames over the frames the original should have, labelled
+/// as an estimate, with the frames and the time spent; and with checks off
+/// the encode isn't taken for a cut-off original because no time came.
+#[cfg(unix)]
+#[tokio::test]
+async fn progress_without_output_time_is_estimated_from_frames() {
+    use std::os::unix::fs::PermissionsExt;
+    require_ffmpeg!();
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let input = support::copy_media(support::MP4_TWO_AUDIO, &library);
+    let script = dir.path().join("ffmpeg-7-frames-only");
+    std::fs::write(&script, FRAMES_ONLY_FFMPEG).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut cfg = config(ValidationLevel::Off);
+    cfg.ffmpeg = script;
+    let spec = spec(&input, &library, profile());
+    let video = spec.probe.primary_video().unwrap();
+    let expected = spec.probe.duration_secs.unwrap() * video.frame_rate.unwrap();
+
+    let (outcome, updates) = run(&cfg, &spec, &fake_plan).await;
+    assert!(matches!(outcome, JobOutcome::Done { .. }), "{outcome:?}");
+    assert_eq!(outcome.attempts().len(), 1, "{outcome:?}");
+    assert_eq!(outcome.attempts()[0].result, AttemptResult::Succeeded);
+    let encoding: Vec<&JobProgress> = updates
+        .iter()
+        .filter(|p| p.stage == JobStage::Transcoding && p.progress_basis.is_some())
+        .collect();
+    assert!(!encoding.is_empty(), "{updates:?}");
+    // Never "unknown" here (the frame count can be turned into a share),
+    // never a percentage from an output time that never came; only ffmpeg's
+    // final report is a measured 100 %.
+    let (last, estimated) = encoding.split_last().unwrap();
+    assert!(
+        estimated
+            .iter()
+            .all(|p| p.progress_basis == Some(ProgressBasis::Frames) && p.progress < 100.0),
+        "{encoding:?}"
+    );
+    assert!(
+        last.progress_basis == Some(ProgressBasis::Frames)
+            || (last.progress_basis == Some(ProgressBasis::Time) && last.progress == 100.0),
+        "{last:?}"
+    );
+    let half = encoding
+        .iter()
+        .find(|p| p.frames == Some(48))
+        .unwrap_or_else(|| panic!("{encoding:?}"));
+    let share = 48.0 / expected * 100.0;
+    assert!((f64::from(half.progress) - share).abs() < 0.5, "{half:?}");
+    assert!(half.progress > 40.0 && half.progress < 60.0, "{half:?}");
+    assert!(half.eta_secs.is_some_and(|s| s <= 3), "{half:?}");
+    assert!(half.elapsed_secs.is_some(), "{half:?}");
+    assert!(
+        encoding.windows(2).all(|w| w[0].progress <= w[1].progress),
+        "{encoding:?}"
+    );
 }
 
 /// With low priority on (the default), ffmpeg runs under `nice`. A missing

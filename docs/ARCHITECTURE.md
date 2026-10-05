@@ -140,7 +140,8 @@ jobs(id TEXT PK, file_id FK→files ON DELETE CASCADE, library_id, file_name, fi
      skip_reason, validation TEXT JSON, command, log_tail, notes TEXT JSON NULL,
      created_at, started_at, finished_at, final_path TEXT NULL, force INT DEFAULT 0,
      freed_bytes INT NULL, profile TEXT JSON NULL, placing INT DEFAULT 0,
-     placing_size INT NULL, placing_original_size INT NULL, final_mount TEXT JSON NULL)
+     placing_size INT NULL, placing_original_size INT NULL, final_mount TEXT JSON NULL,
+     attempts TEXT JSON NULL, progress_basis TEXT NULL, frames INT NULL, elapsed_secs INT NULL)
      INDEX(state, priority DESC, created_at), INDEX(file_id, created_at), INDEX(created_at),
      partial INDEX(finished_at) of finished jobs, partial INDEX(placing) of marked jobs
 activity(id INTEGER PK AUTOINCREMENT, at, level, message, file_id, job_id, library_id,
@@ -210,6 +211,12 @@ onto itself (see "Drives and shares the folders sit on") is another drive,
 never noted. Another filesystem mounted there before that first look (a
 tmpfs, or a host folder bound into a container) can't be told from the
 share and is noted as it; the user then says which one to use as below.
+14 = `jobs.attempts` (JSON `JobAttempt[]`, every way of converting the
+file the job tried with how it ended; see Contract additions (round 6))
+and how a running job's progress was worked out while transcoding:
+`jobs.progress_basis` (`time`, `frames`, `unknown`), `jobs.frames` and
+`jobs.elapsed_secs`. Jobs recorded before have no attempts (`NULL`, read
+as none) and no basis.
 
 Rules:
 - Timestamps are RFC 3339 UTC strings with milliseconds. UUIDs are hyphenated
@@ -645,7 +652,17 @@ dispatcher claims job ─► running(preparing ► transcoding ► verifying ►
   moment ago, or a stale row) is closed directly only while it is still
   `running`, so a result recorded in the meantime is never overwritten.
 - Progress: every update is broadcast as `job.progress`; the DB is written on
-  stage changes and at most every 2 s per job.
+  stage changes and at most every 2 s per job. The update that follows the
+  end of an attempt carries the attempts so far (`JobProgress.attempts`,
+  worker to server only): it is always written (`jobs.attempts`), and the
+  job goes out as `job.updated`, so the job's details say why an attempt
+  failed while the next one runs; the `job.progress` event never carries
+  them. The job's outcome carries the whole list again
+  (`JobOutcome::{Done, Skipped, Failed}.attempts`), written with the result
+  in the same transaction (an outcome without any, such as a job settled
+  from the disk after a restart, keeps those written while it ran). A job
+  that starts again (claimed, put back in the queue, recovered at start-up)
+  starts with none: they describe its latest run.
 - A result is never lost: recording it retries while the database is busy.
 - Encoder candidates come from `hwdetect::encoder_candidates(hw, profile.video_codec,
   settings.hardware, settings.cpu_fallback)`, else the codec's software encoder.
@@ -862,6 +879,37 @@ that a different drive is mounted there).
    time or bytes written moved, or a new stderr line. (ffmpeg 7, as in the
    Docker image, keeps printing identical blocks every half second while
    it is stuck; those don't count.)
+   Every attempt that ran is recorded as it ends (`JobAttempt`, see Contract
+   additions (round 6)): an ffmpeg failure, no file written, an original
+   that stops early, a failed check (the check, and its reason without the
+   job's advice), or a success (a size-rule skip included). Plan failures,
+   repeated commands and attempts cut short by Cancel, Stop or a share that
+   stops answering are not. A fallback's note names the check the attempt
+   before the one that worked failed, when one did: "Converting on the GPU
+   (VA-API) made a file that failed a check (Plays start to finish:
+   playback stopped at 1:01 of 2:21:02), so it was converted on the CPU"
+   ("Decoding on the GPU made a file that failed a check (…), so it was
+   decoded on the CPU"; "The first way of converting … made a file that
+   failed a check (…), so another one was used"); after an ffmpeg error the
+   notes stay as before ("Converting on the NVIDIA GPU didn't work for this
+   file, so it was converted on the CPU"). A similarity score stays out of
+   the note.
+   **Progress while encoding** (`ffmpeg::estimate_progress`): ffmpeg 7
+   reports as its output time that of the track furthest behind, and none
+   at all (`out_time=N/A`) while a track has had no packet yet (a subtitle
+   track without a line so far), sometimes for a whole encode; ffmpeg
+   before 6 printed "no time yet" as `-9223372036854775807`, read as none.
+   The share is the output time over the original's length (`time`); when
+   ffmpeg reports no output time, or the frames encoded are at least 2
+   points ahead of it, it is the frames over the frames the original should
+   have (`frames`: its stated length times its frame rate, both known and
+   plausible, 1 to 240 fps; at most 99 % before ffmpeg's final report, and
+   dropped once the frames pass that count by more than 5 %), with the time
+   left from the frames still to encode at ffmpeg's fps; with neither it is
+   `unknown`: progress 0 and no time left, never a figure that only looks
+   like one, while the frames and the time spent are reported. Where the
+   encode got (for "the original stops early") is likewise its frames over
+   the frame rate when no output time came.
 3. A cut-off original: when ffmpeg reported damaged input or verification
    found the result too short, and the encode ended clearly before the length
    the container claims (> max(2 s, 5 %)), the job fails with "The original
@@ -1144,7 +1192,7 @@ limited to 1 MB (413 `body_too_large`); write requests with a body need
 | `POST /files/{id}/skip` | | `MediaFile` status skipped, reason "Skipped by you"; cancels its job |
 | `POST /files/bulk` | `{"action":"queue"\|"skip"\|"retry_failed", "ids"?: [], "library"?, "status"?}` | `{"affected": n, "left_out": m}`. `queue` with `ids` only queues failed files and files the library's goal would convert (`decide`), except files skipped by the size rule under that goal; the rest are counted in `left_out` (0 for other selections). |
 | `GET /jobs` | `state` (`active` = running+queued, `running`, `queued`, `history` = finished, `all`), `limit`, `offset` | `{"items": Job[], "total"}`; active sorted running-first then queue order; history newest first |
-| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`, `freed_bytes`, `output_name`) |
+| `GET /jobs/{id}` | | `Job` (includes `notes: string[]`, `validation`, `command`, `log_tail`, `problem`, `force`, `freed_bytes`, `output_name`, `attempts`, `progress_basis`, `frames`, `elapsed_secs`; the lists and `GET /files/{id}` carry the same) |
 | `POST /jobs/{id}/cancel` | | `Job` (409 `job_finished`) |
 | `POST /jobs/{id}/priority` | `{"priority": int}` or `{"move":"top"}` | `Job` |
 | `POST /jobs/clear` | `{"state":"history"}` | `{"affected": n}` deletes finished job rows (files keep status) |
@@ -1240,6 +1288,47 @@ headers are sent (except with `--dev-cors`, which also skips the
   job; `null` otherwise. Derived from `jobs.final_path` (where the job put
   its result, stored when it started), so nothing more is stored.
 
+### Contract additions (round 6)
+
+Every new field may be absent in what an older server sends (read as
+`null`, or `[]` for `attempts`); the existing fields mean what they did.
+
+- **`Job.progress_basis`**, **`JobProgress.progress_basis`**
+  (`"time" | "frames" | "unknown" | null`, `jobs.progress_basis`): how
+  `progress` was worked out while transcoding (see "Progress while
+  encoding" under run_job). `time`: ffmpeg's output time over the
+  original's length (or 100 once ffmpeg reports the end); `frames`: an
+  estimate from the frames encoded over the frames the original should
+  have, shown as one; `unknown`: no share is known, `progress` is 0 and
+  means nothing and `eta_secs` is null: show the frames and the time spent
+  instead. `null` outside transcoding (`progress` is then as it says) and
+  for finished jobs.
+- **`Job.frames`**, **`JobProgress.frames`** (`integer | null`,
+  `jobs.frames`): video frames the current attempt has encoded, while
+  transcoding.
+- **`Job.elapsed_secs`**, **`JobProgress.elapsed_secs`** (`integer | null`,
+  `jobs.elapsed_secs`): seconds since the current attempt started
+  encoding, while transcoding. The UI shows "1,017 frames · 7 min elapsed"
+  from these two when the basis is `unknown`.
+- **`Job.attempts`** (`JobAttempt[]`, `jobs.attempts`): every way of
+  converting the file the job tried in its latest run, in order, each with
+  how it ended; the attempt still running is left out (`Job.attempt` and
+  `encoder` describe it). Stored as each attempt ends and sent as
+  `job.updated` then, and with the job's result. `JobAttempt`:
+  `{attempt, encoder, hw_api, device: string|null (render node), hw_decode:
+  bool (the GPU decoded the original; false: the CPU did), elapsed_secs:
+  number (the attempt with its checks), result: "succeeded"|"failed",
+  error: string|null (plain words; a failed check's is its reason without
+  the job's advice), problem: ProblemKind|null, failed_check:
+  ValidationCheck|null (the check that failed, with its plain detail),
+  command: string|null, log_tail: string|null (a failed attempt's last
+  ffmpeg lines: at most 12, without known noise, at most 2 000
+  characters)}`. The job's own `encoder`, `command`, `log_tail`,
+  `validation` and `error` are still those of its last attempt, as before.
+- **`JobProgress.attempts`** (`JobAttempt[]`, left out when absent): the
+  worker's update to the server after an attempt ends; never in the
+  `job.progress` event (see Dispatcher, Progress).
+
 ## Hardware detection (normative)
 
 - CPU: model from `/proc/cpuinfo` (fallback: "Unknown CPU"), logical cores via
@@ -1315,7 +1404,11 @@ Screens:
    attention** (setup hints from hardware detection, libraries that can't be
    reached, failed files grouped by `problem` with the fix for each);
    **Converting now** (live cards per running job: file, stage, progress,
-   speed, time left, where it runs); **Libraries** (each library's
+   speed, time left, where it runs; while the share isn't known
+   (`progress_basis` `unknown`) a moving bar with "1,017 frames · 7 min
+   elapsed" instead of a percentage and no time left, and an estimate from
+   frames reads "About 37% · estimated from 1,017 frames"; a later attempt
+   says which check the last one failed); **Libraries** (each library's
    progress, and "Add library"); the latest finished results. No codec
    breakdown and no activity feed. Without libraries it shows the welcome
    and "Choose a folder".
@@ -1326,8 +1419,13 @@ Screens:
    they apply, and can be cleared. The activity **Log** (scans, warnings
    and problems) sits under History. Queue controls: pause, resume, stop
    now. A job's sheet
-   shows before → after, notes, the verification report, and the ffmpeg
-   command and log tail under a disclosure.
+   shows before → after, notes, the attempts when there was more than one
+   ("Attempt 1 · AMD GPU (VA-API) · decoded on the GPU · 2 min" over
+   "Failed: Plays start to finish: playback stopped at 1:01 of 2:21:02",
+   the one still running last; a VA-API attempt is named after the GPU
+   whose render node it used), the verification report, and under a
+   disclosure the ffmpeg command and log tail, each attempt's command and
+   log, and "Copy for a bug report" (all of it as plain text).
 4. **Library** (one per library, tabs **Files** and **Settings**): Files is
    the library's progress and the file table with search, status filters
    (with counts), sort, pages and bulk Convert / Skip, plus the
