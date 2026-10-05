@@ -30,8 +30,9 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 | `web/` | Next.js UI, exported as static files to `web/out` |
 | `docker/`, `Dockerfile`, `docker-compose*.yml` | Container image and examples |
 | `unraid/` | Community Applications template and icon |
-| `scripts/` | Test and demo media generators, the end-to-end smoke tests and the screenshot script |
+| `scripts/` | Test and demo media generators, the end-to-end smoke tests, the screenshot script, and the release rules (`release-channel.sh`, `release-notes.sh`, tested by `test-release-channel.sh`) |
 | `docs/` | Architecture, Unraid and hardware guides, and `screenshots/` |
+| `CHANGELOG.md` | What changed in each release; the source of the GitHub Release notes |
 | `.github/workflows/` | CI and the image release |
 
 ## Everyday commands
@@ -49,6 +50,7 @@ product principles are in [PRODUCT.md](PRODUCT.md).
 | `make test-media` | Writes a synthetic library to `./media` |
 | `make docker` | Builds the image `chrysopoeia:dev` |
 | `make test-docker` | Builds the image and runs the entrypoint tests |
+| `make test-release` | Checks the release rules without Docker or GitHub: which tags a release moves (`stable` never moves backwards) and the release notes |
 | `make e2e` | Builds the image and runs the end-to-end smoke test (API) |
 | `make e2e-browser` | Builds the image and drives its first run in a real browser |
 
@@ -203,19 +205,19 @@ whose screen has visibly changed since the last time.
 - `.github/workflows/ci.yml` runs on pull requests and on pushes to `main`:
   workflow, shell-script and template lint (actionlint via the
   `rhysd/actionlint` image, shellcheck, xmllint on the Unraid template,
-  `docker compose config` on the compose files), Rust (fmt, clippy, tests with
-  ffmpeg installed), web (lint, typecheck, unit tests, static build) and Docker
-  (amd64 image, entrypoint tests, `scripts/e2e-smoke.sh` and
-  `scripts/e2e-browser.sh` against the built image).
+  `docker compose config` on the compose files, and
+  `scripts/test-release-channel.sh`, the release rules below), Rust (fmt,
+  clippy, tests with ffmpeg installed), web (lint, typecheck, unit tests,
+  static build) and Docker (amd64 image, entrypoint tests,
+  `scripts/e2e-smoke.sh` and `scripts/e2e-browser.sh` against the built image).
 - `.github/workflows/release.yml` runs on pushes to `main`, on `v*` tags and
   by hand. It builds the amd64 image, runs the entrypoint tests and both
   end-to-end tests against it, and only then pushes a multi-arch (amd64 +
-  arm64) image to `ghcr.io/<owner>/chrysopoeia`: a push to `main` is tagged
-  `latest` and `sha-<short>`; a tag `v1.2.3` is tagged `1.2.3`, `1.2`, `1` and
-  `sha-<short>` (a `v0.*` tag gets no major-only tag: `v0.2.3` is tagged `0.2.3`,
-  `0.2` and `sha-<short>`). A version tag never moves `latest`, which always
-  follows `main`. The arm64 image is cross-compiled (only the final `apt-get` step runs
-  under emulation) and is not run in CI.
+  arm64) image to `ghcr.io/<owner>/chrysopoeia`. Which tags a run publishes is
+  in [Update channels](#update-channels) below; a version tag also gets a GitHub
+  Release ([Cutting a release](#cutting-a-release)). The arm64 image is
+  cross-compiled (only the final `apt-get` step runs under emulation) and is not
+  run in CI.
 - There are two version numbers. The server reports the `version` in
   `Cargo.toml` (`[workspace.package]`) in `/api/health`, `/api/system` and its
   "is running" log line. The image version is `1.2.3` for a tag,
@@ -227,14 +229,15 @@ whose screen has visibly changed since the last time.
   main-1a2b3c4)` in the log, `Chrysopoeia 0.2.0 · build main-1a2b3c4` in
   *About*. A bug report that quotes it names the exact commit. To release, set
   `version` in `Cargo.toml` to `1.2.3`, commit, then tag `v1.2.3`; the workflow
-  refuses a tag that does not match.
+  refuses a tag that does not match (see [Cutting a release](#cutting-a-release)).
 - To publish an image from a branch before merging it (for example to try it
   on an Unraid server), open **Actions > Release > Run workflow** and pick the
   branch. The same tests run, and the image is pushed as `edge` and
-  `sha-<short>` (image version `<branch>-<short sha>`); `latest` is not
-  touched. On Unraid, set the container's Repository to
-  `ghcr.io/<owner>/chrysopoeia:edge`. After the merge, `main`'s own release run
-  publishes `latest`; set Repository back to it.
+  `sha-<short>` (image version `<branch>-<short sha>`); `latest` and `stable`
+  are not touched. On Unraid, set the container's Repository to
+  `ghcr.io/<owner>/chrysopoeia:edge`. Afterwards set Repository back to
+  `:stable`, or to `:latest` once the branch is merged and `main`'s own release
+  run has published it.
 - The Unraid template's `TemplateURL` and `Icon` point at the `main` branch
   (`unraid/chrysopoeia.xml`, `unraid/chrysopoeia.png`), so a template or icon
   change reaches users only once it is merged. A template tried from a branch
@@ -246,6 +249,110 @@ whose screen has visibly changed since the last time.
   Public. Until then Unraid and Docker are refused when pulling it. The
   workflow run's summary repeats this.
 
+### Update channels
+
+The image tag is the update channel: a container follows whatever its tag
+follows. `latest` follows every build of `main` and is not a release channel;
+`stable` is.
+
+| Trigger | Image tags pushed | GitHub Release |
+|---|---|---|
+| Push to `main` | `latest`, `sha-<short>` | none |
+| Tag `v1.2.3` | `1.2.3`, `sha-<short>`, then the moving tags below that this release is entitled to | yes, as the latest release if it moved `stable` |
+| Tag `v1.2.0-rc.1` (any tag with a `-` suffix, a prerelease) | `1.2.0-rc.1`, `sha-<short>`; no moving tag | yes, marked as a pre-release |
+| Manual run on another branch | `edge`, `sha-<short>` | none |
+| Manual run on a tag | as for that tag; never moves a moving tag backwards | only if it has none yet |
+
+The moving tags of a release (`scripts/release-channel.sh moving-tags`):
+
+- `stable` only if this is the newest release of all;
+- `1.2` only if it is the newest release of the 1.2 line, and `1` (from 1.0
+  on; `v0.x` has no major-only tag) only if it is the newest of the 1.x line.
+
+A "release" here is a tag that is a strict `vMAJOR.MINOR.PATCH` version
+without a prerelease suffix, and "newest" compares the numbers, not the text,
+so `v0.10.0` is newer than `v0.9.9`. Other tags (`v1`, `vfoo`) are ignored by
+the rules, and the workflow refuses to build a `v*` tag that is not a valid
+version. The tags `1.2.3` and `sha-<short>` are exact and never move.
+
+### Cutting a release
+
+A release is a version tag on `main`. Nothing else moves `stable`.
+
+1. Make sure the commit you want to ship is on `main` and green: CI, and the
+   **Release** run that `main` itself triggers.
+2. Prepare the release in a pull request:
+   - In `CHANGELOG.md`, move the entries of `## [Unreleased]` into a new
+     `## [X.Y.Z] - YYYY-MM-DD` section, leave an empty `## [Unreleased]` above
+     it and update the links at the bottom. The release workflow copies this
+     section into the GitHub Release; without it the notes list commits only and
+     the run says so.
+   - Set `version` in `Cargo.toml` (`[workspace.package]`) to `X.Y.Z` and
+     refresh the lock file with `cargo update --workspace`, which changes only
+     the five workspace crates' versions (CI builds with `--locked`).
+   - Merge it.
+3. Tag the merge commit and push the tag:
+
+   ```sh
+   git switch main && git pull
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+   A prerelease works the same with a suffix: set `version = "X.Y.Z-rc.1"` in
+   `Cargo.toml` and push `vX.Y.Z-rc.1`. The final `vX.Y.Z` needs `X.Y.Z` there.
+4. Watch **Actions > Release**. For a version tag the workflow:
+   1. refuses a tag that is not a valid version, or that does not match
+      `version` in `Cargo.toml`, before building anything;
+   2. builds the amd64 image and runs the entrypoint tests and both end-to-end
+      tests against it;
+   3. pushes the multi-arch image as `X.Y.Z` and `sha-<short>`;
+   4. reads the tags that exist at that moment and, for a release (not a
+      prerelease), copies the image to `stable`, `X.Y` and `X` as far as this
+      release is the newest of each (the same image, by digest, checked after);
+   5. in a second job, the only one allowed to write repository contents,
+      creates the GitHub Release for the tag: the `CHANGELOG.md` section, the
+      commits since the previous release (merge commits left out, at most 100),
+      a link to the full comparison and the image tags. It is marked as a
+      pre-release for a prerelease, and as the latest release only if it moved
+      `stable`. A release that already exists is left as it is, so a re-run
+      cannot overwrite notes you edited.
+5. Run the checks under [Before announcing a release](#before-announcing-a-release).
+
+**The first release.** `stable` is created by the first version tag. Until a
+tag such as `v0.2.0` has been pushed and its Release run has finished,
+`ghcr.io/thekozugroup/chrysopoeia:stable` does not exist, and pulling it fails
+with *manifest unknown*. The Unraid template's Repository is `:stable`, so push
+the first release (and make the package public) before the template reaches
+`main` and Community Applications, or the first install from it fails.
+`Cargo.toml` says `0.2.0` today, so the first tag is `v0.2.0` unless you change
+it.
+
+**How `stable` is protected from moving backwards.**
+
+- The rule is in one place, `scripts/release-channel.sh`, and compares versions
+  numerically (`v0.10.0` beats `v0.9.9`). `scripts/test-release-channel.sh`
+  tests it, with `v0.2.0`, `v0.3.0`, `v0.3.1-rc.1`, `v0.10.0` and `v0.9.9`
+  among others, and CI runs it (`make test-release` locally). Only the newest
+  of those, `v0.10.0`, takes `stable`: `v0.9.9` and the prerelease do not.
+- The decision is made after the build, right before the tags are moved, from
+  the tags that exist then (read from the GitHub API), not from those at the
+  start of the run. If `v0.3.1` is tagged while `v0.3.0` is still building,
+  `v0.3.0` leaves `stable` alone, whichever finishes first.
+- Re-running an older release (from the Actions page) republishes its exact
+  tag and cannot move `stable`, `X.Y` or `X` backwards. A prerelease never
+  moves any of them.
+- The cost: the newest *tag* decides, even if its own run failed. If the
+  newest version's run fails, `stable` stays where it was, and older tags cannot
+  move it. Re-run the failed run, or cut the next patch release with the fix.
+- Never re-tag or force-push a version that was published. Containers that
+  follow `stable` update by themselves, and the database of a newer version
+  cannot be read by an older one. Fix forward with a new patch release. To put
+  `stable` back on an older image after a bad release anyway, do it by hand
+  (`docker login ghcr.io`, then `docker buildx imagetools create -t
+  ghcr.io/<owner>/chrysopoeia:stable ghcr.io/<owner>/chrysopoeia:X.Y.Z`); the
+  workflow will not.
+
 ### Before announcing a release
 
 Everything the README and `docs/UNRAID.md` tell a new user to download or pull
@@ -254,7 +361,7 @@ shell) that is not logged in to GitHub or GHCR, because a private package
 and a logged-in session hide the problem:
 
 1. Merge to `main` (or push the version tag) and wait for the **Release** run
-   to finish green: it pushes `:latest` (or the version tags).
+   to finish green: it pushes `:latest` (or the version tags and `:stable`).
 2. The first time ever: set the package to **Public** (GitHub > Packages >
    chrysopoeia > Package settings > Change visibility).
 3. Check the image and the raw files the docs point at:
@@ -262,6 +369,10 @@ and a logged-in session hide the problem:
    ```sh
    docker logout ghcr.io
    docker pull ghcr.io/thekozugroup/chrysopoeia:latest      # not "denied"
+   docker pull ghcr.io/thekozugroup/chrysopoeia:stable      # needs a version tag; not "manifest unknown"
+   for tag in stable X.Y.Z; do                              # the same digest twice
+     docker buildx imagetools inspect "ghcr.io/thekozugroup/chrysopoeia:$tag" --format '{{json .Manifest}}' | jq -r .digest
+   done
    raw=https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/main
    for f in unraid/chrysopoeia.xml unraid/chrysopoeia.png docker-compose.yml .env.example; do
      curl -fsSL -o /dev/null -w "%{http_code}  $f\n" "$raw/$f" || echo "FAILED  $f"
@@ -272,16 +383,21 @@ and a logged-in session hide the problem:
    README's Compose steps in an empty folder and confirm `docker compose up -d`
    starts `ghcr.io/thekozugroup/chrysopoeia:latest` (`docker compose config`
    shows the image), and open the web UI.
-4. Only then announce it. Until it is done, the README and UNRAID.md callouts
+4. For a version tag, open the project's Releases page: the release has its
+   notes, a prerelease is marked as one, and only a release that moved
+   `stable` carries the *Latest* badge.
+5. Only then announce it. Until it is done, the README and UNRAID.md callouts
    tell people to use the branch's raw URLs and the `:edge` image, or to build
    the image themselves.
 
-Run the workflow checks locally before pushing a change to `.github/`:
+Run the workflow checks locally before pushing a change to `.github/` or
+`scripts/`:
 
 ```sh
 docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
 shellcheck docker/*.sh scripts/*.sh
 xmllint --noout unraid/chrysopoeia.xml
+scripts/test-release-channel.sh       # make test-release
 ```
 
 ## Conventions

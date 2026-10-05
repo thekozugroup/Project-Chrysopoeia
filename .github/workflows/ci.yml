@@ -38,6 +38,11 @@ jobs:
       - name: shellcheck
         run: shellcheck docker/*.sh scripts/*.sh
 
+      - name: Release rules (stable never moves backwards, release notes)
+        # The tag rules behind .github/workflows/release.yml, run without a
+        # registry: scripts/release-channel.sh and scripts/release-notes.sh.
+        run: scripts/test-release-channel.sh
+
       - name: Unraid template is well-formed XML
         run: |
           command -v xmllint >/dev/null || { sudo apt-get update && sudo apt-get install -y --no-install-recommends libxml2-utils; }

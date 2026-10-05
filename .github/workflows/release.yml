@@ -1,18 +1,56 @@
 name: Release
 
-# Publishes ghcr.io/<owner>/chrysopoeia for linux/amd64 and linux/arm64:
-#   push to main  -> :latest and :sha-<short>   (image version main-<short sha>)
-#   tag v1.2.3    -> :1.2.3, :1.2, :1 and :sha-<short>   (image version 1.2.3)
-#                    A tag never moves :latest, which always follows main.
-#                    The tag must match `version` in Cargo.toml
-#                    ([workspace.package]), which the server reports.
+# Publishes ghcr.io/<owner>/chrysopoeia for linux/amd64 and linux/arm64.
+#
+# Update channels: what an installed container follows depends on its tag.
+#   :stable      the newest non-prerelease version tag (vX.Y.Z), compared by
+#                semantic version. For automatic updates (it is the Unraid
+#                template's default). It moves only when a newer release is
+#                published and never backwards: re-running an older tag cannot
+#                move it. It does not exist until the first version tag has
+#                been pushed.
+#   :latest      every tested build of the main branch, between releases too
+#                (image version main-<short sha>). Not a release channel.
+#   :edge        a test build of another branch, from a manual run (below).
+#                Never moves :latest or :stable.
+#   :1.2.3       exactly one release. Published once, never moves.
+#   :1.2, :1     the newest release of that minor / major line, forward only
+#                (:1 only from 1.0 on). A prerelease never moves them.
+#   :sha-<short> exactly one commit.
+#
+# What each trigger publishes:
+#   push to main            -> :latest and :sha-<short>
+#                              (image version main-<short sha>)
+#   tag v1.2.3              -> :1.2.3 and :sha-<short> (image version 1.2.3),
+#                              then, once the push succeeded and only if this
+#                              is still the newest release of its line: :1.2
+#                              and :1, and, only if it is the newest release of
+#                              all: :stable. Then a GitHub Release with notes.
+#                              The tag must match `version` in Cargo.toml
+#                              ([workspace.package]), which the server reports.
+#   tag v1.2.0-rc.1         -> a prerelease (any tag with a "-" suffix):
+#                              :1.2.0-rc.1 and :sha-<short> only, and a GitHub
+#                              Release marked as a prerelease. No moving tag.
 #   manual run on any other branch (Actions -> Release -> Run workflow)
-#                 -> :edge and :sha-<short>   (image version <branch>-<short sha>)
+#                           -> :edge and :sha-<short> (image version
+#                              <branch>-<short sha>)
 #     so an image can be tried (e.g. on Unraid, Repository set to :edge)
-#     before the branch is merged. It never moves :latest.
+#     before the branch is merged.
+# A manual run on a tag repeats that tag's release; it can never move a moving
+# tag backwards.
+#
+# The tag rules (which tags are releases, which moving tags a release may take,
+# the previous release for the notes) are in scripts/release-channel.sh and are
+# tested without a runner by scripts/test-release-channel.sh, which CI runs.
+#
 # The amd64 image must pass the entrypoint tests and both end-to-end tests (API
 # and browser) before anything is pushed. The arm64 image is cross-compiled and
-# is not run here.
+# is not run here. The moving tags are set last, by copying the pushed image
+# (same digest), and are checked afterwards.
+#
+# Permissions: the build job can only write packages. Only the small release
+# job after it can write repository contents, to create the GitHub Release.
+#
 # The first image ever published, including a first :edge from a manual run on
 # a branch, creates the package as private. Make it public once (GitHub ->
 # Packages -> chrysopoeia -> Package settings -> Change visibility) so Unraid
@@ -26,11 +64,13 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a branch replaces the run in progress. A release is never
+  # cancelled half way (after its image was pushed, before its moving tags are
+  # set); a second run for the same tag waits for the first.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 env:
   # Drives web/e2e/smoke.mjs (scripts/e2e-browser.sh) against the built image.
@@ -41,33 +81,62 @@ jobs:
     name: Build, test and push
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.registry.outputs.name }}
+      kind: ${{ steps.channel.outputs.kind }}
+      version: ${{ steps.channel.outputs.version }}
+      prerelease: ${{ steps.channel.outputs.prerelease }}
+      stable_moved: ${{ steps.moving.outputs.stable_moved }}
+      moving_tags: ${{ steps.moving.outputs.moving_tags }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Image name
+        id: registry
         # Registry paths must be lowercase.
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chrysopoeia" >> "$GITHUB_ENV"
-
-      - name: Version string
-        # The image version: shown in the first line of the container log
-        # ("Chrysopoeia 0.2.0 (build main-1a2b3c4)") and in the OCI version
-        # label. Tags: v1.2.3 -> 1.2.3. Branches: <branch>-<short sha>, so a
-        # bug report from a :latest image names the exact commit. The server
-        # itself (API, "is running" log line) reports Cargo.toml's version.
-        id: version
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
-            version="${GITHUB_REF_NAME#v}"
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/chrysopoeia"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Channel and version
+        # kind is "release" for a version tag (v1.2.3, v1.2.0-rc.1) and
+        # "build" for everything else. The image version is shown in the first
+        # line of the container log ("Chrysopoeia 0.2.0 (build main-1a2b3c4)")
+        # and in the OCI version label. Tags: v1.2.3 -> 1.2.3. Branches:
+        # <branch>-<short sha>, so a bug report from a :latest image names the
+        # exact commit. The server itself (API, "is running" log line) reports
+        # Cargo.toml's version.
+        id: channel
+        run: |
+          set -euo pipefail
+          kind=build
+          prerelease=false
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" == v* ]]; then
+            if ! info=$(scripts/release-channel.sh classify "$GITHUB_REF_NAME" 2>&1); then
+              echo "::error::$info Nothing was published."
+              exit 1
+            fi
+            kind=release
+            version=$(sed -n 's/^version=//p' <<<"$info")
+            prerelease=$(sed -n 's/^prerelease=//p' <<<"$info")
             cargo_version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}' Cargo.toml)
             if [[ "$cargo_version" != "$version" ]]; then
-              echo "::error::Tag $GITHUB_REF_NAME does not match version = \"$cargo_version\" in Cargo.toml ([workspace.package]), which the server reports. Set it to \"$version\", commit, and move the tag to that commit."
+              echo "::error::Tag $GITHUB_REF_NAME does not match version = \"$cargo_version\" in Cargo.toml ([workspace.package]), which the server reports. Set it to \"$version\", commit, and move the tag to that commit. Nothing was published."
               exit 1
             fi
           else
             branch="${GITHUB_REF_NAME//[^A-Za-z0-9._-]/-}"
             version="${branch}-${GITHUB_SHA::7}"
           fi
-          echo "value=$version" >> "$GITHUB_OUTPUT"
+          {
+            echo "kind=$kind"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
         with:
@@ -92,15 +161,16 @@ jobs:
           DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ${{ env.IMAGE }}
-          # Only the explicit rule below sets :latest (pushes to main); by
-          # default a version tag would move it too, possibly backwards.
+          # Every tag below is set by an explicit rule, none by the action's
+          # own defaults (which would let a version tag move :latest).
+          # :stable, :MAJOR.MINOR and :MAJOR are not here: they are set after
+          # the push (step "Move stable and the other moving tags"), because
+          # they must move only forward.
           flavor: latest=false
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=edge,enable=${{ github.ref_type == 'branch' && github.ref_name != github.event.repository.default_branch }}
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}},enable=${{ !startsWith(github.ref, 'refs/tags/v0.') }}
+            type=raw,value=${{ steps.channel.outputs.version }},enable=${{ steps.channel.outputs.kind == 'release' }}
             type=sha
           # The version label overrides metadata-action's default, which is
           # "latest" for builds from main.
@@ -108,12 +178,12 @@ jobs:
             org.opencontainers.image.title=Chrysopoeia
             org.opencontainers.image.description=Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original.
             org.opencontainers.image.licenses=Apache-2.0
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.version=${{ steps.channel.outputs.version }}
           annotations: |
             org.opencontainers.image.title=Chrysopoeia
             org.opencontainers.image.description=Self-hosted media transcoder: pick a folder and a goal; every file is verified before it replaces the original.
             org.opencontainers.image.licenses=Apache-2.0
-            org.opencontainers.image.version=${{ steps.version.outputs.value }}
+            org.opencontainers.image.version=${{ steps.channel.outputs.version }}
 
       - name: Build linux/amd64 for the smoke test
         uses: docker/build-push-action@v6
@@ -123,7 +193,7 @@ jobs:
           load: true
           tags: chrysopoeia:release-test
           build-args: |
-            VERSION=${{ steps.version.outputs.value }}
+            VERSION=${{ steps.channel.outputs.version }}
             REVISION=${{ github.sha }}
             CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: |
@@ -146,6 +216,7 @@ jobs:
         run: scripts/e2e-browser.sh chrysopoeia:release-test
 
       - name: Build and push linux/amd64 + linux/arm64
+        id: push
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -155,7 +226,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
-            VERSION=${{ steps.version.outputs.value }}
+            VERSION=${{ steps.channel.outputs.version }}
             REVISION=${{ github.sha }}
             CREATED=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: |
@@ -163,11 +234,56 @@ jobs:
             type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release
 
+      - name: Move stable and the other moving tags
+        # Only for a release (not a prerelease). The tag list is read now, not
+        # when the run started: a newer release tagged while this one was
+        # building must keep :stable even if it finished first, and a re-run of
+        # an older tag must not move anything backwards. The moving tags are
+        # copies of the pushed image's digest, not new builds.
+        id: moving
+        if: steps.channel.outputs.kind == 'release' && steps.channel.outputs.prerelease == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$DIGEST" ]]; then
+            echo "::error::The push step reported no image digest, so no moving tag was set."
+            exit 1
+          fi
+          tag_list=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')
+          mapfile -t moving < <(scripts/release-channel.sh moving-tags "$GITHUB_REF_NAME" <<<"$tag_list")
+          stable_moved=false
+          args=()
+          for t in "${moving[@]}"; do
+            args+=(-t "$IMAGE:$t")
+            if [[ "$t" == stable ]]; then stable_moved=true; fi
+          done
+          if ((${#moving[@]} > 0)); then
+            docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
+            for t in "${moving[@]}"; do
+              got=$(docker buildx imagetools inspect "$IMAGE:$t" --format '{{json .Manifest}}' | jq -r .digest)
+              if [[ "$got" != "$DIGEST" ]]; then
+                echo "::error::$IMAGE:$t points at $got, not at the image this run pushed ($DIGEST)."
+                exit 1
+              fi
+            done
+          fi
+          {
+            echo "stable_moved=$stable_moved"
+            echo "moving_tags=${moving[*]}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Summary
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
-          VERSION: ${{ steps.version.outputs.value }}
+          VERSION: ${{ steps.channel.outputs.version }}
+          KIND: ${{ steps.channel.outputs.kind }}
+          PRERELEASE: ${{ steps.channel.outputs.prerelease }}
+          MOVING_TAGS: ${{ steps.moving.outputs.moving_tags }}
+          STABLE_MOVED: ${{ steps.moving.outputs.stable_moved }}
         run: |
+          read -ra moving <<<"$MOVING_TAGS"
           {
             echo "## Published image version $VERSION"
             echo
@@ -176,6 +292,78 @@ jobs:
             while IFS= read -r tag; do
               if [ -n "$tag" ]; then echo "- \`$tag\`"; fi
             done <<< "$TAGS"
+            for t in "${moving[@]}"; do
+              echo "- \`$IMAGE:$t\` (moved to this release)"
+            done
+            echo
+            if [ "$KIND" != release ]; then
+              echo "\`:stable\` only moves with version tags, so it is unchanged. \`:latest\` follows every build of the default branch; \`:edge\` is the test build of a branch."
+            elif [ "$PRERELEASE" = true ]; then
+              echo "A prerelease: it is published under its exact version only. \`:stable\`, \`:latest\` and the \`MAJOR.MINOR\` tags are unchanged."
+            elif [ "$STABLE_MOVED" = true ]; then
+              echo "\`:stable\` now points at this release."
+            else
+              echo "\`:stable\` was **not** moved: a newer release exists, and the stable channel never moves backwards."
+            fi
             echo
             echo "If this is the first image ever published (including a first \`:edge\` from a branch), the package is private and Unraid and Docker are refused when pulling it. Make it public once: open https://github.com/${GITHUB_REPOSITORY}/pkgs/container/chrysopoeia, then **Package settings > Change visibility > Public**."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: GitHub Release
+    # After the image and its moving tags are published; a failed build
+    # creates no release.
+    needs: image
+    if: needs.image.outputs.kind == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The notes list the commits since the previous release.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create the GitHub Release
+        # The notes are the tag's CHANGELOG.md section, the commits since the
+        # previous release (not prerelease) and the image tags
+        # (scripts/release-notes.sh). A prerelease is marked as one. "Latest
+        # release" on GitHub is set only when this release moved :stable. A
+        # release that already exists is left as it is, so a re-run never
+        # overwrites notes that were edited by hand.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          IMAGE: ${{ needs.image.outputs.image }}
+          VERSION: ${{ needs.image.outputs.version }}
+          PRERELEASE: ${{ needs.image.outputs.prerelease }}
+          STABLE_MOVED: ${{ needs.image.outputs.stable_moved }}
+          MOVING_TAGS: ${{ needs.image.outputs.moving_tags }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "::notice::The release for $tag already exists; it was left as it is."
+            exit 0
+          fi
+          if [[ -f CHANGELOG.md ]] && ! scripts/release-channel.sh changelog "$VERSION" >/dev/null; then
+            echo "::warning::CHANGELOG.md has no \"## [$VERSION]\" section, so the notes list commits only."
+          fi
+          tag_list=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v" --jq '.[].ref | ltrimstr("refs/tags/")')
+          previous=$(scripts/release-channel.sh previous "$tag" <<<"$tag_list")
+          args=("$tag")
+          if [[ -n "$previous" ]]; then args+=("$previous"); fi
+          scripts/release-notes.sh "${args[@]}" > "$RUNNER_TEMP/notes.md"
+
+          flags=()
+          if [[ "$PRERELEASE" == true ]]; then
+            flags+=(--prerelease --latest=false)
+          elif [[ "$STABLE_MOVED" == true ]]; then
+            flags+=(--latest)
+          else
+            flags+=(--latest=false)
+          fi
+          gh release create "$tag" --verify-tag --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"
+          echo "Release: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"

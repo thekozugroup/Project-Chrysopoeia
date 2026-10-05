@@ -94,6 +94,13 @@ while asking far less of you:
 | Plays everywhere | H.264 | AAC | MP4 | always (compatibility is the point) |
 | Archive | AV1, highest quality | original | MKV | at least 5% smaller |
 
+**Audio.** *Save space* converts every audio track to Opus, keeping each
+track's channels, language and flags. Opus is a lossy codec, so a lossless
+track (TrueHD, DTS-HD Master Audio, FLAC) or an Atmos soundtrack does not
+survive it as it was. *Plays everywhere* does the same with AAC. *Balanced* and
+*Archive* copy the original audio unchanged (a track MKV cannot hold is
+converted), so choose one of them to keep lossless or Atmos audio.
+
 The first-run screen suggests the goal that suits the machine (the *Best fit*
 badge) and shows how fast each goal converts on it. When originals are replaced,
 *Plays everywhere* skips a file that has picture subtitles, styled subtitles or
@@ -107,15 +114,20 @@ attachments MP4 can't hold, instead of trimming it (see the [FAQ](#faq)).
 > Until the project is merged to `main`, that workflow has run, and the package
 > has been made public, the template and icon addresses answer *404*, the compose
 > file address may still serve an older, incompatible file, and pulling
-> `:latest` is *denied*. Until then, do one of these:
+> `:latest` is *denied*. The Unraid template installs `:stable`, which also
+> needs the first release: until a version tag (`v0.2.0`, say) has been pushed
+> and its Release run has finished, pulling `:stable` fails (*manifest
+> unknown*). Until then, do one of these:
 >
 > - **Use the branch.** In every `raw.githubusercontent.com` address, replace
 >   `main` with the branch's name (a pushed branch serves the same files), and
->   use the image `ghcr.io/thekozugroup/chrysopoeia:edge` instead of `:latest`.
+>   use the image `ghcr.io/thekozugroup/chrysopoeia:edge` instead of `:latest`
+>   (on Unraid, set **Repository** to it, since the template says `:stable`).
 >   Run **Actions › Release › Run workflow** on the branch to publish it, and
 >   make the package public once (see [Which image](#which-image)).
 > - **[Build the image yourself](#build-it-yourself)**, about 15 minutes, and
->   use the local image (`chrysopoeia:local`) wherever `:latest` appears below.
+>   use the local image (`chrysopoeia:local`) wherever `:latest` or `:stable`
+>   appears below.
 
 ### Unraid
 
@@ -142,6 +154,11 @@ attachments MP4 can't hold, instead of trimming it (see the [FAQ](#faq)).
 4. Click **Apply**, then open the web UI from the container's icon, choose a
    folder under `/media` and a goal.
 
+The template's **Repository** is `ghcr.io/thekozugroup/chrysopoeia:stable`:
+Unraid's update check and the Community Applications auto-update then offer
+tagged releases only, not every change on `main` (see
+[Which image](#which-image) and [Upgrading](#upgrading)).
+
 The full walkthrough, including GPU passthrough, the transcode cache, reverse
 proxies and troubleshooting, is in [docs/UNRAID.md](docs/UNRAID.md).
 
@@ -157,8 +174,11 @@ docker run -d --name chrysopoeia --restart unless-stopped \
 ```
 
 Use the owner of your media for `PUID`/`PGID` (`stat -c '%u %g' /srv/media`).
-Optional: `-v /fast/ssd/chrysopoeia-temp:/temp` keeps in-progress files on a
-fast disk. Add a GPU with one extra flag (more in [GPU setup](#gpu-setup)):
+`:latest` follows every build of `main`; for a server you leave alone, use
+`:stable` (releases only) once the first release exists, as explained under
+[Which image](#which-image). Optional: `-v /fast/ssd/chrysopoeia-temp:/temp`
+keeps in-progress files on a fast disk. Add a GPU with one extra flag (more in
+[GPU setup](#gpu-setup)):
 
 ```sh
 # Intel or AMD
@@ -180,9 +200,10 @@ curl -o .env https://raw.githubusercontent.com/thekozugroup/Project-Chrysopoeia/
 docker compose up -d
 ```
 
-To run another image than `:latest` (the `:edge` test build, or one you
-[built yourself](#build-it-yourself)), add a line to `.env`, for example
-`CHRYSOPOEIA_IMAGE=chrysopoeia:local`.
+To run another image than `:latest` (the `:stable` release channel, the `:edge`
+test build, or one you [built yourself](#build-it-yourself)), add a line to
+`.env`, for example `CHRYSOPOEIA_IMAGE=ghcr.io/thekozugroup/chrysopoeia:stable`
+or `CHRYSOPOEIA_IMAGE=chrysopoeia:local`.
 
 With a GPU, download the matching overlay file too and name both files:
 
@@ -206,23 +227,44 @@ the same rule applies to `LIBRARIES`.
 ### Which image
 
 Images are published to `ghcr.io/thekozugroup/chrysopoeia` for `linux/amd64`
-and `linux/arm64`:
+and `linux/arm64`. The tag a container runs decides which updates it gets:
 
-| Tag | What it is |
-|---|---|
-| `latest` | The newest tested build of the `main` branch. |
-| `1.2.3`, `1.2`, `1` | A release (a `v1.2.3` tag); `1` follows the newest 1.x. |
-| `edge` | A test build of a branch that is not merged yet. It is published when someone runs **Actions › Release › Run workflow** on that branch, and never changes `latest`. |
-| `sha-<commit>` | One exact commit. |
+| Tag | Follows | Use it for |
+|---|---|---|
+| `stable` | The newest release: the highest `vX.Y.Z` tag that is not a prerelease, compared by version number. It moves only when a newer release is published, and never backwards. | A server you leave alone, and anything that updates itself. The Unraid template's default. |
+| `latest` | The newest tested build of the `main` branch: every merged change, released or not. | Following development. |
+| `1.2.3` | Exactly one release. It never changes. | Pinning a version, or going back to one. |
+| `1.2`, `1` | The newest release of that minor line (`1.2`) or major line (`1`), forward only. | Fixes only (`1.2`), or any 1.x (`1`). |
+| `1.2.0-rc.1` | One prerelease (a `v1.2.0-rc.1` tag). It never moves another tag. | Trying a release candidate. |
+| `edge` | A test build of a branch that is not merged yet. It is published when someone runs **Actions › Release › Run workflow** on that branch, and never changes `latest` or `stable`. | Trying a change before it is merged. |
+| `sha-<commit>` | One exact commit. | Bug reports and bisecting. |
+
+`:stable` and `:latest` are different channels, not two names for the same
+thing: `:latest` moves with every merge to `main`, so it runs ahead of the
+newest release between releases, while `:stable` stays on the newest release
+until the next one is tagged. A container started from `:latest` and later
+switched to `:stable` can therefore go back to an older version (see
+[Upgrading](#upgrading)).
 
 Versions before 1.0 are tagged `0.2.3` and `0.2` only; the `1` tag starts with
-version 1.0.
+version 1.0. A re-run of an older release (say `v1.2.3` after `v1.2.4`) never
+moves `stable`, `1.2` or `1` backwards. To see which channel a running image
+came from, read its *build* (*About* at the bottom of Settings, or the first
+line of the container log): `0.3.0` for a release (reached through `stable`,
+`0.3` or `0.3.0`), `main-<commit>` for `latest`, `<branch>-<commit>` for
+`edge`. Every release is listed, with notes, on the project's
+[Releases page](https://github.com/thekozugroup/Project-Chrysopoeia/releases)
+and in [CHANGELOG.md](CHANGELOG.md).
+
+`stable` does not exist until the first release tag has been pushed. Before
+that, use `latest` (or `edge`).
 
 To try a branch before it is merged, run the Release workflow on it, then pull
 `ghcr.io/thekozugroup/chrysopoeia:edge` (Unraid: set the container's
-*Repository* to that). After the merge to `main`, switch back to `:latest`. The
-very first image creates the package as private; make it public once in
-GitHub › Packages › chrysopoeia › Package settings.
+*Repository* to that). Afterwards switch back to the tag you came from:
+`:stable`, or `:latest` once the branch is merged to `main` and you want its
+change straight away. The very first image creates the package as private; make
+it public once in GitHub › Packages › chrysopoeia › Package settings.
 
 The Unraid template's `Icon` and `TemplateURL` point at the `main` branch, so
 the icon and the template's own updates appear only once the template is on
@@ -382,9 +424,32 @@ Pull the new image and recreate the container. Your libraries, settings and
 history live in `/config` and are kept.
 
 - **Unraid:** Docker tab › *Check for Updates* › *apply update*.
-- **docker run:** `docker pull ghcr.io/thekozugroup/chrysopoeia:latest`, then
+- **docker run:** `docker pull ghcr.io/thekozugroup/chrysopoeia:latest` (or
+  whichever tag the container runs, such as `:stable`), then
   `docker rm -f chrysopoeia` and run the same `docker run` command again.
 - **Compose:** `docker compose pull && docker compose up -d`.
+
+**Which updates you get depends on the tag** (see [Which image](#which-image)):
+
+| Container runs | A new image appears | Good for |
+|---|---|---|
+| `:stable` | when a new release is published, never otherwise | Automatic updates: Unraid's daily check and the Community Applications auto-update, Watchtower, `docker compose pull` on a schedule. Only tested, tagged releases arrive. |
+| `:latest` | after every merge to `main` | Following development. An updater that runs by itself installs every change, finished or not. |
+| `:1.2` / `:1` | when a new 1.2.x / 1.x release is published | Staying on one minor or major version. |
+| `:1.2.3` | never | A pinned version. Change the tag to move. |
+| `:edge` | when someone publishes a branch | Testing only. |
+
+To follow releases instead of `main`, change the tag from `:latest` to
+`:stable`. On Unraid, **Edit** the container and change **Repository**, which
+keeps the saved template (paths, GPU device, limits), as
+[docs/UNRAID.md](docs/UNRAID.md#updates-stable-latest-and-edge) describes. With
+Compose, set `CHRYSOPOEIA_IMAGE=ghcr.io/thekozugroup/chrysopoeia:stable` in
+`.env`, then `docker compose up -d`. Check the version first: `:latest` can be
+ahead of the newest release, and `:stable` is then older, which a database
+written by the newer build refuses (see below). In that case wait for the next
+release, or restore a `/config` backup. `:stable` exists once the first release
+has been published; the [CHANGELOG](CHANGELOG.md) lists what each release
+contains.
 
 Files that were converting are stopped, their work files removed, and they
 start again from the beginning; an original is never left half-replaced. The
